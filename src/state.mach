@@ -1,0 +1,59 @@
+# public connection state without exposing secret key schedule storage
+
+use tls.config;
+use tls.error;
+use tls.tls13;
+use tls.transport;
+
+fwd tls.error.Error;
+
+pub def Role: u8;
+pub def Phase: u8;
+pub def Status: u8;
+
+pub val CLIENT: Role = 0;
+pub val SERVER: Role = 1;
+
+pub val INITIAL:           Phase = 0;
+pub val NEGOTIATING:       Phase = 1;
+pub val ESTABLISHED:       Phase = 2;
+pub val CLOSING:           Phase = 3;
+pub val CLOSED:            Phase = 4;
+
+pub val READY:      Status = 0;
+pub val NEED_READ:  Status = 1;
+pub val NEED_WRITE: Status = 2;
+pub val COMPLETE:   Status = 3;
+pub val FAILED:     Status = 4;
+
+pub rec Connection {
+    role:      Role;
+    phase:     Phase;
+    suite:     tls13.CipherSuite;
+    read_seq:  u64;
+    write_seq: u64;
+}
+
+pub rec Client {
+    connection: Connection;
+    config:     *config.ClientConfig;
+    transport:  transport.Transport;
+}
+
+pub rec Server {
+    connection: Connection;
+    config:     *config.ServerConfig;
+    transport:  transport.Transport;
+}
+
+pub rec Progress {
+    status: Status;
+    error:  error.Error;
+}
+
+test "state: connection lifecycle is ordered" {
+    if (INITIAL >= NEGOTIATING) { ret 1; }
+    if (ESTABLISHED >= CLOSING) { ret 1; }
+    if (CLOSING >= CLOSED) { ret 1; }
+    ret 0;
+}

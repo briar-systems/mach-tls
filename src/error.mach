@@ -1,0 +1,29 @@
+# tls protocol and operation errors
+
+pub def Error: u16;
+
+pub val OK:                    Error = 0;
+pub val WANT_READ:             Error = 1;
+pub val WANT_WRITE:            Error = 2;
+pub val CLOSED:                Error = 3;
+pub val CANCELLED:             Error = 4;
+pub val TIMEOUT:               Error = 5;
+pub val DECODE_ERROR:          Error = 6;
+pub val UNEXPECTED_MESSAGE:    Error = 7;
+pub val ILLEGAL_PARAMETER:     Error = 8;
+pub val BAD_RECORD_MAC:        Error = 9;
+pub val HANDSHAKE_FAILURE:     Error = 10;
+pub val BAD_CERTIFICATE:       Error = 11;
+pub val CERTIFICATE_EXPIRED:   Error = 12;
+pub val UNKNOWN_CA:            Error = 13;
+pub val HOSTNAME_MISMATCH:     Error = 14;
+pub val UNSUPPORTED_ALGORITHM: Error = 15;
+pub val RESOURCE_LIMIT:        Error = 16;
+pub val INTERNAL_ERROR:        Error = 17;
+
+test "error: scheduling and terminal results are distinct" {
+    if (WANT_READ == WANT_WRITE) { ret 1; }
+    if (CLOSED == OK) { ret 1; }
+    if (BAD_CERTIFICATE == UNKNOWN_CA) { ret 1; }
+    ret 0;
+}

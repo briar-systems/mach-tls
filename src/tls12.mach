@@ -1,0 +1,20 @@
+# tls 1.2 registry values used by the public state
+
+use std.types.size.usize;
+
+pub val VERSION: u16 = 0x0303;
+
+pub val ECDHE_ECDSA_AES_128_GCM_SHA256: u16 = 0xC02B;
+pub val ECDHE_RSA_AES_128_GCM_SHA256:   u16 = 0xC02F;
+pub val ECDHE_ECDSA_AES_256_GCM_SHA384: u16 = 0xC02C;
+pub val ECDHE_RSA_AES_256_GCM_SHA384:   u16 = 0xC030;
+pub val ECDHE_RSA_CHACHA20_POLY1305:    u16 = 0xCCA8;
+pub val ECDHE_ECDSA_CHACHA20_POLY1305:  u16 = 0xCCA9;
+
+pub val MAX_PLAINTEXT: usize = 16384;
+
+test "tls12: protocol and record bounds are explicit" {
+    if (VERSION != 0x0303) { ret 1; }
+    if (MAX_PLAINTEXT != 16384) { ret 1; }
+    ret 0;
+}

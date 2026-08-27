@@ -1,0 +1,68 @@
+# bounded client and server configuration
+
+use tls.cert;
+use tls.tls13;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+pub rec ProtocolName {
+    data: *u8;
+    len:  usize;
+}
+
+pub rec Limits {
+    max_record_plaintext: usize;
+    max_handshake_bytes:  usize;
+    max_chain_bytes:      usize;
+    max_ticket_bytes:     usize;
+}
+
+pub rec ClientConfig {
+    server_name:     str;
+    alpn:            *ProtocolName;
+    alpn_len:        usize;
+    trust:           *cert.TrustStore;
+    versions:        *u16;
+    version_len:     usize;
+    suites:          *tls13.CipherSuite;
+    suite_len:       usize;
+    groups:          *tls13.NamedGroup;
+    group_len:       usize;
+    signatures:      *tls13.SignatureScheme;
+    signature_len:   usize;
+    limits:          Limits;
+}
+
+pub rec ServerConfig {
+    cert_chain:         *cert.Chain;
+    private_key:        cert.PrivateKey;
+    alpn:               *ProtocolName;
+    alpn_len:           usize;
+    versions:           *u16;
+    version_len:        usize;
+    suites:             *tls13.CipherSuite;
+    suite_len:          usize;
+    groups:             *tls13.NamedGroup;
+    group_len:          usize;
+    signatures:         *tls13.SignatureScheme;
+    signature_len:      usize;
+    require_client_auth: bool;
+    limits:             Limits;
+}
+
+pub fun production_limits() Limits {
+    var limits: Limits;
+    limits.max_record_plaintext = 16384;
+    limits.max_handshake_bytes = 1048576;
+    limits.max_chain_bytes = 524288;
+    limits.max_ticket_bytes = 16384;
+    ret limits;
+}
+
+test "config: default limits are finite and protocol conforming" {
+    val limits: Limits = production_limits();
+    if (limits.max_record_plaintext != 16384) { ret 1; }
+    if (limits.max_handshake_bytes == 0 || limits.max_chain_bytes == 0) { ret 1; }
+    ret 0;
+}

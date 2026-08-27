@@ -1,0 +1,27 @@
+# tls record framing and bounds
+
+use std.types.size.usize;
+
+pub def ContentType: u8;
+
+pub val CHANGE_CIPHER_SPEC: ContentType = 20;
+pub val ALERT:              ContentType = 21;
+pub val HANDSHAKE:          ContentType = 22;
+pub val APPLICATION_DATA:   ContentType = 23;
+
+pub val HEADER_SIZE:          usize = 5;
+pub val MAX_PLAINTEXT:        usize = 16384;
+pub val MAX_CIPHERTEXT_EXTRA: usize = 256;
+pub val MAX_CIPHERTEXT:       usize = MAX_PLAINTEXT + MAX_CIPHERTEXT_EXTRA;
+
+pub rec Header {
+    content_type:   ContentType;
+    legacy_version: u16;
+    length:         u16;
+}
+
+test "record: ciphertext expansion follows tls 1.3 limits" {
+    if (HEADER_SIZE != 5) { ret 1; }
+    if (MAX_CIPHERTEXT != 16640) { ret 1; }
+    ret 0;
+}

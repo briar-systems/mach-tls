@@ -1,0 +1,41 @@
+# incremental tls 1.3 handshake framing
+
+use tls.error;
+use std.types.size.usize;
+
+pub def MessageType: u8;
+pub def ProgressStatus: u8;
+
+pub val CLIENT_HELLO:         MessageType = 1;
+pub val SERVER_HELLO:         MessageType = 2;
+pub val NEW_SESSION_TICKET:   MessageType = 4;
+pub val ENCRYPTED_EXTENSIONS: MessageType = 8;
+pub val CERTIFICATE:          MessageType = 11;
+pub val CERTIFICATE_REQUEST:  MessageType = 13;
+pub val CERTIFICATE_VERIFY:   MessageType = 15;
+pub val FINISHED:             MessageType = 20;
+pub val KEY_UPDATE:           MessageType = 24;
+
+pub val PROGRESSED: ProgressStatus = 0;
+pub val NEED_INPUT: ProgressStatus = 1;
+pub val NEED_OUTPUT: ProgressStatus = 2;
+pub val COMPLETE:   ProgressStatus = 3;
+pub val REJECTED:   ProgressStatus = 4;
+
+pub rec Header {
+    message_type: MessageType;
+    length:       u32;
+}
+
+pub rec Progress {
+    status:   ProgressStatus;
+    consumed: usize;
+    produced: usize;
+    error:    error.Error;
+}
+
+test "handshake: client and server hello use distinct message ids" {
+    if (CLIENT_HELLO == SERVER_HELLO) { ret 1; }
+    if (COMPLETE == REJECTED) { ret 1; }
+    ret 0;
+}

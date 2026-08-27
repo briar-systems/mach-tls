@@ -1,0 +1,36 @@
+# nonblocking byte transport contract below tls
+
+use tls.error;
+use std.types.size.usize;
+
+pub def IoStatus: u8;
+
+pub val READY:      IoStatus = 0;
+pub val NEED_READ:  IoStatus = 1;
+pub val NEED_WRITE: IoStatus = 2;
+pub val EOF:        IoStatus = 3;
+pub val FAILED:     IoStatus = 4;
+
+pub rec IoResult {
+    status:      IoStatus;
+    transferred: usize;
+    error:       error.Error;
+}
+
+pub def ReadFun:  fun(ptr, *u8, usize) IoResult;
+pub def WriteFun: fun(ptr, *u8, usize) IoResult;
+pub def CloseFun: fun(ptr) error.Error;
+
+# callbacks may complete partially and must preserve buffer ownership
+pub rec Transport {
+    context: ptr;
+    read_fn: ReadFun;
+    write_fn: WriteFun;
+    close_fn: CloseFun;
+}
+
+test "transport: readiness states are explicit" {
+    if (READY == NEED_READ || READY == NEED_WRITE) { ret 1; }
+    if (EOF == FAILED) { ret 1; }
+    ret 0;
+}
