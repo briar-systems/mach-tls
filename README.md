@@ -31,8 +31,8 @@ testing, and independent review.
 
 ## Local development
 
-Dependencies use local paths. Build output is written to the shared `.mach-out`
-directory beside this repository.
+Dependencies use pinned Git tags. Build output uses Mach's default `out/`
+directory inside this repository.
 
 ```sh
 mach dep pull .
