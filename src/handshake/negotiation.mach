@@ -99,6 +99,19 @@ fun offered_share(value: *codec.ClientHello, group: tls13.NamedGroup) bool {
     ret false;
 }
 
+fun offered_psk_mode(value: *codec.ClientHello, mode: u8) bool {
+    var modes: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.PSK_KEY_EXCHANGE_MODES, ?modes)) {
+        ret false;
+    }
+    var offset: usize = 1;
+    for (offset < modes.len) {
+        if (modes.data[offset] == mode) { ret true; }
+        offset = offset + 1;
+    }
+    ret false;
+}
+
 fun protocol_offered(value: *codec.ClientHello, protocol: Protocol) bool {
     var alpn: extensions.Extension;
     if (!extensions.find(value.extensions, extensions.APPLICATION_LAYER_PROTOCOL, ?alpn)) {
@@ -234,7 +247,11 @@ pub fun validate_server_selection(server: *codec.ServerHello,
     var psk: extensions.Extension;
     if (extensions.find(server.extensions, extensions.PRE_SHARED_KEY, ?psk)) {
         val selected: usize = (psk.data[0]::usize << 8) | psk.data[1]::usize;
-        if (selected >= psk_identity_count(client)) { ret error.ILLEGAL_PARAMETER; }
+        val has_share: bool = extensions.contains(server.extensions, extensions.KEY_SHARE);
+        var required_mode: u8 = 0;
+        if (has_share) { required_mode = 1; }
+        if (selected >= psk_identity_count(client)
+            || !offered_psk_mode(client, required_mode)) { ret error.ILLEGAL_PARAMETER; }
     }
     ret error.OK;
 }
@@ -282,5 +299,56 @@ test "negotiation: server preference selects a share or one retry" {
     hello.after_retry = true;
     groups_policy[0] = tls13.SECP256R1;
     if (negotiate(?hello, ?policy, ?selected) != error.HANDSHAKE_FAILURE) { ret 3; }
+    ret 0;
+}
+
+test "negotiation: psk selection requires the matching exchange mode" {
+    var suites: [2]u8 = [2]u8{0x13, 0x01};
+    var compression: [1]u8;
+    var random: [32]u8;
+    var client_extensions: [61]u8;
+    var offset: usize = 0;
+    client_extensions[offset] = 0; client_extensions[offset + 1] = 43;
+    client_extensions[offset + 2] = 0; client_extensions[offset + 3] = 3;
+    client_extensions[offset + 4] = 2; client_extensions[offset + 5] = 3;
+    client_extensions[offset + 6] = 4; offset = offset + 7;
+    client_extensions[offset] = 0; client_extensions[offset + 1] = 45;
+    client_extensions[offset + 2] = 0; client_extensions[offset + 3] = 2;
+    client_extensions[offset + 4] = 1; client_extensions[offset + 5] = 0;
+    offset = offset + 6;
+    client_extensions[offset] = 0; client_extensions[offset + 1] = 41;
+    client_extensions[offset + 2] = 0; client_extensions[offset + 3] = 44;
+    client_extensions[offset + 4] = 0; client_extensions[offset + 5] = 7;
+    client_extensions[offset + 6] = 0; client_extensions[offset + 7] = 1;
+    client_extensions[offset + 8] = 0xaa;
+    client_extensions[offset + 9] = 0; client_extensions[offset + 10] = 0;
+    client_extensions[offset + 11] = 0; client_extensions[offset + 12] = 1;
+    client_extensions[offset + 13] = 0; client_extensions[offset + 14] = 33;
+    client_extensions[offset + 15] = 32;
+    var i: usize = 0;
+    for (i < 32) { client_extensions[offset + 16 + i] = i::u8; i = i + 1; }
+    var client: codec.ClientHello;
+    client.legacy_version = tls13.LEGACY_VERSION;
+    client.random = contracts.Bytes{data: ?random[0], len: 32};
+    client.legacy_session_id = contracts.Bytes{data: nil, len: 0};
+    client.cipher_suites = contracts.Bytes{data: ?suites[0], len: 2};
+    client.compression_methods = contracts.Bytes{data: ?compression[0], len: 1};
+    client.extensions = extensions.list(?client_extensions[0], 61, extensions.CLIENT_HELLO);
+    client.after_retry = false;
+    var server_extensions: [12]u8 = [12]u8{
+        0, 43, 0, 2, 3, 4,
+        0, 41, 0, 2, 0, 0,
+    };
+    var server: codec.ServerHello;
+    server.legacy_version = tls13.LEGACY_VERSION;
+    server.random = contracts.Bytes{data: ?random[0], len: 32};
+    server.legacy_session_id = contracts.Bytes{data: nil, len: 0};
+    server.cipher_suite = tls13.AES_128_GCM_SHA256;
+    server.compression_method = 0;
+    server.extensions = extensions.list(?server_extensions[0], 12, extensions.SERVER_HELLO);
+    server.retry = false;
+    if (validate_server_selection(?server, ?client) != error.OK) { ret 1; }
+    client_extensions[12] = 1;
+    if (validate_server_selection(?server, ?client) != error.ILLEGAL_PARAMETER) { ret 2; }
     ret 0;
 }
