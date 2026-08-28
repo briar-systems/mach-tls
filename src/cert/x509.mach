@@ -912,6 +912,13 @@ fun parse_authority_key_id(input: contracts.Bytes,
     ret previous != 0x7f && issuer == serial;
 }
 
+fun valid_implicit_bit_string(value: contracts.Bytes) bool {
+    if (value.len <= 1 || value.data == nil || value.data[0] > 7) { ret false; }
+    if (value.data[0] == 0) { ret true; }
+    val mask: u8 = ((1::u16 << value.data[0]) - 1)::u8;
+    ret (value.data[value.len - 1] & mask) == 0;
+}
+
 fun extension_count(input: contracts.Bytes, expected: contracts.Bytes) usize {
     var body: der.Cursor = der.cursor(input);
     var count: usize = 0;
@@ -1083,11 +1090,12 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
         var optional: der.Element;
         if (der.next(?values, ?optional) != contracts.OK) { ret contracts.INVALID_INPUT; }
         if (optional.tag == 0x81 && !saw_issuer_uid && !saw_subject_uid &&
-            !saw_extensions && version >= 1 && optional.content.len > 1 &&
-            optional.content.data[0] <= 7) { saw_issuer_uid = true; }
+            !saw_extensions && version >= 1 &&
+            valid_implicit_bit_string(optional.content)) { saw_issuer_uid = true; }
         or (optional.tag == 0x82 && !saw_subject_uid && !saw_extensions &&
-            version >= 1 && optional.content.len > 1 &&
-            optional.content.data[0] <= 7) { saw_subject_uid = true; }
+            version >= 1 && valid_implicit_bit_string(optional.content)) {
+            saw_subject_uid = true;
+        }
         or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
             saw_extensions = true;
             if (!parse_extensions(?optional, ?extensions)) { ret contracts.INVALID_INPUT; }
@@ -1161,6 +1169,24 @@ test "cert.x509: dns constraints distinguish subdomains" {
         valid_dns_constraint(contracts.Bytes{
             data: "*.example.com"::*u8,
             len: 13,
+        })) { ret 1; }
+    ret 0;
+}
+
+test "cert.x509: unique identifiers require canonical unused bits" {
+    var canonical: [2]u8 = [2]u8{3, 0xa0};
+    var noncanonical: [2]u8 = [2]u8{3, 0xa1};
+    if (!valid_implicit_bit_string(contracts.Bytes{
+            data: ?canonical[0],
+            len: 2,
+        }) ||
+        valid_implicit_bit_string(contracts.Bytes{
+            data: ?noncanonical[0],
+            len: 2,
+        }) ||
+        valid_implicit_bit_string(contracts.Bytes{
+            data: ?canonical[0],
+            len: 1,
         })) { ret 1; }
     ret 0;
 }
