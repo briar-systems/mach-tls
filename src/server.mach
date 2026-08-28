@@ -2427,6 +2427,15 @@ pub fun poll(server: *Server) engine.Result {
     ret progress;
 }
 
+fun aead_for(suite: tls13.CipherSuite) record.Algorithm {
+    if (suite == tls13.AES_128_GCM_SHA256) { ret record.AES_128_GCM; }
+    if (suite == tls13.AES_256_GCM_SHA384) { ret record.AES_256_GCM; }
+    if (suite == tls13.CHACHA20_POLY1305_SHA256) {
+        ret record.CHACHA20_POLY1305;
+    }
+    ret 0;
+}
+
 fun secret_for(server: *Server, index: usize) *key_schedule.Secret {
     if (index == SEND_HANDSHAKE) {
         ret ?server.schedule.server_handshake_traffic;
@@ -2460,6 +2469,7 @@ fun next_event_inner(server: *Server, output: *engine.Event) bool {
     event.level = item.level;
     event.direction = item.direction;
     event.suite = server.suite;
+    event.aead = aead_for(server.suite);
     event.disposition = item.disposition;
     event.alert = item.alert;
     if (item.kind == engine.CRYPTO) {
@@ -2644,6 +2654,7 @@ fun snapshot_inner(server: *Server) engine.Snapshot {
     var value: engine.Snapshot = engine.empty_snapshot();
     if (!server_owner_valid(server)) { ret value; }
     value.role = engine.SERVER;
+    value.version = tls13.VERSION;
     value.error = server.failure;
     value.suite = server.suite;
     value.group = server.group;

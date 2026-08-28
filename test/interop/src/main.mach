@@ -30,6 +30,8 @@ use tls.engine;
 use tls.error;
 use tls.record;
 use tls.session;
+use tls.tls12;
+use tls12_connection: tls.tls12.connection;
 use tls.stream;
 use tls.tls13;
 use tls.transport;
@@ -199,6 +201,13 @@ fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
 var client_sessions: session.ClientStore;
 var dial_configuration: config.ClientConfig;
 var option_key_update: bool;
+var option_tls12: bool;
+var tls12_configuration: config.ClientConfig;
+var tls12_suites: [6]tls13.CipherSuite;
+var tls12_signatures: [6]tls13.SignatureScheme;
+var tls12_versions: [1]u16;
+var legacy_engine: tls12_connection.Connection;
+var legacy_hello: [16384]u8;
 var handshake_input: [65536]u8;
 var handshake_output: [65536]u8;
 var hello_storage: [65536]u8;
@@ -292,12 +301,26 @@ fun dial_one(index: usize) i64 {
     empty_extra.kind = 0;
     empty_extra.data.data = nil;
     empty_extra.data.len = 0;
-    if (!client.init(?core, ?dial_configuration, core_storage, empty_extra, 0)) {
-        ret 10;
+    if (option_tls12) {
+        val legacy_storage: tls12_connection.Storage =
+            tls12_connection.Storage{input: ?handshake_input[0],
+                input_capacity: 65536, output: ?handshake_output[0],
+                output_capacity: 65536, hello: ?legacy_hello[0],
+                hello_capacity: 16384,
+                certificates: ?peer_certificates[0], certificate_capacity: 8};
+        if (!tls12_connection.init_client(?legacy_engine, ?tls12_configuration,
+                legacy_storage)) { ret 10; }
+        if (!stream.connect_tls12(?secure, ?legacy_engine, storage,
+                ?dial_lower, ?scope,
+                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure, ?dial_runtime)) { ret 5; }
+    } or {
+        if (!client.init(?core, ?dial_configuration, core_storage,
+                empty_extra, 0)) { ret 10; }
+        if (!stream.connect(?secure, ?core, storage, ?dial_lower, ?scope,
+                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure, ?dial_runtime)) { ret 5; }
     }
-    if (!stream.connect(?secure, ?core, storage, ?dial_lower, ?scope,
-            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
-        !settle(?secure, ?dial_runtime)) { ret 5; }
     val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
     val negotiated: engine.Snapshot = stream.negotiated(?secure);
     if (handshake.terminal_error != error.OK) {
@@ -308,6 +331,7 @@ fun dial_one(index: usize) i64 {
         negotiated.selected_alpn.data[0] != 'h' ||
         negotiated.selected_alpn.data[1] != '2') { ret 41; }
     report("connection=", index);
+    report("version=", negotiated.version::usize);
     report("suite=", negotiated.suite::usize);
     if (negotiated.resumed) { print.print("resumed=1\n"); }
     or { print.print("resumed=0\n"); }
@@ -394,11 +418,16 @@ fun dial_one(index: usize) i64 {
         !settle(?secure, ?dial_runtime)) { ret 7; }
     val closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
-        !stream.destroy(?secure) || !client.destroy(?core) ||
+        !stream.destroy(?secure) ||
         !cancel.destroy(?scope) ||
         is_err[bool, io_error.Error](io_runtime.close(?dial_runtime)) ||
         is_err[bool, io_error.Error](io_runtime.destroy(?dial_runtime))) {
         ret 8;
+    }
+    if (option_tls12) {
+        if (!tls12_connection.destroy(?legacy_engine)) { ret 9; }
+    } or {
+        if (!client.destroy(?core)) { ret 9; }
     }
     ret 0;
 }
@@ -417,6 +446,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var connections: usize = 1;
     var use_sessions: bool = false;
     option_key_update = false;
+    option_tls12 = false;
     var argument: i64 = 1;
     for (argument < argc) {
         val current: *u8 = argv[argument];
@@ -427,6 +457,8 @@ fun main(argc: i64, argv: **u8) i64 {
             use_sessions = true;
         } or (streq(current, "--key-update"::*u8)) {
             option_key_update = true;
+        } or (streq(current, "--tls12"::*u8)) {
+            option_tls12 = true;
         }
         argument = argument + 1;
     }
@@ -479,6 +511,40 @@ fun main(argc: i64, argv: **u8) i64 {
         if (!session.client_store_init(?client_sessions)) { ret 11; }
         dial_configuration.sessions = ?client_sessions;
     }
+
+    tls12_versions[0] = tls12.VERSION;
+    tls12_suites[0] = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    tls12_suites[1] = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
+    tls12_suites[2] = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
+    tls12_suites[3] = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
+    tls12_suites[4] = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
+    tls12_suites[5] = tls12.ECDHE_RSA_CHACHA20_POLY1305;
+    tls12_signatures[0] = tls13.ED25519;
+    tls12_signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    tls12_signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
+    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
+    tls12_signatures[4] = 0x0401;
+    tls12_signatures[5] = 0x0501;
+    tls12_configuration = config.ClientConfig{};
+    tls12_configuration.client_identity = nil;
+    tls12_configuration.sessions = nil;
+    tls12_configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
+    tls12_configuration.alpn = ?protocols[0];
+    tls12_configuration.alpn_len = 1;
+    tls12_configuration.trust = ?trust;
+    tls12_configuration.versions = ?tls12_versions[0];
+    tls12_configuration.version_len = 1;
+    tls12_configuration.suites = ?tls12_suites[0];
+    tls12_configuration.suite_len = 6;
+    tls12_configuration.groups = ?groups[0];
+    tls12_configuration.group_len = 2;
+    tls12_configuration.signatures = ?tls12_signatures[0];
+    tls12_configuration.signature_len = 6;
+    tls12_configuration.entropy = ?entropy;
+    tls12_configuration.limits = config.production_limits();
+    tls12_configuration.limits.max_peer_handshake_bytes = 65536;
+    tls12_configuration.limits.max_chain_bytes = 32768;
 
     var index: usize = 0;
     for (index < connections) {

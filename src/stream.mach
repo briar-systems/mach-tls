@@ -16,6 +16,7 @@ use tls.config;
 use tls.engine;
 use tls.error;
 use tls.server;
+use tls12_connection: tls.tls12.connection;
 use tls.memory_range;
 use tls.record;
 use tls.tls13;
@@ -66,6 +67,7 @@ pub rec Stream {
     role: engine.Role;
     client: *client.Client;
     server: *server.Server;
+    legacy: *tls12_connection.Connection;
     operation: transport.Operation;
     read_cipher: record.Cipher;
     write_cipher: record.Cipher;
@@ -195,6 +197,7 @@ fun engine_bound(stream: *Stream) bool {
     if (stream == nil) { ret false; }
     if (stream.role == engine.CLIENT) { ret stream.client != nil; }
     if (stream.role == engine.SERVER) { ret stream.server != nil; }
+    if (engine.is_tls12(stream.role)) { ret stream.legacy != nil; }
     ret false;
 }
 
@@ -203,6 +206,7 @@ fun engine_aliases_borrowed(stream: *Stream, data: *u8, len: usize) bool {
     if (stream.role == engine.CLIENT) {
         ret client.aliases_borrowed(stream.client, data, len);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.aliases_borrowed(stream.legacy, data, len); }
     ret server.aliases_borrowed(stream.server, data, len);
 }
 
@@ -211,6 +215,7 @@ fun engine_aliases_configuration(stream: *Stream, data: *u8, len: usize) bool {
     if (stream.role == engine.CLIENT) {
         ret client.aliases_configuration(stream.client, data, len);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.aliases_configuration(stream.legacy, data, len); }
     ret server.aliases_configuration(stream.server, data, len);
 }
 
@@ -221,6 +226,7 @@ fun engine_start(stream: *Stream, verification_time: i64) engine.Result {
     if (stream.role == engine.CLIENT) {
         ret client.start(stream.client, verification_time);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.start(stream.legacy, verification_time); }
     ret server.start(stream.server, verification_time);
 }
 
@@ -232,6 +238,7 @@ fun engine_ingest(stream: *Stream, level: engine.Level, data: *u8,
     if (stream.role == engine.CLIENT) {
         ret client.ingest(stream.client, level, data, length);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.ingest(stream.legacy, level, data, length); }
     ret server.ingest(stream.server, level, data, length);
 }
 
@@ -240,6 +247,7 @@ fun engine_poll(stream: *Stream) engine.Result {
         ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     if (stream.role == engine.CLIENT) { ret client.poll(stream.client); }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.poll(stream.legacy); }
     ret server.poll(stream.server);
 }
 
@@ -248,6 +256,7 @@ fun engine_next_event(stream: *Stream, output: *engine.Event) bool {
     if (stream.role == engine.CLIENT) {
         ret client.next_event(stream.client, output);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.next_event(stream.legacy, output); }
     ret server.next_event(stream.server, output);
 }
 
@@ -256,6 +265,7 @@ fun engine_complete_event(stream: *Stream, token: u64, accepted: bool) bool {
     if (stream.role == engine.CLIENT) {
         ret client.complete_event(stream.client, token, accepted);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.complete_event(stream.legacy, token, accepted); }
     ret server.complete_event(stream.server, token, accepted);
 }
 
@@ -266,6 +276,7 @@ fun engine_traffic_keys(stream: *Stream, event: *engine.Event,
     if (stream.role == engine.CLIENT) {
         ret client.traffic_keys(stream.client, event, key, iv, key_length);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.traffic_keys(stream.legacy, event, key, iv, key_length); }
     ret server.traffic_keys(stream.server, event, key, iv, key_length);
 }
 
@@ -276,12 +287,14 @@ fun engine_request_key_update(stream: *Stream, request: u8) engine.Result {
     if (stream.role == engine.CLIENT) {
         ret client.request_key_update(stream.client, request);
     }
+    if (engine.is_tls12(stream.role)) { ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
     ret server.request_key_update(stream.server, request);
 }
 
 fun engine_snapshot(stream: *Stream) engine.Snapshot {
     if (!engine_bound(stream)) { ret engine.empty_snapshot(); }
     if (stream.role == engine.CLIENT) { ret client.snapshot(stream.client); }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.snapshot(stream.legacy); }
     ret server.snapshot(stream.server);
 }
 
@@ -290,6 +303,7 @@ fun engine_receive_limit(stream: *Stream) usize {
     if (stream.role == engine.CLIENT) {
         ret client.receive_record_limit(stream.client);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.receive_record_limit(stream.legacy); }
     ret server.receive_record_limit(stream.server);
 }
 
@@ -298,6 +312,7 @@ fun engine_send_limit(stream: *Stream) usize {
     if (stream.role == engine.CLIENT) {
         ret client.send_record_limit(stream.client);
     }
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.send_record_limit(stream.legacy); }
     ret server.send_record_limit(stream.server);
 }
 
@@ -349,16 +364,25 @@ fun configuration_disjoint(stream: *Stream, storage: *Storage,
     ret true;
 }
 
-fun algorithm(suite: tls13.CipherSuite) record.Aead {
-    if (suite == tls13.AES_128_GCM_SHA256) { ret record.aes_128_gcm(); }
-    if (suite == tls13.AES_256_GCM_SHA384) { ret record.aes_256_gcm(); }
+fun algorithm(kind: record.Algorithm) record.Aead {
+    if (kind == record.AES_128_GCM) { ret record.aes_128_gcm(); }
+    if (kind == record.AES_256_GCM) { ret record.aes_256_gcm(); }
     ret record.chacha20_poly1305();
+}
+
+fun stream_protocol(stream: *Stream) record.Protocol {
+    if (engine.is_tls12(stream.role)) { ret record.TLS12; }
+    ret record.TLS13;
 }
 
 fun install_secret(stream: *Stream, event: *engine.Event) bool {
     var key: [engine.MAX_TRAFFIC_KEY]^u8;
     var iv: [engine.TRAFFIC_IV_SIZE]u8;
     var key_length: usize = 0;
+    var iv_length: usize = engine.TRAFFIC_IV_SIZE;
+    if (stream_protocol(stream) == record.TLS12 &&
+        (event.aead == record.AES_128_GCM ||
+         event.aead == record.AES_256_GCM)) { iv_length = 4; }
     if (!engine_traffic_keys(stream, event,
             contracts.SecretBuffer{data: ?key[0],
                 capacity: engine.MAX_TRAFFIC_KEY},
@@ -370,10 +394,10 @@ fun install_secret(stream: *Stream, event: *engine.Event) bool {
     }
     var target: *record.Cipher = ?stream.read_cipher;
     if (event.direction == engine.SEND) { target = ?stream.write_cipher; }
-    val installed: bool = record.install(target, record.TLS13,
-        algorithm(event.suite),
+    val installed: bool = record.install(target, stream_protocol(stream),
+        algorithm(event.aead),
         contracts.SecretBytes{data: ?key[0], len: key_length},
-        contracts.Bytes{data: ?iv[0], len: engine.TRAFFIC_IV_SIZE});
+        contracts.Bytes{data: ?iv[0], len: iv_length});
     ct.zeroize(?key[0], engine.MAX_TRAFFIC_KEY);
     var i: usize = 0;
     for (i < engine.TRAFFIC_IV_SIZE) { iv[i] = 0; i = i + 1; }
@@ -459,7 +483,7 @@ fun prepare_public_record(stream: *Stream, content_type: record.ContentType,
         content.len > stream.send_record_plaintext)) { ret false; }
     var sealed: record.Sealed;
     if (!stream.write_cipher.installed) {
-        sealed = record.encode_plain(content_type, record.TLS13, content,
+        sealed = record.encode_plain(content_type, stream_protocol(stream), content,
             contracts.Buffer{data: stream.storage.wire_output,
                 capacity: stream.storage.wire_output_capacity});
     } or {
@@ -563,6 +587,19 @@ fun handle_core_event(stream: *Stream) bool {
         stream.core_event_alert = true;
         ret true;
     }
+    if (event.kind == engine.CHANGE_CIPHER_SPEC) {
+        var marker: [1]u8;
+        marker[0] = 1;
+        if (!prepare_public_record(stream, record.CHANGE_CIPHER_SPEC,
+                contracts.Bytes{data: ?marker[0], len: 1})) {
+            engine_complete_event(stream, event.token, false);
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        stream.core_event = event;
+        stream.core_event_sending = true;
+        ret true;
+    }
     if (event.kind == engine.HANDSHAKE_COMPLETE) {
         stream.handshake_complete = true;
         stream.state = OPEN;
@@ -573,7 +610,8 @@ fun handle_core_event(stream: *Stream) bool {
 
 fun handle_alert(stream: *Stream, data: *u8, length: usize) bool {
     var alert: record.AlertMessage;
-    if (record.decode_alert(record.TLS13, data, length, ?alert) != error.OK) {
+    if (record.decode_alert(stream_protocol(stream), data, length,
+            ?alert) != error.OK) {
         finish(stream, error.DECODE_ERROR, false);
         ret true;
     }
@@ -629,7 +667,7 @@ fun process_record(stream: *Stream) bool {
     if (stream.read_cipher.installed && !stream.handshake_complete && available >= 1 &&
         input[0] == record.CHANGE_CIPHER_SPEC) {
         val compatibility: record.Parsed = record.inspect(input, available,
-            record.TLS13, false);
+            stream_protocol(stream), false);
         if (compatibility.status == record.PARSE_MORE) {
             if (compatibility.required > stream.storage.wire_input_capacity) {
                 finish(stream, error.RECORD_OVERFLOW, false);
@@ -653,7 +691,8 @@ fun process_record(stream: *Stream) bool {
     var consumed: usize = 0;
     var protected: bool = false;
     if (!stream.read_cipher.installed) {
-        val parsed: record.Parsed = record.inspect(input, available, record.TLS13, false);
+        val parsed: record.Parsed = record.inspect(input, available,
+            stream_protocol(stream), false);
         if (parsed.status == record.PARSE_MORE) {
             if (parsed.required > stream.storage.wire_input_capacity) {
                 finish(stream, error.RECORD_OVERFLOW, false);
@@ -677,7 +716,7 @@ fun process_record(stream: *Stream) bool {
     } or {
         protected = true;
         val bounded: record.Parsed = record.inspect(input, available,
-            record.TLS13, true);
+            stream_protocol(stream), true);
         if (bounded.status == record.PARSE_MORE) {
             if (bounded.required > stream.storage.wire_input_capacity) {
                 finish(stream, error.RECORD_OVERFLOW, false);
@@ -687,7 +726,7 @@ fun process_record(stream: *Stream) bool {
         }
         if (bounded.status != record.PARSE_READY ||
             bounded.frame.length > stream.receive_record_plaintext +
-                1 + record.TAG_SIZE) {
+                record.MAX_CIPHERTEXT_EXTRA) {
             finish(stream, error.RECORD_OVERFLOW, false);
             ret true;
         }
@@ -931,17 +970,21 @@ fun operation_available(stream: *Stream) bool {
 
 fun init_inner(stream: *Stream, role: engine.Role,
     client_engine: *client.Client, server_engine: *server.Server,
-    storage: Storage, lower: *transport.Transport) bool {
+    legacy_engine: *tls12_connection.Connection, storage: Storage,
+    lower: *transport.Transport) bool {
     if (stream_owner_data(stream) == nil ||
         (stream.state != 0 && stream.state != DESTROYED) ||
         (stream.operation.state != 0 &&
         stream.operation.state != transport.OPERATION_DESTROYED) ||
         stream.read_cipher.installed || stream.write_cipher.installed ||
-        (role != engine.CLIENT && role != engine.SERVER) ||
+        (role != engine.CLIENT && role != engine.SERVER &&
+            !engine.is_tls12(role)) ||
         (role == engine.CLIENT && (client_engine == nil ||
-            server_engine != nil)) ||
+            server_engine != nil || legacy_engine != nil)) ||
         (role == engine.SERVER && (server_engine == nil ||
-            client_engine != nil)) ||
+            client_engine != nil || legacy_engine != nil)) ||
+        (engine.is_tls12(role) && (legacy_engine == nil ||
+            client_engine != nil || server_engine != nil)) ||
         !storage_valid(?storage, lower) ||
         storage_overlaps(?storage, stream_owner_data(stream), $size_of(Stream)) ||
         transport.state_overlaps(lower, stream_owner_data(stream),
@@ -949,6 +992,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
     stream.role = role;
     stream.client = client_engine;
     stream.server = server_engine;
+    stream.legacy = legacy_engine;
     val ready: engine.Snapshot = engine_snapshot(stream);
     if (!engine_bound(stream) || ready.role != role || ready.destroyed ||
         ready.status != engine.MORE || ready.event_active ||
@@ -956,6 +1000,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
         stream.role = 0;
         stream.client = nil;
         stream.server = nil;
+        stream.legacy = nil;
         ret false;
     }
     stream.receive_record_plaintext = engine_receive_limit(stream);
@@ -970,6 +1015,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
         stream.role = 0;
         stream.client = nil;
         stream.server = nil;
+        stream.legacy = nil;
         ret false;
     }
     stream.lower_transport = lower[0];
@@ -1005,14 +1051,30 @@ fun init_inner(stream: *Stream, role: engine.Role,
 pub fun init_client(stream: *Stream, core: *client.Client, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
-    ret leave(stream, init_inner(stream, engine.CLIENT, core, nil, storage,
+    ret leave(stream, init_inner(stream, engine.CLIENT, core, nil, nil, storage,
         lower));
+}
+
+pub fun init_tls12_client(stream: *Stream,
+    core: *tls12_connection.Connection, storage: Storage,
+    lower: *transport.Transport) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, init_inner(stream, engine.TLS12_CLIENT, nil, nil, core,
+        storage, lower));
+}
+
+pub fun init_tls12_server(stream: *Stream,
+    core: *tls12_connection.Connection, storage: Storage,
+    lower: *transport.Transport) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, init_inner(stream, engine.TLS12_SERVER, nil, nil, core,
+        storage, lower));
 }
 
 pub fun init_server(stream: *Stream, core: *server.Server, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
-    ret leave(stream, init_inner(stream, engine.SERVER, nil, core, storage,
+    ret leave(stream, init_inner(stream, engine.SERVER, nil, core, nil, storage,
         lower));
 }
 
@@ -1162,9 +1224,36 @@ pub fun connect(stream: *Stream, core: *client.Client, storage: Storage,
     lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
-    if (!init_inner(stream, engine.CLIENT, core, nil, storage, lower)) {
+    if (!init_inner(stream, engine.CLIENT, core, nil, nil, storage, lower)) {
         ret leave(stream, false);
     }
+    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+        destroy_inner(stream);
+        ret leave(stream, false);
+    }
+    ret leave(stream, true);
+}
+
+# a tls 1.2 connection is driven by the same operations as a tls 1.3 one
+pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Connection,
+    storage: Storage, lower: *transport.Transport, scope: *cancel.Scope,
+    token: transport.Token, verification_time: i64, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    if (!init_inner(stream, engine.TLS12_CLIENT, nil, nil, core, storage,
+            lower)) { ret leave(stream, false); }
+    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+        destroy_inner(stream);
+        ret leave(stream, false);
+    }
+    ret leave(stream, true);
+}
+
+pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Connection,
+    storage: Storage, lower: *transport.Transport, scope: *cancel.Scope,
+    token: transport.Token, verification_time: i64, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    if (!init_inner(stream, engine.TLS12_SERVER, nil, nil, core, storage,
+            lower)) { ret leave(stream, false); }
     if (!handshake_inner(stream, scope, token, verification_time, context)) {
         destroy_inner(stream);
         ret leave(stream, false);
@@ -1176,7 +1265,7 @@ pub fun serve(stream: *Stream, core: *server.Server, storage: Storage,
     lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
-    if (!init_inner(stream, engine.SERVER, nil, core, storage, lower)) {
+    if (!init_inner(stream, engine.SERVER, nil, core, nil, storage, lower)) {
         ret leave(stream, false);
     }
     if (!handshake_inner(stream, scope, token, verification_time, context)) {
@@ -1323,6 +1412,7 @@ fun destroy_inner(stream: *Stream) bool {
     stream.role = 0;
     stream.client = nil;
     stream.server = nil;
+    stream.legacy = nil;
     stream.transport = nil;
     stream.lower_transport = transport.Transport{};
     stream.storage.wire_input = nil;

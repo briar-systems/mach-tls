@@ -35,6 +35,8 @@ use tls.memory_range;
 use tls.record;
 use tls.session;
 use tls.server;
+use tls.tls12;
+use tls12_connection: tls.tls12.connection;
 use tls.stream;
 use tls.tls13;
 use tls.transport;
@@ -155,7 +157,7 @@ fun blocking_close(context: ptr, scope: *cancel.Scope,
 }
 
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
-    for (transport.snapshot(?secure.operation).state !=
+    for (transport.snapshot(?secure_static.operation).state !=
         transport.OPERATION_TERMINAL) {
         var completion: io_runtime.Completion;
         val polled: Result[usize, io_error.Error] = io_runtime.poll(owner,
@@ -229,6 +231,16 @@ var option_tickets: u8;
 var option_single_use: bool;
 var option_handshake_only: bool;
 var connection_count: usize;
+var option_tls12: bool;
+var option_dual_version: bool;
+var tls12_configuration: config.ServerConfig;
+var tls12_suites: [6]tls13.CipherSuite;
+var tls12_signatures: [4]tls13.SignatureScheme;
+var tls12_versions: [2]u16;
+var legacy_engine: tls12_connection.Connection;
+var legacy_hello: [16384]u8;
+var listener_engine_static: server.Server;
+var secure_static: stream.Stream;
 var ticket_ring: session.KeyRing;
 var replay_window: session.ReplayWindow;
 var listener_configuration: config.ServerConfig;
@@ -355,7 +367,6 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     storage.wire_output = ?wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 
-    var listener_engine: server.Server;
     var empty_extra: server.ExtraExtension;
     empty_extra.kind = 0;
     empty_extra.data.data = nil;
@@ -367,25 +378,45 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         print.print("cannot size server storage\n");
         ret 10;
     }
-    if (!server.init(?listener_engine, ?listener_configuration, core_storage,
-            empty_extra, 0)) {
-        report("hello required=", hello_required);
-        report("flight required=", flight_required);
-        print.print("cannot initialize the server engine\n");
-        ret 10;
-    }
-
     var scope: cancel.Scope;
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 11; }
-    var secure: stream.Stream;
-    if (!stream.serve(?secure, ?listener_engine, storage, ?lower_transport,
-            ?scope, transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
-        !settle(?secure, ?connection_runtime)) {
-        print.print("the handshake operation was not accepted\n");
-        ret 12;
+    if (option_tls12) {
+        val legacy_storage: tls12_connection.Storage =
+            tls12_connection.Storage{input: ?handshake_input[0],
+                input_capacity: 65536, output: ?handshake_output[0],
+                output_capacity: 65536, hello: ?legacy_hello[0],
+                hello_capacity: 16384,
+                certificates: ?peer_certificates[0], certificate_capacity: 8};
+        if (!tls12_connection.init_server(?legacy_engine, ?tls12_configuration,
+                legacy_storage)) {
+            print.print("cannot initialize the tls 1.2 server engine\n");
+            ret 10;
+        }
+        if (!stream.serve_tls12(?secure_static, ?legacy_engine, storage,
+                ?lower_transport, ?scope,
+                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure_static, ?connection_runtime)) {
+            print.print("the handshake operation was not accepted\n");
+            ret 12;
+        }
+    } or {
+        if (!server.init(?listener_engine_static, ?listener_configuration,
+                core_storage, empty_extra, 0)) {
+            report("hello required=", hello_required);
+            report("flight required=", flight_required);
+            print.print("cannot initialize the server engine\n");
+            ret 10;
+        }
+        if (!stream.serve(?secure_static, ?listener_engine_static, storage,
+                ?lower_transport, ?scope,
+                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure_static, ?connection_runtime)) {
+            print.print("the handshake operation was not accepted\n");
+            ret 12;
+        }
     }
-    val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
-    val negotiated: engine.Snapshot = stream.negotiated(?secure);
+    val handshake: transport.Snapshot = transport.snapshot(?secure_static.operation);
+    val negotiated: engine.Snapshot = stream.negotiated(?secure_static);
 
     if (option_expect_failure) {
         if (handshake.terminal_error == error.OK) {
@@ -399,9 +430,10 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
             print.print("wrong alert\n");
             ret 14;
         }
-        stream.destroy_operation(?secure);
-        stream.destroy(?secure);
-        server.destroy(?listener_engine);
+        stream.destroy_operation(?secure_static);
+        stream.destroy(?secure_static);
+        if (option_tls12) { tls12_connection.destroy(?legacy_engine); }
+        or { server.destroy(?listener_engine_static); }
         ret 0;
     }
 
@@ -420,6 +452,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         ret 22;
     }
     report("connection=", index);
+    report("version=", negotiated.version::usize);
     report("suite=", negotiated.suite::usize);
     report("group=", negotiated.group::usize);
     report("retries=", negotiated.retry_count::usize);
@@ -438,7 +471,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         print.print(?name_text[0]);
         print.print("\n");
     }
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+    if (!stream.destroy_operation(?secure_static) || !cancel.destroy(?scope)) {
         ret 23;
     }
 
@@ -461,38 +494,38 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     # a peer that only measures the handshake has already gone away, so this
     # connection is torn down without attempting another record
     if (option_handshake_only && index + 1 < connection_count) {
-        if (!stream.destroy(?secure) || !server.destroy(?listener_engine)) {
-            ret 46;
-        }
+        if (!stream.destroy(?secure_static)) { ret 46; }
+        if (option_tls12) { tls12_connection.destroy(?legacy_engine); }
+        or { server.destroy(?listener_engine_static); }
         tcp.stream_close(?connection_socket);
         ret 0;
     }
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.read(?secure, ?scope,
+        !stream.read(?secure_static, ?scope,
             transport.Token{index: 2, generation: 1},
             ?application_input[0], 512, 2) ||
-        !settle(?secure, ?connection_runtime)) { ret 30; }
-    val read: transport.Snapshot = transport.snapshot(?secure.operation);
+        !settle(?secure_static, ?connection_runtime)) { ret 30; }
+    val read: transport.Snapshot = transport.snapshot(?secure_static.operation);
     if (read.terminal_error != error.OK || read.application_bytes == 0) {
         report("read error=", read.terminal_error::usize);
         ret 31;
     }
     report("read=", read.application_bytes);
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+    if (!stream.destroy_operation(?secure_static) || !cancel.destroy(?scope)) {
         ret 32;
     }
 
     if (option_key_update) {
         if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-            !stream.key_update(?secure, ?scope,
+            !stream.key_update(?secure_static, ?scope,
                 transport.Token{index: 6, generation: 1}, 0, 6) ||
-            !settle(?secure, ?connection_runtime)) { ret 60; }
-        val updated: transport.Snapshot = transport.snapshot(?secure.operation);
+            !settle(?secure_static, ?connection_runtime)) { ret 60; }
+        val updated: transport.Snapshot = transport.snapshot(?secure_static.operation);
         if (updated.terminal_error != error.OK) {
             report("key update error=", updated.terminal_error::usize);
             ret 61;
         }
-        if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        if (!stream.destroy_operation(?secure_static) || !cancel.destroy(?scope)) {
             ret 62;
         }
         print.print("key-updated\n");
@@ -507,37 +540,41 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     application_output[12] = 'v'; application_output[13] = 'e';
     application_output[14] = 'r'; application_output[15] = '\n';
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.write(?secure, ?scope,
+        !stream.write(?secure_static, ?scope,
             transport.Token{index: 3, generation: 1},
             ?application_output[0], 16, 3) ||
-        !settle(?secure, ?connection_runtime)) { ret 33; }
-    val written: transport.Snapshot = transport.snapshot(?secure.operation);
+        !settle(?secure_static, ?connection_runtime)) { ret 33; }
+    val written: transport.Snapshot = transport.snapshot(?secure_static.operation);
     if (written.terminal_error != error.OK || written.application_bytes != 16) {
         ret 34;
     }
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+    if (!stream.destroy_operation(?secure_static) || !cancel.destroy(?scope)) {
         ret 35;
     }
 
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.half_close(?secure, ?scope,
+        !stream.half_close(?secure_static, ?scope,
             transport.Token{index: 4, generation: 1}, 4) ||
-        !settle(?secure, ?connection_runtime)) { ret 36; }
-    val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (half_closed.terminal_error != error.OK || !secure.send_closed ||
-        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        !settle(?secure_static, ?connection_runtime)) { ret 36; }
+    val half_closed: transport.Snapshot = transport.snapshot(?secure_static.operation);
+    if (half_closed.terminal_error != error.OK || !secure_static.send_closed ||
+        !stream.destroy_operation(?secure_static) || !cancel.destroy(?scope)) {
         ret 37;
     }
 
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.close(?secure, ?scope,
+        !stream.close(?secure_static, ?scope,
             transport.Token{index: 5, generation: 1}, 5) ||
-        !settle(?secure, ?connection_runtime)) { ret 38; }
-    val closed: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
-        !stream.destroy(?secure) || !cancel.destroy(?scope)) { ret 39; }
+        !settle(?secure_static, ?connection_runtime)) { ret 38; }
+    val closed: transport.Snapshot = transport.snapshot(?secure_static.operation);
+    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure_static) ||
+        !stream.destroy(?secure_static) || !cancel.destroy(?scope)) { ret 39; }
 
-    if (!server.destroy(?listener_engine)) { ret 40; }
+    if (option_tls12) {
+        if (!tls12_connection.destroy(?legacy_engine)) { ret 40; }
+    } or {
+        if (!server.destroy(?listener_engine_static)) { ret 40; }
+    }
     if (option_rotate) {
         if (!credentials.reclaimable(retired)) {
             print.print("a retired generation stayed leased after destroy\n");
@@ -560,6 +597,8 @@ fun main(argc: i64, argv: **u8) i64 {
     option_tickets = 0;
     option_single_use = false;
     option_handshake_only = false;
+    option_tls12 = false;
+    option_dual_version = false;
     var prefer_p256: bool = false;
     var suite_choice: usize = 0;
     var no_default: bool = false;
@@ -584,6 +623,10 @@ fun main(argc: i64, argv: **u8) i64 {
             option_single_use = true;
         } or (streq(current, "--handshake-only"::*u8)) {
             option_handshake_only = true;
+        } or (streq(current, "--tls12"::*u8)) {
+            option_tls12 = true;
+        } or (streq(current, "--dual-version"::*u8)) {
+            option_dual_version = true;
         } or (streq(current, "--tickets"::*u8) && argument + 1 < argc) {
             argument = argument + 1;
             option_tickets = parse_number(argv[argument])::u8;
@@ -725,6 +768,40 @@ fun main(argc: i64, argv: **u8) i64 {
     listener_configuration.limits.max_client_hello_bytes = 65536;
     listener_configuration.limits.max_chain_bytes = 32768;
     listener_configuration.limits.max_server_flight_bytes = 65536;
+
+    tls12_versions[0] = tls12.VERSION;
+    tls12_versions[1] = tls13.VERSION;
+    tls12_suites[0] = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    tls12_suites[1] = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
+    tls12_suites[2] = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
+    tls12_suites[3] = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
+    tls12_suites[4] = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
+    tls12_suites[5] = tls12.ECDHE_RSA_CHACHA20_POLY1305;
+    tls12_signatures[0] = tls13.ED25519;
+    tls12_signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    tls12_signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
+    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
+    tls12_configuration = config.ServerConfig{};
+    tls12_configuration.tickets = nil;
+    tls12_configuration.replay = nil;
+    tls12_configuration.credentials = ?store;
+    tls12_configuration.alpn = ?protocols[0];
+    tls12_configuration.alpn_len = 1;
+    tls12_configuration.require_alpn = option_require_alpn;
+    tls12_configuration.versions = ?tls12_versions[0];
+    tls12_configuration.version_len = 1;
+    if (option_dual_version) { tls12_configuration.version_len = 2; }
+    tls12_configuration.suites = ?tls12_suites[0];
+    tls12_configuration.suite_len = 6;
+    tls12_configuration.groups = ?groups[0];
+    tls12_configuration.group_len = group_len;
+    tls12_configuration.signatures = ?tls12_signatures[0];
+    tls12_configuration.signature_len = 4;
+    tls12_configuration.entropy = ?entropy;
+    tls12_configuration.entropy_context_size = 0;
+    tls12_configuration.limits = config.production_limits();
+    tls12_configuration.limits.max_peer_handshake_bytes = 65536;
+    tls12_configuration.limits.max_chain_bytes = 32768;
 
     val listening: Result[tcp.Listener, io_error.Error] = tcp.listen(
         ip.endpoint(127, 0, 0, 1, port), 4);

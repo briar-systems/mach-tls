@@ -360,3 +360,82 @@ refusing the second presentation of one ticket while the permissive policy
 accepts it, GnuTLS reporting a resumed session against our server, and our
 client resuming against an OpenSSL server. Key updates were driven mid-session
 in both directions against both peers.
+
+# TLS 1.2
+
+Both harnesses accept `--tls12`, which selects the TLS 1.2 engine. The server
+also accepts `--dual-version`, which declares TLS 1.3 support on the listener so
+it marks its ServerHello random and refuses `TLS_FALLBACK_SCSV`.
+
+## Our TLS 1.2 server
+
+```sh
+# server: --tls12
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_2 -quiet \
+  -verify_return_error
+```
+
+The credential type and the suite are selected with the same flags as the
+TLS 1.3 legs, and the cipher is forced from the client:
+
+```sh
+# server: --tls12 --identity p256      -> 0xC02B
+# server: --tls12 --identity rsa       -> 0xC02F
+# add -cipher ECDHE-ECDSA-AES256-GCM-SHA384      -> 0xC02C
+# add -cipher ECDHE-ECDSA-CHACHA20-POLY1305      -> 0xCCA9
+# server: --tls12 --identity rsa, add -cipher ECDHE-RSA-AES256-GCM-SHA384   -> 0xC030
+# server: --tls12 --identity rsa, add -cipher ECDHE-RSA-CHACHA20-POLY1305   -> 0xCCA8
+# server: --tls12 --groups-p256        -> group 23
+```
+
+GnuTLS:
+
+```sh
+# server: --tls12
+gnutls-cli --port 9443 127.0.0.1 \
+  --x509cafile test/interop/fixtures/server-root.pem \
+  --priority 'NORMAL:-VERS-ALL:+VERS-TLS1.2' --alpn h2 \
+  --sni-hostname api.example.com --verify-hostname api.example.com
+```
+
+## Downgrade protection
+
+```sh
+# server: --tls12 --dual-version --expect-failure 86   inappropriate_fallback
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_2 -quiet \
+  -fallback_scsv
+
+# server: --tls12 --dual-version    a plain 1.2 client is still served
+
+# server: (no --tls12) --expect-failure 70   protocol_version
+openssl s_client -connect 127.0.0.1:9443 \
+  -CAfile test/interop/fixtures/server-root.pem -tls1_2 -quiet
+```
+
+The last one is the criterion that TLS 1.2 cannot weaken a listener configured
+for TLS 1.3 only: the TLS 1.3 server refuses the connection outright.
+
+## Our TLS 1.2 client
+
+```sh
+openssl s_server -accept 9443 -cert test/interop/fixtures/leaf.pem \
+  -key test/interop/fixtures/leaf.key -tls1_2 -alpn h2 -rev -quiet
+
+test/interop/out/linux-x86_64/debug/bin/tls-client-interop --tls12
+```
+
+The same client leg is run against the `p256` and `rsa` server credentials,
+against `-cipher ECDHE-ECDSA-AES256-GCM-SHA384` and
+`-cipher ECDHE-ECDSA-CHACHA20-POLY1305`, and against `gnutls-serv` restricted to
+TLS 1.2. Pointed at a TLS 1.3 only `openssl s_server`, it fails, which is the
+client half of the same criterion.
+
+## Qualification for the TLS 1.2 revision
+
+Against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64: 13 TLS 1.2 server legs
+and 6 TLS 1.2 client legs returned exit status zero, and the TLS 1.2 client
+against a TLS 1.3 only server failed as required. The TLS 1.3 legs above were
+re-run unchanged: 19 server legs, 10 client legs, and 4 resumption legs, all
+zero.
