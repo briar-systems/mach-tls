@@ -13,6 +13,7 @@ fwd tls.cert.name;
 fwd tls.cert.x509;
 fwd tls.cert.verify;
 fwd tls.cert.load;
+fwd tls.cert.credentials;
 fwd tls.config;
 fwd tls.record;
 fwd tls.handshake;
