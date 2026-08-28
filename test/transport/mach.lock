@@ -7,5 +7,5 @@ commit = "92a8c1b4f598f218949ad559b4ba22ea820d9b0f"
 
 [dep.mach-crypto]
 url = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.2.0"
-commit = "5ae322639a62846760fd6532c254578eb045cedf"
+ref = "tag/v0.3.0"
+commit = "3d7c00cda2fcb82c055765b9a24e7f84b853fe8d"
