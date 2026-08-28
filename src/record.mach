@@ -291,7 +291,13 @@ pub fun inspect(input: *u8, length: usize, protocol: Protocol, protected: bool) 
         if (!protected && version != 0x0301 && version != 0x0303) {
             ret failed_parse(tls_error.ILLEGAL_PARAMETER, PROTOCOL_VERSION_ALERT);
         }
-    } or (version != 0x0303) {
+    } or (protected && version != 0x0303) {
+        ret failed_parse(tls_error.ILLEGAL_PARAMETER, PROTOCOL_VERSION_ALERT);
+    }
+    # rfc 5246 appendix e.1 lets an unprotected tls 1.2 record carry the
+    # sender's lowest supported version, which every deployed client uses for
+    # its first client hello
+    or (!protected && (version < 0x0301 || version > 0x0303)) {
         ret failed_parse(tls_error.ILLEGAL_PARAMETER, PROTOCOL_VERSION_ALERT);
     }
 
@@ -1641,5 +1647,32 @@ test "record: alerts classify known, unknown, warning, and fatal values" {
     message.description = 77;
     data[0] = 3;
     if (decode_alert(TLS13, ?data[0], 2, ?message) != tls_error.DECODE_ERROR || message.description != 77) { ret 7; }
+    ret 0;
+}
+
+test "record: a tls 1.2 initial record may carry a lower legacy version" {
+    var wire: [8]u8 = [8]u8{HANDSHAKE, 0x03, 0x01, 0x00, 0x03, 1, 2, 3};
+    val legacy: Parsed = inspect(?wire[0], 8, TLS12, false);
+    if (legacy.status != PARSE_READY || legacy.frame.length != 3) { ret 1; }
+    wire[2] = 0x03;
+    val current: Parsed = inspect(?wire[0], 8, TLS12, false);
+    if (current.status != PARSE_READY) { ret 2; }
+    # ssl 3.0 and anything above tls 1.2 stay refused
+    wire[2] = 0x00;
+    if (inspect(?wire[0], 8, TLS12, false).error != tls_error.ILLEGAL_PARAMETER) {
+        ret 3;
+    }
+    wire[1] = 0x03; wire[2] = 0x04;
+    if (inspect(?wire[0], 8, TLS12, false).error != tls_error.ILLEGAL_PARAMETER) {
+        ret 4;
+    }
+    # a protected tls 1.2 record must carry the exact version
+    wire[0] = APPLICATION_DATA;
+    wire[2] = 0x01;
+    if (inspect(?wire[0], 8, TLS12, true).error != tls_error.ILLEGAL_PARAMETER) {
+        ret 5;
+    }
+    wire[2] = 0x03;
+    if (inspect(?wire[0], 8, TLS12, true).status != PARSE_READY) { ret 6; }
     ret 0;
 }

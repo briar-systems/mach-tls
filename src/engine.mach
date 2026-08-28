@@ -26,6 +26,8 @@ pub val EARLY_DATA: EventKind = 4;
 pub val AUTHENTICATION: EventKind = 5;
 pub val HANDSHAKE_COMPLETE: EventKind = 6;
 pub val ALERT: EventKind = 7;
+# tls 1.2 announces each key change with its own record
+pub val CHANGE_CIPHER_SPEC: EventKind = 8;
 
 pub def Status: u8;
 pub val OK: Status = 1;
@@ -38,6 +40,16 @@ pub val CLOSED: Status = 6;
 pub def Role: u8;
 pub val CLIENT: Role = 1;
 pub val SERVER: Role = 2;
+pub val TLS12_CLIENT: Role = 3;
+pub val TLS12_SERVER: Role = 4;
+
+pub fun is_client(role: Role) bool {
+    ret role == CLIENT || role == TLS12_CLIENT;
+}
+
+pub fun is_tls12(role: Role) bool {
+    ret role == TLS12_CLIENT || role == TLS12_SERVER;
+}
 
 pub val EARLY_NOT_OFFERED: u8 = 1;
 pub val EARLY_ACCEPTED: u8 = 2;
@@ -62,6 +74,7 @@ pub rec Event {
     level: Level;
     direction: Direction;
     suite: tls13.CipherSuite;
+    aead: record.Algorithm;
     generation: u64;
     data: contracts.Bytes;
     secret: contracts.SecretBytes;
@@ -71,6 +84,7 @@ pub rec Event {
 
 pub rec Snapshot {
     role: Role;
+    version: u16;
     status: Status;
     error: error.Error;
     suite: tls13.CipherSuite;
@@ -103,6 +117,7 @@ pub fun empty_event() Event {
     value.level = 0;
     value.direction = 0;
     value.suite = 0;
+    value.aead = 0;
     value.generation = 0;
     value.data.data = nil;
     value.data.len = 0;
@@ -116,6 +131,7 @@ pub fun empty_event() Event {
 pub fun empty_snapshot() Snapshot {
     var value: Snapshot;
     value.role = 0;
+    value.version = 0;
     value.status = 0;
     value.error = error.OK;
     value.suite = 0;
@@ -168,6 +184,17 @@ pub fun alert_for(failure: error.Error) record.AlertDescription {
     if (failure == error.PROTOCOL_VERSION) { ret record.PROTOCOL_VERSION_ALERT; }
     if (failure == error.UNRECOGNIZED_NAME) { ret record.UNRECOGNIZED_NAME_ALERT; }
     if (failure == error.CERTIFICATE_REQUIRED) { ret record.CERTIFICATE_REQUIRED_ALERT; }
+    if (failure == error.INAPPROPRIATE_FALLBACK) {
+        ret record.INAPPROPRIATE_FALLBACK_ALERT;
+    }
+    # renegotiation is refused outright, so the wire signal is the unambiguous
+    # fatal one rather than the warning the policy is named after
+    if (failure == error.NO_RENEGOTIATION) {
+        ret record.UNEXPECTED_MESSAGE_ALERT;
+    }
+    if (failure == error.INSUFFICIENT_SECURITY) {
+        ret record.INSUFFICIENT_SECURITY_ALERT;
+    }
     if (failure == error.RECORD_OVERFLOW) { ret record.RECORD_OVERFLOW_ALERT; }
     if (failure == error.BAD_RECORD_MAC) { ret record.BAD_RECORD_MAC_ALERT; }
     if (failure == error.HANDSHAKE_FAILURE ||
@@ -182,6 +209,10 @@ test "engine: levels, roles, and generations are total" {
         !valid_level(APPLICATION)) { ret 1; }
     if (next_generation(0) != 1 || next_generation(~(0::u64)) != 1) { ret 2; }
     if (CLIENT == SERVER || SEND == RECEIVE) { ret 3; }
+    if (!is_client(CLIENT) || !is_client(TLS12_CLIENT) || is_client(SERVER) ||
+        is_client(TLS12_SERVER)) { ret 5; }
+    if (!is_tls12(TLS12_CLIENT) || !is_tls12(TLS12_SERVER) ||
+        is_tls12(CLIENT) || is_tls12(SERVER)) { ret 6; }
     if (result(OK, error.OK, 3, 4).consumed != 3) { ret 4; }
     ret 0;
 }
@@ -195,6 +226,11 @@ test "engine: every protocol failure maps to one distinct alert" {
         alert_for(error.UNKNOWN_CA) != record.UNKNOWN_CA_ALERT ||
         alert_for(error.UNRECOGNIZED_NAME) != record.UNRECOGNIZED_NAME_ALERT ||
         alert_for(error.CERTIFICATE_REQUIRED) != record.CERTIFICATE_REQUIRED_ALERT ||
+        alert_for(error.INAPPROPRIATE_FALLBACK) !=
+            record.INAPPROPRIATE_FALLBACK_ALERT ||
+        alert_for(error.NO_RENEGOTIATION) != record.UNEXPECTED_MESSAGE_ALERT ||
+        alert_for(error.INSUFFICIENT_SECURITY) !=
+            record.INSUFFICIENT_SECURITY_ALERT ||
         alert_for(error.INTERNAL_ERROR) != record.INTERNAL_ERROR_ALERT) { ret 1; }
     if (alert_for(error.RESOURCE_LIMIT) != record.INTERNAL_ERROR_ALERT) { ret 2; }
     ret 0;

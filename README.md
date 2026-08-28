@@ -9,6 +9,9 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 ## Modules
 
 - `tls.tls12` and `tls.tls13` define protocol and algorithm registry values.
+- `tls.tls12.prf` implements the TLS 1.2 pseudorandom function and its secrets.
+- `tls.tls12.messages` provides borrowed views and encoders for TLS 1.2 messages.
+- `tls.tls12.connection` implements the TLS 1.2 handshake for both roles.
 - `tls.config` defines bounded client and server configuration.
 - `tls.cert` defines borrowed certificate, chain, and trust store contracts.
 - `tls.cert.x509` parses strict borrowed X.509 certificate views.
@@ -45,6 +48,8 @@ TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GC
 The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction.
 
 The TLS 1.3 server is complete. It selects credentials by SNI with exact, wildcard, and default precedence, negotiates ALPN, suites, groups, and signatures against the leased private key, issues at most one HelloRetryRequest, requests and verifies optional client authentication, and answers invalid ClientHellos with protocol-correct alerts and bounded work. Certificate rotation retires a generation without disturbing any established connection.
+
+TLS 1.2 is implemented for both roles over the same engine contract, the same records, and the same transport. It negotiates the six declared ECDHE AEAD suites, always uses the RFC 7627 extended master secret, refuses renegotiation outright, and implements downgrade protection in both directions: a dual-version listener marks its random and refuses `TLS_FALLBACK_SCSV`, and a client that could have offered TLS 1.3 refuses a marked random. A listener configured for TLS 1.3 only cannot be reached over TLS 1.2. TLS 1.2 client authentication and TLS 1.2 resumption are deliberately absent; the contract and the reasons are in [`doc/tls12.md`](doc/tls12.md).
 
 Session resumption is implemented for both roles. A server seals sessions under a rotating ticket key with an exact retirement overlap, verifies PSK binders on a separate transcript, and can require a ticket to be single-use. A client retains tickets in a bounded store and offers one PSK per connection. Either role can initiate a post-handshake key update. Early data is not implemented and is never offered. The contract is in [`doc/sessions.md`](doc/sessions.md).
 

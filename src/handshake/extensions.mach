@@ -30,6 +30,9 @@ pub val OID_FILTERS:                    ExtensionType = 48;
 pub val POST_HANDSHAKE_AUTH:            ExtensionType = 49;
 pub val SIGNATURE_ALGORITHMS_CERT:      ExtensionType = 50;
 pub val KEY_SHARE:                      ExtensionType = 51;
+pub val EC_POINT_FORMATS:               ExtensionType = 11;
+pub val EXTENDED_MASTER_SECRET:         ExtensionType = 23;
+pub val RENEGOTIATION_INFO:             ExtensionType = 0xFF01;
 
 pub val CLIENT_HELLO:         Context = 1;
 pub val SERVER_HELLO:         Context = 2;
@@ -38,6 +41,9 @@ pub val ENCRYPTED_EXTENSIONS: Context = 4;
 pub val CERTIFICATE_REQUEST:  Context = 5;
 pub val CERTIFICATE_ENTRY:    Context = 6;
 pub val NEW_SESSION_TICKET:   Context = 7;
+# a tls 1.2 server hello carries extensions tls 1.3 forbids there, so it is a
+# context of its own rather than a relaxation of the tls 1.3 rules
+pub val TLS12_SERVER_HELLO:   Context = 8;
 
 pub val NEXT_ITEM:    NextStatus = 0;
 pub val NEXT_DONE:    NextStatus = 1;
@@ -71,7 +77,7 @@ fun read_u24(data: *u8, offset: usize) usize {
 }
 
 fun valid_context(context: Context) bool {
-    ret context >= CLIENT_HELLO && context <= NEW_SESSION_TICKET;
+    ret context >= CLIENT_HELLO && context <= TLS12_SERVER_HELLO;
 }
 
 pub fun list(data: *u8, len: usize, context: Context) List {
@@ -108,6 +114,8 @@ pub fun next(state: *Iterator, output: *Extension) NextStatus {
 
 fun known(kind: ExtensionType) bool {
     ret kind == SERVER_NAME || kind == MAX_FRAGMENT_LENGTH || kind == STATUS_REQUEST
+        || kind == EC_POINT_FORMATS || kind == EXTENDED_MASTER_SECRET
+        || kind == RENEGOTIATION_INFO
         || kind == SUPPORTED_GROUPS || kind == SIGNATURE_ALGORITHMS
         || kind == APPLICATION_LAYER_PROTOCOL || kind == SIGNED_CERTIFICATE_TIMESTAMP
         || kind == PADDING || kind == RECORD_SIZE_LIMIT || kind == PRE_SHARED_KEY
@@ -119,10 +127,12 @@ fun known(kind: ExtensionType) bool {
 
 fun allowed(kind: ExtensionType, context: Context) bool {
     if (kind == SERVER_NAME) {
-        ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS;
+        ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS ||
+            context == TLS12_SERVER_HELLO;
     }
     if (kind == MAX_FRAGMENT_LENGTH || kind == RECORD_SIZE_LIMIT) {
-        ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS;
+        ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS ||
+            context == TLS12_SERVER_HELLO;
     }
     if (kind == STATUS_REQUEST) {
         ret context == CLIENT_HELLO || context == CERTIFICATE_REQUEST
@@ -131,11 +141,18 @@ fun allowed(kind: ExtensionType, context: Context) bool {
     if (kind == SUPPORTED_GROUPS) {
         ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS;
     }
+    if (kind == EC_POINT_FORMATS) {
+        ret context == CLIENT_HELLO || context == TLS12_SERVER_HELLO;
+    }
+    if (kind == EXTENDED_MASTER_SECRET || kind == RENEGOTIATION_INFO) {
+        ret context == CLIENT_HELLO || context == TLS12_SERVER_HELLO;
+    }
     if (kind == SIGNATURE_ALGORITHMS || kind == SIGNATURE_ALGORITHMS_CERT) {
         ret context == CLIENT_HELLO || context == CERTIFICATE_REQUEST;
     }
     if (kind == APPLICATION_LAYER_PROTOCOL) {
-        ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS;
+        ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS ||
+            context == TLS12_SERVER_HELLO;
     }
     if (kind == SIGNED_CERTIFICATE_TIMESTAMP) {
         ret context == CLIENT_HELLO || context == CERTIFICATE_REQUEST
@@ -190,7 +207,9 @@ fun u16_vector(data: *u8, length: usize, minimum: usize) bool {
 }
 
 fun valid_server_name(extension: Extension, context: Context) bool {
-    if (context == ENCRYPTED_EXTENSIONS) { ret extension.len == 0; }
+    if (context == ENCRYPTED_EXTENSIONS || context == TLS12_SERVER_HELLO) {
+        ret extension.len == 0;
+    }
     if (extension.len < 5) { ret false; }
     val list_len: usize = read_u16(extension.data, 0)::usize;
     if (list_len != extension.len - 2) { ret false; }
@@ -248,7 +267,10 @@ fun valid_alpn(extension: Extension, context: Context) bool {
         count = count + 1;
     }
     if (offset != extension.len || count == 0) { ret false; }
-    ret context != ENCRYPTED_EXTENSIONS || count == 1;
+    if (context == ENCRYPTED_EXTENSIONS || context == TLS12_SERVER_HELLO) {
+        ret count == 1;
+    }
+    ret true;
 }
 
 fun valid_sct(extension: Extension, context: Context) bool {
@@ -452,6 +474,15 @@ fun valid_one(extension: Extension, context: Context) bool {
     if (extension.kind == CERTIFICATE_AUTHORITIES) { ret valid_distinguished_names(extension); }
     if (extension.kind == OID_FILTERS) { ret valid_oid_filters(extension); }
     if (extension.kind == POST_HANDSHAKE_AUTH) { ret extension.len == 0; }
+    if (extension.kind == EC_POINT_FORMATS) {
+        ret extension.len >= 2 &&
+            extension.data[0]::usize == extension.len - 1;
+    }
+    if (extension.kind == EXTENDED_MASTER_SECRET) { ret extension.len == 0; }
+    if (extension.kind == RENEGOTIATION_INFO) {
+        # only an initial handshake is ever accepted, so the field stays empty
+        ret extension.len == 1 && extension.data[0] == 0;
+    }
     if (extension.kind == KEY_SHARE) {
         if (context == CLIENT_HELLO) { ret valid_key_share_client(extension); }
         if (context == HELLO_RETRY_REQUEST) {

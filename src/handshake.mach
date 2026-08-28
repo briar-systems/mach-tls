@@ -22,6 +22,11 @@ pub val FINISHED:             MessageType = 20;
 pub val KEY_UPDATE:           MessageType = 24;
 pub val MESSAGE_HASH:         MessageType = 254;
 
+pub val HELLO_REQUEST:        MessageType = 0;
+pub val SERVER_KEY_EXCHANGE:  MessageType = 12;
+pub val SERVER_HELLO_DONE:    MessageType = 14;
+pub val CLIENT_KEY_EXCHANGE:  MessageType = 16;
+
 pub val PROGRESSED:  ProgressStatus = 0;
 pub val NEED_INPUT:  ProgressStatus = 1;
 pub val NEED_OUTPUT: ProgressStatus = 2;
@@ -58,6 +63,16 @@ fun known_message_type(message_type: MessageType) bool {
         || message_type == MESSAGE_HASH;
 }
 
+fun known_tls12_message_type(message_type: MessageType) bool {
+    ret message_type == HELLO_REQUEST || message_type == CLIENT_HELLO
+        || message_type == SERVER_HELLO || message_type == CERTIFICATE
+        || message_type == SERVER_KEY_EXCHANGE
+        || message_type == CERTIFICATE_REQUEST
+        || message_type == SERVER_HELLO_DONE
+        || message_type == CERTIFICATE_VERIFY
+        || message_type == CLIENT_KEY_EXCHANGE || message_type == FINISHED;
+}
+
 fun read_u24(data: *u8) u32 {
     ret (data[0]::u32 << 16) | (data[1]::u32 << 8) | data[2]::u32;
 }
@@ -81,6 +96,12 @@ fun progress(status: ProgressStatus, consumed: usize, produced: usize,
 
 # parse one complete handshake frame without consuming partial input
 pub fun parse(input: *u8, length: usize, limit: usize, output: *Message) Progress {
+    ret parse_version(input, length, limit, false, output);
+}
+
+# the tls 1.2 message set is disjoint enough that each version keeps its own
+pub fun parse_version(input: *u8, length: usize, limit: usize, tls12: bool,
+    output: *Message) Progress {
     if (output == nil || (length != 0 && input == nil) || limit > MAX_BODY_SIZE) {
         ret progress(REJECTED, 0, 0, 0, error.ILLEGAL_PARAMETER);
     }
@@ -88,7 +109,9 @@ pub fun parse(input: *u8, length: usize, limit: usize, output: *Message) Progres
         ret progress(NEED_INPUT, 0, 0, HEADER_SIZE, error.OK);
     }
     val message_type: MessageType = input[0];
-    if (!known_message_type(message_type)) {
+    var known: bool = known_message_type(message_type);
+    if (tls12) { known = known_tls12_message_type(message_type); }
+    if (!known) {
         ret progress(REJECTED, 0, 0, HEADER_SIZE, error.UNEXPECTED_MESSAGE);
     }
     val body_length: usize = read_u24(?input[1])::usize;
@@ -110,7 +133,14 @@ pub fun parse(input: *u8, length: usize, limit: usize, output: *Message) Progres
 # serialize one frame transactionally into caller-owned storage
 pub fun serialize(message_type: MessageType, body: contracts.Bytes,
     output: contracts.Buffer) Progress {
-    if (!known_message_type(message_type) || (body.len != 0 && body.data == nil)
+    ret serialize_version(message_type, body, false, output);
+}
+
+pub fun serialize_version(message_type: MessageType, body: contracts.Bytes,
+    tls12: bool, output: contracts.Buffer) Progress {
+    var known: bool = known_message_type(message_type);
+    if (tls12) { known = known_tls12_message_type(message_type); }
+    if (!known || (body.len != 0 && body.data == nil)
         || body.len > MAX_BODY_SIZE || (output.capacity != 0 && output.data == nil)) {
         ret progress(REJECTED, 0, 0, 0, error.ILLEGAL_PARAMETER);
     }
