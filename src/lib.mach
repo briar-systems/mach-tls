@@ -5,6 +5,7 @@ use std.runtime;
 fwd tls.error;
 fwd tls.tls12;
 fwd tls.tls13;
+fwd tls.tls13.key_schedule;
 fwd tls.transport;
 fwd tls.cert;
 fwd tls.config;
