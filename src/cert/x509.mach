@@ -4,6 +4,7 @@ use crypto.contracts;
 use crypto.encoding.der;
 use crypto.encoding.keys;
 use std.chrono.date;
+use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -12,6 +13,7 @@ use tls.cert.name;
 
 pub val MAX_SERIAL_SIZE: usize = 20;
 pub val MAX_PATH_LENGTH: usize = 64;
+pub val MAX_RDN_ATTRIBUTES: usize = 16;
 
 pub def SignatureAlgorithm: u8;
 
@@ -141,6 +143,9 @@ val OID_CLIENT_AUTH: [8]u8 = [8]u8{
     0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02,
 };
 val OID_ANY_PURPOSE: [4]u8 = [4]u8{0x55, 0x1d, 0x25, 0x00};
+val OID_DOMAIN_COMPONENT: [10]u8 = [10]u8{
+    0x09, 0x92, 0x26, 0x89, 0x93, 0xf2, 0x2c, 0x64, 0x01, 0x19,
+};
 
 fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
     if (first.len != second.len) { ret false; }
@@ -329,7 +334,10 @@ fun parse_name(element: *der.Element, empty: *bool) bool {
         var set_body: der.Cursor;
         if (der.enter(?set_parent, ?set, ?set_body) != contracts.OK) { ret false; }
         var previous: contracts.Bytes = contracts.Bytes{data: nil, len: 0};
+        var attribute_count: usize = 0;
         for (!der.complete(?set_body)) {
+            attribute_count = attribute_count + 1;
+            if (attribute_count > MAX_RDN_ATTRIBUTES) { ret false; }
             var attribute: der.Element;
             if (der.next(?set_body, ?attribute) != contracts.OK ||
                 attribute.tag != der.SEQUENCE) { ret false; }
@@ -356,8 +364,240 @@ fun parse_name(element: *der.Element, empty: *bool) bool {
             if (der.next(?attribute_body, ?oid) != contracts.OK ||
                 oid.tag != der.OBJECT_ID ||
                 der.next(?attribute_body, ?value) != contracts.OK ||
-                (value.tag & 0x20) != 0 || !der.complete(?attribute_body)) { ret false; }
+                (value.tag & 0x20) != 0 || value.content.len == 0 ||
+                !der.complete(?attribute_body)) { ret false; }
+            if (value.tag == 0x0c &&
+                !utf8.validate(value.content.data, value.content.len)) { ret false; }
+            if ((value.tag == 0x16 || value.tag == 0x13)) {
+                var i: usize = 0;
+                for (i < value.content.len) {
+                    if (value.content.data[i] >= 0x80) { ret false; }
+                    i = i + 1;
+                }
+            }
+            if ((value.tag == 0x1e && value.content.len % 2 != 0) ||
+                (value.tag == 0x1c && value.content.len % 4 != 0)) { ret false; }
         }
+    }
+    ret true;
+}
+
+fun attribute_parts(element: *der.Element, oid: *contracts.Bytes,
+    value: *der.Element) bool {
+    if (element == nil || oid == nil || value == nil ||
+        element.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(element.encoded);
+    var body: der.Cursor;
+    if (der.enter(?parent, element, ?body) != contracts.OK) { ret false; }
+    var oid_element: der.Element;
+    if (der.next(?body, ?oid_element) != contracts.OK ||
+        oid_element.tag != der.OBJECT_ID ||
+        der.next(?body, value) != contracts.OK || !der.complete(?body)) {
+        ret false;
+    }
+    @oid = oid_element.content;
+    ret true;
+}
+
+fun ascii_only(value: contracts.Bytes) bool {
+    if (value.len > 0 && value.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] >= 0x80) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun folded(value: u8) u8 {
+    if (value >= 'A' && value <= 'Z') { ret value + ('a' - 'A'); }
+    ret value;
+}
+
+fun canonical_ascii_equal(first: contracts.Bytes,
+    second: contracts.Bytes) bool {
+    if (!ascii_only(first) || !ascii_only(second)) { ret false; }
+    var first_start: usize = 0;
+    var second_start: usize = 0;
+    var first_end: usize = first.len;
+    var second_end: usize = second.len;
+    for (first_start < first_end && first.data[first_start] == ' ') {
+        first_start = first_start + 1;
+    }
+    for (second_start < second_end && second.data[second_start] == ' ') {
+        second_start = second_start + 1;
+    }
+    for (first_end > first_start && first.data[first_end - 1] == ' ') {
+        first_end = first_end - 1;
+    }
+    for (second_end > second_start && second.data[second_end - 1] == ' ') {
+        second_end = second_end - 1;
+    }
+    var first_index: usize = first_start;
+    var second_index: usize = second_start;
+    for (first_index < first_end && second_index < second_end) {
+        var first_byte: u8 = folded(first.data[first_index]);
+        var second_byte: u8 = folded(second.data[second_index]);
+        if (first_byte != second_byte) { ret false; }
+        if (first_byte == ' ') {
+            for (first_index < first_end && first.data[first_index] == ' ') {
+                first_index = first_index + 1;
+            }
+            for (second_index < second_end && second.data[second_index] == ' ') {
+                second_index = second_index + 1;
+            }
+        } or {
+            first_index = first_index + 1;
+            second_index = second_index + 1;
+        }
+    }
+    ret first_index == first_end && second_index == second_end;
+}
+
+fun folded_ascii_equal(first: contracts.Bytes,
+    second: contracts.Bytes) bool {
+    if (first.len != second.len || !ascii_only(first) || !ascii_only(second)) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (folded(first.data[i]) != folded(second.data[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun attribute_equal(first: *der.Element, second: *der.Element) bool {
+    var first_oid: contracts.Bytes;
+    var second_oid: contracts.Bytes;
+    var first_value: der.Element;
+    var second_value: der.Element;
+    if (!attribute_parts(first, ?first_oid, ?first_value) ||
+        !attribute_parts(second, ?second_oid, ?second_value) ||
+        !bytes_equal(first_oid, second_oid)) { ret false; }
+    if (bytes_equal(first_value.encoded, second_value.encoded)) { ret true; }
+    if (oid_equal(first_oid, (?OID_DOMAIN_COMPONENT[0]), 10)) {
+        ret folded_ascii_equal(first_value.content, second_value.content);
+    }
+    val first_directory: bool = first_value.tag == 0x0c || first_value.tag == 0x13;
+    val second_directory: bool = second_value.tag == 0x0c || second_value.tag == 0x13;
+    if (first_directory && second_directory) {
+        ret canonical_ascii_equal(first_value.content, second_value.content);
+    }
+    ret false;
+}
+
+fun attribute_at(set: *der.Element, index: usize,
+    output: *der.Element) bool {
+    if (set == nil || output == nil || set.tag != 0x31) { ret false; }
+    var parent: der.Cursor = der.cursor(set.encoded);
+    var body: der.Cursor;
+    if (der.enter(?parent, set, ?body) != contracts.OK) { ret false; }
+    var current: usize = 0;
+    for (!der.complete(?body)) {
+        var attribute: der.Element;
+        if (der.next(?body, ?attribute) != contracts.OK) { ret false; }
+        if (current == index) { @output = attribute; ret true; }
+        current = current + 1;
+    }
+    ret false;
+}
+
+fun attribute_count(set: *der.Element) usize {
+    if (set == nil || set.tag != 0x31) { ret MAX_RDN_ATTRIBUTES + 1; }
+    var parent: der.Cursor = der.cursor(set.encoded);
+    var body: der.Cursor;
+    if (der.enter(?parent, set, ?body) != contracts.OK) {
+        ret MAX_RDN_ATTRIBUTES + 1;
+    }
+    var count: usize = 0;
+    for (!der.complete(?body)) {
+        var attribute: der.Element;
+        if (der.next(?body, ?attribute) != contracts.OK) {
+            ret MAX_RDN_ATTRIBUTES + 1;
+        }
+        count = count + 1;
+    }
+    ret count;
+}
+
+fun rdn_equal(first: *der.Element, second: *der.Element) bool {
+    val count: usize = attribute_count(first);
+    if (count > MAX_RDN_ATTRIBUTES || count != attribute_count(second)) {
+        ret false;
+    }
+    var used: u16 = 0;
+    var first_index: usize = 0;
+    for (first_index < count) {
+        var first_attribute: der.Element;
+        if (!attribute_at(first, first_index, ?first_attribute)) { ret false; }
+        var found: bool = false;
+        var second_index: usize = 0;
+        for (second_index < count && !found) {
+            val bit: u16 = 1::u16 << second_index;
+            if ((used & bit) == 0) {
+                var second_attribute: der.Element;
+                if (!attribute_at(second, second_index, ?second_attribute)) {
+                    ret false;
+                }
+                if (attribute_equal(?first_attribute, ?second_attribute)) {
+                    used = used | bit;
+                    found = true;
+                }
+            }
+            second_index = second_index + 1;
+        }
+        if (!found) { ret false; }
+        first_index = first_index + 1;
+    }
+    ret true;
+}
+
+fun next_rdn(body: *der.Cursor, output: *der.Element) bool {
+    ret body != nil && output != nil && der.next(body, output) == contracts.OK &&
+        output.tag == 0x31;
+}
+
+pub fun name_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
+    if (bytes_equal(first, second)) { ret true; }
+    var first_root: der.Element;
+    var second_root: der.Element;
+    if (!one_element(first, der.SEQUENCE, ?first_root) ||
+        !one_element(second, der.SEQUENCE, ?second_root)) { ret false; }
+    var first_parent: der.Cursor = der.cursor(first);
+    var second_parent: der.Cursor = der.cursor(second);
+    var first_body: der.Cursor;
+    var second_body: der.Cursor;
+    der.enter(?first_parent, ?first_root, ?first_body);
+    der.enter(?second_parent, ?second_root, ?second_body);
+    for (!der.complete(?first_body) && !der.complete(?second_body)) {
+        var first_rdn: der.Element;
+        var second_rdn: der.Element;
+        if (!next_rdn(?first_body, ?first_rdn) ||
+            !next_rdn(?second_body, ?second_rdn) ||
+            !rdn_equal(?first_rdn, ?second_rdn)) { ret false; }
+    }
+    ret der.complete(?first_body) && der.complete(?second_body);
+}
+
+pub fun name_within(subject: contracts.Bytes,
+    constraint: contracts.Bytes) bool {
+    var subject_root: der.Element;
+    var constraint_root: der.Element;
+    if (!one_element(subject, der.SEQUENCE, ?subject_root) ||
+        !one_element(constraint, der.SEQUENCE, ?constraint_root)) { ret false; }
+    var subject_parent: der.Cursor = der.cursor(subject);
+    var constraint_parent: der.Cursor = der.cursor(constraint);
+    var subject_body: der.Cursor;
+    var constraint_body: der.Cursor;
+    der.enter(?subject_parent, ?subject_root, ?subject_body);
+    der.enter(?constraint_parent, ?constraint_root, ?constraint_body);
+    for (!der.complete(?constraint_body)) {
+        var subject_rdn: der.Element;
+        var constraint_rdn: der.Element;
+        if (der.complete(?subject_body) || !next_rdn(?subject_body, ?subject_rdn) ||
+            !next_rdn(?constraint_body, ?constraint_rdn) ||
+            !rdn_equal(?subject_rdn, ?constraint_rdn)) { ret false; }
     }
     ret true;
 }
@@ -454,6 +694,7 @@ fun parse_key_usage(input: contracts.Bytes, output: *Extensions) bool {
         }
         i = i + 1;
     }
+    if ((usage & (1::u16 << (bit_count - 1))) == 0) { ret false; }
     output.key_usage = usage;
     ret true;
 }
@@ -487,24 +728,108 @@ fun parse_extended_key_usage(input: contracts.Bytes,
     ret true;
 }
 
-fun parse_general_names(input: contracts.Bytes) bool {
-    var root: der.Element;
-    if (!one_element(input, der.SEQUENCE, ?root) || root.content.len == 0) {
-        ret false;
+fun valid_ia5(value: contracts.Bytes) bool {
+    if (value.len == 0 || value.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        if (value.data[i] == 0 || value.data[i] >= 0x80) { ret false; }
+        i = i + 1;
     }
-    var parent: der.Cursor = der.cursor(input);
-    var body: der.Cursor;
-    der.enter(?parent, ?root, ?body);
+    ret true;
+}
+
+fun valid_oid_content(value: contracts.Bytes) bool {
+    if (value.len == 0 || value.data == nil) { ret false; }
+    var start: bool = true;
+    var i: usize = 0;
+    for (i < value.len) {
+        if (start && value.data[i] == 0x80) { ret false; }
+        start = (value.data[i] & 0x80) == 0;
+        i = i + 1;
+    }
+    ret start;
+}
+
+fun valid_general_name(value: *der.Element, constraints: bool) bool {
+    if (value == nil || value.content.len == 0) { ret false; }
+    if (value.tag == 0xa0) {
+        var body: der.Cursor = der.cursor(value.content);
+        var oid: der.Element;
+        var wrapped: der.Element;
+        ret der.next(?body, ?oid) == contracts.OK && oid.tag == der.OBJECT_ID &&
+            der.next(?body, ?wrapped) == contracts.OK && wrapped.tag == 0xa0 &&
+            wrapped.content.len > 0 && der.complete(?body);
+    }
+    if (value.tag == 0x81 || value.tag == 0x86) {
+        ret valid_ia5(value.content);
+    }
+    if (value.tag == 0x82) {
+        if (constraints) { ret name.valid_reference_dns(value.content); }
+        ret name.valid_presented_dns(value.content);
+    }
+    if (value.tag == 0xa3) { ret true; }
+    if (value.tag == 0xa4) {
+        var directory: der.Element;
+        var empty: bool = false;
+        ret one_element(value.content, der.SEQUENCE, ?directory) &&
+            parse_name(?directory, ?empty);
+    }
+    if (value.tag == 0xa5) {
+        var body: der.Cursor = der.cursor(value.content);
+        var previous: u8 = 0x9f;
+        var party: bool = false;
+        for (!der.complete(?body)) {
+            var field: der.Element;
+            if (der.next(?body, ?field) != contracts.OK ||
+                (field.tag != 0xa0 && field.tag != 0xa1) ||
+                (previous != 0x9f && field.tag <= previous) ||
+                field.content.len == 0) { ret false; }
+            previous = field.tag;
+            if (field.tag == 0xa1) { party = true; }
+        }
+        ret party;
+    }
+    if (value.tag == 0x87) {
+        if (constraints) {
+            if (value.content.len != 8 && value.content.len != 32) { ret false; }
+            val half: usize = value.content.len / 2;
+            var zero_seen: bool = false;
+            var i: usize = 0;
+            for (i < half) {
+                val address: u8 = value.content.data[i];
+                val mask: u8 = value.content.data[half + i];
+                var bit: u8 = 0x80;
+                for (bit != 0) {
+                    if ((mask & bit) == 0) { zero_seen = true; }
+                    or (zero_seen) { ret false; }
+                    bit = bit >> 1;
+                }
+                if ((address & ~mask) != 0) { ret false; }
+                i = i + 1;
+            }
+            ret true;
+        }
+        ret value.content.len == 4 || value.content.len == 16;
+    }
+    if (value.tag == 0x88) { ret valid_oid_content(value.content); }
+    ret false;
+}
+
+fun parse_general_name_body(input: contracts.Bytes, constraints: bool) bool {
+    if (input.len == 0 || input.data == nil) { ret false; }
+    var body: der.Cursor = der.cursor(input);
     for (!der.complete(?body)) {
         var general_name: der.Element;
         if (der.next(?body, ?general_name) != contracts.OK ||
-            general_name.tag < 0x80 || general_name.tag > 0xa8 ||
-            (general_name.tag == 0x82 &&
-                !name.valid_presented_dns(general_name.content)) ||
-            (general_name.tag == 0x87 && general_name.content.len != 4 &&
-                general_name.content.len != 16)) { ret false; }
+            !valid_general_name(?general_name, constraints)) { ret false; }
     }
     ret true;
+}
+
+fun parse_general_names(input: contracts.Bytes) bool {
+    var root: der.Element;
+    ret one_element(input, der.SEQUENCE, ?root) &&
+        parse_general_name_body(root.content, false);
 }
 
 fun parse_name_constraints(input: contracts.Bytes) bool {
@@ -536,12 +861,8 @@ fun parse_name_constraints(input: contracts.Bytes) bool {
             der.enter(?subtree_parent, ?subtree, ?subtree_body);
             var base: der.Element;
             if (der.next(?subtree_body, ?base) != contracts.OK ||
-                !der.complete(?subtree_body)) { ret false; }
-            if (base.tag == 0x82 && !name.valid_reference_dns(base.content)) {
-                ret false;
-            }
-            if (base.tag == 0x87 && base.content.len != 8 &&
-                base.content.len != 32) { ret false; }
+                !der.complete(?subtree_body) ||
+                !valid_general_name(?base, true)) { ret false; }
         }
     }
     ret true;
@@ -555,6 +876,8 @@ fun parse_authority_key_id(input: contracts.Bytes,
     var body: der.Cursor;
     der.enter(?parent, ?root, ?body);
     var previous: u8 = 0x7f;
+    var issuer: bool = false;
+    var serial: bool = false;
     for (!der.complete(?body)) {
         var field: der.Element;
         if (der.next(?body, ?field) != contracts.OK || field.tag < 0x80 ||
@@ -564,9 +887,18 @@ fun parse_authority_key_id(input: contracts.Bytes,
             if (field.content.len == 0) { ret false; }
             output.authority_key_id_present = true;
             output.authority_key_id = field.content;
+        } or (field.tag == 0xa1) {
+            if (!parse_general_name_body(field.content, false)) { ret false; }
+            issuer = true;
+        } or {
+            if (field.content.len == 0 || field.content.data == nil ||
+                (field.content.data[0] & 0x80) != 0 ||
+                (field.content.len > 1 && field.content.data[0] == 0 &&
+                    (field.content.data[1] & 0x80) == 0)) { ret false; }
+            serial = true;
         }
     }
-    ret true;
+    ret previous != 0x7f && issuer == serial;
 }
 
 fun extension_count(input: contracts.Bytes, expected: contracts.Bytes) usize {
@@ -654,7 +986,8 @@ fun parse_extensions(element: *der.Element, output: *Extensions) bool {
     ret true;
 }
 
-pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
+fun parse_with(input: contracts.Bytes, output: *Certificate,
+    trust_anchor: bool) contracts.Error {
     if (output == nil || input.len == 0 || input.data == nil) {
         ret contracts.INVALID_INPUT;
     }
@@ -673,7 +1006,7 @@ pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
         signature.content.data[0] != 0) { ret contracts.INVALID_INPUT; }
     var algorithm: SignatureAlgorithm = SIGNATURE_NONE;
     if (!parse_signature_algorithm(?outer_algorithm, ?algorithm)) {
-        ret contracts.UNSUPPORTED;
+        if (!trust_anchor) { ret contracts.UNSUPPORTED; }
     }
     var tbs_parent: der.Cursor = der.cursor(tbs.encoded);
     var values: der.Cursor;
@@ -739,9 +1072,11 @@ pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
         var optional: der.Element;
         if (der.next(?values, ?optional) != contracts.OK) { ret contracts.INVALID_INPUT; }
         if (optional.tag == 0x81 && !saw_issuer_uid && !saw_subject_uid &&
-            !saw_extensions && version >= 1) { saw_issuer_uid = true; }
+            !saw_extensions && version >= 1 && optional.content.len > 1 &&
+            optional.content.data[0] <= 7) { saw_issuer_uid = true; }
         or (optional.tag == 0x82 && !saw_subject_uid && !saw_extensions &&
-            version >= 1) { saw_subject_uid = true; }
+            version >= 1 && optional.content.len > 1 &&
+            optional.content.data[0] <= 7) { saw_subject_uid = true; }
         or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
             saw_extensions = true;
             if (!parse_extensions(?optional, ?extensions)) { ret contracts.INVALID_INPUT; }
@@ -766,6 +1101,15 @@ pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
     ret contracts.OK;
 }
 
+pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
+    ret parse_with(input, output, false);
+}
+
+pub fun parse_trust_anchor(input: contracts.Bytes,
+    output: *Certificate) contracts.Error {
+    ret parse_with(input, output, true);
+}
+
 test "cert.x509: strict utc and generalized time parsing" {
     var utc_bytes: [15]u8 = [15]u8{
         0x17, 0x0d, '4', '9', '1', '2', '3', '1', '2', '3', '5', '9', '5', '9', 'Z',
@@ -787,6 +1131,23 @@ test "cert.x509: strict utc and generalized time parsing" {
             ?generalized) != contracts.OK || parse_time(?generalized, ?timestamp)) {
         ret 3;
     }
+    ret 0;
+}
+
+test "cert.x509: distinguished names compare prepared directory strings" {
+    var first: [22]u8 = [22]u8{
+        0x30, 0x14, 0x31, 0x12, 0x30, 0x10, 0x06, 0x03, 0x55, 0x04, 0x03,
+        0x0c, 0x09, ' ', 'E', 'x', 'a', 'm', 'p', 'l', 'e', ' ',
+    };
+    var second: [20]u8 = [20]u8{
+        0x30, 0x12, 0x31, 0x10, 0x30, 0x0e, 0x06, 0x03, 0x55, 0x04, 0x03,
+        0x13, 0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+    };
+    if (!name_equal(contracts.Bytes{data: ?first[0], len: 22},
+            contracts.Bytes{data: ?second[0], len: 20})) { ret 1; }
+    second[19] = 'x';
+    if (name_equal(contracts.Bytes{data: ?first[0], len: 22},
+            contracts.Bytes{data: ?second[0], len: 20})) { ret 2; }
     ret 0;
 }
 
