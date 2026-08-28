@@ -3,10 +3,10 @@
 use tls.cert;
 use tls.cert.credentials;
 use tls.tls13;
+use crypto.contracts;
 use crypto.secret;
 use std.types.bool.bool;
 use std.types.size.usize;
-use std.types.string.str;
 
 pub rec ProtocolName {
     data: *u8;
@@ -21,7 +21,7 @@ pub rec Limits {
 }
 
 pub rec ClientConfig {
-    server_name:     str;
+    server_name:     contracts.Bytes;
     alpn:            *ProtocolName;
     alpn_len:        usize;
     trust:           *cert.TrustStore;

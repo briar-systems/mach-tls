@@ -11,10 +11,10 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use std.types.string.str_len;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
+use tls.cert.name;
 use tls.cert.verify;
 use tls.cert.x509;
 use tls.config;
@@ -23,6 +23,7 @@ use tls.handshake;
 use tls.handshake.codec;
 use tls.handshake.extensions;
 use tls.handshake.negotiation;
+use tls.memory_range;
 use tls.record;
 use tls.tls13;
 use tls.tls13.key_schedule;
@@ -137,6 +138,10 @@ pub rec Snapshot {
 
 pub rec Client {
     config: *config.ClientConfig;
+    configuration: config.ClientConfig;
+    entropy: secret.Entropy;
+    trust: cert.TrustStore;
+    identity: credentials.Identity;
     storage: Storage;
     extra: ExtraExtension;
     peer_extension: u16;
@@ -238,6 +243,216 @@ fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
     ret true;
 }
 
+fun config_borrows_valid(value: *config.ClientConfig,
+    extra: ExtraExtension) bool {
+    var alpn_bytes: usize = 0;
+    var version_bytes: usize = 0;
+    var suite_bytes: usize = 0;
+    var group_bytes: usize = 0;
+    var signature_bytes: usize = 0;
+    var anchor_bytes: usize = 0;
+    if (!memory_range.scaled(value.alpn_len, $size_of(config.ProtocolName),
+            ?alpn_bytes) ||
+        !memory_range.scaled(value.version_len, $size_of(u16), ?version_bytes) ||
+        !memory_range.scaled(value.suite_len, $size_of(tls13.CipherSuite),
+            ?suite_bytes) ||
+        !memory_range.scaled(value.group_len, $size_of(tls13.NamedGroup),
+            ?group_bytes) ||
+        !memory_range.scaled(value.signature_len,
+            $size_of(tls13.SignatureScheme), ?signature_bytes) ||
+        !memory_range.scaled(value.trust.len, $size_of(cert.Certificate),
+            ?anchor_bytes) ||
+        !memory_range.valid(value.server_name.data, value.server_name.len) ||
+        !memory_range.valid(value.alpn::*u8, alpn_bytes) ||
+        !memory_range.valid(value.versions::*u8, version_bytes) ||
+        !memory_range.valid(value.suites::*u8, suite_bytes) ||
+        !memory_range.valid(value.groups::*u8, group_bytes) ||
+        !memory_range.valid(value.signatures::*u8, signature_bytes) ||
+        !memory_range.valid(value.trust.anchors::*u8, anchor_bytes) ||
+        !memory_range.valid(extra.data.data, extra.data.len) ||
+        !name.valid_reference_dns(value.server_name)) { ret false; }
+    var i: usize = 0;
+    for (i < value.alpn_len) {
+        if (!memory_range.valid(value.alpn[i].data, value.alpn[i].len)) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < value.trust.len) {
+        if (value.trust.anchors[i].der_len == 0 ||
+            !memory_range.valid(value.trust.anchors[i].der,
+                value.trust.anchors[i].der_len)) { ret false; }
+        i = i + 1;
+    }
+    if (value.client_identity != nil) {
+        val identity: *credentials.Identity = value.client_identity;
+        var chain_bytes: usize = 0;
+        if (identity.chain.len == 0 ||
+            identity.chain.len > verify.MAX_CHAIN_DEPTH ||
+            !memory_range.scaled(identity.chain.len,
+                $size_of(cert.Certificate), ?chain_bytes) ||
+            !memory_range.valid(identity.chain.certificates::*u8,
+                chain_bytes)) { ret false; }
+        i = 0;
+        for (i < identity.chain.len) {
+            if (identity.chain.certificates[i].der_len == 0 ||
+                !memory_range.valid(identity.chain.certificates[i].der,
+                    identity.chain.certificates[i].der_len)) { ret false; }
+            i = i + 1;
+        }
+    }
+    ret true;
+}
+
+fun storage_ranges_valid(storage: *Storage) bool {
+    if (storage == nil) { ret false; }
+    var certificate_bytes: usize = 0;
+    if (!memory_range.scaled(storage.certificate_capacity,
+            $size_of(cert.Certificate), ?certificate_bytes) ||
+        !memory_range.valid(storage.input, storage.input_capacity) ||
+        !memory_range.valid(storage.output, storage.output_capacity) ||
+        !memory_range.valid(storage.hello, storage.hello_capacity) ||
+        !memory_range.valid(storage.certificates::*u8, certificate_bytes) ||
+        !memory_range.valid(storage.peer_parameters,
+            storage.peer_parameters_capacity)) { ret false; }
+    if (memory_range.overlap(storage.input, storage.input_capacity,
+            storage.output, storage.output_capacity) ||
+        memory_range.overlap(storage.input, storage.input_capacity,
+            storage.hello, storage.hello_capacity) ||
+        memory_range.overlap(storage.input, storage.input_capacity,
+            storage.certificates::*u8, certificate_bytes) ||
+        memory_range.overlap(storage.input, storage.input_capacity,
+            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        memory_range.overlap(storage.output, storage.output_capacity,
+            storage.hello, storage.hello_capacity) ||
+        memory_range.overlap(storage.output, storage.output_capacity,
+            storage.certificates::*u8, certificate_bytes) ||
+        memory_range.overlap(storage.output, storage.output_capacity,
+            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        memory_range.overlap(storage.hello, storage.hello_capacity,
+            storage.certificates::*u8, certificate_bytes) ||
+        memory_range.overlap(storage.hello, storage.hello_capacity,
+            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        memory_range.overlap(storage.certificates::*u8, certificate_bytes,
+            storage.peer_parameters, storage.peer_parameters_capacity)) {
+        ret false;
+    }
+    ret true;
+}
+
+fun storage_overlaps(storage: *Storage, data: *u8, len: usize) bool {
+    if (storage == nil || !memory_range.valid(data, len)) { ret true; }
+    var certificate_bytes: usize = 0;
+    if (!memory_range.scaled(storage.certificate_capacity,
+            $size_of(cert.Certificate), ?certificate_bytes)) { ret true; }
+    ret memory_range.overlap(data, len, storage.input, storage.input_capacity) ||
+        memory_range.overlap(data, len, storage.output, storage.output_capacity) ||
+        memory_range.overlap(data, len, storage.hello, storage.hello_capacity) ||
+        memory_range.overlap(data, len, storage.certificates::*u8,
+            certificate_bytes) ||
+        memory_range.overlap(data, len, storage.peer_parameters,
+            storage.peer_parameters_capacity);
+}
+
+fun borrowed_overlaps(value: *config.ClientConfig, extra: ExtraExtension,
+    data: *u8, len: usize) bool {
+    if (value == nil || !memory_range.valid(data, len)) { ret true; }
+    var alpn_bytes: usize = 0;
+    var version_bytes: usize = 0;
+    var suite_bytes: usize = 0;
+    var group_bytes: usize = 0;
+    var signature_bytes: usize = 0;
+    var anchor_bytes: usize = 0;
+    if (!memory_range.scaled(value.alpn_len, $size_of(config.ProtocolName),
+            ?alpn_bytes) ||
+        !memory_range.scaled(value.version_len, $size_of(u16), ?version_bytes) ||
+        !memory_range.scaled(value.suite_len, $size_of(tls13.CipherSuite),
+            ?suite_bytes) ||
+        !memory_range.scaled(value.group_len, $size_of(tls13.NamedGroup),
+            ?group_bytes) ||
+        !memory_range.scaled(value.signature_len,
+            $size_of(tls13.SignatureScheme), ?signature_bytes) ||
+        value.trust == nil || !memory_range.scaled(value.trust.len,
+            $size_of(cert.Certificate), ?anchor_bytes)) { ret true; }
+    if (memory_range.overlap(data, len, value.trust::*u8,
+            $size_of(cert.TrustStore)) ||
+        memory_range.overlap(data, len, value.server_name.data,
+            value.server_name.len) ||
+        memory_range.overlap(data, len, value.alpn::*u8,
+            alpn_bytes) ||
+        memory_range.overlap(data, len, value.versions::*u8,
+            version_bytes) ||
+        memory_range.overlap(data, len, value.suites::*u8,
+            suite_bytes) ||
+        memory_range.overlap(data, len, value.groups::*u8,
+            group_bytes) ||
+        memory_range.overlap(data, len, value.signatures::*u8,
+            signature_bytes) ||
+        memory_range.overlap(data, len, value.trust.anchors::*u8,
+            anchor_bytes) ||
+        memory_range.overlap(data, len, extra.data.data, extra.data.len)) {
+        ret true;
+    }
+    var i: usize = 0;
+    for (i < value.alpn_len) {
+        if (memory_range.overlap(data, len, value.alpn[i].data,
+                value.alpn[i].len)) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < value.trust.len) {
+        if (memory_range.overlap(data, len, value.trust.anchors[i].der,
+                value.trust.anchors[i].der_len)) { ret true; }
+        i = i + 1;
+    }
+    if (value.client_identity != nil) {
+        val identity: *credentials.Identity = value.client_identity;
+        var chain_bytes: usize = 0;
+        if (!memory_range.scaled(identity.chain.len,
+                $size_of(cert.Certificate), ?chain_bytes)) { ret true; }
+        if (memory_range.overlap(data, len, identity.chain.certificates::*u8,
+                chain_bytes)) { ret true; }
+        i = 0;
+        for (i < identity.chain.len) {
+            if (memory_range.overlap(data, len,
+                    identity.chain.certificates[i].der,
+                    identity.chain.certificates[i].der_len)) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
+pub fun aliases_borrowed(client: *Client, data: *u8, len: usize) bool {
+    if (client == nil || client.config != ?client.configuration ||
+        client.state < EXPECT_SERVER_HELLO || client.state >= DESTROYED) {
+        ret true;
+    }
+    ret borrowed_overlaps(client.config, client.extra, data, len);
+}
+
+fun config_sources_disjoint(client: *Client, value: *config.ClientConfig,
+    storage: *Storage, extra: ExtraExtension) bool {
+    if (value == ?client.configuration || value.entropy == ?client.entropy ||
+        value.trust == ?client.trust ||
+        (value.client_identity != nil &&
+        value.client_identity == ?client.identity)) {
+        ret false;
+    }
+    var certificate_bytes: usize = 0;
+    if (!memory_range.scaled(storage.certificate_capacity,
+            $size_of(cert.Certificate), ?certificate_bytes) ||
+        borrowed_overlaps(value, extra, storage.input, storage.input_capacity) ||
+        borrowed_overlaps(value, extra, storage.output, storage.output_capacity) ||
+        borrowed_overlaps(value, extra, storage.hello, storage.hello_capacity) ||
+        borrowed_overlaps(value, extra, storage.certificates::*u8,
+            certificate_bytes) ||
+        borrowed_overlaps(value, extra, storage.peer_parameters,
+            storage.peer_parameters_capacity)) { ret false; }
+    ret true;
+}
+
 fun client_identity_valid(value: *config.ClientConfig) bool {
     val identity: *credentials.Identity = value.client_identity;
     if (identity == nil) { ret true; }
@@ -291,9 +506,10 @@ fun fill_private(client: *Client) bool {
 fun config_valid(value: *config.ClientConfig, storage: *Storage,
     extra: ExtraExtension, peer_extension: u16) bool {
     if (value == nil || storage == nil || value.entropy == nil ||
-        !value.entropy.initialized || value.server_name == nil ||
-        str_len(value.server_name) == 0 || str_len(value.server_name) > 253 ||
-        value.trust == nil || value.trust.len == 0 ||
+        !value.entropy.initialized || value.server_name.data == nil ||
+        value.server_name.len == 0 || value.server_name.len > 253 ||
+        value.trust == nil || value.trust.anchors == nil ||
+        value.trust.len == 0 ||
         value.trust.len > MAX_TRUST_ANCHORS || value.alpn == nil ||
         value.alpn_len == 0 || value.alpn_len > 255 ||
         value.versions == nil || value.version_len != 1 ||
@@ -311,6 +527,7 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         storage.input == nil ||
         storage.output == nil || storage.hello == nil ||
         storage.certificates == nil || storage.certificate_capacity == 0 ||
+        storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.input_capacity < value.limits.max_handshake_bytes ||
         storage.output_capacity < value.limits.max_handshake_bytes ||
         storage.hello_capacity < value.limits.max_handshake_bytes ||
@@ -322,6 +539,8 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         (storage.peer_parameters == nil || storage.peer_parameters_capacity == 0))) {
         ret false;
     }
+    if (!storage_ranges_valid(storage) ||
+        !config_borrows_valid(value, extra)) { ret false; }
     if (value.versions[0] != tls13.VERSION) { ret false; }
     var i: usize = 0;
     for (i < value.suite_len) {
@@ -375,11 +594,24 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
 
 pub fun init(client: *Client, configuration: *config.ClientConfig,
     storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
-    if (client == nil || !config_valid(configuration, ?storage, extra,
-        peer_extension)) {
+    if (client == nil || (client.state != 0 && client.state != DESTROYED) ||
+        !config_valid(configuration, ?storage, extra, peer_extension) ||
+        !config_sources_disjoint(client, configuration, ?storage, extra)) {
         ret false;
     }
-    client.config = configuration;
+    client.configuration = configuration[0];
+    client.entropy = configuration.entropy[0];
+    client.trust = configuration.trust[0];
+    client.configuration.entropy = ?client.entropy;
+    client.configuration.trust = ?client.trust;
+    if (configuration.client_identity != nil) {
+        client.identity = configuration.client_identity[0];
+        client.configuration.client_identity = ?client.identity;
+    } or {
+        client.identity = credentials.Identity{};
+        client.configuration.client_identity = nil;
+    }
+    client.config = ?client.configuration;
     client.storage = storage;
     client.extra = extra;
     client.peer_extension = peer_extension;
@@ -463,7 +695,7 @@ fun derive_share(client: *Client, group: tls13.NamedGroup) bool {
 }
 
 fun build_extensions(client: *Client, output: *u8, capacity: usize) usize {
-    val name_len: usize = str_len(client.config.server_name);
+    val name_len: usize = client.config.server_name.len;
     var required: usize = 4 + 2 + 1 + 2 + name_len;
     required = required + 4 + 2 + client.config.group_len * 2;
     required = required + 4 + 2 + client.config.signature_len * 2;
@@ -486,7 +718,7 @@ fun build_extensions(client: *Client, output: *u8, capacity: usize) usize {
     write_u16(output, offset + 4, (3 + name_len)::u16);
     output[offset + 6] = 0;
     write_u16(output, offset + 7, name_len::u16);
-    copy_bytes(?output[offset + 9], client.config.server_name::*u8, name_len);
+    copy_bytes(?output[offset + 9], client.config.server_name.data, name_len);
     offset = offset + 9 + name_len;
 
     write_u16(output, offset, extensions.SUPPORTED_GROUPS);
@@ -959,8 +1191,7 @@ fun handle_certificate(client: *Client, frame: contracts.Bytes,
     if (count != certificate_message.count || count == 0) { ret error.BAD_CERTIFICATE; }
     val chain: cert.Chain = cert.Chain{certificates: client.storage.certificates,
         len: count};
-    val name: contracts.Bytes = contracts.Bytes{
-        data: client.config.server_name::*u8, len: str_len(client.config.server_name)};
+    val name: contracts.Bytes = client.config.server_name;
     var options: verify.Options;
     options.identity = name;
     options.purpose = verify.SERVER_AUTH;
@@ -1391,7 +1622,8 @@ pub fun ingest(client: *Client, level: Level, data: *u8,
     length: usize) Result {
     if (client == nil || client.config == nil || !valid_level(level) ||
         client.state == DESTROYED || client.state == TERMINAL ||
-        (length != 0 && data == nil)) {
+        !memory_range.valid(data, length) ||
+        storage_overlaps(?client.storage, data, length)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     if (client.output_pending || client.event_active) {
@@ -1436,7 +1668,8 @@ fun pending(client: *Client) bool {
 }
 
 pub fun next_event(client: *Client, output: *Event) bool {
-    if (client == nil || output == nil || client.event_active ||
+    if (client == nil || output == nil || output == ?client.active_event ||
+        client.event_active ||
         client.state == DESTROYED || !pending(client)) { ret false; }
     var event: Event;
     event.token = next_generation(client.event_generation);
@@ -1567,6 +1800,10 @@ pub fun destroy(client: *Client) bool {
     transcript.destroy(?client.transcript);
     key_schedule.destroy(?client.schedule);
     client.config = nil;
+    client.configuration = config.ClientConfig{};
+    client.entropy = secret.Entropy{};
+    client.trust = cert.TrustStore{};
+    client.identity = credentials.Identity{};
     client.storage.input = nil;
     client.storage.output = nil;
     client.storage.hello = nil;
@@ -1658,7 +1895,8 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
         tls13.ED25519};
     var configuration: config.ClientConfig;
-    configuration.server_name = "api.example.com";
+    configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
     configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
     configuration.trust = ?trust;
     configuration.versions = ?versions[0]; configuration.version_len = 1;
@@ -1679,7 +1917,8 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     };
     var value: Client;
     if (configuration.entropy == nil || !configuration.entropy.initialized) { ret 21; }
-    if (configuration.server_name == nil || str_len(configuration.server_name) == 0) { ret 22; }
+    if (configuration.server_name.data == nil ||
+        configuration.server_name.len == 0) { ret 22; }
     if (configuration.trust == nil || configuration.trust.len == 0) { ret 23; }
     if (configuration.alpn == nil || configuration.alpn_len == 0) { ret 24; }
     if (configuration.versions == nil || configuration.version_len == 0) { ret 25; }
@@ -1704,19 +1943,85 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     var quic_extra: ExtraExtension;
     quic_extra.kind = QUIC_TRANSPORT_PARAMETERS;
     if (quic_extra.data.len != 0) { ret 38; }
+    var aliased: Storage = storage;
+    aliased.output = storage.input;
+    if (config_valid(?configuration, ?aliased, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 50; }
+    aliased = storage;
+    aliased.output = ?storage.input[1];
+    if (config_valid(?configuration, ?aliased, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 51; }
+    var overflowing: Storage = storage;
+    overflowing.certificate_capacity = ~(0::usize) /
+        $size_of(cert.Certificate) + 1;
+    if (config_valid(?configuration, ?overflowing, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 52; }
+    var wrapping: Storage = storage;
+    wrapping.input = (~(0::usize) - 1)::*u8;
+    if (config_valid(?configuration, ?wrapping, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 53; }
+    var alias_protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: storage.output, len: 2}};
+    var alias_configuration: config.ClientConfig = configuration;
+    alias_configuration.alpn = ?alias_protocols[0];
+    if (init(?value, ?alias_configuration, storage, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 54; }
+    alias_configuration = configuration;
+    alias_configuration.server_name = contracts.Bytes{
+        data: (~(0::usize) - 1)::*u8, len: 3};
+    if (config_valid(?alias_configuration, ?storage, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 58; }
+    alias_configuration = configuration;
+    alias_configuration.alpn = (~(0::usize) - 1)::*config.ProtocolName;
+    if (config_valid(?alias_configuration, ?storage, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 59; }
+    var wrapping_protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: (~(0::usize) - 1)::*u8, len: 3}};
+    alias_configuration = configuration;
+    alias_configuration.alpn = ?wrapping_protocols[0];
+    if (config_valid(?alias_configuration, ?storage, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 60; }
+    var nul_name: [15]u8 = [15]u8{'a', 'p', 'i', 0, 'e', 'x', 'a', 'm',
+        'p', 'l', 'e', '.', 'c', 'o', 'm'};
+    alias_configuration = configuration;
+    alias_configuration.server_name = contracts.Bytes{
+        data: ?nul_name[0], len: 15};
+    if (config_valid(?alias_configuration, ?storage, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 61; }
     if (!config_valid(?configuration, ?storage, quic_extra,
         QUIC_TRANSPORT_PARAMETERS)) { ret 32; }
     if (!init(?value, ?configuration, storage, quic_extra,
         QUIC_TRANSPORT_PARAMETERS)) { ret 1; }
+    if (!aliases_borrowed(?value, configuration.groups::*u8,
+            2 * $size_of(tls13.NamedGroup)) ||
+        aliases_borrowed(?value, storage.output, storage.output_capacity)) {
+        ret 62;
+    }
+    if (init(?value, ?configuration, storage, quic_extra,
+            QUIC_TRANSPORT_PARAMETERS)) { ret 55; }
+    configuration.entropy = nil;
+    configuration.trust = nil;
+    configuration.groups = nil;
+    configuration.group_len = 0;
+    entropy.initialized = false;
+    trust.len = 0;
+    if (value.config == ?configuration || value.config.entropy != ?value.entropy ||
+        value.config.trust != ?value.trust || value.config.groups == nil ||
+        !value.config.entropy.initialized || value.config.trust.len != 1) {
+        ret 57;
+    }
     val started: Result = start(?value, 1787875200);
     if (started.status != OK || !value.output_pending) { ret 2; }
     var event: Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO ||
         event.level != INITIAL || event.data.len == 0 ||
+        next_event(?value, ?value.active_event) ||
         next_event(?value, ?event) || complete_event(?value, event.token + 1, true) ||
         destroy(?value)) { ret 3; }
     val hello_token: u64 = value.active_event.token;
     if (!complete_event(?value, hello_token, true)) { ret 4; }
+    if (ingest(?value, INITIAL, value.storage.output, 1).status != FAILED ||
+        value.state != EXPECT_SERVER_HELLO) { ret 56; }
     if (restart(?value, RESTART_VERSION_NEGOTIATION).status != OK ||
         !next_event(?value, ?event) || event.kind != CRYPTO ||
         event.level != INITIAL || !bytes_equal(event.data,
@@ -1782,7 +2087,8 @@ test "client: event rejection has one terminal alert ownership path" {
     var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{tls13.ED25519};
     var configuration: config.ClientConfig;
-    configuration.server_name = "api.example.com";
+    configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
     configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
     configuration.trust = ?trust;
     configuration.versions = ?versions[0]; configuration.version_len = 1;
@@ -1798,6 +2104,7 @@ test "client: event rejection has one terminal alert ownership path" {
         output: ?reject_output[0], output_capacity: 4096,
         hello: ?reject_hello[0], hello_capacity: 4096,
         certificates: ?reject_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0,
     };
     var empty_extra: ExtraExtension;
     var value: Client;
@@ -1828,7 +2135,8 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
         tls13.ED25519};
     var configuration: config.ClientConfig;
-    configuration.server_name = "api.example.com";
+    configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
     configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
     configuration.trust = ?trust;
     configuration.versions = ?versions[0]; configuration.version_len = 1;
@@ -1844,6 +2152,7 @@ test "client: wrong-level and out-of-state messages fail closed once" {
         output: ?hostile_output[0], output_capacity: 4096,
         hello: ?hostile_hello[0], hello_capacity: 4096,
         certificates: ?hostile_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0,
     };
     var empty_extra: ExtraExtension;
     var value: Client;
@@ -1938,7 +2247,8 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{tls13.ED25519};
     var configuration: config.ClientConfig;
-    configuration.server_name = "api.example.com";
+    configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
     configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
     configuration.trust = ?trust;
     configuration.versions = ?versions[0]; configuration.version_len = 1;

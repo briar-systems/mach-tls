@@ -24,3 +24,4 @@ fwd tls.state;
 fwd tls.session;
 fwd tls.client;
 fwd tls.stream;
+fwd tls.memory_range;
