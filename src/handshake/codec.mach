@@ -598,6 +598,37 @@ pub fun encode_client_hello(value: *ClientHello, output: contracts.Buffer) hands
     ret result(handshake.COMPLETE, writer.offset, writer.offset, error.OK);
 }
 
+# return the encoded prefix covered by psk binder transcript hashes
+pub fun client_hello_binder_prefix(encoded: contracts.Bytes, after_retry: bool,
+    output: *contracts.Bytes) error.Error {
+    if (output == nil || encoded.data == nil || encoded.len < handshake.HEADER_SIZE) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    var message: handshake.Message;
+    val parsed: handshake.Progress = handshake.parse(encoded.data, encoded.len,
+        handshake.MAX_BODY_SIZE, ?message);
+    if (parsed.status != handshake.COMPLETE || parsed.consumed != encoded.len) {
+        ret error.DECODE_ERROR;
+    }
+    var hello: ClientHello;
+    val decoded: error.Error = decode_client_hello(?message, after_retry, ?hello);
+    if (decoded != error.OK) { ret decoded; }
+    var psk: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.PRE_SHARED_KEY, ?psk)) {
+        ret error.MISSING_EXTENSION;
+    }
+    val identities_length: usize = (psk.data[0]::usize << 8) | psk.data[1]::usize;
+    val psk_offset: usize = hello.extensions.len - 4 - psk.len;
+    val body_prefix: usize = 2 + 32 + 1 + hello.legacy_session_id.len
+        + 2 + hello.cipher_suites.len + 1 + hello.compression_methods.len
+        + 2 + psk_offset + 4 + 2 + identities_length;
+    val prefix_length: usize = handshake.HEADER_SIZE + body_prefix;
+    if (prefix_length > encoded.len) { ret error.DECODE_ERROR; }
+    output.data = encoded.data;
+    output.len = prefix_length;
+    ret error.OK;
+}
+
 pub fun validate_server(value: *ServerHello) error.Error {
     if (value == nil || value.legacy_version != tls13.LEGACY_VERSION
         || value.random.len != 32 || value.random.data == nil
@@ -834,6 +865,59 @@ test "codec: client hello round trips through fragmented framing" {
     var decoded: ClientHello;
     if (decode_client_hello(?message, false, ?decoded) != error.OK
         || decoded.extensions.len != offset || decoded.cipher_suites.len != 2) { ret 4; }
+    ret 0;
+}
+
+test "codec: psk binder prefix retains encoded length fields and identities" {
+    var random: [32]u8;
+    var suites: [2]u8 = [2]u8{0x13, 0x01};
+    var compression: [1]u8;
+    var extension_bytes: [61]u8;
+    var offset: usize = 0;
+    extension_bytes[offset] = 0; extension_bytes[offset + 1] = 43;
+    extension_bytes[offset + 2] = 0; extension_bytes[offset + 3] = 3;
+    extension_bytes[offset + 4] = 2; extension_bytes[offset + 5] = 3;
+    extension_bytes[offset + 6] = 4; offset = offset + 7;
+    extension_bytes[offset] = 0; extension_bytes[offset + 1] = 45;
+    extension_bytes[offset + 2] = 0; extension_bytes[offset + 3] = 2;
+    extension_bytes[offset + 4] = 1; extension_bytes[offset + 5] = 0;
+    offset = offset + 6;
+    extension_bytes[offset] = 0; extension_bytes[offset + 1] = 41;
+    extension_bytes[offset + 2] = 0; extension_bytes[offset + 3] = 44;
+    extension_bytes[offset + 4] = 0; extension_bytes[offset + 5] = 7;
+    extension_bytes[offset + 6] = 0; extension_bytes[offset + 7] = 1;
+    extension_bytes[offset + 8] = 0xaa;
+    extension_bytes[offset + 9] = 0; extension_bytes[offset + 10] = 0;
+    extension_bytes[offset + 11] = 0; extension_bytes[offset + 12] = 1;
+    extension_bytes[offset + 13] = 0; extension_bytes[offset + 14] = 33;
+    extension_bytes[offset + 15] = 32;
+    var i: usize = 0;
+    for (i < 32) { extension_bytes[offset + 16 + i] = i::u8; i = i + 1; }
+    offset = offset + 48;
+    var hello: ClientHello;
+    hello.legacy_version = tls13.LEGACY_VERSION;
+    hello.random = contracts.Bytes{data: ?random[0], len: 32};
+    hello.legacy_session_id = contracts.Bytes{data: nil, len: 0};
+    hello.cipher_suites = contracts.Bytes{data: ?suites[0], len: 2};
+    hello.compression_methods = contracts.Bytes{data: ?compression[0], len: 1};
+    hello.extensions = extensions.list(?extension_bytes[0], offset, extensions.CLIENT_HELLO);
+    hello.after_retry = false;
+    var wire: [128]u8;
+    val encoded: handshake.Progress = encode_client_hello(?hello,
+        contracts.Buffer{data: ?wire[0], capacity: 128});
+    if (encoded.status != handshake.COMPLETE || encoded.produced != 108) { ret 1; }
+    var prefix: contracts.Bytes;
+    if (client_hello_binder_prefix(
+            contracts.Bytes{data: ?wire[0], len: encoded.produced}, false, ?prefix) != error.OK
+        || prefix.data != ?wire[0] || prefix.len != 73 || prefix.data[prefix.len - 1] != 1
+        || wire[prefix.len] != 0 || wire[prefix.len + 1] != 33) { ret 2; }
+    if (client_hello_binder_prefix(
+        contracts.Bytes{data: ?wire[0], len: encoded.produced + 1}, false, ?prefix)
+        != error.DECODE_ERROR) { ret 3; }
+    hello.extensions = extensions.list(?extension_bytes[0], 13, extensions.CLIENT_HELLO);
+    val without_psk: handshake.Progress = encode_client_hello(?hello,
+        contracts.Buffer{data: ?wire[0], capacity: 128});
+    if (without_psk.status != handshake.REJECTED) { ret 4; }
     ret 0;
 }
 
