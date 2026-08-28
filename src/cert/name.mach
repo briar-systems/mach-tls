@@ -56,6 +56,14 @@ fun valid_dns(value: contracts.Bytes, wildcard: bool) bool {
     ret true;
 }
 
+pub fun valid_reference_dns(value: contracts.Bytes) bool {
+    ret valid_dns(value, false);
+}
+
+pub fun valid_presented_dns(value: contracts.Bytes) bool {
+    ret valid_dns(value, true);
+}
+
 fun equal_folded(first: *u8, second: *u8, length: usize) bool {
     var i: usize = 0;
     for (i < length) {

@@ -6,6 +6,7 @@ use std.types.size.usize;
 use std.types.string.str;
 
 fwd tls.cert.name;
+fwd tls.cert.x509;
 
 pub def KeyFormat: u8;
 

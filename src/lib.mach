@@ -10,6 +10,7 @@ fwd tls.tls13.transcript;
 fwd tls.transport;
 fwd tls.cert;
 fwd tls.cert.name;
+fwd tls.cert.x509;
 fwd tls.config;
 fwd tls.record;
 fwd tls.handshake;

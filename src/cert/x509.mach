@@ -1,0 +1,854 @@
+# strict borrowed x.509 certificate parsing
+
+use crypto.contracts;
+use crypto.encoding.der;
+use crypto.encoding.keys;
+use std.chrono.date;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.cert.name;
+
+pub val MAX_SERIAL_SIZE: usize = 20;
+pub val MAX_PATH_LENGTH: usize = 64;
+
+pub def SignatureAlgorithm: u8;
+
+pub val SIGNATURE_NONE: SignatureAlgorithm = 0;
+pub val ECDSA_P256_SHA256: SignatureAlgorithm = 1;
+pub val ED25519: SignatureAlgorithm = 2;
+pub val RSA_PSS_SHA256: SignatureAlgorithm = 3;
+pub val RSA_PSS_SHA384: SignatureAlgorithm = 4;
+pub val RSA_PKCS1_SHA256: SignatureAlgorithm = 5;
+pub val RSA_PKCS1_SHA384: SignatureAlgorithm = 6;
+
+pub val KEY_USAGE_DIGITAL_SIGNATURE: u16 = 1 << 0;
+pub val KEY_USAGE_CONTENT_COMMITMENT: u16 = 1 << 1;
+pub val KEY_USAGE_KEY_ENCIPHERMENT: u16 = 1 << 2;
+pub val KEY_USAGE_DATA_ENCIPHERMENT: u16 = 1 << 3;
+pub val KEY_USAGE_KEY_AGREEMENT: u16 = 1 << 4;
+pub val KEY_USAGE_KEY_CERT_SIGN: u16 = 1 << 5;
+pub val KEY_USAGE_CRL_SIGN: u16 = 1 << 6;
+pub val KEY_USAGE_ENCIPHER_ONLY: u16 = 1 << 7;
+pub val KEY_USAGE_DECIPHER_ONLY: u16 = 1 << 8;
+
+pub val PURPOSE_SERVER_AUTH: u8 = 1 << 0;
+pub val PURPOSE_CLIENT_AUTH: u8 = 1 << 1;
+pub val PURPOSE_ANY: u8 = 1 << 2;
+
+pub rec Extensions {
+    basic_constraints_present: bool;
+    basic_constraints_critical: bool;
+    ca: bool;
+    path_length_present: bool;
+    path_length: usize;
+    key_usage_present: bool;
+    key_usage_critical: bool;
+    key_usage: u16;
+    extended_key_usage_present: bool;
+    extended_key_usage_critical: bool;
+    purposes: u8;
+    subject_alt_name_present: bool;
+    subject_alt_name_critical: bool;
+    subject_alt_name: contracts.Bytes;
+    name_constraints_present: bool;
+    name_constraints_critical: bool;
+    name_constraints: contracts.Bytes;
+    subject_key_id_present: bool;
+    subject_key_id: contracts.Bytes;
+    authority_key_id_present: bool;
+    authority_key_id: contracts.Bytes;
+}
+
+pub rec Certificate {
+    encoded: contracts.Bytes;
+    tbs: contracts.Bytes;
+    version: u8;
+    serial: contracts.Bytes;
+    issuer: contracts.Bytes;
+    subject: contracts.Bytes;
+    subject_empty: bool;
+    not_before: i64;
+    not_after: i64;
+    public_key: keys.PublicKey;
+    signature_algorithm: SignatureAlgorithm;
+    signature: contracts.Bytes;
+    extensions: Extensions;
+}
+
+fun empty_extensions() Extensions {
+    ret Extensions{
+        basic_constraints_present: false,
+        basic_constraints_critical: false,
+        ca: false,
+        path_length_present: false,
+        path_length: 0,
+        key_usage_present: false,
+        key_usage_critical: false,
+        key_usage: 0,
+        extended_key_usage_present: false,
+        extended_key_usage_critical: false,
+        purposes: 0,
+        subject_alt_name_present: false,
+        subject_alt_name_critical: false,
+        subject_alt_name: contracts.Bytes{data: nil, len: 0},
+        name_constraints_present: false,
+        name_constraints_critical: false,
+        name_constraints: contracts.Bytes{data: nil, len: 0},
+        subject_key_id_present: false,
+        subject_key_id: contracts.Bytes{data: nil, len: 0},
+        authority_key_id_present: false,
+        authority_key_id: contracts.Bytes{data: nil, len: 0},
+    };
+}
+
+val OID_ECDSA_SHA256: [8]u8 = [8]u8{
+    0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+};
+val OID_ED25519: [3]u8 = [3]u8{0x2b, 0x65, 0x70};
+val OID_RSA_PSS: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a,
+};
+val OID_RSA_PKCS1_SHA256: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b,
+};
+val OID_RSA_PKCS1_SHA384: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c,
+};
+val OID_SHA256: [9]u8 = [9]u8{
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
+};
+val OID_SHA384: [9]u8 = [9]u8{
+    0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
+};
+val OID_MGF1: [9]u8 = [9]u8{
+    0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08,
+};
+
+val OID_BASIC_CONSTRAINTS: [3]u8 = [3]u8{0x55, 0x1d, 0x13};
+val OID_KEY_USAGE: [3]u8 = [3]u8{0x55, 0x1d, 0x0f};
+val OID_EXTENDED_KEY_USAGE: [3]u8 = [3]u8{0x55, 0x1d, 0x25};
+val OID_SUBJECT_ALT_NAME: [3]u8 = [3]u8{0x55, 0x1d, 0x11};
+val OID_NAME_CONSTRAINTS: [3]u8 = [3]u8{0x55, 0x1d, 0x1e};
+val OID_SUBJECT_KEY_ID: [3]u8 = [3]u8{0x55, 0x1d, 0x0e};
+val OID_AUTHORITY_KEY_ID: [3]u8 = [3]u8{0x55, 0x1d, 0x23};
+
+val OID_SERVER_AUTH: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01,
+};
+val OID_CLIENT_AUTH: [8]u8 = [8]u8{
+    0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x02,
+};
+val OID_ANY_PURPOSE: [4]u8 = [4]u8{0x55, 0x1d, 0x25, 0x00};
+
+fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
+    if (first.len != second.len) { ret false; }
+    if (first.len > 0 && (first.data == nil || second.data == nil)) { ret false; }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (first.data[i] != second.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun oid_equal(value: contracts.Bytes, expected: *u8, length: usize) bool {
+    if (value.len != length || value.data == nil || expected == nil) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (value.data[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun one_element(input: contracts.Bytes, tag: der.Tag,
+    output: *der.Element) bool {
+    ret output != nil && der.exact(input, output) == contracts.OK && output.tag == tag;
+}
+
+fun null_or_absent(body: *der.Cursor) bool {
+    if (der.complete(body)) { ret true; }
+    var parameter: der.Element;
+    ret der.next(body, ?parameter) == contracts.OK && parameter.tag == der.NULL &&
+        parameter.content.len == 0 && der.complete(body);
+}
+
+fun parse_hash_algorithm(element: *der.Element, output: *u8) bool {
+    if (element == nil || output == nil || element.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(element.encoded);
+    var body: der.Cursor;
+    if (der.enter(?parent, element, ?body) != contracts.OK) { ret false; }
+    var oid: der.Element;
+    if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+        !null_or_absent(?body)) { ret false; }
+    if (oid_equal(oid.content, (?OID_SHA256[0]), 9)) { @output = 32; ret true; }
+    if (oid_equal(oid.content, (?OID_SHA384[0]), 9)) { @output = 48; ret true; }
+    ret false;
+}
+
+fun parse_nonnegative(element: *der.Element, output: *usize) bool {
+    if (element == nil || output == nil || element.tag != der.INTEGER ||
+        element.content.len == 0 || element.content.data == nil ||
+        (element.content.data[0] & 0x80) != 0) { ret false; }
+    var start: usize = 0;
+    if (element.content.len > 1 && element.content.data[0] == 0) { start = 1; }
+    if (element.content.len - start > 8) { ret false; }
+    var value: usize = 0;
+    var i: usize = start;
+    for (i < element.content.len) {
+        if (value > ((0 - 1) - element.content.data[i]::usize) >> 8) { ret false; }
+        value = (value << 8) | element.content.data[i]::usize;
+        i = i + 1;
+    }
+    @output = value;
+    ret true;
+}
+
+fun parse_pss_parameters(input: contracts.Bytes,
+    output: *SignatureAlgorithm) bool {
+    if (output == nil) { ret false; }
+    var root: der.Element;
+    if (!one_element(input, der.SEQUENCE, ?root)) { ret false; }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    if (der.enter(?parent, ?root, ?body) != contracts.OK) { ret false; }
+    var hash_len: u8 = 0;
+    var mask_hash_len: u8 = 0;
+    var salt_len: usize = 0;
+    var saw_hash: bool = false;
+    var saw_mask: bool = false;
+    var saw_salt: bool = false;
+    var saw_trailer: bool = false;
+    var previous_tag: u8 = 0x9f;
+    for (!der.complete(?body)) {
+        var field: der.Element;
+        if (der.next(?body, ?field) != contracts.OK || field.tag < 0xa0 ||
+            field.tag > 0xa3 || (previous_tag != 0x9f && field.tag <= previous_tag)) {
+            ret false;
+        }
+        previous_tag = field.tag;
+        var field_parent: der.Cursor = der.cursor(field.encoded);
+        var field_body: der.Cursor;
+        if (der.enter(?field_parent, ?field, ?field_body) != contracts.OK) { ret false; }
+        var value: der.Element;
+        if (der.next(?field_body, ?value) != contracts.OK ||
+            !der.complete(?field_body)) { ret false; }
+        if (field.tag == 0xa0) {
+            if (!parse_hash_algorithm(?value, ?hash_len)) { ret false; }
+            saw_hash = true;
+        } or (field.tag == 0xa1) {
+            if (value.tag != der.SEQUENCE) { ret false; }
+            var algorithm_parent: der.Cursor = der.cursor(value.encoded);
+            var algorithm_body: der.Cursor;
+            if (der.enter(?algorithm_parent, ?value, ?algorithm_body) != contracts.OK) {
+                ret false;
+            }
+            var oid: der.Element;
+            var hash: der.Element;
+            if (der.next(?algorithm_body, ?oid) != contracts.OK ||
+                oid.tag != der.OBJECT_ID ||
+                !oid_equal(oid.content, (?OID_MGF1[0]), 9) ||
+                der.next(?algorithm_body, ?hash) != contracts.OK ||
+                !der.complete(?algorithm_body) ||
+                !parse_hash_algorithm(?hash, ?mask_hash_len)) { ret false; }
+            saw_mask = true;
+        } or (field.tag == 0xa2) {
+            if (!parse_nonnegative(?value, ?salt_len)) { ret false; }
+            saw_salt = true;
+        } or {
+            var trailer: usize = 0;
+            if (!parse_nonnegative(?value, ?trailer) || trailer != 1) { ret false; }
+            saw_trailer = true;
+        }
+    }
+    if (!saw_hash || !saw_mask || !saw_salt || hash_len != mask_hash_len ||
+        (saw_trailer && previous_tag != 0xa3)) { ret false; }
+    if (hash_len == 32 && salt_len == 32) {
+        @output = RSA_PSS_SHA256;
+        ret true;
+    }
+    if (hash_len == 48 && salt_len == 48) {
+        @output = RSA_PSS_SHA384;
+        ret true;
+    }
+    ret false;
+}
+
+fun parse_signature_algorithm(element: *der.Element,
+    output: *SignatureAlgorithm) bool {
+    if (element == nil || output == nil || element.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(element.encoded);
+    var body: der.Cursor;
+    if (der.enter(?parent, element, ?body) != contracts.OK) { ret false; }
+    var oid: der.Element;
+    if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID) {
+        ret false;
+    }
+    if (oid_equal(oid.content, (?OID_ECDSA_SHA256[0]), 8)) {
+        if (!der.complete(?body)) { ret false; }
+        @output = ECDSA_P256_SHA256;
+        ret true;
+    }
+    if (oid_equal(oid.content, (?OID_ED25519[0]), 3)) {
+        if (!der.complete(?body)) { ret false; }
+        @output = ED25519;
+        ret true;
+    }
+    if (oid_equal(oid.content, (?OID_RSA_PSS[0]), 9)) {
+        var parameters: der.Element;
+        if (der.next(?body, ?parameters) != contracts.OK ||
+            !der.complete(?body)) { ret false; }
+        ret parse_pss_parameters(parameters.encoded, output);
+    }
+    if (oid_equal(oid.content, (?OID_RSA_PKCS1_SHA256[0]), 9) ||
+        oid_equal(oid.content, (?OID_RSA_PKCS1_SHA384[0]), 9)) {
+        var parameter: der.Element;
+        if (der.next(?body, ?parameter) != contracts.OK || parameter.tag != der.NULL ||
+            parameter.content.len != 0 || !der.complete(?body)) { ret false; }
+        if (oid_equal(oid.content, (?OID_RSA_PKCS1_SHA256[0]), 9)) {
+            @output = RSA_PKCS1_SHA256;
+        } or { @output = RSA_PKCS1_SHA384; }
+        ret true;
+    }
+    ret false;
+}
+
+fun parse_name(element: *der.Element, empty: *bool) bool {
+    if (element == nil || empty == nil || element.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(element.encoded);
+    var body: der.Cursor;
+    if (der.enter(?parent, element, ?body) != contracts.OK) { ret false; }
+    @empty = der.complete(?body);
+    for (!der.complete(?body)) {
+        var set: der.Element;
+        if (der.next(?body, ?set) != contracts.OK || set.tag != 0x31 ||
+            set.content.len == 0) { ret false; }
+        var set_parent: der.Cursor = der.cursor(set.encoded);
+        var set_body: der.Cursor;
+        if (der.enter(?set_parent, ?set, ?set_body) != contracts.OK) { ret false; }
+        var previous: contracts.Bytes = contracts.Bytes{data: nil, len: 0};
+        for (!der.complete(?set_body)) {
+            var attribute: der.Element;
+            if (der.next(?set_body, ?attribute) != contracts.OK ||
+                attribute.tag != der.SEQUENCE) { ret false; }
+            if (previous.len > 0) {
+                val common: usize = previous.len;
+                var compare_len: usize = attribute.encoded.len;
+                if (common < compare_len) { compare_len = common; }
+                var i: usize = 0;
+                var ordered: bool = previous.len <= attribute.encoded.len;
+                for (i < compare_len) {
+                    if (previous.data[i] < attribute.encoded.data[i]) { ordered = true; i = compare_len; }
+                    or (previous.data[i] > attribute.encoded.data[i]) { ordered = false; i = compare_len; }
+                    or { i = i + 1; }
+                }
+                if (!ordered) { ret false; }
+            }
+            previous = attribute.encoded;
+            var attribute_parent: der.Cursor = der.cursor(attribute.encoded);
+            var attribute_body: der.Cursor;
+            if (der.enter(?attribute_parent, ?attribute, ?attribute_body) !=
+                contracts.OK) { ret false; }
+            var oid: der.Element;
+            var value: der.Element;
+            if (der.next(?attribute_body, ?oid) != contracts.OK ||
+                oid.tag != der.OBJECT_ID ||
+                der.next(?attribute_body, ?value) != contracts.OK ||
+                (value.tag & 0x20) != 0 || !der.complete(?attribute_body)) { ret false; }
+        }
+    }
+    ret true;
+}
+
+fun decimal(data: *u8, offset: usize, width: usize, output: *i64) bool {
+    if (data == nil || output == nil) { ret false; }
+    var value: i64 = 0;
+    var i: usize = 0;
+    for (i < width) {
+        val character: u8 = data[offset + i];
+        if (character < '0' || character > '9') { ret false; }
+        value = value * 10 + (character - '0')::i64;
+        i = i + 1;
+    }
+    @output = value;
+    ret true;
+}
+
+fun parse_time(element: *der.Element, output: *i64) bool {
+    if (element == nil || output == nil || element.content.data == nil) { ret false; }
+    var year: i64 = 0;
+    var offset: usize = 0;
+    if (element.tag == 0x17 && element.content.len == 13) {
+        if (!decimal(element.content.data, 0, 2, ?year)) { ret false; }
+        if (year >= 50) { year = year + 1900; }
+        or { year = year + 2000; }
+        offset = 2;
+    } or (element.tag == 0x18 && element.content.len == 15) {
+        if (!decimal(element.content.data, 0, 4, ?year) || year < 2050) {
+            ret false;
+        }
+        offset = 4;
+    } or { ret false; }
+    if (element.content.data[element.content.len - 1] != 'Z') { ret false; }
+    var month: i64 = 0;
+    var day: i64 = 0;
+    var hour: i64 = 0;
+    var minute: i64 = 0;
+    var second: i64 = 0;
+    if (!decimal(element.content.data, offset, 2, ?month) ||
+        !decimal(element.content.data, offset + 2, 2, ?day) ||
+        !decimal(element.content.data, offset + 4, 2, ?hour) ||
+        !decimal(element.content.data, offset + 6, 2, ?minute) ||
+        !decimal(element.content.data, offset + 8, 2, ?second) ||
+        month < 1 || month > 12 || day < 1 ||
+        day > date.days_in_month(year, month) || hour > 23 || minute > 59 ||
+        second > 59) { ret false; }
+    val days: i64 = date.civil_to_days(year, month, day);
+    @output = days * 86400 + hour * 3600 + minute * 60 + second;
+    ret true;
+}
+
+fun parse_basic_constraints(input: contracts.Bytes,
+    output: *Extensions) bool {
+    var root: der.Element;
+    if (output == nil || !one_element(input, der.SEQUENCE, ?root)) { ret false; }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    if (der.enter(?parent, ?root, ?body) != contracts.OK) { ret false; }
+    output.ca = false;
+    output.path_length_present = false;
+    if (!der.complete(?body)) {
+        var value: der.Element;
+        if (der.next(?body, ?value) != contracts.OK) { ret false; }
+        if (value.tag == der.BOOLEAN) {
+            if (value.content.len != 1 || value.content.data[0] != 0xff) { ret false; }
+            output.ca = true;
+            if (!der.complete(?body) && der.next(?body, ?value) != contracts.OK) {
+                ret false;
+            }
+            or (der.complete(?body)) { ret true; }
+        }
+        var path_length: usize = 0;
+        if (!parse_nonnegative(?value, ?path_length) || !output.ca ||
+            path_length > MAX_PATH_LENGTH || !der.complete(?body)) { ret false; }
+        output.path_length_present = true;
+        output.path_length = path_length;
+    }
+    ret true;
+}
+
+fun parse_key_usage(input: contracts.Bytes, output: *Extensions) bool {
+    var value: der.Element;
+    if (output == nil || !one_element(input, der.BIT_STRING, ?value) ||
+        value.content.len < 2 || value.content.len > 3) { ret false; }
+    val bit_count: usize = (value.content.len - 1) * 8 - value.content.data[0]::usize;
+    if (bit_count == 0 || bit_count > 9) { ret false; }
+    var usage: u16 = 0;
+    var i: usize = 0;
+    for (i < bit_count) {
+        val mask: u8 = (0x80::u16 >> (i % 8))::u8;
+        if ((value.content.data[1 + i / 8] & mask) != 0) {
+            usage = usage | (1::u16 << i);
+        }
+        i = i + 1;
+    }
+    output.key_usage = usage;
+    ret true;
+}
+
+fun parse_extended_key_usage(input: contracts.Bytes,
+    output: *Extensions) bool {
+    var root: der.Element;
+    if (output == nil || !one_element(input, der.SEQUENCE, ?root) ||
+        root.content.len == 0) { ret false; }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    var purposes: u8 = 0;
+    for (!der.complete(?body)) {
+        var oid: der.Element;
+        if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID) {
+            ret false;
+        }
+        var purpose: u8 = 0;
+        if (oid_equal(oid.content, (?OID_SERVER_AUTH[0]), 8)) {
+            purpose = PURPOSE_SERVER_AUTH;
+        } or (oid_equal(oid.content, (?OID_CLIENT_AUTH[0]), 8)) {
+            purpose = PURPOSE_CLIENT_AUTH;
+        } or (oid_equal(oid.content, (?OID_ANY_PURPOSE[0]), 4)) {
+            purpose = PURPOSE_ANY;
+        }
+        if (purpose != 0 && (purposes & purpose) != 0) { ret false; }
+        purposes = purposes | purpose;
+    }
+    output.purposes = purposes;
+    ret true;
+}
+
+fun parse_general_names(input: contracts.Bytes) bool {
+    var root: der.Element;
+    if (!one_element(input, der.SEQUENCE, ?root) || root.content.len == 0) {
+        ret false;
+    }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    for (!der.complete(?body)) {
+        var general_name: der.Element;
+        if (der.next(?body, ?general_name) != contracts.OK ||
+            general_name.tag < 0x80 || general_name.tag > 0xa8 ||
+            (general_name.tag == 0x82 &&
+                !name.valid_presented_dns(general_name.content)) ||
+            (general_name.tag == 0x87 && general_name.content.len != 4 &&
+                general_name.content.len != 16)) { ret false; }
+    }
+    ret true;
+}
+
+fun parse_name_constraints(input: contracts.Bytes) bool {
+    var root: der.Element;
+    if (!one_element(input, der.SEQUENCE, ?root) || root.content.len == 0) {
+        ret false;
+    }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    var previous: u8 = 0x9f;
+    for (!der.complete(?body)) {
+        var group: der.Element;
+        if (der.next(?body, ?group) != contracts.OK ||
+            (group.tag != 0xa0 && group.tag != 0xa1) ||
+            (previous != 0x9f && group.tag <= previous) || group.content.len == 0) {
+            ret false;
+        }
+        previous = group.tag;
+        var group_parent: der.Cursor = der.cursor(group.encoded);
+        var group_body: der.Cursor;
+        der.enter(?group_parent, ?group, ?group_body);
+        for (!der.complete(?group_body)) {
+            var subtree: der.Element;
+            if (der.next(?group_body, ?subtree) != contracts.OK ||
+                subtree.tag != der.SEQUENCE) { ret false; }
+            var subtree_parent: der.Cursor = der.cursor(subtree.encoded);
+            var subtree_body: der.Cursor;
+            der.enter(?subtree_parent, ?subtree, ?subtree_body);
+            var base: der.Element;
+            if (der.next(?subtree_body, ?base) != contracts.OK ||
+                !der.complete(?subtree_body)) { ret false; }
+            if (base.tag == 0x82 && !name.valid_reference_dns(base.content)) {
+                ret false;
+            }
+            if (base.tag == 0x87 && base.content.len != 8 &&
+                base.content.len != 32) { ret false; }
+        }
+    }
+    ret true;
+}
+
+fun parse_authority_key_id(input: contracts.Bytes,
+    output: *Extensions) bool {
+    var root: der.Element;
+    if (output == nil || !one_element(input, der.SEQUENCE, ?root)) { ret false; }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    var previous: u8 = 0x7f;
+    for (!der.complete(?body)) {
+        var field: der.Element;
+        if (der.next(?body, ?field) != contracts.OK || field.tag < 0x80 ||
+            field.tag > 0x82 || field.tag <= previous) { ret false; }
+        previous = field.tag;
+        if (field.tag == 0x80) {
+            if (field.content.len == 0) { ret false; }
+            output.authority_key_id_present = true;
+            output.authority_key_id = field.content;
+        }
+    }
+    ret true;
+}
+
+fun extension_count(input: contracts.Bytes, expected: contracts.Bytes) usize {
+    var body: der.Cursor = der.cursor(input);
+    var count: usize = 0;
+    for (!der.complete(?body)) {
+        var extension: der.Element;
+        if (der.next(?body, ?extension) != contracts.OK ||
+            extension.tag != der.SEQUENCE) { ret 2; }
+        var parent: der.Cursor = der.cursor(extension.encoded);
+        var values: der.Cursor;
+        der.enter(?parent, ?extension, ?values);
+        var oid: der.Element;
+        if (der.next(?values, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID) {
+            ret 2;
+        }
+        if (bytes_equal(oid.content, expected)) { count = count + 1; }
+    }
+    ret count;
+}
+
+fun parse_extensions(element: *der.Element, output: *Extensions) bool {
+    if (element == nil || output == nil || element.tag != 0xa3) { ret false; }
+    var outer_parent: der.Cursor = der.cursor(element.encoded);
+    var outer: der.Cursor;
+    der.enter(?outer_parent, element, ?outer);
+    var sequence: der.Element;
+    if (der.next(?outer, ?sequence) != contracts.OK ||
+        sequence.tag != der.SEQUENCE || sequence.content.len == 0 ||
+        !der.complete(?outer)) { ret false; }
+    var parent: der.Cursor = der.cursor(sequence.encoded);
+    var body: der.Cursor;
+    der.enter(?parent, ?sequence, ?body);
+    for (!der.complete(?body)) {
+        var extension: der.Element;
+        if (der.next(?body, ?extension) != contracts.OK ||
+            extension.tag != der.SEQUENCE) { ret false; }
+        var extension_parent: der.Cursor = der.cursor(extension.encoded);
+        var values: der.Cursor;
+        der.enter(?extension_parent, ?extension, ?values);
+        var oid: der.Element;
+        var value: der.Element;
+        if (der.next(?values, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+            extension_count(sequence.content, oid.content) != 1 ||
+            der.next(?values, ?value) != contracts.OK) { ret false; }
+        var critical: bool = false;
+        if (value.tag == der.BOOLEAN) {
+            if (value.content.len != 1 || value.content.data[0] != 0xff ||
+                der.next(?values, ?value) != contracts.OK) { ret false; }
+            critical = true;
+        }
+        if (value.tag != der.OCTET_STRING || !der.complete(?values)) { ret false; }
+        if (oid_equal(oid.content, (?OID_BASIC_CONSTRAINTS[0]), 3)) {
+            output.basic_constraints_present = true;
+            output.basic_constraints_critical = critical;
+            if (!parse_basic_constraints(value.content, output)) { ret false; }
+        } or (oid_equal(oid.content, (?OID_KEY_USAGE[0]), 3)) {
+            output.key_usage_present = true;
+            output.key_usage_critical = critical;
+            if (!parse_key_usage(value.content, output)) { ret false; }
+        } or (oid_equal(oid.content, (?OID_EXTENDED_KEY_USAGE[0]), 3)) {
+            output.extended_key_usage_present = true;
+            output.extended_key_usage_critical = critical;
+            if (!parse_extended_key_usage(value.content, output)) { ret false; }
+        } or (oid_equal(oid.content, (?OID_SUBJECT_ALT_NAME[0]), 3)) {
+            output.subject_alt_name_present = true;
+            output.subject_alt_name_critical = critical;
+            output.subject_alt_name = value.content;
+            if (!parse_general_names(value.content)) { ret false; }
+        } or (oid_equal(oid.content, (?OID_NAME_CONSTRAINTS[0]), 3)) {
+            output.name_constraints_present = true;
+            output.name_constraints_critical = critical;
+            output.name_constraints = value.content;
+            if (!critical || !parse_name_constraints(value.content)) { ret false; }
+        } or (oid_equal(oid.content, (?OID_SUBJECT_KEY_ID[0]), 3)) {
+            var key_id: der.Element;
+            if (!one_element(value.content, der.OCTET_STRING, ?key_id) ||
+                key_id.content.len == 0) { ret false; }
+            output.subject_key_id_present = true;
+            output.subject_key_id = key_id.content;
+        } or (oid_equal(oid.content, (?OID_AUTHORITY_KEY_ID[0]), 3)) {
+            if (!parse_authority_key_id(value.content, output)) { ret false; }
+        } or (critical) { ret false; }
+    }
+    ret true;
+}
+
+pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
+    if (output == nil || input.len == 0 || input.data == nil) {
+        ret contracts.INVALID_INPUT;
+    }
+    var root: der.Element;
+    if (!one_element(input, der.SEQUENCE, ?root)) { ret contracts.INVALID_INPUT; }
+    var parent: der.Cursor = der.cursor(input);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    var tbs: der.Element;
+    var outer_algorithm: der.Element;
+    var signature: der.Element;
+    if (der.next(?body, ?tbs) != contracts.OK || tbs.tag != der.SEQUENCE ||
+        der.next(?body, ?outer_algorithm) != contracts.OK ||
+        der.next(?body, ?signature) != contracts.OK || !der.complete(?body) ||
+        signature.tag != der.BIT_STRING || signature.content.len < 2 ||
+        signature.content.data[0] != 0) { ret contracts.INVALID_INPUT; }
+    var algorithm: SignatureAlgorithm = SIGNATURE_NONE;
+    if (!parse_signature_algorithm(?outer_algorithm, ?algorithm)) {
+        ret contracts.UNSUPPORTED;
+    }
+    var tbs_parent: der.Cursor = der.cursor(tbs.encoded);
+    var values: der.Cursor;
+    der.enter(?tbs_parent, ?tbs, ?values);
+    var current: der.Element;
+    if (der.next(?values, ?current) != contracts.OK) { ret contracts.INVALID_INPUT; }
+    var version: u8 = 0;
+    if (current.tag == 0xa0) {
+        var version_parent: der.Cursor = der.cursor(current.encoded);
+        var version_body: der.Cursor;
+        der.enter(?version_parent, ?current, ?version_body);
+        var value: der.Element;
+        var parsed_version: usize = 0;
+        if (der.next(?version_body, ?value) != contracts.OK ||
+            !der.complete(?version_body) || !parse_nonnegative(?value, ?parsed_version) ||
+            parsed_version == 0 || parsed_version > 2) { ret contracts.INVALID_INPUT; }
+        version = parsed_version::u8;
+        if (der.next(?values, ?current) != contracts.OK) { ret contracts.INVALID_INPUT; }
+    }
+    var serial: contracts.Bytes;
+    if (current.tag != der.INTEGER || current.content.len > MAX_SERIAL_SIZE ||
+        der.positive_integer(?current, ?serial) != contracts.OK || serial.len == 0) {
+        ret contracts.INVALID_INPUT;
+    }
+    var inner_algorithm: der.Element;
+    var issuer: der.Element;
+    var validity: der.Element;
+    var subject: der.Element;
+    var spki: der.Element;
+    if (der.next(?values, ?inner_algorithm) != contracts.OK ||
+        !bytes_equal(inner_algorithm.encoded, outer_algorithm.encoded) ||
+        der.next(?values, ?issuer) != contracts.OK ||
+        der.next(?values, ?validity) != contracts.OK ||
+        der.next(?values, ?subject) != contracts.OK ||
+        der.next(?values, ?spki) != contracts.OK) { ret contracts.INVALID_INPUT; }
+    var ignored_empty: bool = false;
+    var subject_empty: bool = false;
+    if (!parse_name(?issuer, ?ignored_empty) || ignored_empty ||
+        !parse_name(?subject, ?subject_empty) || validity.tag != der.SEQUENCE ||
+        spki.tag != der.SEQUENCE) { ret contracts.INVALID_INPUT; }
+    var validity_parent: der.Cursor = der.cursor(validity.encoded);
+    var validity_body: der.Cursor;
+    der.enter(?validity_parent, ?validity, ?validity_body);
+    var not_before_element: der.Element;
+    var not_after_element: der.Element;
+    var not_before: i64 = 0;
+    var not_after: i64 = 0;
+    if (der.next(?validity_body, ?not_before_element) != contracts.OK ||
+        der.next(?validity_body, ?not_after_element) != contracts.OK ||
+        !der.complete(?validity_body) ||
+        !parse_time(?not_before_element, ?not_before) ||
+        !parse_time(?not_after_element, ?not_after) || not_after < not_before) {
+        ret contracts.INVALID_INPUT;
+    }
+    var public_key: keys.PublicKey;
+    val key_status: contracts.Error = keys.decode_spki(spki.encoded, ?public_key);
+    if (key_status != contracts.OK) { ret key_status; }
+    var extensions: Extensions = empty_extensions();
+    var saw_issuer_uid: bool = false;
+    var saw_subject_uid: bool = false;
+    var saw_extensions: bool = false;
+    for (!der.complete(?values)) {
+        var optional: der.Element;
+        if (der.next(?values, ?optional) != contracts.OK) { ret contracts.INVALID_INPUT; }
+        if (optional.tag == 0x81 && !saw_issuer_uid && !saw_subject_uid &&
+            !saw_extensions && version >= 1) { saw_issuer_uid = true; }
+        or (optional.tag == 0x82 && !saw_subject_uid && !saw_extensions &&
+            version >= 1) { saw_subject_uid = true; }
+        or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
+            saw_extensions = true;
+            if (!parse_extensions(?optional, ?extensions)) { ret contracts.INVALID_INPUT; }
+        } or { ret contracts.INVALID_INPUT; }
+    }
+    if (subject_empty && (!extensions.subject_alt_name_present ||
+        !extensions.subject_alt_name_critical)) { ret contracts.INVALID_INPUT; }
+    output.encoded = input;
+    output.tbs = tbs.encoded;
+    output.version = version;
+    output.serial = serial;
+    output.issuer = issuer.encoded;
+    output.subject = subject.encoded;
+    output.subject_empty = subject_empty;
+    output.not_before = not_before;
+    output.not_after = not_after;
+    output.public_key = public_key;
+    output.signature_algorithm = algorithm;
+    output.signature = contracts.Bytes{data: ?signature.content.data[1],
+        len: signature.content.len - 1};
+    output.extensions = extensions;
+    ret contracts.OK;
+}
+
+test "cert.x509: strict utc and generalized time parsing" {
+    var utc_bytes: [15]u8 = [15]u8{
+        0x17, 0x0d, '4', '9', '1', '2', '3', '1', '2', '3', '5', '9', '5', '9', 'Z',
+    };
+    var utc: der.Element;
+    var timestamp: i64 = 0;
+    if (der.exact(contracts.Bytes{data: ?utc_bytes[0], len: 15}, ?utc) != contracts.OK ||
+        !parse_time(?utc, ?timestamp) || timestamp != 2524607999) { ret 1; }
+    var generalized_bytes: [17]u8 = [17]u8{
+        0x18, 0x0f, '2', '0', '5', '0', '0', '1', '0', '1', '0', '0', '0', '0', '0', '0', 'Z',
+    };
+    var generalized: der.Element;
+    if (der.exact(contracts.Bytes{data: ?generalized_bytes[0], len: 17},
+            ?generalized) != contracts.OK ||
+        !parse_time(?generalized, ?timestamp) || timestamp != 2524608000) { ret 2; }
+    generalized_bytes[4] = '4';
+    generalized_bytes[5] = '9';
+    if (der.exact(contracts.Bytes{data: ?generalized_bytes[0], len: 17},
+            ?generalized) != contracts.OK || parse_time(?generalized, ?timestamp)) {
+        ret 3;
+    }
+    ret 0;
+}
+
+test "cert.x509: parse a strict ed25519 server certificate" {
+    var certificate_der: [480]u8 = [480]u8{
+        0x30, 0x82, 0x01, 0xdc, 0x30, 0x82, 0x01, 0x8e, 0xa0, 0x03, 0x02, 0x01,
+        0x02, 0x02, 0x14, 0x13, 0x3b, 0x05, 0x92, 0x1a, 0x78, 0x86, 0xe4, 0xbe,
+        0x79, 0xcd, 0x80, 0x96, 0x8a, 0x4d, 0xdd, 0xef, 0x66, 0x5d, 0xaa, 0x30,
+        0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x30, 0x3b, 0x31, 0x0b, 0x30, 0x09,
+        0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x31, 0x16, 0x30,
+        0x14, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x0c, 0x0d, 0x42, 0x72, 0x69, 0x61,
+        0x72, 0x20, 0x53, 0x79, 0x73, 0x74, 0x65, 0x6d, 0x73, 0x31, 0x14, 0x30,
+        0x12, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x0b, 0x65, 0x78, 0x61, 0x6d,
+        0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x30, 0x1e, 0x17, 0x0d, 0x32,
+        0x36, 0x30, 0x38, 0x32, 0x38, 0x31, 0x31, 0x31, 0x37, 0x34, 0x35, 0x5a,
+        0x17, 0x0d, 0x33, 0x36, 0x30, 0x38, 0x32, 0x35, 0x31, 0x31, 0x31, 0x37,
+        0x34, 0x35, 0x5a, 0x30, 0x3b, 0x31, 0x0b, 0x30, 0x09, 0x06, 0x03, 0x55,
+        0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x31, 0x16, 0x30, 0x14, 0x06, 0x03,
+        0x55, 0x04, 0x0a, 0x0c, 0x0d, 0x42, 0x72, 0x69, 0x61, 0x72, 0x20, 0x53,
+        0x79, 0x73, 0x74, 0x65, 0x6d, 0x73, 0x31, 0x14, 0x30, 0x12, 0x06, 0x03,
+        0x55, 0x04, 0x03, 0x0c, 0x0b, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65,
+        0x2e, 0x63, 0x6f, 0x6d, 0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65,
+        0x70, 0x03, 0x21, 0x00, 0x78, 0x62, 0x22, 0xb2, 0x39, 0xb2, 0xda, 0x87,
+        0xe8, 0xd1, 0x25, 0x9e, 0x69, 0x77, 0x20, 0x14, 0xd4, 0x9d, 0xde, 0x9b,
+        0x70, 0x35, 0x37, 0x22, 0x83, 0xf5, 0xfb, 0xba, 0xee, 0x09, 0x38, 0x2d,
+        0xa3, 0x81, 0xa3, 0x30, 0x81, 0xa0, 0x30, 0x0c, 0x06, 0x03, 0x55, 0x1d,
+        0x13, 0x01, 0x01, 0xff, 0x04, 0x02, 0x30, 0x00, 0x30, 0x0e, 0x06, 0x03,
+        0x55, 0x1d, 0x0f, 0x01, 0x01, 0xff, 0x04, 0x04, 0x03, 0x02, 0x07, 0x80,
+        0x30, 0x13, 0x06, 0x03, 0x55, 0x1d, 0x25, 0x04, 0x0c, 0x30, 0x0a, 0x06,
+        0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01, 0x30, 0x2b, 0x06,
+        0x03, 0x55, 0x1d, 0x11, 0x04, 0x24, 0x30, 0x22, 0x82, 0x0b, 0x65, 0x78,
+        0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 0x82, 0x0d, 0x2a,
+        0x2e, 0x65, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+        0x87, 0x04, 0xc0, 0x00, 0x02, 0x01, 0x30, 0x1d, 0x06, 0x03, 0x55, 0x1d,
+        0x0e, 0x04, 0x16, 0x04, 0x14, 0x33, 0x94, 0x2e, 0x64, 0x68, 0xdc, 0x27,
+        0xc8, 0x1c, 0xe0, 0xdd, 0x75, 0xd5, 0x04, 0xd4, 0x0d, 0x41, 0x76, 0x9e,
+        0xa3, 0x30, 0x1f, 0x06, 0x03, 0x55, 0x1d, 0x23, 0x04, 0x18, 0x30, 0x16,
+        0x80, 0x14, 0x33, 0x94, 0x2e, 0x64, 0x68, 0xdc, 0x27, 0xc8, 0x1c, 0xe0,
+        0xdd, 0x75, 0xd5, 0x04, 0xd4, 0x0d, 0x41, 0x76, 0x9e, 0xa3, 0x30, 0x05,
+        0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x41, 0x00, 0x20, 0xa7, 0xc0, 0x6f,
+        0x6f, 0xae, 0xc3, 0x76, 0x3f, 0x7b, 0x73, 0x53, 0xf3, 0x87, 0x64, 0x9a,
+        0x15, 0x86, 0x05, 0x18, 0xba, 0xf2, 0x6a, 0xf7, 0x90, 0xcb, 0x62, 0x99,
+        0xb8, 0xc5, 0x1c, 0x40, 0xee, 0xd7, 0xfc, 0x32, 0x0c, 0x51, 0xe3, 0xe7,
+        0xf3, 0x7c, 0xd6, 0xb7, 0x66, 0x4f, 0xb5, 0x78, 0x58, 0xb2, 0x33, 0x4e,
+        0xd7, 0x95, 0xf9, 0x37, 0xba, 0xc8, 0x36, 0x37, 0xc3, 0x05, 0x22, 0x0a,
+    };
+    var certificate: Certificate;
+    if (parse(contracts.Bytes{data: ?certificate_der[0], len: 480},
+            ?certificate) != contracts.OK || certificate.version != 2 ||
+        certificate.signature_algorithm != ED25519 ||
+        certificate.public_key.algorithm != keys.ED25519 ||
+        certificate.serial.len != 20 || certificate.signature.len != 64 ||
+        certificate.extensions.ca ||
+        !certificate.extensions.basic_constraints_present ||
+        !certificate.extensions.basic_constraints_critical ||
+        certificate.extensions.key_usage != KEY_USAGE_DIGITAL_SIGNATURE ||
+        certificate.extensions.purposes != PURPOSE_SERVER_AUTH ||
+        !certificate.extensions.subject_alt_name_present ||
+        !certificate.extensions.subject_key_id_present ||
+        !certificate.extensions.authority_key_id_present) { ret 1; }
+    certificate_der[9] = 0x04;
+    if (parse(contracts.Bytes{data: ?certificate_der[0], len: 480},
+            ?certificate) == contracts.OK) { ret 2; }
+    ret 0;
+}
