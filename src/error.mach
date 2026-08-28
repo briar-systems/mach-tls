@@ -21,11 +21,18 @@ pub val INTERNAL_ERROR:        Error = 15;
 pub val RECORD_OVERFLOW:       Error = 16;
 pub val SEQUENCE_EXHAUSTED:    Error = 17;
 pub val ALERT_RECEIVED:        Error = 18;
+pub val PROTOCOL_VERSION:      Error = 19;
+pub val MISSING_EXTENSION:     Error = 20;
+pub val UNSUPPORTED_EXTENSION: Error = 21;
+pub val NO_APPLICATION_PROTOCOL: Error = 22;
+pub val DECRYPT_ERROR:         Error = 23;
 
 test "error: terminal results are distinct" {
     if (CANCELLED == TIMEOUT) { ret 1; }
     if (CLOSED == OK) { ret 1; }
     if (BAD_CERTIFICATE == UNKNOWN_CA) { ret 1; }
     if (RECORD_OVERFLOW == SEQUENCE_EXHAUSTED) { ret 1; }
+    if (PROTOCOL_VERSION == MISSING_EXTENSION) { ret 1; }
+    if (UNSUPPORTED_EXTENSION == NO_APPLICATION_PROTOCOL) { ret 1; }
     ret 0;
 }

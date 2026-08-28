@@ -10,5 +10,8 @@ fwd tls.cert;
 fwd tls.config;
 fwd tls.record;
 fwd tls.handshake;
+fwd tls.handshake.extensions;
+fwd tls.handshake.codec;
+fwd tls.handshake.negotiation;
 fwd tls.state;
 fwd tls.session;
