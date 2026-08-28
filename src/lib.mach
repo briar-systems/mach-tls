@@ -22,3 +22,5 @@ fwd tls.handshake.codec;
 fwd tls.handshake.negotiation;
 fwd tls.state;
 fwd tls.session;
+fwd tls.client;
+fwd tls.stream;

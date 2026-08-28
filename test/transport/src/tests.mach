@@ -13,7 +13,11 @@ use std.sync.cancel;
 use io_runtime: std.io.runtime;
 use io_error: std.io.error;
 use tls.error;
+use tls.record;
+use tls.stream;
 use tls.transport;
+use crypto.contracts;
+use std.crypto.ct;
 
 rec TestTransport {
     runtime: *io_runtime.Runtime;
@@ -50,6 +54,13 @@ fun test_close(context: ptr, scope: *cancel.Scope, token_context: usize) Result[
     ret test_submit(context, scope, io_runtime.CLOSE, nil, 0, token_context);
 }
 
+fun test_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *TestTransport = context::*TestTransport;
+    state.last_scope = scope;
+    state.closes = state.closes + 1;
+    ret test_submit(context, scope, io_runtime.SHUTDOWN, nil, 0, token_context);
+}
+
 fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, runtime: *io_runtime.Runtime) {
     state.runtime = runtime;
     state.last_scope = nil;
@@ -60,7 +71,9 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     adapter.context = state::ptr;
     adapter.submit_read = test_read;
     adapter.submit_write = test_write;
+    adapter.submit_shutdown = test_shutdown;
     adapter.submit_close = test_close;
+    adapter.submit_abort = test_close;
 }
 
 fun take_one(runtime: *io_runtime.Runtime, completion: *io_runtime.Completion) bool {
@@ -82,6 +95,8 @@ test "transport: one application write may drive write and read completions" {
     val token: transport.Token = transport.Token{index: 4, generation: 7};
     var operation: transport.Operation;
     if (!transport.begin(?operation, token, transport.APPLICATION_WRITE, ?scope, ?application[0], 8, 99)) { ret 3; }
+    if (transport.begin(?operation, token, transport.APPLICATION_WRITE, ?scope,
+        ?application[0], 8, 99)) { ret 15; }
     if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_WRITE, buffer: ?wire[0], length: 16, context: 101})) { ret 4; }
     val first_lower: io_runtime.Token = operation.lower_token;
     if (is_err[bool, io_error.Error](io_runtime.complete(?runtime, first_lower, 5, 0, false))) { ret 5; }
@@ -96,6 +111,8 @@ test "transport: one application write may drive write and read completions" {
     if (!transport.advance(?operation, 8) || !transport.finish(?operation, error.OK, false) || transport.finish(?operation, error.OK, false)) { ret 12; }
     val terminal: transport.Snapshot = transport.snapshot(?operation);
     if (terminal.state != transport.OPERATION_TERMINAL || terminal.application_bytes != 8 || transport_state.reads != 1 || transport_state.writes != 1) { ret 13; }
+    if (transport.begin(?operation, token, transport.APPLICATION_WRITE, ?scope,
+        ?application[0], 8, 99)) { ret 16; }
     if (!transport.destroy_operation(?operation) || !cancel.destroy(?scope) || is_err[bool, io_error.Error](io_runtime.close(?runtime)) || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 14; }
     ret 0;
 }
@@ -160,5 +177,281 @@ test "transport: timeout resolves an idle operation once" {
     if (terminal.state != transport.OPERATION_TERMINAL || terminal.terminal_error != error.TIMEOUT) { ret 4; }
     if (transport.finish(?operation, error.TIMEOUT, false)) { ret 5; }
     if (!transport.destroy_operation(?operation) || !cancel.destroy(?scope)) { ret 6; }
+    ret 0;
+}
+
+var write_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var write_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var write_plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
+var write_content: [record.MAX_PLAINTEXT]^u8;
+var write_scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+var cancel_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var cancel_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var cancel_plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
+var cancel_content: [record.MAX_PLAINTEXT]^u8;
+var cancel_scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+var zero_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var zero_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var zero_plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
+var zero_content: [record.MAX_PLAINTEXT]^u8;
+var zero_scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+var close_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var close_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var close_plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
+var close_content: [record.MAX_PLAINTEXT]^u8;
+var close_scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+var fragment_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var fragment_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var fragment_plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
+var fragment_content: [record.MAX_PLAINTEXT]^u8;
+var fragment_scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+
+fun make_open_stream(value: *stream.Stream, adapter: *transport.Transport,
+    wire_input: *u8, wire_output: *u8, plaintext: *^u8, content: *^u8,
+    scratch: *^u8) bool {
+    value.transport = adapter;
+    value.state = stream.OPEN;
+    value.handshake_complete = true;
+    value.storage.wire_input = wire_input;
+    value.storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    value.storage.wire_output = wire_output;
+    value.storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    value.storage.plaintext = plaintext;
+    value.storage.plaintext_capacity = record.MAX_INNER_PLAINTEXT;
+    value.storage.content = content;
+    value.storage.content_capacity = record.MAX_PLAINTEXT;
+    value.storage.scratch = scratch;
+    value.storage.scratch_capacity = record.MAX_INNER_PLAINTEXT;
+    var key: [16]^u8;
+    var iv: [12]u8;
+    var i: usize = 0;
+    for (i < 16) { key[i] = (i + 1)::u8; i = i + 1; }
+    for (i < 12) { iv[i] = (0x80 + i)::u8; i = i + 1; }
+    val installed: bool = record.install(?value.write_cipher, record.TLS13,
+        record.aes_128_gcm(), contracts.SecretBytes{data: ?key[0], len: 16},
+        contracts.Bytes{data: ?iv[0], len: 12});
+    val read_installed: bool = record.install(?value.read_cipher, record.TLS13,
+        record.aes_128_gcm(), contracts.SecretBytes{data: ?key[0], len: 16},
+        contracts.Bytes{data: ?iv[0], len: 12});
+    ct.zeroize(?key[0], 16);
+    ret installed && read_installed;
+}
+
+test "stream: partial write retains application ownership until the whole record settles" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_open_stream(?secure, ?adapter, ?write_wire_input[0],
+        ?write_wire_output[0], ?write_plaintext[0], ?write_content[0],
+        ?write_scratch[0])) { ret 3; }
+    var application: [5]u8 = [5]u8{'h', 'e', 'l', 'l', 'o'};
+    if (!stream.write(?secure, ?scope, transport.Token{index: 10, generation: 1},
+        ?application[0], 5, 44)) { ret 4; }
+    val wire_length: usize = secure.wire_output_len;
+    if (wire_length <= 5 || secure.operation.application_buffer != ?application[0]) { ret 5; }
+    var completion: io_runtime.Completion;
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, 3, 0, false)) || !take_one(?runtime, ?completion) ||
+        !stream.accept(?secure, ?completion)) { ret 6; }
+    if (transport.snapshot(?secure.operation).application_bytes != 0 ||
+        secure.operation.application_buffer != ?application[0]) { ret 7; }
+    val remaining: usize = wire_length - 3;
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, remaining, 0, false)) ||
+        !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 8; }
+    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (finished.state != transport.OPERATION_TERMINAL || finished.application_bytes != 5 ||
+        finished.terminal_error != error.OK || transport_state.writes != 2) { ret 9; }
+    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope) ||
+        is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 10; }
+    ret 0;
+}
+
+test "stream: write cancellation requires an abortive lower close" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_open_stream(?secure, ?adapter, ?cancel_wire_input[0],
+        ?cancel_wire_output[0], ?cancel_plaintext[0], ?cancel_content[0],
+        ?cancel_scratch[0])) { ret 3; }
+    var application: [3]u8 = [3]u8{1, 2, 3};
+    if (!stream.write(?secure, ?scope, transport.Token{index: 11, generation: 1},
+        ?application[0], 3, 45) || !cancel.cancel(?scope)) { ret 4; }
+    if (transport.snapshot(?secure.operation).state != transport.OPERATION_WAITING ||
+        secure.operation.application_buffer != ?application[0]) { ret 5; }
+    var completion: io_runtime.Completion;
+    if (!take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 6; }
+    if (transport.snapshot(?secure.operation).terminal_error != error.CANCELLED ||
+        secure.state != stream.FAILED || !stream.destroy_operation(?secure) ||
+        !cancel.destroy(?scope)) { ret 7; }
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.close(?secure, ?scope,
+            transport.Token{index: 11, generation: 2}, 46) ||
+        secure.pending_action != transport.TRANSPORT_ABORT) { ret 8; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, 0, 0, false)) || !take_one(?runtime, ?completion) ||
+        !stream.accept(?secure, ?completion)) { ret 9; }
+    if (transport.snapshot(?secure.operation).terminal_error != error.OK ||
+        secure.state != stream.CLOSED || !stream.destroy_operation(?secure) ||
+        !stream.destroy(?secure) || !cancel.destroy(?scope) ||
+        is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 10; }
+    ret 0;
+}
+
+test "stream: zero-byte write completion makes sequence reuse impossible" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_open_stream(?secure, ?adapter, ?zero_wire_input[0],
+        ?zero_wire_output[0], ?zero_plaintext[0], ?zero_content[0],
+        ?zero_scratch[0])) { ret 3; }
+    var application: [3]u8 = [3]u8{1, 2, 3};
+    if (!stream.write(?secure, ?scope,
+        transport.Token{index: 14, generation: 1}, ?application[0], 3, 50)) {
+        ret 4;
+    }
+    var completion: io_runtime.Completion;
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, 0, 0, false)) ||
+        !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
+        ret 5;
+    }
+    if (transport.snapshot(?secure.operation).terminal_error != error.INTERNAL_ERROR ||
+        secure.state != stream.FAILED || !stream.destroy_operation(?secure) ||
+        stream.write(?secure, ?scope, transport.Token{index: 14, generation: 2},
+            ?application[0], 3, 51) || !stream.close(?secure, ?scope,
+            transport.Token{index: 14, generation: 3}, 52)) { ret 6; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, 0, 0, false)) ||
+        !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
+        ret 7;
+    }
+    if (secure.state != stream.CLOSED || !stream.destroy_operation(?secure) ||
+        !stream.destroy(?secure) || !cancel.destroy(?scope) ||
+        is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 8; }
+    ret 0;
+}
+
+test "stream: close notify is fully written before write-side shutdown" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_open_stream(?secure, ?adapter, ?close_wire_input[0],
+        ?close_wire_output[0], ?close_plaintext[0], ?close_content[0],
+        ?close_scratch[0]) || !stream.half_close(?secure, ?scope,
+        transport.Token{index: 12, generation: 1}, 47)) { ret 3; }
+    if (transport_state.writes != 1 || transport_state.closes != 0) { ret 4; }
+    var completion: io_runtime.Completion;
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, secure.wire_output_len, 0, false)) ||
+        !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 5; }
+    if (transport_state.closes != 1 || secure.pending_action != transport.TRANSPORT_SHUTDOWN ||
+        !secure.send_closed) { ret 6; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+        secure.operation.lower_token, 0, 0, false)) || !take_one(?runtime, ?completion) ||
+        !stream.accept(?secure, ?completion)) { ret 7; }
+    if (transport.snapshot(?secure.operation).state != transport.OPERATION_TERMINAL ||
+        secure.state != stream.OPEN || !secure.send_closed ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 8; }
+    var received: [1]u8;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.read(?secure, ?scope,
+            transport.Token{index: 12, generation: 2}, ?received[0], 1, 48) ||
+        is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+            secure.operation.lower_token, 0, 0, true)) ||
+        !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
+        ret 9;
+    }
+    if (transport.snapshot(?secure.operation).terminal_error != error.CLOSED ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope) ||
+        is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 10; }
+    ret 0;
+}
+
+test "stream: encrypted records retain read ownership at every byte boundary" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 32))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_open_stream(?secure, ?adapter, ?fragment_wire_input[0],
+        ?fragment_wire_output[0], ?fragment_plaintext[0], ?fragment_content[0],
+        ?fragment_scratch[0])) { ret 3; }
+
+    var key: [16]^u8;
+    var iv: [12]u8;
+    var i: usize = 0;
+    for (i < 16) { key[i] = (i + 1)::u8; i = i + 1; }
+    for (i < 12) { iv[i] = (0x80 + i)::u8; i = i + 1; }
+    var peer: record.Cipher;
+    if (!record.install(?peer, record.TLS13, record.aes_128_gcm(),
+        contracts.SecretBytes{data: ?key[0], len: 16},
+        contracts.Bytes{data: ?iv[0], len: 12})) { ret 4; }
+    ct.zeroize(?key[0], 16);
+    var clear: [5]^u8 = [5]^u8{'w', 'o', 'r', 'l', 'd'};
+    var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+    var wire: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    val sealed: record.Sealed = record.seal(?peer, record.APPLICATION_DATA,
+        contracts.SecretBytes{data: ?clear[0], len: 5}, 0,
+        contracts.SecretBuffer{data: ?scratch[0], capacity: record.MAX_INNER_PLAINTEXT},
+        contracts.Buffer{data: ?wire[0],
+            capacity: record.HEADER_SIZE + record.MAX_CIPHERTEXT});
+    ct.zeroize(?clear[0], 5);
+    if (sealed.error != error.OK) { ret 5; }
+    var application: [5]u8;
+    if (!stream.read(?secure, ?scope,
+        transport.Token{index: 13, generation: 1}, ?application[0], 5, 49)) {
+        ret 6;
+    }
+    i = 0;
+    for (i < sealed.written) {
+        secure.operation.lower_buffer[0] = wire[i];
+        if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+                secure.operation.lower_token, 1, 0, false))) { ret 7; }
+        var completion: io_runtime.Completion;
+        if (!take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
+            ret 8;
+        }
+        i = i + 1;
+    }
+    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    record.destroy(?peer);
+    if (finished.state != transport.OPERATION_TERMINAL) { ret 10; }
+    if (finished.application_bytes != 5) { ret 11; }
+    if (application[0] != 'w' ||
+        application[1] != 'o' || application[2] != 'r' || application[3] != 'l' ||
+        application[4] != 'd') { ret 12; }
+    if (!stream.destroy_operation(?secure)) { ret 13; }
+    if (!cancel.destroy(?scope)) { ret 14; }
+    if (
+        is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 15; }
     ret 0;
 }

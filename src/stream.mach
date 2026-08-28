@@ -1,0 +1,837 @@
+# completion-driven tls 1.3 secure stream
+
+use crypto.contracts;
+use std.crypto.ct;
+use std.io.runtime;
+use std.sync.cancel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.client;
+use tls.config;
+use tls.error;
+use tls.record;
+use tls.tls13;
+use tls.tls13.key_schedule;
+use tls.transport;
+
+pub def State: u8;
+pub val NEW: State = 1;
+pub val HANDSHAKING: State = 2;
+pub val OPEN: State = 3;
+pub val CLOSING: State = 4;
+pub val CLOSED: State = 5;
+pub val FAILED: State = 6;
+pub val DESTROYED: State = 7;
+
+pub def Control: u8;
+val CONTROL_NONE: Control = 0;
+val CONTROL_ALERT: Control = 1;
+val CONTROL_HALF_CLOSE: Control = 2;
+val CONTROL_CLOSE: Control = 3;
+val CONTROL_ABORT: Control = 4;
+
+pub rec Storage {
+    handshake: client.Storage;
+    wire_input: *u8;
+    wire_input_capacity: usize;
+    wire_output: *u8;
+    wire_output_capacity: usize;
+    plaintext: *^u8;
+    plaintext_capacity: usize;
+    content: *^u8;
+    content_capacity: usize;
+    scratch: *^u8;
+    scratch_capacity: usize;
+}
+
+pub rec Snapshot {
+    state: State;
+    operation: transport.Snapshot;
+    handshake_complete: bool;
+    send_closed: bool;
+    peer_closed: bool;
+    alert: record.AlertDescription;
+}
+
+# one operation is active at a time, while read and write cipher sequences remain independent
+pub rec Stream {
+    transport: *transport.Transport;
+    storage: Storage;
+    client: client.Client;
+    operation: transport.Operation;
+    read_cipher: record.Cipher;
+    write_cipher: record.Cipher;
+    state: State;
+    control: Control;
+    pending_action: transport.ActionKind;
+    wire_input_len: usize;
+    wire_input_read: usize;
+    wire_output_len: usize;
+    wire_output_sent: usize;
+    plaintext_len: usize;
+    plaintext_read: usize;
+    application_chunk: usize;
+    core_event: client.Event;
+    core_event_sending: bool;
+    core_event_alert: bool;
+    core_event_offset: usize;
+    core_event_chunk: usize;
+    control_alert: record.AlertDescription;
+    control_record_sent: bool;
+    handshake_complete: bool;
+    send_closed: bool;
+    peer_closed: bool;
+    peer_alert: record.AlertDescription;
+    ccs_count: usize;
+}
+
+fun storage_valid(value: *Storage, configuration: *config.ClientConfig) bool {
+    ret value != nil && configuration != nil &&
+        value.wire_input != nil && value.wire_input_capacity >= record.HEADER_SIZE + record.MAX_CIPHERTEXT &&
+        value.wire_output != nil && value.wire_output_capacity >= record.HEADER_SIZE + record.MAX_CIPHERTEXT &&
+        value.plaintext != nil && value.plaintext_capacity >= record.MAX_INNER_PLAINTEXT &&
+        value.content != nil && value.content_capacity >= record.MAX_PLAINTEXT &&
+        value.scratch != nil && value.scratch_capacity >= record.MAX_INNER_PLAINTEXT;
+}
+
+fun algorithm(suite: tls13.CipherSuite) record.Aead {
+    if (suite == tls13.AES_128_GCM_SHA256) { ret record.aes_128_gcm(); }
+    if (suite == tls13.AES_256_GCM_SHA384) { ret record.aes_256_gcm(); }
+    ret record.chacha20_poly1305();
+}
+
+fun secret_for(stream: *Stream, event: *client.Event) *key_schedule.Secret {
+    if (event.level == client.HANDSHAKE && event.direction == client.SEND) {
+        ret ?stream.client.schedule.client_handshake_traffic;
+    }
+    if (event.level == client.HANDSHAKE && event.direction == client.RECEIVE) {
+        ret ?stream.client.schedule.server_handshake_traffic;
+    }
+    if (event.level == client.APPLICATION && event.direction == client.SEND) {
+        ret ?stream.client.schedule.client_application_traffic;
+    }
+    if (event.level == client.APPLICATION && event.direction == client.RECEIVE) {
+        ret ?stream.client.schedule.server_application_traffic;
+    }
+    ret nil;
+}
+
+fun install_secret(stream: *Stream, event: *client.Event) bool {
+    val traffic: *key_schedule.Secret = secret_for(stream, event);
+    if (traffic == nil) { ret false; }
+    var key: [32]^u8;
+    var iv: [12]u8;
+    val key_length: usize = key_schedule.key_size(stream.client.suite);
+    if (key_schedule.traffic_key(?stream.client.schedule, traffic,
+            contracts.SecretBuffer{data: ?key[0], capacity: 32}) != error.OK ||
+        key_schedule.traffic_iv(?stream.client.schedule, traffic,
+            contracts.Buffer{data: ?iv[0], capacity: 12}) != error.OK) {
+        ct.zeroize(?key[0], 32);
+        ret false;
+    }
+    var target: *record.Cipher = ?stream.read_cipher;
+    if (event.direction == client.SEND) { target = ?stream.write_cipher; }
+    val installed: bool = record.install(target, record.TLS13,
+        algorithm(stream.client.suite),
+        contracts.SecretBytes{data: ?key[0], len: key_length},
+        contracts.Bytes{data: ?iv[0], len: 12});
+    ct.zeroize(?key[0], 32);
+    var i: usize = 0;
+    for (i < 12) { iv[i] = 0; i = i + 1; }
+    ret installed;
+}
+
+fun finish(stream: *Stream, failure: error.Error, end_of_stream: bool) bool {
+    if (failure != error.OK && failure != error.CANCELLED &&
+        failure != error.TIMEOUT) { stream.state = FAILED; }
+    ret transport.finish(?stream.operation, failure, end_of_stream);
+}
+
+fun submit(stream: *Stream, kind: transport.ActionKind, buffer: *u8,
+    length: usize) bool {
+    val action: transport.Action = transport.Action{kind: kind, buffer: buffer,
+        length: length, context: stream.operation.context};
+    if (!transport.begin_action(?stream.operation, stream.transport, action)) {
+        if (transport.snapshot(?stream.operation).state ==
+            transport.OPERATION_TERMINAL) { stream.state = FAILED; }
+        ret false;
+    }
+    stream.pending_action = kind;
+    ret true;
+}
+
+fun compact_input(stream: *Stream) {
+    if (stream.wire_input_read == 0) { ret; }
+    if (stream.wire_input_read == stream.wire_input_len) {
+        stream.wire_input_read = 0;
+        stream.wire_input_len = 0;
+        ret;
+    }
+    val remaining: usize = stream.wire_input_len - stream.wire_input_read;
+    var i: usize = 0;
+    for (i < remaining) {
+        stream.storage.wire_input[i] = stream.storage.wire_input[stream.wire_input_read + i];
+        i = i + 1;
+    }
+    stream.wire_input_read = 0;
+    stream.wire_input_len = remaining;
+}
+
+fun prepare_public_record(stream: *Stream, content_type: record.ContentType,
+    content: contracts.Bytes) bool {
+    if (content.len > stream.storage.content_capacity) { ret false; }
+    var sealed: record.Sealed;
+    if (!stream.write_cipher.installed) {
+        sealed = record.encode_plain(content_type, record.TLS13, content,
+            contracts.Buffer{data: stream.storage.wire_output,
+                capacity: stream.storage.wire_output_capacity});
+    } or {
+        var i: usize = 0;
+        for (i < content.len) { stream.storage.content[i] = content.data[i]; i = i + 1; }
+        sealed = record.seal(?stream.write_cipher, content_type,
+            contracts.SecretBytes{data: stream.storage.content, len: content.len}, 0,
+            contracts.SecretBuffer{data: stream.storage.scratch,
+                capacity: stream.storage.scratch_capacity},
+            contracts.Buffer{data: stream.storage.wire_output,
+                capacity: stream.storage.wire_output_capacity});
+        ct.zeroize(stream.storage.content, content.len);
+    }
+    if (sealed.error != error.OK) { ret false; }
+    stream.wire_output_len = sealed.written;
+    stream.wire_output_sent = 0;
+    ret true;
+}
+
+fun prepare_application_record(stream: *Stream) bool {
+    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
+    if (snapshot.application_bytes >= stream.operation.application_length) { ret false; }
+    var amount: usize = stream.operation.application_length - snapshot.application_bytes;
+    if (amount > record.MAX_PLAINTEXT) { amount = record.MAX_PLAINTEXT; }
+    var i: usize = 0;
+    for (i < amount) {
+        stream.storage.content[i] = stream.operation.application_buffer[
+            snapshot.application_bytes + i];
+        i = i + 1;
+    }
+    val sealed: record.Sealed = record.seal(?stream.write_cipher,
+        record.APPLICATION_DATA,
+        contracts.SecretBytes{data: stream.storage.content, len: amount}, 0,
+        contracts.SecretBuffer{data: stream.storage.scratch,
+            capacity: stream.storage.scratch_capacity},
+        contracts.Buffer{data: stream.storage.wire_output,
+            capacity: stream.storage.wire_output_capacity});
+    ct.zeroize(stream.storage.content, amount);
+    if (sealed.error != error.OK) { ret false; }
+    stream.application_chunk = amount;
+    stream.wire_output_len = sealed.written;
+    stream.wire_output_sent = 0;
+    ret true;
+}
+
+fun prepare_alert(stream: *Stream, description: record.AlertDescription) bool {
+    var bytes: [2]u8;
+    bytes[0] = record.FATAL;
+    if (description == record.CLOSE_NOTIFY || description == record.USER_CANCELED_ALERT) {
+        bytes[0] = record.WARNING;
+    }
+    bytes[1] = description;
+    ret prepare_public_record(stream, record.ALERT,
+        contracts.Bytes{data: ?bytes[0], len: 2});
+}
+
+fun prepare_core_fragment(stream: *Stream) bool {
+    if (!stream.core_event_sending || stream.core_event.kind != client.CRYPTO ||
+        stream.core_event_offset >= stream.core_event.data.len) { ret false; }
+    var amount: usize = stream.core_event.data.len - stream.core_event_offset;
+    if (amount > record.MAX_PLAINTEXT) { amount = record.MAX_PLAINTEXT; }
+    if (!prepare_public_record(stream, record.HANDSHAKE,
+        contracts.Bytes{data: ?stream.core_event.data.data[stream.core_event_offset],
+            len: amount})) { ret false; }
+    stream.core_event_chunk = amount;
+    ret true;
+}
+
+fun handle_core_event(stream: *Stream) bool {
+    var event: client.Event;
+    if (!client.next_event(?stream.client, ?event)) { ret false; }
+    if (event.kind == client.CRYPTO) {
+        stream.core_event = event;
+        stream.core_event_sending = true;
+        stream.core_event_offset = 0;
+        stream.core_event_chunk = 0;
+        if (!prepare_core_fragment(stream)) {
+            client.complete_event(?stream.client, event.token, false);
+            stream.core_event_sending = false;
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        ret true;
+    }
+    if (event.kind == client.TRAFFIC_SECRET && !install_secret(stream, ?event)) {
+        client.complete_event(?stream.client, event.token, false);
+        finish(stream, error.INTERNAL_ERROR, false);
+        ret true;
+    }
+    if (event.kind == client.ALERT) {
+        if (!prepare_alert(stream, event.alert)) {
+            client.complete_event(?stream.client, event.token, false);
+            finish(stream, stream.client.failure, false);
+            ret true;
+        }
+        stream.core_event = event;
+        stream.core_event_sending = true;
+        stream.core_event_alert = true;
+        ret true;
+    }
+    if (event.kind == client.HANDSHAKE_COMPLETE) {
+        stream.handshake_complete = true;
+        stream.state = OPEN;
+    }
+    client.complete_event(?stream.client, event.token, true);
+    ret true;
+}
+
+fun handle_alert(stream: *Stream, data: *u8, length: usize) bool {
+    var alert: record.AlertMessage;
+    if (record.decode_alert(record.TLS13, data, length, ?alert) != error.OK) {
+        finish(stream, error.DECODE_ERROR, false);
+        ret false;
+    }
+    stream.peer_alert = alert.description;
+    if (alert.description == record.CLOSE_NOTIFY) {
+        stream.peer_closed = true;
+        finish(stream, error.OK, true);
+    } or {
+        finish(stream, error.ALERT_RECEIVED, false);
+    }
+    ret true;
+}
+
+fun consume_plaintext(stream: *Stream) bool {
+    if (stream.plaintext_read >= stream.plaintext_len) { ret false; }
+    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
+    if (stream.operation.kind != transport.APPLICATION_READ) { ret false; }
+    val available: usize = stream.plaintext_len - stream.plaintext_read;
+    val remaining: usize = stream.operation.application_length - snapshot.application_bytes;
+    var amount: usize = available;
+    if (amount > remaining) { amount = remaining; }
+    var i: usize = 0;
+    for (i < amount) {
+        stream.operation.application_buffer[snapshot.application_bytes + i] =
+            stream.storage.plaintext[stream.plaintext_read + i]:^;
+        i = i + 1;
+    }
+    if (!transport.advance(?stream.operation, amount)) {
+        finish(stream, error.INTERNAL_ERROR, false);
+        ret true;
+    }
+    stream.plaintext_read = stream.plaintext_read + amount;
+    if (stream.plaintext_read == stream.plaintext_len) {
+        ct.zeroize(stream.storage.plaintext, stream.plaintext_len);
+        stream.plaintext_read = 0;
+        stream.plaintext_len = 0;
+    }
+    if (transport.snapshot(?stream.operation).application_bytes ==
+        stream.operation.application_length || amount != 0) {
+        finish(stream, error.OK, false);
+    }
+    ret true;
+}
+
+fun process_record(stream: *Stream) bool {
+    if (stream.wire_input_read >= stream.wire_input_len) { ret false; }
+    val input: *u8 = ?stream.storage.wire_input[stream.wire_input_read];
+    val available: usize = stream.wire_input_len - stream.wire_input_read;
+    if (stream.read_cipher.installed && !stream.handshake_complete && available >= 1 &&
+        input[0] == record.CHANGE_CIPHER_SPEC) {
+        val compatibility: record.Parsed = record.inspect(input, available,
+            record.TLS13, false);
+        if (compatibility.status == record.PARSE_MORE) { ret false; }
+        if (compatibility.status != record.PARSE_READY ||
+            compatibility.frame.length != 1 || compatibility.frame.fragment[0] != 1 ||
+            stream.ccs_count >= 8) {
+            finish(stream, error.UNEXPECTED_MESSAGE, false);
+            ret true;
+        }
+        stream.ccs_count = stream.ccs_count + 1;
+        stream.wire_input_read = stream.wire_input_read + compatibility.frame.consumed;
+        ret true;
+    }
+    var content_type: record.ContentType;
+    var content: *u8 = nil;
+    var content_length: usize = 0;
+    var consumed: usize = 0;
+    var protected: bool = false;
+    if (!stream.read_cipher.installed) {
+        val parsed: record.Parsed = record.inspect(input, available, record.TLS13, false);
+        if (parsed.status == record.PARSE_MORE) { ret false; }
+        if (parsed.status != record.PARSE_READY) {
+            finish(stream, parsed.error, false);
+            ret true;
+        }
+        content_type = parsed.frame.header.content_type;
+        content = parsed.frame.fragment;
+        content_length = parsed.frame.length;
+        consumed = parsed.frame.consumed;
+    } or {
+        protected = true;
+        val opened: record.Opened = record.open(?stream.read_cipher, input, available,
+            contracts.SecretBuffer{data: stream.storage.plaintext,
+                capacity: stream.storage.plaintext_capacity});
+        if (opened.status == record.PARSE_MORE) { ret false; }
+        if (opened.status != record.PARSE_READY || opened.error != error.OK) {
+            finish(stream, opened.error, false);
+            ret true;
+        }
+        content_type = opened.content_type;
+        content_length = opened.written;
+        consumed = opened.consumed;
+    }
+    stream.wire_input_read = stream.wire_input_read + consumed;
+    if (content_type == record.CHANGE_CIPHER_SPEC) {
+        if (protected || content_length != 1 || content[0] != 1) {
+            finish(stream, error.UNEXPECTED_MESSAGE, false);
+        }
+        ret true;
+    }
+    if (content_type == record.ALERT) {
+        var alert_bytes: [2]u8;
+        if (protected && content_length == 2) {
+            alert_bytes[0] = stream.storage.plaintext[0]:^;
+            alert_bytes[1] = stream.storage.plaintext[1]:^;
+            content = ?alert_bytes[0];
+        }
+        val handled: bool = handle_alert(stream, content, content_length);
+        if (protected) { ct.zeroize(stream.storage.plaintext, content_length); }
+        ret handled;
+    }
+    if (content_type == record.HANDSHAKE) {
+        var revealed: [record.MAX_INNER_PLAINTEXT]u8;
+        if (protected) {
+            var i: usize = 0;
+            for (i < content_length) {
+                revealed[i] = stream.storage.plaintext[i]:^;
+                i = i + 1;
+            }
+            content = ?revealed[0];
+        }
+        var level: client.Level = client.INITIAL;
+        if (protected) { level = client.HANDSHAKE; }
+        if (stream.handshake_complete) { level = client.APPLICATION; }
+        val progress: client.Result = client.ingest(?stream.client, level,
+            content, content_length);
+        if (protected) {
+            ct.zeroize(stream.storage.plaintext, content_length);
+            var i: usize = 0;
+            for (i < content_length) { revealed[i] = 0; i = i + 1; }
+        }
+        if (progress.status == client.FAILED) {
+            if (!handle_core_event(stream)) { finish(stream, progress.error, false); }
+        }
+        ret true;
+    }
+    if (content_type == record.APPLICATION_DATA && stream.handshake_complete &&
+        stream.operation.kind == transport.APPLICATION_READ) {
+        stream.plaintext_len = content_length;
+        stream.plaintext_read = 0;
+        ret consume_plaintext(stream);
+    }
+    if (protected) { ct.zeroize(stream.storage.plaintext, content_length); }
+    finish(stream, error.UNEXPECTED_MESSAGE, false);
+    ret true;
+}
+
+fun submit_read(stream: *Stream) bool {
+    compact_input(stream);
+    if (stream.wire_input_len == stream.storage.wire_input_capacity) {
+        finish(stream, error.RESOURCE_LIMIT, false);
+        ret false;
+    }
+    ret submit(stream, transport.TRANSPORT_READ,
+        ?stream.storage.wire_input[stream.wire_input_len],
+        stream.storage.wire_input_capacity - stream.wire_input_len);
+}
+
+fun drive_handshake(stream: *Stream) bool {
+    for (true) {
+        if (stream.wire_output_sent < stream.wire_output_len) {
+            ret submit(stream, transport.TRANSPORT_WRITE,
+                ?stream.storage.wire_output[stream.wire_output_sent],
+                stream.wire_output_len - stream.wire_output_sent);
+        }
+        var advanced: bool = false;
+        if (handle_core_event(stream)) {
+            if (transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
+                ret true;
+            }
+            if (stream.handshake_complete && !stream.core_event_sending) {
+                ret finish(stream, error.OK, false);
+            }
+            advanced = true;
+        }
+        if (!advanced) {
+            val polled: client.Result = client.poll(?stream.client);
+            if (polled.status == client.FAILED) {
+                if (handle_core_event(stream)) { advanced = true; }
+                or { ret finish(stream, polled.error, false); }
+            }
+        }
+        if (!advanced && handle_core_event(stream)) { advanced = true; }
+        if (!advanced && process_record(stream)) {
+            if (transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
+                ret true;
+            }
+            advanced = true;
+        }
+        if (!advanced) { ret submit_read(stream); }
+    }
+    ret false;
+}
+
+fun drive_write(stream: *Stream) bool {
+    if (stream.wire_output_sent < stream.wire_output_len) {
+        ret submit(stream, transport.TRANSPORT_WRITE,
+            ?stream.storage.wire_output[stream.wire_output_sent],
+            stream.wire_output_len - stream.wire_output_sent);
+    }
+    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
+    if (snapshot.application_bytes == stream.operation.application_length) {
+        ret finish(stream, error.OK, false);
+    }
+    if (!prepare_application_record(stream)) {
+        ret finish(stream, error.INTERNAL_ERROR, false);
+    }
+    ret drive_write(stream);
+}
+
+fun drive_read(stream: *Stream) bool {
+    if (stream.wire_output_sent < stream.wire_output_len) {
+        ret submit(stream, transport.TRANSPORT_WRITE,
+            ?stream.storage.wire_output[stream.wire_output_sent],
+            stream.wire_output_len - stream.wire_output_sent);
+    }
+    if (handle_core_event(stream)) {
+        if (transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
+            ret true;
+        }
+        ret drive_read(stream);
+    }
+    if (consume_plaintext(stream)) { ret true; }
+    for (process_record(stream)) {
+        if (transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
+            ret true;
+        }
+        if (consume_plaintext(stream)) { ret true; }
+        if (handle_core_event(stream)) {
+            if (stream.wire_output_len != 0) { ret drive_read(stream); }
+        }
+    }
+    ret submit_read(stream);
+}
+
+fun drive_control(stream: *Stream) bool {
+    if (stream.control == CONTROL_ABORT) {
+        stream.state = CLOSING;
+        ret submit(stream, transport.TRANSPORT_ABORT, nil, 0);
+    }
+    if (!stream.control_record_sent && stream.wire_output_len == 0) {
+        if (!prepare_alert(stream, stream.control_alert)) {
+            ret finish(stream, error.INTERNAL_ERROR, false);
+        }
+    }
+    if (stream.wire_output_sent < stream.wire_output_len) {
+        ret submit(stream, transport.TRANSPORT_WRITE,
+            ?stream.storage.wire_output[stream.wire_output_sent],
+            stream.wire_output_len - stream.wire_output_sent);
+    }
+    stream.control_record_sent = true;
+    if (stream.control == CONTROL_ALERT) {
+        if (stream.control_alert != record.USER_CANCELED_ALERT) {
+            stream.send_closed = true;
+            stream.state = FAILED;
+        }
+        ret finish(stream, error.OK, false);
+    }
+    stream.send_closed = true;
+    if (stream.control == CONTROL_HALF_CLOSE) {
+        ret submit(stream, transport.TRANSPORT_SHUTDOWN, nil, 0);
+    }
+    stream.state = CLOSING;
+    ret submit(stream, transport.TRANSPORT_CLOSE, nil, 0);
+}
+
+fun drive(stream: *Stream) bool {
+    if (stream == nil || transport.snapshot(?stream.operation).state !=
+        transport.OPERATION_OPEN) { ret false; }
+    if (stream.operation.kind == transport.HANDSHAKE) { ret drive_handshake(stream); }
+    if (stream.operation.kind == transport.APPLICATION_WRITE) { ret drive_write(stream); }
+    if (stream.operation.kind == transport.APPLICATION_READ) { ret drive_read(stream); }
+    ret drive_control(stream);
+}
+
+fun operation_available(stream: *Stream) bool {
+    if (stream == nil) { ret false; }
+    val state: transport.OperationState = transport.snapshot(?stream.operation).state;
+    ret state == 0 || state == transport.OPERATION_DESTROYED;
+}
+
+pub fun init(stream: *Stream, configuration: *config.ClientConfig,
+    storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
+    peer_extension: u16) bool {
+    if (stream == nil || !storage_valid(?storage, configuration) ||
+        !transport.valid(lower) || !client.init(?stream.client, configuration,
+            storage.handshake, extra, peer_extension)) { ret false; }
+    stream.transport = lower;
+    stream.storage = storage;
+    stream.state = NEW;
+    stream.control = CONTROL_NONE;
+    stream.pending_action = 0;
+    stream.wire_input_len = 0;
+    stream.wire_input_read = 0;
+    stream.wire_output_len = 0;
+    stream.wire_output_sent = 0;
+    stream.plaintext_len = 0;
+    stream.plaintext_read = 0;
+    stream.core_event_sending = false;
+    stream.core_event_alert = false;
+    stream.core_event_offset = 0;
+    stream.core_event_chunk = 0;
+    stream.handshake_complete = false;
+    stream.send_closed = false;
+    stream.peer_closed = false;
+    stream.peer_alert = record.NO_ALERT;
+    stream.ccs_count = 0;
+    ret true;
+}
+
+pub fun handshake(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    verification_time: i64, context: usize) bool {
+    if (stream == nil || stream.state != NEW || !operation_available(stream) ||
+        !transport.begin(?stream.operation,
+        token, transport.HANDSHAKE, scope, nil, 0, context)) { ret false; }
+    stream.state = HANDSHAKING;
+    val started: client.Result = client.start(?stream.client, verification_time);
+    if (started.status != client.OK) {
+        finish(stream, started.error, false);
+        ret false;
+    }
+    ret drive(stream);
+}
+
+pub fun read(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    buffer: *u8, length: usize, context: usize) bool {
+    if (stream == nil || stream.state != OPEN || stream.peer_closed ||
+        !operation_available(stream) ||
+        !transport.begin(?stream.operation, token, transport.APPLICATION_READ,
+            scope, buffer, length, context)) { ret false; }
+    if (length == 0) { ret finish(stream, error.OK, false); }
+    ret drive(stream);
+}
+
+pub fun write(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    buffer: *u8, length: usize, context: usize) bool {
+    if (stream == nil || stream.state != OPEN || stream.send_closed ||
+        !operation_available(stream) ||
+        !transport.begin(?stream.operation, token, transport.APPLICATION_WRITE,
+            scope, buffer, length, context)) { ret false; }
+    if (length == 0) { ret finish(stream, error.OK, false); }
+    ret drive(stream);
+}
+
+fun begin_control(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    control: Control, description: record.AlertDescription, context: usize) bool {
+    if (stream == nil || stream.state != OPEN || stream.send_closed ||
+        !operation_available(stream) ||
+        !transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
+            scope, nil, 0, context)) { ret false; }
+    stream.control = control;
+    stream.control_alert = description;
+    stream.control_record_sent = false;
+    stream.wire_output_len = 0;
+    stream.wire_output_sent = 0;
+    ret drive(stream);
+}
+
+pub fun alert(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    description: record.AlertDescription, context: usize) bool {
+    if (description == record.CLOSE_NOTIFY || description == record.NO_ALERT) {
+        ret false;
+    }
+    ret begin_control(stream, scope, token, CONTROL_ALERT, description, context);
+}
+
+pub fun half_close(stream: *Stream, scope: *cancel.Scope,
+    token: transport.Token, context: usize) bool {
+    ret begin_control(stream, scope, token, CONTROL_HALF_CLOSE,
+        record.CLOSE_NOTIFY, context);
+}
+
+pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    context: usize) bool {
+    if (stream != nil && stream.state == FAILED && operation_available(stream) &&
+        transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
+            scope, nil, 0, context)) {
+        stream.control = CONTROL_ABORT;
+        stream.control_record_sent = true;
+        ret drive(stream);
+    }
+    ret begin_control(stream, scope, token, CONTROL_CLOSE,
+        record.CLOSE_NOTIFY, context);
+}
+
+pub fun connect(stream: *Stream, configuration: *config.ClientConfig,
+    storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
+    peer_extension: u16, scope: *cancel.Scope, token: transport.Token,
+    verification_time: i64, context: usize) bool {
+    if (!init(stream, configuration, storage, lower, extra, peer_extension)) {
+        ret false;
+    }
+    ret handshake(stream, scope, token, verification_time, context);
+}
+
+pub fun negotiated(stream: *Stream) client.Snapshot {
+    if (stream == nil) { ret client.Snapshot{}; }
+    ret client.snapshot(?stream.client);
+}
+
+pub fun accept(stream: *Stream, completion: *runtime.Completion) bool {
+    if (stream == nil || completion == nil || !transport.accept(?stream.operation,
+        completion)) { ret false; }
+    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
+    if (snapshot.state == transport.OPERATION_TERMINAL) {
+        if (stream.core_event_sending) {
+            client.complete_event(?stream.client, stream.core_event.token, false);
+            stream.core_event_sending = false;
+            stream.core_event_alert = false;
+            stream.core_event_offset = 0;
+            stream.core_event_chunk = 0;
+        }
+        if (snapshot.terminal_error != error.OK &&
+            (stream.pending_action == transport.TRANSPORT_WRITE ||
+            stream.operation.kind == transport.HANDSHAKE ||
+            stream.operation.kind == transport.APPLICATION_CLOSE)) {
+            stream.state = FAILED;
+        }
+        if ((stream.control == CONTROL_CLOSE || stream.control == CONTROL_ABORT) &&
+            (stream.pending_action == transport.TRANSPORT_CLOSE ||
+            stream.pending_action == transport.TRANSPORT_ABORT) &&
+            snapshot.terminal_error == error.OK) { stream.state = CLOSED; }
+        ret true;
+    }
+    val action: transport.ActionKind = stream.pending_action;
+    stream.pending_action = 0;
+    if (action == transport.TRANSPORT_WRITE) {
+        if (snapshot.last_transport_bytes == 0 || snapshot.last_transport_bytes >
+            stream.wire_output_len - stream.wire_output_sent) {
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        stream.wire_output_sent = stream.wire_output_sent + snapshot.last_transport_bytes;
+        if (stream.wire_output_sent == stream.wire_output_len) {
+            stream.wire_output_len = 0;
+            stream.wire_output_sent = 0;
+            if (stream.core_event_sending) {
+                val alert_event: bool = stream.core_event_alert;
+                if (stream.core_event.kind == client.CRYPTO) {
+                    stream.core_event_offset = stream.core_event_offset +
+                        stream.core_event_chunk;
+                    stream.core_event_chunk = 0;
+                }
+                if (stream.core_event.kind == client.CRYPTO &&
+                    stream.core_event_offset < stream.core_event.data.len) {
+                    if (!prepare_core_fragment(stream)) {
+                        client.complete_event(?stream.client,
+                            stream.core_event.token, false);
+                        stream.core_event_sending = false;
+                        finish(stream, error.INTERNAL_ERROR, false);
+                        ret true;
+                    }
+                } or {
+                    stream.core_event_sending = false;
+                    stream.core_event_alert = false;
+                    stream.core_event_offset = 0;
+                    client.complete_event(?stream.client, stream.core_event.token, true);
+                    if (alert_event) {
+                        finish(stream, stream.client.failure, false);
+                        ret true;
+                    }
+                }
+            }
+            if (stream.application_chunk != 0) {
+                transport.advance(?stream.operation, stream.application_chunk);
+                stream.application_chunk = 0;
+            }
+            if (stream.operation.kind == transport.APPLICATION_CLOSE &&
+                stream.control != CONTROL_NONE) {
+                stream.control_record_sent = true;
+            }
+        }
+    } or (action == transport.TRANSPORT_READ) {
+        if (snapshot.last_transport_bytes > stream.storage.wire_input_capacity -
+            stream.wire_input_len) {
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        stream.wire_input_len = stream.wire_input_len + snapshot.last_transport_bytes;
+        if (snapshot.last_end_of_stream || snapshot.last_transport_bytes == 0) {
+            if (stream.peer_closed) { finish(stream, error.OK, true); }
+            or { finish(stream, error.CLOSED, true); }
+            ret true;
+        }
+    }
+    ret drive(stream);
+}
+
+pub fun snapshot(stream: *Stream) Snapshot {
+    var value: Snapshot;
+    if (stream == nil) { ret value; }
+    value.state = stream.state;
+    value.operation = transport.snapshot(?stream.operation);
+    value.handshake_complete = stream.handshake_complete;
+    value.send_closed = stream.send_closed;
+    value.peer_closed = stream.peer_closed;
+    value.alert = stream.peer_alert;
+    ret value;
+}
+
+pub fun destroy_operation(stream: *Stream) bool {
+    if (stream == nil) { ret false; }
+    ret transport.destroy_operation(?stream.operation);
+}
+
+pub fun destroy(stream: *Stream) bool {
+    if (stream == nil || stream.state == DESTROYED ||
+        transport.snapshot(?stream.operation).state == transport.OPERATION_WAITING ||
+        stream.client.event_active) { ret false; }
+    val operation_state: transport.OperationState =
+        transport.snapshot(?stream.operation).state;
+    if (operation_state == transport.OPERATION_OPEN) { ret false; }
+    if (operation_state == transport.OPERATION_TERMINAL &&
+        !transport.destroy_operation(?stream.operation)) { ret false; }
+    record.destroy(?stream.read_cipher);
+    record.destroy(?stream.write_cipher);
+    if (!client.destroy(?stream.client)) { ret false; }
+    ct.zeroize(stream.storage.plaintext, stream.storage.plaintext_capacity);
+    ct.zeroize(stream.storage.content, stream.storage.content_capacity);
+    ct.zeroize(stream.storage.scratch, stream.storage.scratch_capacity);
+    stream.transport = nil;
+    stream.storage.wire_input = nil;
+    stream.storage.wire_output = nil;
+    stream.storage.plaintext = nil;
+    stream.storage.content = nil;
+    stream.storage.scratch = nil;
+    stream.state = DESTROYED;
+    ret true;
+}
+
+test "stream: storage bounds reject record truncation surfaces" {
+    var stream: Stream;
+    var configuration: config.ClientConfig;
+    var storage: Storage;
+    var lower: transport.Transport;
+    var extra: client.ExtraExtension;
+    if (init(?stream, ?configuration, storage, ?lower, extra, 0)) { ret 1; }
+    ret 0;
+}
