@@ -1,36 +1,720 @@
-# nonblocking byte transport contract below tls
+# completion-based ordered-byte transport below tls
 
-use tls.error;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
 use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+use std.system.os;
+use std.sync.cancel;
+use std.sync.mutex;
+use std.net.tcp;
+use std.io.lifecycle;
+use io_runtime: std.io.runtime;
+use io_error: std.io.error;
+use net_async: std.net.async;
+use tls.error;
+use tls.memory_range;
 
-pub def IoStatus: u8;
+pub def SubmitBufferFun: fun(ptr, *cancel.Scope, *u8, usize, usize) Result[io_runtime.Token, io_error.Error];
+pub def SubmitCloseFun: fun(ptr, *cancel.Scope, usize) Result[io_runtime.Token, io_error.Error];
+pub def AliasesStateFun: fun(ptr, *u8, usize) bool;
 
-pub val READY:      IoStatus = 0;
-pub val NEED_READ:  IoStatus = 1;
-pub val NEED_WRITE: IoStatus = 2;
-pub val EOF:        IoStatus = 3;
-pub val FAILED:     IoStatus = 4;
-
-pub rec IoResult {
-    status:      IoStatus;
-    transferred: usize;
-    error:       error.Error;
-}
-
-pub def ReadFun:  fun(ptr, *u8, usize) IoResult;
-pub def WriteFun: fun(ptr, *u8, usize) IoResult;
-pub def CloseFun: fun(ptr) error.Error;
-
-# callbacks may complete partially and must preserve buffer ownership
+# every submission resolves through the shared runtime exactly once
 pub rec Transport {
+    runtime: *io_runtime.Runtime;
     context: ptr;
-    read_fn: ReadFun;
-    write_fn: WriteFun;
-    close_fn: CloseFun;
+    context_size: usize;
+    aliases_state: AliasesStateFun;
+    submit_read: SubmitBufferFun;
+    submit_write: SubmitBufferFun;
+    submit_shutdown: SubmitCloseFun;
+    submit_close: SubmitCloseFun;
+    submit_abort: SubmitCloseFun;
 }
 
-test "transport: readiness states are explicit" {
-    if (READY == NEED_READ || READY == NEED_WRITE) { ret 1; }
-    if (EOF == FAILED) { ret 1; }
-    ret 0;
+fun invalid(operation: io_error.Operation) io_error.Error {
+    ret io_error.from_code(os.EINVAL, operation);
+}
+
+fun descriptor_equal(first: *Transport, second: *Transport) bool {
+    ret first.runtime == second.runtime && first.context == second.context &&
+        first.context_size == second.context_size &&
+        first.aliases_state::usize == second.aliases_state::usize &&
+        first.submit_read::usize == second.submit_read::usize &&
+        first.submit_write::usize == second.submit_write::usize &&
+        first.submit_shutdown::usize == second.submit_shutdown::usize &&
+        first.submit_close::usize == second.submit_close::usize &&
+        first.submit_abort::usize == second.submit_abort::usize;
+}
+
+fun load(transport: *Transport, output: *Transport) bool {
+    if (!memory_range.valid(transport::*u8, $size_of(Transport)) ||
+        !memory_range.valid(output::*u8, $size_of(Transport))) { ret false; }
+    @output = @transport;
+    if (output.runtime == nil ||
+        !memory_range.valid(output.context::*u8, output.context_size) ||
+        ((output.context == nil) != (output.context_size == 0)) ||
+        output.aliases_state::usize == 0 ||
+        output.submit_read::usize == 0 || output.submit_write::usize == 0 ||
+        output.submit_shutdown::usize == 0 || output.submit_close::usize == 0 ||
+        output.submit_abort::usize == 0 ||
+        io_runtime.aliases(output.runtime, transport::*u8,
+            $size_of(Transport)) ||
+        io_runtime.aliases(output.runtime, output.context::*u8,
+            output.context_size) ||
+        output.aliases_state(output.context, transport::*u8,
+            $size_of(Transport)) ||
+        !descriptor_equal(output, transport)) { ret false; }
+    ret true;
+}
+
+pub fun valid(transport: *Transport) bool {
+    var descriptor: Transport;
+    ret load(transport, ?descriptor);
+}
+
+fun state_overlaps_loaded(owner: *Transport, descriptor: *Transport,
+    data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len) ||
+        memory_range.overlap(owner::*u8, $size_of(Transport), data, len) ||
+        memory_range.overlap(descriptor.context::*u8,
+            descriptor.context_size, data, len) ||
+        io_runtime.aliases(descriptor.runtime, data, len) ||
+        descriptor.aliases_state(descriptor.context, data, len)) { ret true; }
+    ret !descriptor_equal(descriptor, owner);
+}
+
+pub fun state_overlaps(transport: *Transport, data: *u8, len: usize) bool {
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor)) { ret true; }
+    ret state_overlaps_loaded(transport, ?descriptor, data, len);
+}
+
+pub fun read(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    buffer: *u8,
+    length: usize,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor) || scope == nil ||
+        state_overlaps_loaded(transport, ?descriptor, scope::*u8,
+            $size_of(cancel.Scope)) ||
+        state_overlaps_loaded(transport, ?descriptor, buffer, length) ||
+        memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer,
+            length)) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_READ));
+    }
+    ret descriptor.submit_read(descriptor.context, scope, buffer, length,
+        context);
+}
+
+pub fun write(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    buffer: *u8,
+    length: usize,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor) || scope == nil ||
+        state_overlaps_loaded(transport, ?descriptor, scope::*u8,
+            $size_of(cancel.Scope)) ||
+        state_overlaps_loaded(transport, ?descriptor, buffer, length) ||
+        memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer,
+            length)) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_WRITE));
+    }
+    ret descriptor.submit_write(descriptor.context, scope, buffer, length,
+        context);
+}
+
+pub fun close(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor) || scope == nil ||
+        state_overlaps_loaded(transport, ?descriptor, scope::*u8,
+            $size_of(cancel.Scope))) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+    }
+    ret descriptor.submit_close(descriptor.context, scope, context);
+}
+
+pub fun shutdown(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor) || scope == nil ||
+        state_overlaps_loaded(transport, ?descriptor, scope::*u8,
+            $size_of(cancel.Scope))) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SHUTDOWN));
+    }
+    ret descriptor.submit_shutdown(descriptor.context, scope, context);
+}
+
+pub fun abort(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor) || scope == nil ||
+        state_overlaps_loaded(transport, ?descriptor, scope::*u8,
+            $size_of(cancel.Scope))) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+    }
+    ret descriptor.submit_abort(descriptor.context, scope, context);
+}
+
+pub rec TcpAdapter {
+    driver: *net_async.Driver;
+    stream: *tcp.Stream;
+    close_mode: lifecycle.Mode;
+}
+
+fun tcp_aliases_state(context: ptr, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    if (len == 0) { ret false; }
+    if (!memory_range.valid(context::*u8, $size_of(TcpAdapter))) { ret true; }
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    if (!memory_range.valid(adapter.stream::*u8, $size_of(tcp.Stream)) ||
+        memory_range.overlap(adapter::*u8, $size_of(TcpAdapter),
+            adapter.stream::*u8, $size_of(tcp.Stream)) ||
+        net_async.aliases(adapter.driver, adapter::*u8,
+            $size_of(TcpAdapter)) ||
+        net_async.aliases(adapter.driver, adapter.stream::*u8,
+            $size_of(tcp.Stream))) { ret true; }
+    ret memory_range.overlap(adapter::*u8, $size_of(TcpAdapter), data, len) ||
+        memory_range.overlap(adapter.stream::*u8, $size_of(tcp.Stream),
+            data, len) || net_async.aliases(adapter.driver, data, len);
+}
+
+fun tcp_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_read(adapter.driver, scope, adapter.stream, buffer, length, token_context);
+}
+
+fun tcp_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_write(adapter.driver, scope, adapter.stream, buffer, length, token_context);
+}
+
+fun tcp_close(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream, adapter.close_mode, token_context);
+}
+
+fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_shutdown_write(adapter.driver, scope, adapter.stream,
+        token_context);
+}
+
+fun tcp_abort(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream,
+        lifecycle.ABORTIVE, token_context);
+}
+
+pub fun make_tcp(
+    transport: *Transport,
+    adapter: *TcpAdapter,
+    driver: *net_async.Driver,
+    stream: *tcp.Stream,
+    close_mode: lifecycle.Mode,
+) bool {
+    if (!memory_range.valid(transport::*u8, $size_of(Transport)) ||
+        !memory_range.valid(adapter::*u8, $size_of(TcpAdapter)) ||
+        !memory_range.valid(driver::*u8, $size_of(net_async.Driver)) ||
+        !memory_range.valid(stream::*u8, $size_of(tcp.Stream)) ||
+        close_mode > lifecycle.ABORTIVE ||
+        memory_range.overlap(transport::*u8, $size_of(Transport),
+            adapter::*u8, $size_of(TcpAdapter)) ||
+        memory_range.overlap(transport::*u8, $size_of(Transport),
+            stream::*u8, $size_of(tcp.Stream)) ||
+        memory_range.overlap(adapter::*u8, $size_of(TcpAdapter),
+            stream::*u8, $size_of(tcp.Stream)) ||
+        net_async.aliases(driver, transport::*u8, $size_of(Transport)) ||
+        net_async.aliases(driver, adapter::*u8, $size_of(TcpAdapter)) ||
+        net_async.aliases(driver, stream::*u8, $size_of(tcp.Stream))) {
+        ret false;
+    }
+    adapter.driver = driver;
+    adapter.stream = stream;
+    adapter.close_mode = close_mode;
+    transport.runtime = driver.runtime;
+    transport.context = adapter::ptr;
+    transport.context_size = $size_of(TcpAdapter);
+    transport.aliases_state = tcp_aliases_state;
+    transport.submit_read = tcp_read;
+    transport.submit_write = tcp_write;
+    transport.submit_shutdown = tcp_shutdown;
+    transport.submit_close = tcp_close;
+    transport.submit_abort = tcp_abort;
+    ret true;
+}
+
+pub def ApplicationKind: u8;
+pub val APPLICATION_READ: ApplicationKind = 1;
+pub val APPLICATION_WRITE: ApplicationKind = 2;
+pub val HANDSHAKE: ApplicationKind = 3;
+pub val APPLICATION_CLOSE: ApplicationKind = 4;
+
+pub def ActionKind: u8;
+pub val TRANSPORT_READ: ActionKind = 1;
+pub val TRANSPORT_WRITE: ActionKind = 2;
+pub val TRANSPORT_CLOSE: ActionKind = 3;
+pub val TRANSPORT_SHUTDOWN: ActionKind = 4;
+pub val TRANSPORT_ABORT: ActionKind = 5;
+
+pub def OperationState: u8;
+pub val OPERATION_OPEN: OperationState = 1;
+pub val OPERATION_WAITING: OperationState = 2;
+pub val OPERATION_TERMINAL: OperationState = 3;
+pub val OPERATION_DESTROYED: OperationState = 4;
+pub val OPERATION_SUBMITTING: OperationState = 5;
+pub val OPERATION_ACCEPTING: OperationState = 6;
+
+pub rec Token {
+    index: u32;
+    generation: u32;
+}
+
+pub rec Action {
+    kind: ActionKind;
+    buffer: *u8;
+    length: usize;
+    context: usize;
+}
+
+pub rec Snapshot {
+    token: Token;
+    kind: ApplicationKind;
+    state: OperationState;
+    context: usize;
+    application_bytes: usize;
+    last_transport_bytes: usize;
+    last_end_of_stream: bool;
+    terminal_error: error.Error;
+}
+
+# an operation retains its application buffer and scope until terminal resolution
+pub rec Operation {
+    token: Token;
+    kind: ApplicationKind;
+    scope: *cancel.Scope;
+    application_buffer: *u8;
+    application_length: usize;
+    application_bytes: usize;
+    context: usize;
+    state: OperationState;
+    lower_token: io_runtime.Token;
+    lower_kind: ActionKind;
+    lower_buffer: *u8;
+    lower_length: usize;
+    last_transport_bytes: usize;
+    last_end_of_stream: bool;
+    terminal_error: error.Error;
+    cancellation: cancel.Registration;
+    cancellation_active: bool;
+    cancellation_requested: bool;
+    cancellation_error: error.Error;
+    provider: Transport;
+    provider_owner: *Transport;
+    provider_drifted: bool;
+    lock: mutex.Mutex;
+}
+
+fun reason_error(reason: cancel.Reason) error.Error {
+    if (reason == cancel.TIMED_OUT) { ret error.TIMEOUT; }
+    if (reason == cancel.CANCELLED) { ret error.CANCELLED; }
+    ret error.CLOSED;
+}
+
+pub fun map_error(failure: io_error.Error) error.Error {
+    if (failure.kind == io_error.TIMEOUT) { ret error.TIMEOUT; }
+    if (failure.kind == io_error.CANCELLED) { ret error.CANCELLED; }
+    if (failure.kind == io_error.CLOSED || failure.kind == io_error.RESET || failure.kind == io_error.ABORTED) { ret error.CLOSED; }
+    if (failure.kind == io_error.RESOURCE_EXHAUSTED) { ret error.RESOURCE_LIMIT; }
+    ret error.INTERNAL_ERROR;
+}
+
+fun terminal_locked(operation: *Operation, terminal_error: error.Error, end_of_stream: bool, cancellation_owner: bool) bool {
+    if (operation.state == OPERATION_TERMINAL || operation.state == OPERATION_DESTROYED) { ret false; }
+    if (operation.state == OPERATION_WAITING ||
+        operation.state == OPERATION_SUBMITTING ||
+        operation.state == OPERATION_ACCEPTING) { ret false; }
+    if (!cancellation_owner && operation.cancellation_active) {
+        if (!cancel.unregister(?operation.cancellation)) { ret false; }
+        operation.cancellation_active = false;
+    }
+    operation.state = OPERATION_TERMINAL;
+    operation.terminal_error = terminal_error;
+    operation.last_end_of_stream = end_of_stream;
+    ret true;
+}
+
+fun cancel_operation(context: ptr, reason: cancel.Reason) {
+    val operation: *Operation = context::*Operation;
+    mutex.lock(?operation.lock);
+    operation.cancellation_active = false;
+    operation.cancellation_requested = true;
+    operation.cancellation_error = reason_error(reason);
+    if (operation.state != OPERATION_WAITING &&
+        operation.state != OPERATION_SUBMITTING &&
+        operation.state != OPERATION_ACCEPTING) {
+        terminal_locked(operation, operation.cancellation_error, false, true);
+    }
+    mutex.unlock(?operation.lock);
+}
+
+pub fun begin(
+    operation: *Operation,
+    token: Token,
+    kind: ApplicationKind,
+    scope: *cancel.Scope,
+    buffer: *u8,
+    length: usize,
+    context: usize,
+) bool {
+    if (operation == nil || token.generation == 0 || scope == nil ||
+        kind < APPLICATION_READ || kind > APPLICATION_CLOSE ||
+        !memory_range.valid(operation::*u8, $size_of(Operation)) ||
+        !memory_range.valid(scope::*u8, $size_of(cancel.Scope)) ||
+        !memory_range.valid(buffer, length) ||
+        memory_range.overlap(operation::*u8, $size_of(Operation),
+            scope::*u8, $size_of(cancel.Scope)) ||
+        memory_range.overlap(operation::*u8, $size_of(Operation), buffer,
+            length) ||
+        memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer,
+            length) ||
+        (kind == APPLICATION_CLOSE && (buffer != nil || length != 0))) {
+        ret false;
+    }
+    if (operation.state != 0 && operation.state != OPERATION_DESTROYED) {
+        ret false;
+    }
+    operation.token = token;
+    operation.kind = kind;
+    operation.scope = scope;
+    operation.application_buffer = buffer;
+    operation.application_length = length;
+    operation.application_bytes = 0;
+    operation.context = context;
+    operation.state = OPERATION_OPEN;
+    operation.lower_kind = 0;
+    operation.lower_buffer = nil;
+    operation.lower_length = 0;
+    operation.last_transport_bytes = 0;
+    operation.last_end_of_stream = false;
+    operation.terminal_error = error.OK;
+    operation.cancellation_active = false;
+    operation.cancellation_requested = false;
+    operation.cancellation_error = error.OK;
+    operation.provider = Transport{};
+    operation.provider_owner = nil;
+    operation.provider_drifted = false;
+    operation.lock = mutex.make();
+    cancel.init_registration(?operation.cancellation);
+    val attached: cancel.Reason = cancel.attach(scope, ?operation.cancellation, cancel_operation, operation::ptr);
+    if (attached == cancel.ACTIVE) {
+        operation.cancellation_active = true;
+    } or {
+        operation.cancellation_requested = true;
+        operation.cancellation_error = reason_error(attached);
+        operation.terminal_error = operation.cancellation_error;
+        operation.state = OPERATION_TERMINAL;
+    }
+    ret true;
+}
+
+fun action_submission(transport: *Transport, operation: *Operation, action: Action) Result[io_runtime.Token, io_error.Error] {
+    if (action.kind == TRANSPORT_READ) {
+        ret read(transport, operation.scope, action.buffer, action.length, action.context);
+    }
+    if (action.kind == TRANSPORT_WRITE) {
+        ret write(transport, operation.scope, action.buffer, action.length, action.context);
+    }
+    if (action.kind == TRANSPORT_CLOSE) {
+        if (action.buffer != nil || action.length != 0) { ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE)); }
+        ret close(transport, operation.scope, action.context);
+    }
+    if (action.kind == TRANSPORT_SHUTDOWN) {
+        if (action.buffer != nil || action.length != 0) {
+            ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SHUTDOWN));
+        }
+        ret shutdown(transport, operation.scope, action.context);
+    }
+    if (action.kind == TRANSPORT_ABORT) {
+        if (action.buffer != nil || action.length != 0) {
+            ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+        }
+        ret abort(transport, operation.scope, action.context);
+    }
+    ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SUBMIT));
+}
+
+# engines may sequence reads and writes under one stable application token
+pub fun begin_action(operation: *Operation, transport: *Transport, action: Action) bool {
+    if (operation == nil ||
+        !memory_range.valid(operation::*u8, $size_of(Operation)) ||
+        !memory_range.valid(action.buffer, action.length) ||
+        memory_range.overlap(operation::*u8, $size_of(Operation),
+            action.buffer, action.length)) { ret false; }
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_OPEN || operation.cancellation_requested ||
+        operation.scope == nil || action.kind < TRANSPORT_READ ||
+        action.kind > TRANSPORT_ABORT ||
+        (action.kind != TRANSPORT_CLOSE && action.kind != TRANSPORT_SHUTDOWN &&
+        action.kind != TRANSPORT_ABORT && action.buffer == nil &&
+        action.length != 0) ||
+        ((action.kind == TRANSPORT_CLOSE || action.kind == TRANSPORT_SHUTDOWN ||
+        action.kind == TRANSPORT_ABORT) &&
+        (action.buffer != nil || action.length != 0)) ||
+        !memory_range.valid(operation.scope::*u8, $size_of(cancel.Scope)) ||
+        memory_range.overlap(operation.scope::*u8, $size_of(cancel.Scope),
+            action.buffer, action.length)) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    operation.state = OPERATION_SUBMITTING;
+    mutex.unlock(?operation.lock);
+
+    var descriptor: Transport;
+    val valid_submission: bool = load(transport, ?descriptor) &&
+        !state_overlaps_loaded(transport, ?descriptor, operation::*u8,
+            $size_of(Operation)) &&
+        !state_overlaps_loaded(transport, ?descriptor, action.buffer,
+            action.length) &&
+        !state_overlaps_loaded(transport, ?descriptor,
+            operation.application_buffer, operation.application_length) &&
+        !state_overlaps_loaded(transport, ?descriptor,
+            operation.scope::*u8, $size_of(cancel.Scope));
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_SUBMITTING) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    if (!valid_submission || operation.cancellation_requested) {
+        operation.state = OPERATION_OPEN;
+        if (operation.cancellation_requested) {
+            terminal_locked(operation, operation.cancellation_error, false, true);
+        }
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    operation.provider = descriptor;
+    operation.provider_owner = transport;
+    mutex.unlock(?operation.lock);
+
+    val submitted: Result[io_runtime.Token, io_error.Error] =
+        action_submission(?descriptor, operation, action);
+    val descriptor_stable: bool = descriptor_equal(?descriptor, transport);
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_SUBMITTING) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) {
+        operation.state = OPERATION_OPEN;
+        operation.provider = Transport{};
+        operation.provider_owner = nil;
+        if (!descriptor_stable) {
+            terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+        } or (operation.cancellation_requested) {
+            terminal_locked(operation, operation.cancellation_error, false, true);
+        } or {
+            terminal_locked(operation,
+                map_error(unwrap_err[io_runtime.Token, io_error.Error](submitted)),
+                false, false);
+        }
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    val lower_token: io_runtime.Token =
+        unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    if (lower_token.generation == 0) {
+        operation.state = OPERATION_OPEN;
+        operation.provider = Transport{};
+        operation.provider_owner = nil;
+        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    operation.lower_token = lower_token;
+    operation.lower_kind = action.kind;
+    operation.lower_buffer = action.buffer;
+    operation.lower_length = action.length;
+    operation.provider_drifted = !descriptor_stable;
+    operation.state = OPERATION_WAITING;
+    mutex.unlock(?operation.lock);
+    ret true;
+}
+
+fun token_equals(a: io_runtime.Token, b: io_runtime.Token) bool {
+    ret a.index == b.index && a.generation == b.generation;
+}
+
+fun completion_matches(operation: *Operation, completion: *io_runtime.Completion) bool {
+    if (!token_equals(operation.lower_token, completion.token)) { ret false; }
+    if (operation.lower_kind == TRANSPORT_READ) { ret completion.kind == io_runtime.READ; }
+    if (operation.lower_kind == TRANSPORT_WRITE) { ret completion.kind == io_runtime.WRITE; }
+    if (operation.lower_kind == TRANSPORT_SHUTDOWN) {
+        ret completion.kind == io_runtime.SHUTDOWN;
+    }
+    if (operation.lower_kind == TRANSPORT_CLOSE ||
+        operation.lower_kind == TRANSPORT_ABORT) {
+        ret completion.kind == io_runtime.CLOSE;
+    }
+    ret false;
+}
+
+fun completion_equal(first: *io_runtime.Completion,
+    second: *io_runtime.Completion) bool {
+    ret token_equals(first.token, second.token) && first.kind == second.kind &&
+        first.context == second.context && first.bytes == second.bytes &&
+        first.items == second.items && first.resource == second.resource &&
+        first.has_error == second.has_error &&
+        first.error.kind == second.error.kind &&
+        first.error.code == second.error.code &&
+        first.error.operation == second.error.operation &&
+        first.end_of_stream == second.end_of_stream;
+}
+
+fun provider_state_overlaps(descriptor: *Transport, data: *u8,
+    len: usize) bool {
+    if (descriptor == nil || descriptor.runtime == nil ||
+        descriptor.aliases_state::usize == 0 ||
+        !memory_range.valid(data, len) ||
+        !memory_range.valid(descriptor.context::*u8,
+            descriptor.context_size)) { ret true; }
+    ret memory_range.overlap(descriptor.context::*u8,
+            descriptor.context_size, data, len) ||
+        io_runtime.aliases(descriptor.runtime, data, len) ||
+        descriptor.aliases_state(descriptor.context, data, len);
+}
+
+pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
+    if (operation == nil || completion == nil ||
+        !memory_range.valid(completion::*u8, $size_of(io_runtime.Completion)) ||
+        memory_range.overlap(operation::*u8, $size_of(Operation),
+            completion::*u8, $size_of(io_runtime.Completion))) { ret false; }
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_WAITING || !completion_matches(operation, completion)) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    val provider: Transport = operation.provider;
+    val provider_owner: *Transport = operation.provider_owner;
+    val settled: io_runtime.Completion = @completion;
+    operation.state = OPERATION_ACCEPTING;
+    mutex.unlock(?operation.lock);
+    val aliases_provider: bool = provider_state_overlaps(?provider,
+        completion::*u8, $size_of(io_runtime.Completion));
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_ACCEPTING) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    val lower_kind: ActionKind = operation.lower_kind;
+    val lower_length: usize = operation.lower_length;
+    val completion_stable: bool = completion_equal(?settled, completion);
+    val provider_stable: bool = provider_owner != nil &&
+        memory_range.valid(provider_owner::*u8, $size_of(Transport)) &&
+        descriptor_equal(?provider, provider_owner);
+    val provider_drifted: bool = operation.provider_drifted || !provider_stable;
+    operation.state = OPERATION_OPEN;
+    operation.lower_kind = 0;
+    operation.lower_buffer = nil;
+    operation.lower_length = 0;
+    operation.provider = Transport{};
+    operation.provider_owner = nil;
+    operation.provider_drifted = false;
+    operation.last_transport_bytes = settled.bytes;
+    operation.last_end_of_stream = settled.end_of_stream;
+    if (operation.cancellation_requested) {
+        terminal_locked(operation, operation.cancellation_error, false, true);
+    } or (aliases_provider || !completion_stable || provider_drifted) {
+        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+    } or (settled.has_error) {
+        terminal_locked(operation, map_error(settled.error), false, false);
+    } or ((lower_kind == TRANSPORT_READ || lower_kind == TRANSPORT_WRITE) && settled.bytes > lower_length) {
+        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+    } or ((lower_kind == TRANSPORT_CLOSE ||
+        lower_kind == TRANSPORT_SHUTDOWN || lower_kind == TRANSPORT_ABORT) &&
+        (settled.bytes != 0 || settled.end_of_stream)) {
+        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+    } or (lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN ||
+        lower_kind == TRANSPORT_ABORT) {
+        terminal_locked(operation, error.OK, false, false);
+    }
+    mutex.unlock(?operation.lock);
+    ret true;
+}
+
+pub fun advance(operation: *Operation, bytes: usize) bool {
+    if (operation == nil) { ret false; }
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_OPEN || bytes > operation.application_length - operation.application_bytes) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    operation.application_bytes = operation.application_bytes + bytes;
+    mutex.unlock(?operation.lock);
+    ret true;
+}
+
+pub fun finish(operation: *Operation, terminal_error: error.Error, end_of_stream: bool) bool {
+    if (operation == nil) { ret false; }
+    mutex.lock(?operation.lock);
+    val finished: bool = terminal_locked(operation, terminal_error, end_of_stream, false);
+    mutex.unlock(?operation.lock);
+    ret finished;
+}
+
+pub fun snapshot(operation: *Operation) Snapshot {
+    var result: Snapshot;
+    if (operation == nil) { ret result; }
+    mutex.lock(?operation.lock);
+    result.token = operation.token;
+    result.kind = operation.kind;
+    result.state = operation.state;
+    result.context = operation.context;
+    result.application_bytes = operation.application_bytes;
+    result.last_transport_bytes = operation.last_transport_bytes;
+    result.last_end_of_stream = operation.last_end_of_stream;
+    result.terminal_error = operation.terminal_error;
+    mutex.unlock(?operation.lock);
+    ret result;
+}
+
+pub fun destroy_operation(operation: *Operation) bool {
+    if (operation == nil) { ret false; }
+    mutex.lock(?operation.lock);
+    if (operation.state != OPERATION_TERMINAL || operation.cancellation_active) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    operation.scope = nil;
+    operation.application_buffer = nil;
+    operation.application_length = 0;
+    operation.lower_buffer = nil;
+    operation.lower_length = 0;
+    operation.provider = Transport{};
+    operation.provider_owner = nil;
+    operation.provider_drifted = false;
+    operation.state = OPERATION_DESTROYED;
+    mutex.unlock(?operation.lock);
+    ret true;
 }

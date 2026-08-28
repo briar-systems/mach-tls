@@ -20,11 +20,9 @@ pub val ESTABLISHED:       Phase = 2;
 pub val CLOSING:           Phase = 3;
 pub val CLOSED:            Phase = 4;
 
-pub val READY:      Status = 0;
-pub val NEED_READ:  Status = 1;
-pub val NEED_WRITE: Status = 2;
-pub val COMPLETE:   Status = 3;
-pub val FAILED:     Status = 4;
+pub val PENDING:  Status = 0;
+pub val COMPLETE: Status = 1;
+pub val FAILED:   Status = 2;
 
 pub rec Connection {
     role:      Role;

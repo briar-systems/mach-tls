@@ -1,0 +1,354 @@
+# tls 1.3 offer selection and server response validation
+
+use crypto.contracts;
+use tls.error;
+use tls.handshake.codec;
+use tls.handshake.extensions;
+use tls.tls13;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub rec Protocol {
+    data: *u8;
+    len:  usize;
+}
+
+pub rec Policy {
+    suites:        *tls13.CipherSuite;
+    suite_len:      usize;
+    groups:        *tls13.NamedGroup;
+    group_len:      usize;
+    signatures:    *tls13.SignatureScheme;
+    signature_len:  usize;
+    protocols:     *Protocol;
+    protocol_len:   usize;
+    require_protocol: bool;
+}
+
+pub rec Selection {
+    suite:     tls13.CipherSuite;
+    group:     tls13.NamedGroup;
+    signature: tls13.SignatureScheme;
+    protocol:  Protocol;
+    retry:     bool;
+}
+
+fun bytes_equal(a: contracts.Bytes, b: contracts.Bytes) bool {
+    if (a.len != b.len || (a.len != 0 && (a.data == nil || b.data == nil))) { ret false; }
+    var i: usize = 0;
+    for (i < a.len) {
+        if (a.data[i] != b.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun extension_u16_contains(extension: extensions.Extension, value: u16) bool {
+    if (extension.len < 2) { ret false; }
+    var offset: usize = 2;
+    for (offset + 1 < extension.len) {
+        val current: u16 = (extension.data[offset]::u16 << 8)
+            | extension.data[offset + 1]::u16;
+        if (current == value) { ret true; }
+        offset = offset + 2;
+    }
+    ret false;
+}
+
+fun offered_suite(value: *codec.ClientHello, suite: tls13.CipherSuite) bool {
+    var offset: usize = 0;
+    for (offset < value.cipher_suites.len) {
+        val offered: u16 = (value.cipher_suites.data[offset]::u16 << 8)
+            | value.cipher_suites.data[offset + 1]::u16;
+        if (offered == suite) { ret true; }
+        offset = offset + 2;
+    }
+    ret false;
+}
+
+fun offered_signature(value: *codec.ClientHello, scheme: tls13.SignatureScheme) bool {
+    var algorithms: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.SIGNATURE_ALGORITHMS, ?algorithms)) {
+        ret false;
+    }
+    ret extension_u16_contains(algorithms, scheme);
+}
+
+fun offered_group(value: *codec.ClientHello, group: tls13.NamedGroup) bool {
+    var groups: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.SUPPORTED_GROUPS, ?groups)) { ret false; }
+    ret extension_u16_contains(groups, group);
+}
+
+fun offered_share(value: *codec.ClientHello, group: tls13.NamedGroup) bool {
+    var shares: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.KEY_SHARE, ?shares) || shares.len < 2) {
+        ret false;
+    }
+    var offset: usize = 2;
+    for (offset + 3 < shares.len) {
+        val current: u16 = (shares.data[offset]::u16 << 8)
+            | shares.data[offset + 1]::u16;
+        val key_len: usize = (shares.data[offset + 2]::usize << 8)
+            | shares.data[offset + 3]::usize;
+        if (current == group) { ret true; }
+        offset = offset + 4 + key_len;
+    }
+    ret false;
+}
+
+fun offered_psk_mode(value: *codec.ClientHello, mode: u8) bool {
+    var modes: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.PSK_KEY_EXCHANGE_MODES, ?modes)) {
+        ret false;
+    }
+    var offset: usize = 1;
+    for (offset < modes.len) {
+        if (modes.data[offset] == mode) { ret true; }
+        offset = offset + 1;
+    }
+    ret false;
+}
+
+fun protocol_offered(value: *codec.ClientHello, protocol: Protocol) bool {
+    var alpn: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.APPLICATION_LAYER_PROTOCOL, ?alpn)) {
+        ret false;
+    }
+    var offset: usize = 2;
+    for (offset < alpn.len) {
+        val length: usize = alpn.data[offset]::usize;
+        val offered: contracts.Bytes = contracts.Bytes{data: ?alpn.data[offset + 1], len: length};
+        if (bytes_equal(offered,
+            contracts.Bytes{data: protocol.data, len: protocol.len})) { ret true; }
+        offset = offset + 1 + length;
+    }
+    ret false;
+}
+
+fun valid_policy(policy: *Policy) bool {
+    if (policy == nil || policy.suite_len == 0 || policy.suites == nil
+        || policy.group_len == 0 || policy.groups == nil
+        || policy.signature_len == 0 || policy.signatures == nil
+        || (policy.protocol_len != 0 && policy.protocols == nil)) { ret false; }
+    var i: usize = 0;
+    for (i < policy.protocol_len) {
+        if (policy.protocols[i].len == 0 || policy.protocols[i].len > 255
+            || policy.protocols[i].data == nil) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun negotiate(value: *codec.ClientHello, policy: *Policy,
+    output: *Selection) error.Error {
+    if (output == nil || !valid_policy(policy)) { ret error.ILLEGAL_PARAMETER; }
+    val hello_error: error.Error = codec.validate_client(value);
+    if (hello_error != error.OK) { ret hello_error; }
+    var found: bool = false;
+    var i: usize = 0;
+    for (i < policy.suite_len && !found) {
+        if (codec.valid_cipher_suite(policy.suites[i])
+            && offered_suite(value, policy.suites[i])) {
+            output.suite = policy.suites[i];
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (!found) { ret error.HANDSHAKE_FAILURE; }
+    found = false;
+    output.retry = false;
+    i = 0;
+    for (i < policy.group_len && !found) {
+        if (codec.valid_named_group(policy.groups[i])
+            && offered_share(value, policy.groups[i])) {
+            output.group = policy.groups[i];
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (!found) {
+        i = 0;
+        for (i < policy.group_len && !found) {
+            if (codec.valid_named_group(policy.groups[i])
+                && offered_group(value, policy.groups[i])) {
+                output.group = policy.groups[i];
+                output.retry = true;
+                found = true;
+            }
+            i = i + 1;
+        }
+    }
+    if (!found || (value.after_retry && output.retry)) { ret error.HANDSHAKE_FAILURE; }
+    found = false;
+    i = 0;
+    for (i < policy.signature_len && !found) {
+        if (codec.valid_signature_scheme(policy.signatures[i])
+            && offered_signature(value, policy.signatures[i])) {
+            output.signature = policy.signatures[i];
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (!found) { ret error.HANDSHAKE_FAILURE; }
+    output.protocol.data = nil;
+    output.protocol.len = 0;
+    found = false;
+    i = 0;
+    for (i < policy.protocol_len && !found) {
+        if (protocol_offered(value, policy.protocols[i])) {
+            output.protocol = policy.protocols[i];
+            found = true;
+        }
+        i = i + 1;
+    }
+    if (policy.require_protocol && !found) { ret error.NO_APPLICATION_PROTOCOL; }
+    ret error.OK;
+}
+
+fun psk_identity_count(value: *codec.ClientHello) usize {
+    var psk: extensions.Extension;
+    if (!extensions.find(value.extensions, extensions.PRE_SHARED_KEY, ?psk)) { ret 0; }
+    val identities_len: usize = (psk.data[0]::usize << 8) | psk.data[1]::usize;
+    var offset: usize = 2;
+    val end: usize = 2 + identities_len;
+    var count: usize = 0;
+    for (offset < end) {
+        val identity_len: usize = (psk.data[offset]::usize << 8)
+            | psk.data[offset + 1]::usize;
+        offset = offset + 2 + identity_len + 4;
+        count = count + 1;
+    }
+    ret count;
+}
+
+pub fun validate_server_selection(server: *codec.ServerHello,
+    client: *codec.ClientHello) error.Error {
+    val server_error: error.Error = codec.validate_server(server);
+    if (server_error != error.OK) { ret server_error; }
+    if (codec.validate_client(client) != error.OK
+        || !offered_suite(client, server.cipher_suite)
+        || !bytes_equal(server.legacy_session_id, client.legacy_session_id)) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    var share: extensions.Extension;
+    if (extensions.find(server.extensions, extensions.KEY_SHARE, ?share)) {
+        val group: u16 = (share.data[0]::u16 << 8) | share.data[1]::u16;
+        if (server.retry) {
+            if (!offered_group(client, group) || offered_share(client, group)) {
+                ret error.ILLEGAL_PARAMETER;
+            }
+        } or {
+            if (!offered_share(client, group)) { ret error.ILLEGAL_PARAMETER; }
+        }
+    }
+    var psk: extensions.Extension;
+    if (extensions.find(server.extensions, extensions.PRE_SHARED_KEY, ?psk)) {
+        val selected: usize = (psk.data[0]::usize << 8) | psk.data[1]::usize;
+        val has_share: bool = extensions.contains(server.extensions, extensions.KEY_SHARE);
+        var required_mode: u8 = 0;
+        if (has_share) { required_mode = 1; }
+        if (selected >= psk_identity_count(client)
+            || !offered_psk_mode(client, required_mode)) { ret error.ILLEGAL_PARAMETER; }
+    }
+    ret error.OK;
+}
+
+test "negotiation: server preference selects a share or one retry" {
+    var suites: [2]u8 = [2]u8{0x13, 0x01};
+    var compression: [1]u8;
+    var random: [32]u8;
+    var prefix: [25]u8 = [25]u8{
+        0, 43, 0, 3, 2, 3, 4,
+        0, 10, 0, 6, 0, 4, 0, 29, 0, 23,
+        0, 13, 0, 4, 0, 2, 4, 3,
+    };
+    var extension_bytes: [67]u8;
+    var i: usize = 0;
+    for (i < 25) { extension_bytes[i] = prefix[i]; i = i + 1; }
+    extension_bytes[25] = 0; extension_bytes[26] = 51;
+    extension_bytes[27] = 0; extension_bytes[28] = 38;
+    extension_bytes[29] = 0; extension_bytes[30] = 36;
+    extension_bytes[31] = 0; extension_bytes[32] = 29;
+    extension_bytes[33] = 0; extension_bytes[34] = 32;
+    i = 0;
+    for (i < 32) { extension_bytes[35 + i] = (0x40 + i)::u8; i = i + 1; }
+    var hello: codec.ClientHello;
+    hello.legacy_version = tls13.LEGACY_VERSION;
+    hello.random = contracts.Bytes{data: ?random[0], len: 32};
+    hello.legacy_session_id = contracts.Bytes{data: nil, len: 0};
+    hello.cipher_suites = contracts.Bytes{data: ?suites[0], len: 2};
+    hello.compression_methods = contracts.Bytes{data: ?compression[0], len: 1};
+    hello.extensions = extensions.list(?extension_bytes[0], 67, extensions.CLIENT_HELLO);
+    hello.after_retry = false;
+    var suites_policy: [1]tls13.CipherSuite = [1]tls13.CipherSuite{tls13.AES_128_GCM_SHA256};
+    var groups_policy: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.SECP256R1};
+    var signatures_policy: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{tls13.ECDSA_SECP256R1_SHA256};
+    var policy: Policy;
+    policy.suites = ?suites_policy[0]; policy.suite_len = 1;
+    policy.groups = ?groups_policy[0]; policy.group_len = 1;
+    policy.signatures = ?signatures_policy[0]; policy.signature_len = 1;
+    var selected: Selection;
+    if (negotiate(?hello, ?policy, ?selected) != error.OK || !selected.retry
+        || selected.group != tls13.SECP256R1) { ret 1; }
+    groups_policy[0] = tls13.X25519;
+    if (negotiate(?hello, ?policy, ?selected) != error.OK || selected.retry
+        || selected.group != tls13.X25519) { ret 2; }
+    hello.after_retry = true;
+    groups_policy[0] = tls13.SECP256R1;
+    if (negotiate(?hello, ?policy, ?selected) != error.HANDSHAKE_FAILURE) { ret 3; }
+    ret 0;
+}
+
+test "negotiation: psk selection requires the matching exchange mode" {
+    var suites: [2]u8 = [2]u8{0x13, 0x01};
+    var compression: [1]u8;
+    var random: [32]u8;
+    var client_extensions: [61]u8;
+    var offset: usize = 0;
+    client_extensions[offset] = 0; client_extensions[offset + 1] = 43;
+    client_extensions[offset + 2] = 0; client_extensions[offset + 3] = 3;
+    client_extensions[offset + 4] = 2; client_extensions[offset + 5] = 3;
+    client_extensions[offset + 6] = 4; offset = offset + 7;
+    client_extensions[offset] = 0; client_extensions[offset + 1] = 45;
+    client_extensions[offset + 2] = 0; client_extensions[offset + 3] = 2;
+    client_extensions[offset + 4] = 1; client_extensions[offset + 5] = 0;
+    offset = offset + 6;
+    client_extensions[offset] = 0; client_extensions[offset + 1] = 41;
+    client_extensions[offset + 2] = 0; client_extensions[offset + 3] = 44;
+    client_extensions[offset + 4] = 0; client_extensions[offset + 5] = 7;
+    client_extensions[offset + 6] = 0; client_extensions[offset + 7] = 1;
+    client_extensions[offset + 8] = 0xaa;
+    client_extensions[offset + 9] = 0; client_extensions[offset + 10] = 0;
+    client_extensions[offset + 11] = 0; client_extensions[offset + 12] = 1;
+    client_extensions[offset + 13] = 0; client_extensions[offset + 14] = 33;
+    client_extensions[offset + 15] = 32;
+    var i: usize = 0;
+    for (i < 32) { client_extensions[offset + 16 + i] = i::u8; i = i + 1; }
+    var client: codec.ClientHello;
+    client.legacy_version = tls13.LEGACY_VERSION;
+    client.random = contracts.Bytes{data: ?random[0], len: 32};
+    client.legacy_session_id = contracts.Bytes{data: nil, len: 0};
+    client.cipher_suites = contracts.Bytes{data: ?suites[0], len: 2};
+    client.compression_methods = contracts.Bytes{data: ?compression[0], len: 1};
+    client.extensions = extensions.list(?client_extensions[0], 61, extensions.CLIENT_HELLO);
+    client.after_retry = false;
+    var server_extensions: [12]u8 = [12]u8{
+        0, 43, 0, 2, 3, 4,
+        0, 41, 0, 2, 0, 0,
+    };
+    var server: codec.ServerHello;
+    server.legacy_version = tls13.LEGACY_VERSION;
+    server.random = contracts.Bytes{data: ?random[0], len: 32};
+    server.legacy_session_id = contracts.Bytes{data: nil, len: 0};
+    server.cipher_suite = tls13.AES_128_GCM_SHA256;
+    server.compression_method = 0;
+    server.extensions = extensions.list(?server_extensions[0], 12, extensions.SERVER_HELLO);
+    server.retry = false;
+    if (validate_server_selection(?server, ?client) != error.OK) { ret 1; }
+    client_extensions[12] = 1;
+    if (validate_server_selection(?server, ?client) != error.ILLEGAL_PARAMETER) { ret 2; }
+    ret 0;
+}

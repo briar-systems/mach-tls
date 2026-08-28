@@ -1,31 +1,1010 @@
-# bounded tls 1.3 session ticket storage contracts
+# bounded tls 1.3 session tickets, ticket-key rotation, and replay control
 
+use crypto.aead.aes_gcm;
 use crypto.contracts;
+use crypto.hash;
+use crypto.secret;
+use std.crypto.ct;
+use std.sync.atomic;
+use std.sync.mutex;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use tls.memory_range;
+use tls.tls13;
 
-pub rec Ticket {
-    identity:        contracts.Bytes;
-    secret:          contracts.SecretBytes;
-    issued_at_ns:    u64;
-    lifetime_seconds: u32;
-    age_add:         u32;
-    max_early_data:  u32;
-}
+pub val KEY_NAME_SIZE: usize = 16;
+pub val TICKET_KEY_SIZE: usize = 32;
+pub val TICKET_NONCE_SIZE: usize = 12;
+pub val TICKET_TAG_SIZE: usize = 16;
+pub val MAX_TICKET_KEYS: usize = 4;
+pub val MAX_SECRET: usize = 48;
+pub val MAX_ALPN: usize = 255;
+pub val MAX_SERVER_NAME: usize = 253;
+pub val NONCE_SIZE: usize = 8;
 
-pub rec Store {
-    context: ptr;
-    load_fn: LoadFun;
-    save_fn: SaveFun;
-    remove_fn: RemoveFun;
-}
-
-pub def LoadFun:   fun(ptr, contracts.Bytes, *Ticket) u8;
-pub def SaveFun:   fun(ptr, *Ticket) u8;
-pub def RemoveFun: fun(ptr, contracts.Bytes) u8;
+# version, suite, secret length, secret, issued, lifetime, age add,
+# max early data, credential generation, flags, alpn, server name
+pub val STATE_FIXED_SIZE: usize = 2 + 2 + 1 + MAX_SECRET + 8 + 4 + 4 + 4 + 8 + 1;
+pub val MAX_STATE_BYTES: usize = STATE_FIXED_SIZE + 1 + MAX_ALPN + 1 +
+    MAX_SERVER_NAME;
+pub val MAX_TICKET_BYTES: usize = KEY_NAME_SIZE + TICKET_NONCE_SIZE +
+    MAX_STATE_BYTES + TICKET_TAG_SIZE;
 
 pub val DEFAULT_MAX_TICKETS: usize = 8;
+pub val MAX_REPLAY_ENTRIES: usize = 512;
+pub val MAX_TICKET_LIFETIME_SECONDS: u32 = 604800;
 
-test "session: default client ticket retention is bounded" {
-    if (DEFAULT_MAX_TICKETS == 0 || DEFAULT_MAX_TICKETS > 64) { ret 1; }
+pub def ReplayPolicy: u8;
+# a ticket may be presented more than once; the default for compatibility
+pub val REPLAY_PERMISSIVE: ReplayPolicy = 0;
+# a ticket binder is admitted exactly once inside its lifetime
+pub val REPLAY_SINGLE_USE: ReplayPolicy = 1;
+
+pub val STATE_CLIENT_AUTHENTICATED: u8 = 1;
+
+# the session a server seals into a ticket and recovers from one
+pub rec State {
+    version: u16;
+    suite: tls13.CipherSuite;
+    secret: [MAX_SECRET]^u8;
+    secret_len: usize;
+    issued_at: i64;
+    lifetime_seconds: u32;
+    age_add: u32;
+    max_early_data: u32;
+    credential_generation: u64;
+    client_authenticated: bool;
+    alpn: [MAX_ALPN]u8;
+    alpn_len: usize;
+    server_name: [MAX_SERVER_NAME]u8;
+    server_name_len: usize;
+}
+
+pub rec TicketKey {
+    name: [KEY_NAME_SIZE]u8;
+    key: [TICKET_KEY_SIZE]^u8;
+    seal_until: i64;
+    open_until: i64;
+    active: bool;
+}
+
+# one ring seals under exactly one key while older keys stay openable
+pub rec KeyRing {
+    keys: [MAX_TICKET_KEYS]TicketKey;
+    count: usize;
+    current: usize;
+    seal_lifetime_seconds: u32;
+    overlap_seconds: u32;
+    ticket_lifetime_seconds: u32;
+    generation: u64;
+    initialized: bool;
+    lock: mutex.Mutex;
+}
+
+rec ReplayEntry {
+    digest: [32]u8;
+    expires_at: i64;
+    used: bool;
+}
+
+pub rec ReplayWindow {
+    entries: [MAX_REPLAY_ENTRIES]ReplayEntry;
+    count: usize;
+    initialized: bool;
+    admitted: u64;
+    rejected: u64;
+    lock: mutex.Mutex;
+}
+
+# one retained client ticket and everything needed to offer it again
+pub rec Ticket {
+    identity: [MAX_TICKET_BYTES]u8;
+    identity_len: usize;
+    secret: [MAX_SECRET]^u8;
+    secret_len: usize;
+    suite: tls13.CipherSuite;
+    received_at: i64;
+    lifetime_seconds: u32;
+    age_add: u32;
+    max_early_data: u32;
+    server_name: [MAX_SERVER_NAME]u8;
+    server_name_len: usize;
+    alpn: [MAX_ALPN]u8;
+    alpn_len: usize;
+    valid: bool;
+}
+
+pub rec ClientStore {
+    tickets: [DEFAULT_MAX_TICKETS]Ticket;
+    count: usize;
+    sequence: u64;
+    order: [DEFAULT_MAX_TICKETS]u64;
+    initialized: bool;
+    lock: mutex.Mutex;
+}
+
+fun write_u16(data: *u8, offset: usize, value: u16) {
+    data[offset] = (value >> 8)::u8;
+    data[offset + 1] = value::u8;
+}
+
+fun read_u16(data: *u8, offset: usize) u16 {
+    ret (data[offset]::u16 << 8) | data[offset + 1]::u16;
+}
+
+fun write_u32(data: *u8, offset: usize, value: u32) {
+    data[offset] = (value >> 24)::u8;
+    data[offset + 1] = (value >> 16)::u8;
+    data[offset + 2] = (value >> 8)::u8;
+    data[offset + 3] = value::u8;
+}
+
+fun read_u32(data: *u8, offset: usize) u32 {
+    ret (data[offset]::u32 << 24) | (data[offset + 1]::u32 << 16) |
+        (data[offset + 2]::u32 << 8) | data[offset + 3]::u32;
+}
+
+fun write_u64(data: *u8, offset: usize, value: u64) {
+    var i: usize = 0;
+    for (i < 8) {
+        data[offset + i] = (value >> ((7 - i) * 8)::u64)::u8;
+        i = i + 1;
+    }
+}
+
+fun read_u64(data: *u8, offset: usize) u64 {
+    var value: u64 = 0;
+    var i: usize = 0;
+    for (i < 8) {
+        value = (value << 8) | data[offset + i]::u64;
+        i = i + 1;
+    }
+    ret value;
+}
+
+fun copy_bytes(destination: *u8, source: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        destination[i] = source[i];
+        i = i + 1;
+    }
+}
+
+#[oblivious]
+fun copy_secret(destination: *^u8, source: *^u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        destination[i] = source[i];
+        i = i + 1;
+    }
+}
+
+fun names_equal(first: *u8, second: *u8) bool {
+    var i: usize = 0;
+    for (i < KEY_NAME_SIZE) {
+        if (first[i] != second[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun fill_public(entropy: *secret.Entropy, output: *u8, length: usize) bool {
+    if (entropy == nil || !entropy.initialized || entropy.fill_fn == nil ||
+        output == nil || length == 0 || length > MAX_TICKET_BYTES) { ret false; }
+    var temporary: [MAX_TICKET_BYTES]^u8;
+    val status: i64 = entropy.fill_fn(entropy.context, entropy.secret_context,
+        ?temporary[0], length);
+    if (status != 0) {
+        ct.zeroize(?temporary[0], MAX_TICKET_BYTES);
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < length) { output[i] = temporary[i]:^; i = i + 1; }
+    ct.zeroize(?temporary[0], MAX_TICKET_BYTES);
+    ret true;
+}
+
+fun fill_secret(entropy: *secret.Entropy, output: *^u8, length: usize) bool {
+    if (entropy == nil || !entropy.initialized || entropy.fill_fn == nil ||
+        output == nil || length == 0) { ret false; }
+    ct.zeroize(output, length);
+    ret entropy.fill_fn(entropy.context, entropy.secret_context, output,
+        length) == 0;
+}
+
+pub fun empty_state() State {
+    var value: State;
+    value.version = 0;
+    value.suite = 0;
+    value.secret_len = 0;
+    value.issued_at = 0;
+    value.lifetime_seconds = 0;
+    value.age_add = 0;
+    value.max_early_data = 0;
+    value.credential_generation = 0;
+    value.client_authenticated = false;
+    value.alpn_len = 0;
+    value.server_name_len = 0;
+    ct.zeroize(?value.secret[0], MAX_SECRET);
+    ret value;
+}
+
+pub fun state_destroy(value: *State) {
+    if (value == nil) { ret; }
+    ct.zeroize(?value.secret[0], MAX_SECRET);
+    value.secret_len = 0;
+    value.suite = 0;
+    value.alpn_len = 0;
+    value.server_name_len = 0;
+    value.max_early_data = 0;
+    value.client_authenticated = false;
+}
+
+fun key_expired(key: *TicketKey, now: i64) bool {
+    ret !key.active || now > key.open_until;
+}
+
+fun ring_prune(ring: *KeyRing, now: i64) {
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        if (ring.keys[index].active && now > ring.keys[index].open_until) {
+            ct.zeroize(?ring.keys[index].key[0], TICKET_KEY_SIZE);
+            var i: usize = 0;
+            for (i < KEY_NAME_SIZE) { ring.keys[index].name[i] = 0; i = i + 1; }
+            ring.keys[index].active = false;
+            ring.keys[index].seal_until = 0;
+            ring.keys[index].open_until = 0;
+            if (ring.count != 0) { ring.count = ring.count - 1; }
+        }
+        index = index + 1;
+    }
+}
+
+fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, now: i64) bool {
+    var slot: usize = MAX_TICKET_KEYS;
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        if (!ring.keys[index].active) { slot = index; index = MAX_TICKET_KEYS; }
+        or { index = index + 1; }
+    }
+    if (slot == MAX_TICKET_KEYS) {
+        # evict the key that stops opening first
+        var oldest: usize = 0;
+        index = 1;
+        for (index < MAX_TICKET_KEYS) {
+            if (ring.keys[index].open_until < ring.keys[oldest].open_until) {
+                oldest = index;
+            }
+            index = index + 1;
+        }
+        ct.zeroize(?ring.keys[oldest].key[0], TICKET_KEY_SIZE);
+        ring.keys[oldest].active = false;
+        slot = oldest;
+        if (ring.count != 0) { ring.count = ring.count - 1; }
+    }
+    if (!fill_public(entropy, ?ring.keys[slot].name[0], KEY_NAME_SIZE) ||
+        !fill_secret(entropy, ?ring.keys[slot].key[0], TICKET_KEY_SIZE)) {
+        ct.zeroize(?ring.keys[slot].key[0], TICKET_KEY_SIZE);
+        ret false;
+    }
+    index = 0;
+    for (index < MAX_TICKET_KEYS) {
+        if (index != slot && ring.keys[index].active &&
+            names_equal(?ring.keys[index].name[0], ?ring.keys[slot].name[0])) {
+            ct.zeroize(?ring.keys[slot].key[0], TICKET_KEY_SIZE);
+            ret false;
+        }
+        index = index + 1;
+    }
+    ring.keys[slot].seal_until = now + ring.seal_lifetime_seconds::i64;
+    ring.keys[slot].open_until = ring.keys[slot].seal_until +
+        ring.overlap_seconds::i64;
+    ring.keys[slot].active = true;
+    ring.current = slot;
+    ring.count = ring.count + 1;
+    ring.generation = ring.generation + 1;
+    ret true;
+}
+
+pub fun keyring_init(ring: *KeyRing, entropy: *secret.Entropy, now: i64,
+    seal_lifetime_seconds: u32, overlap_seconds: u32,
+    ticket_lifetime_seconds: u32) bool {
+    if (ring == nil || ring.initialized || seal_lifetime_seconds == 0 ||
+        ticket_lifetime_seconds == 0 ||
+        ticket_lifetime_seconds > MAX_TICKET_LIFETIME_SECONDS ||
+        seal_lifetime_seconds > MAX_TICKET_LIFETIME_SECONDS ||
+        overlap_seconds > MAX_TICKET_LIFETIME_SECONDS ||
+        !memory_range.valid((?ring.count)::*u8, 1)) { ret false; }
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        ring.keys[index].active = false;
+        ring.keys[index].seal_until = 0;
+        ring.keys[index].open_until = 0;
+        ct.zeroize(?ring.keys[index].key[0], TICKET_KEY_SIZE);
+        var i: usize = 0;
+        for (i < KEY_NAME_SIZE) { ring.keys[index].name[i] = 0; i = i + 1; }
+        index = index + 1;
+    }
+    ring.count = 0;
+    ring.current = 0;
+    ring.generation = 0;
+    ring.seal_lifetime_seconds = seal_lifetime_seconds;
+    ring.overlap_seconds = overlap_seconds;
+    ring.ticket_lifetime_seconds = ticket_lifetime_seconds;
+    ring.lock = mutex.make();
+    if (!ring_mint(ring, entropy, now)) { ret false; }
+    ring.initialized = true;
+    ret true;
+}
+
+# retire the sealing key while every prior key stays openable for the overlap
+pub fun keyring_rotate(ring: *KeyRing, entropy: *secret.Entropy,
+    now: i64) bool {
+    if (ring == nil || !ring.initialized) { ret false; }
+    mutex.lock(?ring.lock);
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        # retirement is exact: a rotated key opens for the configured overlap
+        # and no longer, whatever remained of its original window
+        if (ring.keys[index].active && ring.keys[index].seal_until > now) {
+            ring.keys[index].seal_until = now;
+            ring.keys[index].open_until = now + ring.overlap_seconds::i64;
+        }
+        index = index + 1;
+    }
+    ring_prune(ring, now);
+    val minted: bool = ring_mint(ring, entropy, now);
+    mutex.unlock(?ring.lock);
+    ret minted;
+}
+
+pub fun keyring_generation(ring: *KeyRing) u64 {
+    if (ring == nil || !ring.initialized) { ret 0; }
+    mutex.lock(?ring.lock);
+    val value: u64 = ring.generation;
+    mutex.unlock(?ring.lock);
+    ret value;
+}
+
+pub fun keyring_openable(ring: *KeyRing, now: i64) usize {
+    if (ring == nil || !ring.initialized) { ret 0; }
+    mutex.lock(?ring.lock);
+    var openable: usize = 0;
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        if (ring.keys[index].active && now <= ring.keys[index].open_until) {
+            openable = openable + 1;
+        }
+        index = index + 1;
+    }
+    mutex.unlock(?ring.lock);
+    ret openable;
+}
+
+pub fun keyring_destroy(ring: *KeyRing) {
+    if (ring == nil) { ret; }
+    mutex.lock(?ring.lock);
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        ct.zeroize(?ring.keys[index].key[0], TICKET_KEY_SIZE);
+        var i: usize = 0;
+        for (i < KEY_NAME_SIZE) { ring.keys[index].name[i] = 0; i = i + 1; }
+        ring.keys[index].active = false;
+        index = index + 1;
+    }
+    ring.count = 0;
+    ring.current = 0;
+    ring.initialized = false;
+    mutex.unlock(?ring.lock);
+}
+
+fun state_valid(value: *State) bool {
+    ret value != nil && value.version == tls13.VERSION &&
+        value.secret_len != 0 && value.secret_len <= MAX_SECRET &&
+        value.lifetime_seconds != 0 &&
+        value.lifetime_seconds <= MAX_TICKET_LIFETIME_SECONDS &&
+        value.alpn_len <= MAX_ALPN && value.server_name_len <= MAX_SERVER_NAME;
+}
+
+#[oblivious]
+fun encode_state(value: *State, output: *^u8) usize {
+    var offset: usize = 0;
+    output[0] = (value.version >> 8)::u8;
+    output[1] = value.version::u8;
+    output[2] = (value.suite >> 8)::u8;
+    output[3] = value.suite::u8;
+    output[4] = value.secret_len::u8;
+    offset = 5;
+    var i: usize = 0;
+    for (i < MAX_SECRET) {
+        output[offset + i] = value.secret[i];
+        i = i + 1;
+    }
+    offset = offset + MAX_SECRET;
+    i = 0;
+    for (i < 8) {
+        output[offset + i] = (value.issued_at::u64 >> ((7 - i) * 8)::u64)::u8;
+        i = i + 1;
+    }
+    offset = offset + 8;
+    i = 0;
+    for (i < 4) {
+        output[offset + i] = (value.lifetime_seconds >> ((3 - i) * 8)::u32)::u8;
+        output[offset + 4 + i] = (value.age_add >> ((3 - i) * 8)::u32)::u8;
+        output[offset + 8 + i] = (value.max_early_data >> ((3 - i) * 8)::u32)::u8;
+        i = i + 1;
+    }
+    offset = offset + 12;
+    i = 0;
+    for (i < 8) {
+        output[offset + i] =
+            (value.credential_generation >> ((7 - i) * 8)::u64)::u8;
+        i = i + 1;
+    }
+    offset = offset + 8;
+    var flags: u8 = 0;
+    if (value.client_authenticated) { flags = STATE_CLIENT_AUTHENTICATED; }
+    output[offset] = flags;
+    offset = offset + 1;
+    output[offset] = value.alpn_len::u8;
+    offset = offset + 1;
+    i = 0;
+    for (i < value.alpn_len) { output[offset + i] = value.alpn[i]; i = i + 1; }
+    offset = offset + value.alpn_len;
+    output[offset] = value.server_name_len::u8;
+    offset = offset + 1;
+    i = 0;
+    for (i < value.server_name_len) {
+        output[offset + i] = value.server_name[i];
+        i = i + 1;
+    }
+    ret offset + value.server_name_len;
+}
+
+#[oblivious]
+fun decode_state(input: *^u8, length: usize, output: *State) bool {
+    if (length < STATE_FIXED_SIZE + 2) { ret false; }
+    @output = empty_state();
+    output.version = (input[0]:^::u16 << 8) | input[1]:^::u16;
+    output.suite = (input[2]:^::u16 << 8) | input[3]:^::u16;
+    output.secret_len = input[4]:^::usize;
+    var offset: usize = 5;
+    var i: usize = 0;
+    for (i < MAX_SECRET) {
+        output.secret[i] = input[offset + i];
+        i = i + 1;
+    }
+    offset = offset + MAX_SECRET;
+    var issued: u64 = 0;
+    i = 0;
+    for (i < 8) { issued = (issued << 8) | input[offset + i]:^::u64; i = i + 1; }
+    output.issued_at = issued::i64;
+    offset = offset + 8;
+    var lifetime: u32 = 0;
+    var age_add: u32 = 0;
+    var early: u32 = 0;
+    i = 0;
+    for (i < 4) {
+        lifetime = (lifetime << 8) | input[offset + i]:^::u32;
+        age_add = (age_add << 8) | input[offset + 4 + i]:^::u32;
+        early = (early << 8) | input[offset + 8 + i]:^::u32;
+        i = i + 1;
+    }
+    output.lifetime_seconds = lifetime;
+    output.age_add = age_add;
+    output.max_early_data = early;
+    offset = offset + 12;
+    var generation: u64 = 0;
+    i = 0;
+    for (i < 8) {
+        generation = (generation << 8) | input[offset + i]:^::u64;
+        i = i + 1;
+    }
+    output.credential_generation = generation;
+    offset = offset + 8;
+    output.client_authenticated =
+        (input[offset]:^ & STATE_CLIENT_AUTHENTICATED) != 0;
+    offset = offset + 1;
+    val alpn_len: usize = input[offset]:^::usize;
+    offset = offset + 1;
+    if (alpn_len > MAX_ALPN || offset + alpn_len + 1 > length) { ret false; }
+    i = 0;
+    for (i < alpn_len) { output.alpn[i] = input[offset + i]:^; i = i + 1; }
+    output.alpn_len = alpn_len;
+    offset = offset + alpn_len;
+    val name_len: usize = input[offset]:^::usize;
+    offset = offset + 1;
+    if (name_len > MAX_SERVER_NAME || offset + name_len != length) { ret false; }
+    i = 0;
+    for (i < name_len) { output.server_name[i] = input[offset + i]:^; i = i + 1; }
+    output.server_name_len = name_len;
+    ret state_valid(output);
+}
+
+# seal one session into an opaque ticket under the current ticket key
+pub fun seal(ring: *KeyRing, value: *State, now: i64,
+    entropy: *secret.Entropy, output: contracts.Buffer) usize {
+    if (ring == nil || !ring.initialized || !state_valid(value) ||
+        output.data == nil || output.capacity < MAX_TICKET_BYTES) { ret 0; }
+    mutex.lock(?ring.lock);
+    ring_prune(ring, now);
+    val slot: usize = ring.current;
+    if (slot >= MAX_TICKET_KEYS || !ring.keys[slot].active ||
+        now > ring.keys[slot].seal_until) {
+        mutex.unlock(?ring.lock);
+        ret 0;
+    }
+    var plaintext: [MAX_STATE_BYTES]^u8;
+    val length: usize = encode_state(value, ?plaintext[0]);
+    var nonce: [TICKET_NONCE_SIZE]u8;
+    if (length == 0 || length > MAX_STATE_BYTES ||
+        !fill_public(entropy, ?nonce[0], TICKET_NONCE_SIZE)) {
+        ct.zeroize(?plaintext[0], MAX_STATE_BYTES);
+        mutex.unlock(?ring.lock);
+        ret 0;
+    }
+    copy_bytes(output.data, ?ring.keys[slot].name[0], KEY_NAME_SIZE);
+    copy_bytes(?output.data[KEY_NAME_SIZE], ?nonce[0], TICKET_NONCE_SIZE);
+    val header: usize = KEY_NAME_SIZE + TICKET_NONCE_SIZE;
+    val operation: contracts.Operation = aes_gcm.seal(
+        contracts.SecretBytes{data: ?ring.keys[slot].key[0],
+            len: TICKET_KEY_SIZE},
+        contracts.Bytes{data: ?nonce[0], len: TICKET_NONCE_SIZE},
+        contracts.Bytes{data: output.data, len: KEY_NAME_SIZE},
+        contracts.SecretBytes{data: ?plaintext[0], len: length},
+        contracts.Buffer{data: ?output.data[header],
+            capacity: output.capacity - header});
+    ct.zeroize(?plaintext[0], MAX_STATE_BYTES);
+    mutex.unlock(?ring.lock);
+    if (operation.error != contracts.OK) { ret 0; }
+    ret header + operation.written;
+}
+
+# recover a session from a ticket sealed by any key still inside its overlap
+pub fun open(ring: *KeyRing, ticket: contracts.Bytes, now: i64,
+    output: *State) bool {
+    if (ring == nil || !ring.initialized || output == nil ||
+        ticket.data == nil ||
+        ticket.len <= KEY_NAME_SIZE + TICKET_NONCE_SIZE + TICKET_TAG_SIZE ||
+        ticket.len > MAX_TICKET_BYTES) { ret false; }
+    mutex.lock(?ring.lock);
+    var slot: usize = MAX_TICKET_KEYS;
+    var index: usize = 0;
+    for (index < MAX_TICKET_KEYS) {
+        if (ring.keys[index].active && !key_expired(?ring.keys[index], now) &&
+            names_equal(?ring.keys[index].name[0], ticket.data)) {
+            slot = index;
+            index = MAX_TICKET_KEYS;
+        } or { index = index + 1; }
+    }
+    if (slot == MAX_TICKET_KEYS) {
+        mutex.unlock(?ring.lock);
+        ret false;
+    }
+    val header: usize = KEY_NAME_SIZE + TICKET_NONCE_SIZE;
+    var plaintext: [MAX_STATE_BYTES]^u8;
+    val operation: contracts.Operation = aes_gcm.open(
+        contracts.SecretBytes{data: ?ring.keys[slot].key[0],
+            len: TICKET_KEY_SIZE},
+        contracts.Bytes{data: ?ticket.data[KEY_NAME_SIZE],
+            len: TICKET_NONCE_SIZE},
+        contracts.Bytes{data: ticket.data, len: KEY_NAME_SIZE},
+        contracts.Bytes{data: ?ticket.data[header], len: ticket.len - header},
+        contracts.SecretBuffer{data: ?plaintext[0],
+            capacity: MAX_STATE_BYTES});
+    mutex.unlock(?ring.lock);
+    if (operation.error != contracts.OK) {
+        ct.zeroize(?plaintext[0], MAX_STATE_BYTES);
+        ret false;
+    }
+    val decoded: bool = decode_state(?plaintext[0], operation.written, output);
+    ct.zeroize(?plaintext[0], MAX_STATE_BYTES);
+    if (!decoded) {
+        state_destroy(output);
+        ret false;
+    }
+    if (now < output.issued_at ||
+        now - output.issued_at > output.lifetime_seconds::i64) {
+        state_destroy(output);
+        ret false;
+    }
+    ret true;
+}
+
+pub fun replay_init(window: *ReplayWindow) bool {
+    if (window == nil) { ret false; }
+    var index: usize = 0;
+    for (index < MAX_REPLAY_ENTRIES) {
+        window.entries[index].used = false;
+        window.entries[index].expires_at = 0;
+        index = index + 1;
+    }
+    window.count = 0;
+    window.admitted = 0;
+    window.rejected = 0;
+    window.lock = mutex.make();
+    window.initialized = true;
+    ret true;
+}
+
+fun digest_binder(binder: contracts.Bytes, output: *u8) bool {
+    var context: hash.Sha256 = hash.empty_sha256();
+    if (hash.init_sha256(?context) != contracts.OK ||
+        hash.update_sha256(?context, binder) != contracts.OK) {
+        hash.destroy_sha256(?context);
+        ret false;
+    }
+    val operation: contracts.Operation = hash.final_sha256(?context,
+        contracts.Buffer{data: output, capacity: 32});
+    hash.destroy_sha256(?context);
+    ret operation.error == contracts.OK && operation.written == 32;
+}
+
+fun digests_equal(first: *u8, second: *u8) bool {
+    var difference: u8 = 0;
+    var i: usize = 0;
+    for (i < 32) {
+        difference = difference | (first[i] ^ second[i]);
+        i = i + 1;
+    }
+    ret difference == 0;
+}
+
+# admit one opaque value exactly once inside its lifetime, and fail closed when
+# the bounded window is full. a server keys this on the ticket identity, which
+# is stable across presentations, rather than on a binder, which is not
+pub fun replay_admit(window: *ReplayWindow, binder: contracts.Bytes,
+    expires_at: i64, now: i64) bool {
+    if (window == nil || !window.initialized || binder.data == nil ||
+        binder.len == 0 || expires_at <= now) { ret false; }
+    var digest: [32]u8;
+    if (!digest_binder(binder, ?digest[0])) { ret false; }
+    mutex.lock(?window.lock);
+    var free_slot: usize = MAX_REPLAY_ENTRIES;
+    var index: usize = 0;
+    for (index < MAX_REPLAY_ENTRIES) {
+        if (window.entries[index].used && now > window.entries[index].expires_at) {
+            window.entries[index].used = false;
+            if (window.count != 0) { window.count = window.count - 1; }
+        }
+        if (window.entries[index].used &&
+            digests_equal(?window.entries[index].digest[0], ?digest[0])) {
+            window.rejected = window.rejected + 1;
+            mutex.unlock(?window.lock);
+            ret false;
+        }
+        if (!window.entries[index].used && free_slot == MAX_REPLAY_ENTRIES) {
+            free_slot = index;
+        }
+        index = index + 1;
+    }
+    if (free_slot == MAX_REPLAY_ENTRIES) {
+        window.rejected = window.rejected + 1;
+        mutex.unlock(?window.lock);
+        ret false;
+    }
+    copy_bytes(?window.entries[free_slot].digest[0], ?digest[0], 32);
+    window.entries[free_slot].expires_at = expires_at;
+    window.entries[free_slot].used = true;
+    window.count = window.count + 1;
+    window.admitted = window.admitted + 1;
+    mutex.unlock(?window.lock);
+    ret true;
+}
+
+pub fun replay_live(window: *ReplayWindow) usize {
+    if (window == nil || !window.initialized) { ret 0; }
+    mutex.lock(?window.lock);
+    val value: usize = window.count;
+    mutex.unlock(?window.lock);
+    ret value;
+}
+
+pub fun replay_destroy(window: *ReplayWindow) {
+    if (window == nil) { ret; }
+    mutex.lock(?window.lock);
+    var index: usize = 0;
+    for (index < MAX_REPLAY_ENTRIES) {
+        window.entries[index].used = false;
+        index = index + 1;
+    }
+    window.count = 0;
+    window.initialized = false;
+    mutex.unlock(?window.lock);
+}
+
+pub fun client_store_init(store: *ClientStore) bool {
+    if (store == nil) { ret false; }
+    var index: usize = 0;
+    for (index < DEFAULT_MAX_TICKETS) {
+        store.tickets[index].valid = false;
+        store.tickets[index].identity_len = 0;
+        store.tickets[index].secret_len = 0;
+        store.order[index] = 0;
+        ct.zeroize(?store.tickets[index].secret[0], MAX_SECRET);
+        index = index + 1;
+    }
+    store.count = 0;
+    store.sequence = 0;
+    store.lock = mutex.make();
+    store.initialized = true;
+    ret true;
+}
+
+fun ticket_clear(value: *Ticket) {
+    ct.zeroize(?value.secret[0], MAX_SECRET);
+    value.secret_len = 0;
+    value.identity_len = 0;
+    value.alpn_len = 0;
+    value.server_name_len = 0;
+    value.suite = 0;
+    value.lifetime_seconds = 0;
+    value.max_early_data = 0;
+    value.valid = false;
+}
+
+# retain one ticket, evicting the oldest when the bounded ring is full
+pub fun client_store_save(store: *ClientStore, value: *Ticket) bool {
+    if (store == nil || !store.initialized || value == nil || !value.valid ||
+        value.identity_len == 0 || value.identity_len > MAX_TICKET_BYTES ||
+        value.secret_len == 0 || value.secret_len > MAX_SECRET ||
+        value.lifetime_seconds == 0 ||
+        value.lifetime_seconds > MAX_TICKET_LIFETIME_SECONDS) { ret false; }
+    mutex.lock(?store.lock);
+    var slot: usize = DEFAULT_MAX_TICKETS;
+    var index: usize = 0;
+    for (index < DEFAULT_MAX_TICKETS) {
+        if (!store.tickets[index].valid) {
+            slot = index;
+            index = DEFAULT_MAX_TICKETS;
+        } or { index = index + 1; }
+    }
+    if (slot == DEFAULT_MAX_TICKETS) {
+        var oldest: usize = 0;
+        index = 1;
+        for (index < DEFAULT_MAX_TICKETS) {
+            if (store.order[index] < store.order[oldest]) { oldest = index; }
+            index = index + 1;
+        }
+        ticket_clear(?store.tickets[oldest]);
+        slot = oldest;
+        if (store.count != 0) { store.count = store.count - 1; }
+    }
+    store.tickets[slot] = @value;
+    store.sequence = store.sequence + 1;
+    store.order[slot] = store.sequence;
+    store.tickets[slot].valid = true;
+    store.count = store.count + 1;
+    mutex.unlock(?store.lock);
+    ret true;
+}
+
+fun name_matches(value: *Ticket, server_name: contracts.Bytes) bool {
+    if (server_name.len != value.server_name_len) { ret false; }
+    var i: usize = 0;
+    for (i < server_name.len) {
+        if (server_name.data[i] != value.server_name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# take the freshest unexpired ticket for one name, removing it from the store
+pub fun client_store_take(store: *ClientStore, server_name: contracts.Bytes,
+    now: i64, output: *Ticket) bool {
+    if (store == nil || !store.initialized || output == nil) { ret false; }
+    mutex.lock(?store.lock);
+    var chosen: usize = DEFAULT_MAX_TICKETS;
+    var index: usize = 0;
+    for (index < DEFAULT_MAX_TICKETS) {
+        if (store.tickets[index].valid) {
+            val expired: bool = now < store.tickets[index].received_at ||
+                now - store.tickets[index].received_at >
+                    store.tickets[index].lifetime_seconds::i64;
+            if (expired) {
+                ticket_clear(?store.tickets[index]);
+                if (store.count != 0) { store.count = store.count - 1; }
+            } or (name_matches(?store.tickets[index], server_name)) {
+                if (chosen == DEFAULT_MAX_TICKETS ||
+                    store.order[index] > store.order[chosen]) {
+                    chosen = index;
+                }
+            }
+        }
+        index = index + 1;
+    }
+    if (chosen == DEFAULT_MAX_TICKETS) {
+        mutex.unlock(?store.lock);
+        ret false;
+    }
+    @output = store.tickets[chosen];
+    ticket_clear(?store.tickets[chosen]);
+    store.order[chosen] = 0;
+    if (store.count != 0) { store.count = store.count - 1; }
+    mutex.unlock(?store.lock);
+    ret true;
+}
+
+pub fun client_store_count(store: *ClientStore) usize {
+    if (store == nil || !store.initialized) { ret 0; }
+    mutex.lock(?store.lock);
+    val value: usize = store.count;
+    mutex.unlock(?store.lock);
+    ret value;
+}
+
+pub fun client_store_destroy(store: *ClientStore) {
+    if (store == nil) { ret; }
+    mutex.lock(?store.lock);
+    var index: usize = 0;
+    for (index < DEFAULT_MAX_TICKETS) {
+        ticket_clear(?store.tickets[index]);
+        store.order[index] = 0;
+        index = index + 1;
+    }
+    store.count = 0;
+    store.initialized = false;
+    mutex.unlock(?store.lock);
+}
+
+pub fun ticket_destroy(value: *Ticket) {
+    if (value == nil) { ret; }
+    ticket_clear(value);
+}
+
+var probe_counter: u8;
+
+#[oblivious]
+fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
+    length: usize) i64 {
+    val counter: *u8 = context::*u8;
+    var i: usize = 0;
+    for (i < length) {
+        output[i] = counter[0] + i::u8 + 1;
+        i = i + 1;
+    }
+    counter[0] = counter[0] + 31;
+    ret 0;
+}
+
+test "session: tickets survive key rotation for exactly the configured overlap" {
+    probe_counter = 1;
+    var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
+        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+    var ring: KeyRing;
+    if (!keyring_init(?ring, ?entropy, 1000, 3600, 1800, 7200)) { ret 1; }
+    if (keyring_openable(?ring, 1000) != 1) { ret 2; }
+    var state: State = empty_state();
+    state.version = tls13.VERSION;
+    state.suite = tls13.AES_128_GCM_SHA256;
+    state.secret_len = 32;
+    var i: usize = 0;
+    for (i < 32) { state.secret[i] = (0x30 + i)::u8; i = i + 1; }
+    state.issued_at = 1000;
+    state.lifetime_seconds = 7200;
+    state.age_add = 0x11223344;
+    state.credential_generation = 7;
+    state.alpn_len = 2;
+    state.alpn[0] = 'h'; state.alpn[1] = '2';
+    state.server_name_len = 15;
+    copy_bytes(?state.server_name[0], "api.example.com"::*u8, 15);
+    var ticket: [MAX_TICKET_BYTES]u8;
+    val length: usize = seal(?ring, ?state, 1000, ?entropy,
+        contracts.Buffer{data: ?ticket[0], capacity: MAX_TICKET_BYTES});
+    if (length == 0 || length > MAX_TICKET_BYTES) { ret 3; }
+
+    var recovered: State;
+    if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, 1000,
+            ?recovered)) { ret 4; }
+    if (recovered.suite != tls13.AES_128_GCM_SHA256 ||
+        recovered.secret_len != 32 || recovered.age_add != 0x11223344 ||
+        recovered.credential_generation != 7 || recovered.alpn_len != 2 ||
+        recovered.server_name_len != 15) { ret 5; }
+    i = 0;
+    for (i < 32) {
+        if (recovered.secret[i]:^ != (0x30 + i)::u8) { ret 6; }
+        i = i + 1;
+    }
+
+    # rotating at 1600 keeps the prior key openable until 1600 + 1800
+    if (!keyring_rotate(?ring, ?entropy, 1600)) { ret 7; }
+    if (keyring_generation(?ring) != 2 || keyring_openable(?ring, 1600) != 2) {
+        ret 8;
+    }
+    if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, 3400,
+            ?recovered)) { ret 9; }
+    if (open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, 3401,
+            ?recovered)) { ret 10; }
+    if (keyring_openable(?ring, 3401) != 1) { ret 14; }
+
+    # a ticket sealed by the replacement key opens under the new generation
+    state.issued_at = 1600;
+    val rotated_length: usize = seal(?ring, ?state, 1600, ?entropy,
+        contracts.Buffer{data: ?ticket[0], capacity: MAX_TICKET_BYTES});
+    if (rotated_length == 0 ||
+        !open(?ring, contracts.Bytes{data: ?ticket[0], len: rotated_length},
+            3401, ?recovered)) { ret 11; }
+
+    # expiry is enforced from the sealed issue time, not the key window
+    if (open(?ring, contracts.Bytes{data: ?ticket[0], len: rotated_length},
+            1600 + 7201, ?recovered)) { ret 12; }
+
+    # a tampered ticket never authenticates
+    ticket[rotated_length - 1] = ticket[rotated_length - 1] ^ 0x01;
+    if (open(?ring, contracts.Bytes{data: ?ticket[0], len: rotated_length},
+            3401, ?recovered)) { ret 13; }
+
+    keyring_destroy(?ring);
+    state_destroy(?state);
+    state_destroy(?recovered);
+    ret 0;
+}
+
+test "session: single use replay control admits one presentation" {
+    var window: ReplayWindow;
+    if (!replay_init(?window)) { ret 1; }
+    var binder: [32]u8;
+    var i: usize = 0;
+    for (i < 32) { binder[i] = (0x50 + i)::u8; i = i + 1; }
+    val value: contracts.Bytes = contracts.Bytes{data: ?binder[0], len: 32};
+    if (!replay_admit(?window, value, 2000, 1000)) { ret 2; }
+    if (replay_admit(?window, value, 2000, 1000)) { ret 3; }
+    if (replay_live(?window) != 1) { ret 4; }
+    # a different binder is unaffected
+    binder[0] = 0x99;
+    if (!replay_admit(?window, contracts.Bytes{data: ?binder[0], len: 32}, 2000,
+            1000)) { ret 5; }
+    # the entry is reusable once its lifetime has passed
+    binder[0] = 0x50;
+    if (!replay_admit(?window, value, 4000, 2100)) { ret 6; }
+    if (replay_admit(?window, value, 4000, 2100)) { ret 7; }
+    if (replay_admit(?window, value, 1000, 2100)) { ret 8; }
+    replay_destroy(?window);
+    ret 0;
+}
+
+test "session: client ticket retention is bounded and freshest first" {
+    var store: ClientStore;
+    if (!client_store_init(?store)) { ret 1; }
+    var value: Ticket;
+    var index: usize = 0;
+    for (index < DEFAULT_MAX_TICKETS + 3) {
+        ticket_clear(?value);
+        value.identity_len = 32;
+        var i: usize = 0;
+        for (i < 32) { value.identity[i] = (index + i)::u8; i = i + 1; }
+        value.secret_len = 32;
+        i = 0;
+        for (i < 32) { value.secret[i] = (index + i)::u8; i = i + 1; }
+        value.suite = tls13.AES_128_GCM_SHA256;
+        value.received_at = 1000;
+        value.lifetime_seconds = 3600;
+        value.server_name_len = 15;
+        copy_bytes(?value.server_name[0], "api.example.com"::*u8, 15);
+        value.valid = true;
+        if (!client_store_save(?store, ?value)) { ret 2; }
+        index = index + 1;
+    }
+    if (client_store_count(?store) != DEFAULT_MAX_TICKETS) { ret 3; }
+    var taken: Ticket;
+    if (!client_store_take(?store,
+            contracts.Bytes{data: "api.example.com"::*u8, len: 15}, 1000,
+            ?taken)) { ret 4; }
+    # the freshest ticket is offered first and taking it consumes it
+    if (taken.identity[0] != (DEFAULT_MAX_TICKETS + 2)::u8) { ret 5; }
+    if (client_store_count(?store) != DEFAULT_MAX_TICKETS - 1) { ret 6; }
+    if (client_store_take(?store,
+            contracts.Bytes{data: "other.example.com"::*u8, len: 17}, 1000,
+            ?taken)) { ret 7; }
+    # every retained ticket expires with its lifetime
+    if (client_store_take(?store,
+            contracts.Bytes{data: "api.example.com"::*u8, len: 15}, 1000 + 3601,
+            ?taken)) { ret 8; }
+    if (client_store_count(?store) != 0) { ret 9; }
+    ticket_destroy(?taken);
+    ticket_destroy(?value);
+    client_store_destroy(?store);
     ret 0;
 }

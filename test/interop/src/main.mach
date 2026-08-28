@@ -1,0 +1,561 @@
+use crypto.contracts;
+use crypto.encoding.keys;
+use crypto.secret;
+use std.chrono.time;
+use std.crypto.ct;
+use std.net.ip;
+use std.net.tcp;
+use std.print;
+use std.runtime;
+use std.types.char.char;
+use std.types.string.str;
+use std.sync.cancel;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_err;
+use std.types.result.unwrap_ok;
+use std.types.size.usize;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use tls.cert;
+use tls.cert.credentials;
+use tls.cert.load;
+use tls.client;
+use tls.config;
+use tls.engine;
+use tls.error;
+use tls.record;
+use tls.session;
+use tls.tls12;
+use tls12_connection: tls.tls12.connection;
+use tls.stream;
+use tls.tls13;
+use tls.transport;
+use tls.memory_range;
+
+rec BlockingTransport {
+    runtime: *io_runtime.Runtime;
+    stream: *tcp.Stream;
+}
+
+fun blocking_aliases_state(context: ptr, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    if (len == 0) { ret false; }
+    if (!memory_range.valid(context::*u8, $size_of(BlockingTransport))) {
+        ret true;
+    }
+    val state: *BlockingTransport = context::*BlockingTransport;
+    if (!memory_range.valid(state.stream::*u8, $size_of(tcp.Stream)) ||
+        memory_range.overlap(state::*u8, $size_of(BlockingTransport),
+            state.stream::*u8, $size_of(tcp.Stream)) ||
+        io_runtime.aliases(state.runtime, state::*u8,
+            $size_of(BlockingTransport)) ||
+        io_runtime.aliases(state.runtime, state.stream::*u8,
+            $size_of(tcp.Stream))) { ret true; }
+    ret memory_range.overlap(state::*u8, $size_of(BlockingTransport),
+            data, len) ||
+        memory_range.overlap(state.stream::*u8, $size_of(tcp.Stream),
+            data, len) || io_runtime.aliases(state.runtime, data, len);
+}
+
+fun submit(state: *BlockingTransport, scope: *cancel.Scope,
+    kind: io_runtime.Kind, buffer: *u8, length: usize,
+    context: usize) Result[io_runtime.Token, io_error.Error] {
+    val operation: io_runtime.Operation = io_runtime.Operation{kind: kind,
+        resource: state.stream.handle.value, buffer: buffer, length: length,
+        offset: 0, context: context};
+    ret io_runtime.submit_scoped(state.runtime, scope, operation);
+}
+
+fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
+    length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.READ, buffer, length, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val received: Result[usize, io_error.Error] = tcp.stream_read(state.stream,
+        buffer, length);
+    if (is_err[usize, io_error.Error](received)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[usize, io_error.Error](received));
+    } or {
+        val bytes: usize = unwrap_ok[usize, io_error.Error](received);
+        io_runtime.complete(state.runtime, token, bytes,
+            state.stream.handle.value, bytes == 0);
+    }
+    ret submitted;
+}
+
+fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
+    length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.WRITE, buffer, length, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val written: Result[usize, io_error.Error] = tcp.stream_write(state.stream,
+        buffer, length);
+    if (is_err[usize, io_error.Error](written)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[usize, io_error.Error](written));
+    } or {
+        io_runtime.complete(state.runtime, token,
+            unwrap_ok[usize, io_error.Error](written), state.stream.handle.value, false);
+    }
+    ret submitted;
+}
+
+fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.SHUTDOWN, nil, 0, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val stopped: Result[bool, io_error.Error] = tcp.stream_shutdown(state.stream,
+        os.SHUT_WR);
+    if (is_err[bool, io_error.Error](stopped)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[bool, io_error.Error](stopped));
+    } or {
+        io_runtime.complete(state.runtime, token, 0, state.stream.handle.value, false);
+    }
+    ret submitted;
+}
+
+fun blocking_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val resource: usize = state.stream.handle.value;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.CLOSE, nil, 0, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val closed: Result[bool, io_error.Error] = tcp.stream_close(state.stream);
+    if (is_err[bool, io_error.Error](closed)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[bool, io_error.Error](closed));
+    } or {
+        io_runtime.complete(state.runtime, token, 0, resource, false);
+    }
+    ret submitted;
+}
+
+fun hex_nibble(value: u8, output: *u8) bool {
+    if (value >= '0' && value <= '9') { output[0] = value - '0'; ret true; }
+    if (value >= 'a' && value <= 'f') { output[0] = value - 'a' + 10; ret true; }
+    ret false;
+}
+
+fun decode_hex(input: *u8, length: usize, output: *u8,
+    capacity: usize) bool {
+    if (input == nil || output == nil || (length & 1) != 0 ||
+        length / 2 > capacity) { ret false; }
+    var i: usize = 0;
+    for (i < length / 2) {
+        var high: u8;
+        var low: u8;
+        if (!hex_nibble(input[i * 2], ?high) ||
+            !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
+        output[i] = (high << 4) | low;
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[oblivious]
+fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
+    capacity: usize) bool {
+    if (input == nil || output == nil || (length & 1) != 0 ||
+        length / 2 > capacity) { ret false; }
+    var i: usize = 0;
+    for (i < length / 2) {
+        var high: u8;
+        var low: u8;
+        if (!hex_nibble(input[i * 2], ?high) ||
+            !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
+        output[i] = (high << 4) | low;
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
+    for (transport.snapshot(?secure.operation).state !=
+        transport.OPERATION_TERMINAL) {
+        var completion: io_runtime.Completion;
+        val polled: Result[usize, io_error.Error] = io_runtime.poll(owner,
+            ?completion, 1);
+        if (is_err[usize, io_error.Error](polled) ||
+            unwrap_ok[usize, io_error.Error](polled) != 1 ||
+            !stream.accept(secure, ?completion)) { ret false; }
+    }
+    ret true;
+}
+
+var client_sessions: session.ClientStore;
+var dial_configuration: config.ClientConfig;
+var option_key_update: bool;
+var option_tls12: bool;
+var tls12_configuration: config.ClientConfig;
+var tls12_suites: [6]tls13.CipherSuite;
+var tls12_signatures: [6]tls13.SignatureScheme;
+var tls12_versions: [1]u16;
+var legacy_engine: tls12_connection.Connection;
+var legacy_hello: [16384]u8;
+var handshake_input: [65536]u8;
+var handshake_output: [65536]u8;
+var hello_storage: [65536]u8;
+var peer_certificates: [8]cert.Certificate;
+var wire_input_storage: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var wire_output_storage: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var dial_socket: tcp.Stream;
+var dial_runtime: io_runtime.Runtime;
+var dial_blocking: BlockingTransport;
+var dial_lower: transport.Transport;
+
+fun streq(a: *u8, b: *u8) bool {
+    if (a == nil || b == nil) { ret false; }
+    var i: usize = 0;
+    for (a[i] != 0 && b[i] != 0) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret a[i] == b[i];
+}
+
+fun parse_number(value: *u8) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    for (value[i] != 0) {
+        if (value[i] < '0' || value[i] > '9') { ret 0; }
+        total = total * 10 + (value[i] - '0')::usize;
+        i = i + 1;
+    }
+    ret total;
+}
+
+fun report(label: str, value: usize) {
+    print.print(label);
+    var digits: [24]u8;
+    var count: usize = 0;
+    var remaining: usize = value;
+    if (remaining == 0) { digits[0] = '0'; count = 1; }
+    for (remaining != 0) {
+        digits[count] = '0' + (remaining % 10)::u8;
+        remaining = remaining / 10;
+        count = count + 1;
+    }
+    var text: [25]char;
+    var i: usize = 0;
+    for (i < count) {
+        text[i] = digits[count - 1 - i]::char;
+        i = i + 1;
+    }
+    text[count] = 0::char;
+    print.print(?text[0]);
+    print.print("\n");
+}
+
+# one complete connection: handshake, bounded settlement checks, exchange, close
+fun dial_one(index: usize) i64 {
+    val connected: Result[tcp.Stream, io_error.Error] = tcp.connect(
+        ip.endpoint(127, 0, 0, 1, 9443));
+    if (is_err[tcp.Stream, io_error.Error](connected)) { ret 2; }
+    dial_socket = unwrap_ok[tcp.Stream, io_error.Error](connected);
+    if (is_err[bool, io_error.Error](io_runtime.make(?dial_runtime, 16))) {
+        ret 3;
+    }
+    dial_blocking = BlockingTransport{runtime: ?dial_runtime,
+        stream: ?dial_socket};
+    dial_lower = transport.Transport{runtime: ?dial_runtime,
+        context: (?dial_blocking)::ptr,
+        context_size: $size_of(BlockingTransport),
+        aliases_state: blocking_aliases_state,
+        submit_read: blocking_read, submit_write: blocking_write,
+        submit_shutdown: blocking_shutdown, submit_close: blocking_close,
+        submit_abort: blocking_close};
+
+    var core_storage: client.Storage = client.Storage{
+        input: ?handshake_input[0], input_capacity: 65536,
+        output: ?handshake_output[0], output_capacity: 65536,
+        hello: ?hello_storage[0], hello_capacity: 65536,
+        certificates: ?peer_certificates[0], certificate_capacity: 8,
+        peer_parameters: nil, peer_parameters_capacity: 0};
+    var storage: stream.Storage;
+    storage.wire_input = ?wire_input_storage[0];
+    storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    storage.wire_output = ?wire_output_storage[0];
+    storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }
+    var secure: stream.Stream;
+    var core: client.Client;
+    var empty_extra: client.ExtraExtension;
+    empty_extra.kind = 0;
+    empty_extra.data.data = nil;
+    empty_extra.data.len = 0;
+    if (option_tls12) {
+        val legacy_storage: tls12_connection.Storage =
+            tls12_connection.Storage{input: ?handshake_input[0],
+                input_capacity: 65536, output: ?handshake_output[0],
+                output_capacity: 65536, hello: ?legacy_hello[0],
+                hello_capacity: 16384,
+                certificates: ?peer_certificates[0], certificate_capacity: 8};
+        if (!tls12_connection.init_client(?legacy_engine, ?tls12_configuration,
+                legacy_storage)) { ret 10; }
+        if (!stream.connect_tls12(?secure, ?legacy_engine, storage,
+                ?dial_lower, ?scope,
+                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure, ?dial_runtime)) { ret 5; }
+    } or {
+        if (!client.init(?core, ?dial_configuration, core_storage,
+                empty_extra, 0)) { ret 10; }
+        if (!stream.connect(?secure, ?core, storage, ?dial_lower, ?scope,
+                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure, ?dial_runtime)) { ret 5; }
+    }
+    val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
+    val negotiated: engine.Snapshot = stream.negotiated(?secure);
+    if (handshake.terminal_error != error.OK) {
+        ret 20 + handshake.terminal_error::i64;
+    }
+    if (!negotiated.authenticated) { ret 40; }
+    if (negotiated.selected_alpn.len != 2 ||
+        negotiated.selected_alpn.data[0] != 'h' ||
+        negotiated.selected_alpn.data[1] != '2') { ret 41; }
+    report("connection=", index);
+    report("version=", negotiated.version::usize);
+    report("suite=", negotiated.suite::usize);
+    if (negotiated.resumed) { print.print("resumed=1\n"); }
+    or { print.print("resumed=0\n"); }
+    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 43; }
+
+    var application_input: [64]u8;
+    if (index == 0) {
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+            !cancel.cancel(?scope) ||
+            !stream.read(?secure, ?scope,
+                transport.Token{index: 2, generation: 1},
+                ?application_input[0], 64, 2)) { ret 44; }
+        val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
+        if (cancelled.terminal_error != error.CANCELLED ||
+            !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+            ret 45;
+        }
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+            !cancel.timeout(?scope) ||
+            !stream.read(?secure, ?scope,
+                transport.Token{index: 2, generation: 2},
+                ?application_input[0], 64, 3)) { ret 46; }
+        val timed_out: transport.Snapshot = transport.snapshot(?secure.operation);
+        if (timed_out.terminal_error != error.TIMEOUT ||
+            !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+            ret 47;
+        }
+    }
+
+    if (option_key_update) {
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+            !stream.key_update(?secure, ?scope,
+                transport.Token{index: 7, generation: 1}, 0, 7) ||
+            !settle(?secure, ?dial_runtime)) { ret 60; }
+        val updated: transport.Snapshot = transport.snapshot(?secure.operation);
+        if (updated.terminal_error != error.OK) {
+            report("key update error=", updated.terminal_error::usize);
+            ret 61;
+        }
+        if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+            ret 62;
+        }
+        print.print("key-updated\n");
+    }
+
+    var application_output: [16]u8 = [16]u8{
+        'm', 'a', 'c', 'h', '-', 't', 'l', 's', ' ', 'i', 'n', 't', 'e', 'r',
+        '\n', 0};
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.write(?secure, ?scope,
+            transport.Token{index: 3, generation: 1},
+            ?application_output[0], 15, 4) ||
+        !settle(?secure, ?dial_runtime)) { ret 48; }
+    val written: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (written.terminal_error != error.OK || written.application_bytes != 15 ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 49;
+    }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.read(?secure, ?scope,
+            transport.Token{index: 4, generation: 1},
+            ?application_input[0], 64, 5) ||
+        !settle(?secure, ?dial_runtime)) { ret 50; }
+    val read: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (read.terminal_error != error.OK || read.application_bytes == 0 ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 51;
+    }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.half_close(?secure, ?scope,
+            transport.Token{index: 5, generation: 1}, 6) ||
+        !settle(?secure, ?dial_runtime)) { ret 52; }
+    val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (half_closed.terminal_error != error.OK || !secure.send_closed ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 53;
+    }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.close(?secure, ?scope,
+            transport.Token{index: 6, generation: 1}, 7) ||
+        !settle(?secure, ?dial_runtime)) { ret 7; }
+    val closed: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
+        !stream.destroy(?secure) ||
+        !cancel.destroy(?scope) ||
+        is_err[bool, io_error.Error](io_runtime.close(?dial_runtime)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?dial_runtime))) {
+        ret 8;
+    }
+    if (option_tls12) {
+        if (!tls12_connection.destroy(?legacy_engine)) { ret 9; }
+    } or {
+        if (!client.destroy(?core)) { ret 9; }
+    }
+    ret 0;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
+    val client_hex: *u8 = "3082016530820117a00302010202147da845f0ef3c4bedac9ebe18bdafc1e948a3424a300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133343832305a170d3237303832383133343832305a30183116301406035504030c0d4d616368544c53436c69656e74302a300506032b657003210033e63a8f44421a42ed9b8120e72beee01e147bde123fe0489ccb27e41993c527a3753073300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070302301d0603551d0e04160414928fd5e4ed358ed2992a33dbb12e18ffade4f16b301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300506032b65700341002a1880fbe668a98aef6514366d6ea77a10f26b8018955f559791658fae49d564d27b240dcd44fa613414aceb9b09d1cec53acc280568a38378c5dcfb032e8a0b"::*u8;
+    val client_key_hex: *u8 = "302e020100300506032b6570042204206dd175e2faad594759fd8fb1cd1eeea1f40d01f11189bfd4a6dda111ebee0935"::*u8;
+    var root_der: [341]u8;
+    var client_der: [361]u8;
+    var client_key_der: [48]^u8;
+    if (!decode_hex(root_hex, 682, ?root_der[0], 341) ||
+        !decode_hex(client_hex, 722, ?client_der[0], 361) ||
+        !decode_secret_hex(client_key_hex, 96, ?client_key_der[0], 48)) { ret 1; }
+    var connections: usize = 1;
+    var use_sessions: bool = false;
+    option_key_update = false;
+    option_tls12 = false;
+    var argument: i64 = 1;
+    for (argument < argc) {
+        val current: *u8 = argv[argument];
+        if (streq(current, "--connections"::*u8) && argument + 1 < argc) {
+            argument = argument + 1;
+            connections = parse_number(argv[argument]);
+        } or (streq(current, "--sessions"::*u8)) {
+            use_sessions = true;
+        } or (streq(current, "--key-update"::*u8)) {
+            option_key_update = true;
+        } or (streq(current, "--tls12"::*u8)) {
+            option_tls12 = true;
+        }
+        argument = argument + 1;
+    }
+    if (connections == 0 || connections > 4) { connections = 1; }
+
+    var anchor: cert.Certificate = cert.Certificate{der: ?root_der[0], der_len: 341};
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: "h2"::*u8, len: 2}};
+    var versions: [1]u16 = [1]u16{tls13.VERSION};
+    var suites: [3]tls13.CipherSuite = [3]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256, tls13.AES_256_GCM_SHA384,
+        tls13.CHACHA20_POLY1305_SHA256};
+    var groups: [2]tls13.NamedGroup = [2]tls13.NamedGroup{
+        tls13.X25519, tls13.SECP256R1};
+    var signatures: [4]tls13.SignatureScheme = [4]tls13.SignatureScheme{
+        tls13.ED25519, tls13.ECDSA_SECP256R1_SHA256,
+        tls13.RSA_PSS_RSAE_SHA256, tls13.RSA_PSS_RSAE_SHA384};
+    var entropy: secret.Entropy = secret.system_entropy();
+    var allocator: secret.Allocator = secret.system_allocator();
+    var client_key: keys.PrivateKey = keys.empty_private();
+    val loaded_key: contracts.Error = load.private_der(
+        contracts.SecretBytes{data: ?client_key_der[0], len: 48}, cert.PKCS8_DER,
+        ?allocator, ?client_key);
+    ct.zeroize(?client_key_der[0], 48);
+    if (loaded_key != contracts.OK) { ret 9; }
+    var client_certificate: cert.Certificate = cert.Certificate{
+        der: ?client_der[0], der_len: 361};
+    var client_chain: cert.Chain = cert.Chain{
+        certificates: ?client_certificate, len: 1};
+    var client_identity: credentials.Identity = credentials.Identity{
+        server_name: contracts.Bytes{data: nil, len: 0}, chain: client_chain,
+        private_key: ?client_key};
+    dial_configuration = config.ClientConfig{};
+    dial_configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
+    dial_configuration.alpn = ?protocols[0]; dial_configuration.alpn_len = 1;
+    dial_configuration.trust = ?trust;
+    dial_configuration.versions = ?versions[0]; dial_configuration.version_len = 1;
+    dial_configuration.suites = ?suites[0]; dial_configuration.suite_len = 3;
+    dial_configuration.groups = ?groups[0]; dial_configuration.group_len = 2;
+    dial_configuration.signatures = ?signatures[0]; dial_configuration.signature_len = 4;
+    dial_configuration.client_identity = ?client_identity;
+    dial_configuration.entropy = ?entropy;
+    dial_configuration.limits = config.production_limits();
+    dial_configuration.limits.max_peer_handshake_bytes = 65536;
+
+    dial_configuration.sessions = nil;
+    if (use_sessions) {
+        if (!session.client_store_init(?client_sessions)) { ret 11; }
+        dial_configuration.sessions = ?client_sessions;
+    }
+
+    tls12_versions[0] = tls12.VERSION;
+    tls12_suites[0] = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    tls12_suites[1] = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
+    tls12_suites[2] = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
+    tls12_suites[3] = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
+    tls12_suites[4] = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
+    tls12_suites[5] = tls12.ECDHE_RSA_CHACHA20_POLY1305;
+    tls12_signatures[0] = tls13.ED25519;
+    tls12_signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
+    tls12_signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
+    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
+    tls12_signatures[4] = 0x0401;
+    tls12_signatures[5] = 0x0501;
+    tls12_configuration = config.ClientConfig{};
+    tls12_configuration.client_identity = nil;
+    tls12_configuration.sessions = nil;
+    tls12_configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
+    tls12_configuration.alpn = ?protocols[0];
+    tls12_configuration.alpn_len = 1;
+    tls12_configuration.trust = ?trust;
+    tls12_configuration.versions = ?tls12_versions[0];
+    tls12_configuration.version_len = 1;
+    tls12_configuration.suites = ?tls12_suites[0];
+    tls12_configuration.suite_len = 6;
+    tls12_configuration.groups = ?groups[0];
+    tls12_configuration.group_len = 2;
+    tls12_configuration.signatures = ?tls12_signatures[0];
+    tls12_configuration.signature_len = 6;
+    tls12_configuration.entropy = ?entropy;
+    tls12_configuration.limits = config.production_limits();
+    tls12_configuration.limits.max_peer_handshake_bytes = 65536;
+    tls12_configuration.limits.max_chain_bytes = 32768;
+
+    var index: usize = 0;
+    for (index < connections) {
+        val dialed: i64 = dial_one(index);
+        if (dialed != 0) { ret dialed; }
+        index = index + 1;
+    }
+    if (use_sessions) {
+        report("retained=", session.client_store_count(?client_sessions));
+        session.client_store_destroy(?client_sessions);
+    }
+    print.print("ok\n");
+    ret 0;
+}
