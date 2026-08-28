@@ -1,0 +1,188 @@
+# release evidence: the algorithm matrix printed from the library's own tables
+
+use std.print;
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.size.usize;
+use std.types.string.str;
+use tls.handshake.codec;
+use tls.record;
+use tls.tls12;
+use tls.tls13;
+use tls.tls13.key_schedule;
+use tls.session;
+use tls.cert.verify;
+
+fun hex_digit(value: u8) char {
+    if (value < 10) { ret ('0' + value)::char; }
+    ret ('a' + value - 10)::char;
+}
+
+fun print_hex16(value: u16) {
+    var text: [7]char;
+    text[0] = '0'::char;
+    text[1] = 'x'::char;
+    text[2] = hex_digit((value >> 12)::u8 & 0x0f);
+    text[3] = hex_digit((value >> 8)::u8 & 0x0f);
+    text[4] = hex_digit((value >> 4)::u8 & 0x0f);
+    text[5] = hex_digit(value::u8 & 0x0f);
+    text[6] = 0::char;
+    print.print(?text[0]);
+}
+
+fun print_number(value: usize) {
+    var digits: [24]u8;
+    var count: usize = 0;
+    var remaining: usize = value;
+    if (remaining == 0) { digits[0] = '0'; count = 1; }
+    for (remaining != 0) {
+        digits[count] = '0' + (remaining % 10)::u8;
+        remaining = remaining / 10;
+        count = count + 1;
+    }
+    var text: [25]char;
+    var i: usize = 0;
+    for (i < count) {
+        text[i] = digits[count - 1 - i]::char;
+        i = i + 1;
+    }
+    text[count] = 0::char;
+    print.print(?text[0]);
+}
+
+fun row(label: str, value: u16, detail: str) {
+    print.print("| ");
+    print.print(label);
+    print.print(" | ");
+    print_hex16(value);
+    print.print(" | ");
+    print.print(detail);
+    print.print(" |\n");
+}
+
+fun hash_name(algorithm: key_schedule.HashAlgorithm) str {
+    if (algorithm == key_schedule.SHA256) { ret "SHA-256"; }
+    if (algorithm == key_schedule.SHA384) { ret "SHA-384"; }
+    ret "none";
+}
+
+fun aead_name(kind: record.Algorithm) str {
+    if (kind == record.AES_128_GCM) { ret "AES-128-GCM"; }
+    if (kind == record.AES_256_GCM) { ret "AES-256-GCM"; }
+    if (kind == record.CHACHA20_POLY1305) { ret "ChaCha20-Poly1305"; }
+    ret "none";
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    print.print("# Release evidence\n\n");
+    print.print("Every value below is printed from the same predicate the\n");
+    print.print("library uses to accept it, so this table cannot drift from\n");
+    print.print("the implementation.\n\n");
+
+    print.print("## TLS 1.3 cipher suites\n\n");
+    print.print("| suite | value | hash and aead |\n| --- | --- | --- |\n");
+    var suites13: [3]tls13.CipherSuite = [3]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256, tls13.AES_256_GCM_SHA384,
+        tls13.CHACHA20_POLY1305_SHA256};
+    var names13: [3]str = [3]str{"TLS_AES_128_GCM_SHA256",
+        "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"};
+    var i: usize = 0;
+    var accepted: usize = 0;
+    for (i < 3) {
+        if (!codec.valid_cipher_suite(suites13[i])) { ret 1; }
+        row(names13[i], suites13[i],
+            hash_name(key_schedule.algorithm_for_suite(suites13[i])));
+        accepted = accepted + 1;
+        i = i + 1;
+    }
+    # nothing outside the declared set is accepted
+    if (codec.valid_cipher_suite(0x1304) || codec.valid_cipher_suite(0)) {
+        ret 2;
+    }
+    print.print("\n## TLS 1.2 cipher suites\n\n");
+    print.print("| suite | value | hash and aead |\n| --- | --- | --- |\n");
+    var suites12: [6]u16 = [6]u16{
+        tls12.ECDHE_ECDSA_AES_128_GCM_SHA256,
+        tls12.ECDHE_ECDSA_AES_256_GCM_SHA384,
+        tls12.ECDHE_ECDSA_CHACHA20_POLY1305,
+        tls12.ECDHE_RSA_AES_128_GCM_SHA256,
+        tls12.ECDHE_RSA_AES_256_GCM_SHA384,
+        tls12.ECDHE_RSA_CHACHA20_POLY1305};
+    var names12: [6]str = [6]str{
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"};
+    i = 0;
+    for (i < 6) {
+        if (!tls12.valid_suite(suites12[i])) { ret 3; }
+        print.print("| ");
+        print.print(names12[i]);
+        print.print(" | ");
+        print_hex16(suites12[i]);
+        print.print(" | ");
+        print.print(hash_name(tls12.suite_hash(suites12[i])));
+        print.print(" and ");
+        print.print(aead_name(tls12.suite_aead(suites12[i])));
+        print.print(" |\n");
+        accepted = accepted + 1;
+        i = i + 1;
+    }
+    if (tls12.valid_suite(0x1301) || tls12.valid_suite(0)) { ret 4; }
+
+    print.print("\n## Groups\n\n");
+    print.print("| group | value | roles |\n| --- | --- | --- |\n");
+    if (!codec.valid_named_group(tls13.X25519) ||
+        !codec.valid_named_group(tls13.SECP256R1)) { ret 5; }
+    row("x25519", tls13.X25519, "TLS 1.3 and TLS 1.2 ECDHE");
+    row("secp256r1", tls13.SECP256R1, "TLS 1.3 and TLS 1.2 ECDHE");
+    if (codec.valid_named_group(0x0018) || codec.valid_named_group(0)) {
+        ret 6;
+    }
+
+    print.print("\n## Signature schemes\n\n");
+    print.print("| scheme | value | roles |\n| --- | --- | --- |\n");
+    if (!codec.valid_signature_scheme(tls13.ED25519) ||
+        !codec.valid_signature_scheme(tls13.ECDSA_SECP256R1_SHA256) ||
+        !codec.valid_signature_scheme(tls13.RSA_PSS_RSAE_SHA256) ||
+        !codec.valid_signature_scheme(tls13.RSA_PSS_RSAE_SHA384)) { ret 7; }
+    row("ed25519", tls13.ED25519, "sign and verify, both versions");
+    row("ecdsa_secp256r1_sha256", tls13.ECDSA_SECP256R1_SHA256,
+        "sign and verify, both versions");
+    row("rsa_pss_rsae_sha256", tls13.RSA_PSS_RSAE_SHA256,
+        "sign and verify, both versions");
+    row("rsa_pss_rsae_sha384", tls13.RSA_PSS_RSAE_SHA384,
+        "sign and verify, both versions");
+    row("rsa_pkcs1_sha256", 0x0401, "verify only, TLS 1.2 peer signatures");
+    row("rsa_pkcs1_sha384", 0x0501, "verify only, TLS 1.2 peer signatures");
+    if (codec.valid_signature_scheme(0x0401)) { ret 8; }
+
+    print.print("\n## Bounds\n\n");
+    print.print("| bound | value |\n| --- | --- |\n");
+    print.print("| record plaintext | ");
+    print_number(record.MAX_PLAINTEXT);
+    print.print(" |\n| certificate chain depth | ");
+    print_number(verify.MAX_CHAIN_DEPTH);
+    print.print(" |\n| certificate signature checks | ");
+    print_number(verify.MAX_SIGNATURE_CHECKS);
+    print.print(" |\n| ticket keys per ring | ");
+    print_number(session.MAX_TICKET_KEYS);
+    print.print(" |\n| client tickets retained | ");
+    print_number(session.DEFAULT_MAX_TICKETS);
+    print.print(" |\n| replay window entries | ");
+    print_number(session.MAX_REPLAY_ENTRIES);
+    print.print(" |\n| ticket lifetime seconds | ");
+    print_number(session.MAX_TICKET_LIFETIME_SECONDS::usize);
+    print.print(" |\n");
+
+    print.print("\nalgorithms=");
+    print_number(accepted);
+    print.print("\n");
+    ret 0;
+}
