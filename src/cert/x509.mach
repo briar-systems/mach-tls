@@ -225,7 +225,6 @@ fun parse_pss_parameters(input: contracts.Bytes,
     var saw_hash: bool = false;
     var saw_mask: bool = false;
     var saw_salt: bool = false;
-    var saw_trailer: bool = false;
     var previous_tag: u8 = 0x9f;
     for (!der.complete(?body)) {
         var field: der.Element;
@@ -262,14 +261,10 @@ fun parse_pss_parameters(input: contracts.Bytes,
         } or (field.tag == 0xa2) {
             if (!parse_nonnegative(?value, ?salt_len)) { ret false; }
             saw_salt = true;
-        } or {
-            var trailer: usize = 0;
-            if (!parse_nonnegative(?value, ?trailer) || trailer != 1) { ret false; }
-            saw_trailer = true;
-        }
+        } or { ret false; }
     }
     if (!saw_hash || !saw_mask || !saw_salt || hash_len != mask_hash_len ||
-        (saw_trailer && previous_tag != 0xa3)) { ret false; }
+        previous_tag == 0xa3) { ret false; }
     if (hash_len == 32 && salt_len == 32) {
         @output = RSA_PSS_SHA256;
         ret true;
@@ -695,6 +690,8 @@ fun parse_key_usage(input: contracts.Bytes, output: *Extensions) bool {
         i = i + 1;
     }
     if ((usage & (1::u16 << (bit_count - 1))) == 0) { ret false; }
+    if ((usage & (KEY_USAGE_ENCIPHER_ONLY | KEY_USAGE_DECIPHER_ONLY)) != 0 &&
+        (usage & KEY_USAGE_KEY_AGREEMENT) == 0) { ret false; }
     output.key_usage = usage;
     ret true;
 }
@@ -756,9 +753,13 @@ fun valid_general_name(value: *der.Element, constraints: bool) bool {
         var body: der.Cursor = der.cursor(value.content);
         var oid: der.Element;
         var wrapped: der.Element;
-        ret der.next(?body, ?oid) == contracts.OK && oid.tag == der.OBJECT_ID &&
-            der.next(?body, ?wrapped) == contracts.OK && wrapped.tag == 0xa0 &&
-            wrapped.content.len > 0 && der.complete(?body);
+        if (der.next(?body, ?oid) != contracts.OK || oid.tag != der.OBJECT_ID ||
+            der.next(?body, ?wrapped) != contracts.OK || wrapped.tag != 0xa0 ||
+            wrapped.content.len == 0 || !der.complete(?body)) { ret false; }
+        var wrapped_body: der.Cursor = der.cursor(wrapped.content);
+        var inner: der.Element;
+        ret der.next(?wrapped_body, ?inner) == contracts.OK &&
+            der.complete(?wrapped_body);
     }
     if (value.tag == 0x81 || value.tag == 0x86) {
         ret valid_ia5(value.content);
