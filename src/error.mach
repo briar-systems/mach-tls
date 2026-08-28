@@ -18,10 +18,14 @@ pub val HOSTNAME_MISMATCH:     Error = 12;
 pub val UNSUPPORTED_ALGORITHM: Error = 13;
 pub val RESOURCE_LIMIT:        Error = 14;
 pub val INTERNAL_ERROR:        Error = 15;
+pub val RECORD_OVERFLOW:       Error = 16;
+pub val SEQUENCE_EXHAUSTED:    Error = 17;
+pub val ALERT_RECEIVED:        Error = 18;
 
 test "error: terminal results are distinct" {
     if (CANCELLED == TIMEOUT) { ret 1; }
     if (CLOSED == OK) { ret 1; }
     if (BAD_CERTIFICATE == UNKNOWN_CA) { ret 1; }
+    if (RECORD_OVERFLOW == SEQUENCE_EXHAUSTED) { ret 1; }
     ret 0;
 }
