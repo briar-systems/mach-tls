@@ -3,6 +3,7 @@
 use tls.cert;
 use tls.cert.credentials;
 use tls.tls13;
+use crypto.secret;
 use std.types.bool.bool;
 use std.types.size.usize;
 use std.types.string.str;
@@ -32,6 +33,8 @@ pub rec ClientConfig {
     group_len:       usize;
     signatures:      *tls13.SignatureScheme;
     signature_len:   usize;
+    client_identity: *credentials.Identity;
+    entropy:         *secret.Entropy;
     limits:          Limits;
 }
 

@@ -28,6 +28,7 @@ pub rec Transport {
     context: ptr;
     submit_read: SubmitBufferFun;
     submit_write: SubmitBufferFun;
+    submit_shutdown: SubmitCloseFun;
     submit_close: SubmitCloseFun;
 }
 
@@ -40,6 +41,7 @@ pub fun valid(transport: *Transport) bool {
         && transport.runtime != nil
         && transport.submit_read::usize != 0
         && transport.submit_write::usize != 0
+        && transport.submit_shutdown::usize != 0
         && transport.submit_close::usize != 0;
 }
 
@@ -80,6 +82,17 @@ pub fun close(
     ret transport.submit_close(transport.context, scope, context);
 }
 
+pub fun shutdown(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    if (!valid(transport) || scope == nil) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SHUTDOWN));
+    }
+    ret transport.submit_shutdown(transport.context, scope, context);
+}
+
 pub rec TcpAdapter {
     driver: *net_async.Driver;
     stream: *tcp.Stream;
@@ -101,6 +114,12 @@ fun tcp_close(context: ptr, scope: *cancel.Scope, token_context: usize) Result[i
     ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream, adapter.close_mode, token_context);
 }
 
+fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_shutdown_write(adapter.driver, scope, adapter.stream,
+        token_context);
+}
+
 pub fun make_tcp(
     transport: *Transport,
     adapter: *TcpAdapter,
@@ -118,6 +137,7 @@ pub fun make_tcp(
     transport.context = adapter::ptr;
     transport.submit_read = tcp_read;
     transport.submit_write = tcp_write;
+    transport.submit_shutdown = tcp_shutdown;
     transport.submit_close = tcp_close;
     ret true;
 }
@@ -132,6 +152,7 @@ pub def ActionKind: u8;
 pub val TRANSPORT_READ: ActionKind = 1;
 pub val TRANSPORT_WRITE: ActionKind = 2;
 pub val TRANSPORT_CLOSE: ActionKind = 3;
+pub val TRANSPORT_SHUTDOWN: ActionKind = 4;
 
 pub def OperationState: u8;
 pub val OPERATION_OPEN: OperationState = 1;
@@ -237,6 +258,9 @@ pub fun begin(
     if (operation == nil || token.generation == 0 || scope == nil || kind < APPLICATION_READ || kind > APPLICATION_CLOSE || (buffer == nil && length != 0) || (kind == APPLICATION_CLOSE && (buffer != nil || length != 0))) {
         ret false;
     }
+    if (operation.state != 0 && operation.state != OPERATION_DESTROYED) {
+        ret false;
+    }
     operation.token = token;
     operation.kind = kind;
     operation.scope = scope;
@@ -279,6 +303,12 @@ fun action_submission(transport: *Transport, operation: *Operation, action: Acti
         if (action.buffer != nil || action.length != 0) { ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE)); }
         ret close(transport, operation.scope, action.context);
     }
+    if (action.kind == TRANSPORT_SHUTDOWN) {
+        if (action.buffer != nil || action.length != 0) {
+            ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SHUTDOWN));
+        }
+        ret shutdown(transport, operation.scope, action.context);
+    }
     ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SUBMIT));
 }
 
@@ -313,6 +343,9 @@ fun completion_matches(operation: *Operation, completion: *io_runtime.Completion
     if (!token_equals(operation.lower_token, completion.token)) { ret false; }
     if (operation.lower_kind == TRANSPORT_READ) { ret completion.kind == io_runtime.READ; }
     if (operation.lower_kind == TRANSPORT_WRITE) { ret completion.kind == io_runtime.WRITE; }
+    if (operation.lower_kind == TRANSPORT_SHUTDOWN) {
+        ret completion.kind == io_runtime.SHUTDOWN;
+    }
     ret completion.kind == io_runtime.CLOSE || completion.kind == io_runtime.SHUTDOWN;
 }
 
@@ -337,7 +370,7 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
         terminal_locked(operation, map_error(completion.error), false, false);
     } or ((lower_kind == TRANSPORT_READ || lower_kind == TRANSPORT_WRITE) && completion.bytes > lower_length) {
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
-    } or (lower_kind == TRANSPORT_CLOSE) {
+    } or (lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN) {
         terminal_locked(operation, error.OK, false, false);
     }
     mutex.unlock(?operation.lock);
