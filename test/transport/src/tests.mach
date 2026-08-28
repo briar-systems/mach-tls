@@ -16,6 +16,7 @@ use tls.error;
 use tls.record;
 use tls.stream;
 use tls.transport;
+use tls.memory_range;
 use crypto.contracts;
 use std.crypto.ct;
 
@@ -27,6 +28,19 @@ rec TestTransport {
     reads: usize;
     writes: usize;
     closes: usize;
+}
+
+fun test_aliases_state(context: ptr, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    if (len == 0) { ret false; }
+    if (!memory_range.valid(context::*u8, $size_of(TestTransport))) {
+        ret true;
+    }
+    val state: *TestTransport = context::*TestTransport;
+    if (io_runtime.aliases(state.runtime, state::*u8,
+            $size_of(TestTransport))) { ret true; }
+    ret memory_range.overlap(state::*u8, $size_of(TestTransport), data, len) ||
+        io_runtime.aliases(state.runtime, data, len);
 }
 
 fun test_submit(context: ptr, scope: *cancel.Scope, kind: io_runtime.Kind, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
@@ -78,6 +92,7 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     adapter.runtime = runtime;
     adapter.context = state::ptr;
     adapter.context_size = $size_of(TestTransport);
+    adapter.aliases_state = test_aliases_state;
     adapter.submit_read = test_read;
     adapter.submit_write = test_write;
     adapter.submit_shutdown = test_shutdown;

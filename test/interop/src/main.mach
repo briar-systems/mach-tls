@@ -28,10 +28,31 @@ use tls.record;
 use tls.stream;
 use tls.tls13;
 use tls.transport;
+use tls.memory_range;
 
 rec BlockingTransport {
     runtime: *io_runtime.Runtime;
     stream: *tcp.Stream;
+}
+
+fun blocking_aliases_state(context: ptr, data: *u8, len: usize) bool {
+    if (!memory_range.valid(data, len)) { ret true; }
+    if (len == 0) { ret false; }
+    if (!memory_range.valid(context::*u8, $size_of(BlockingTransport))) {
+        ret true;
+    }
+    val state: *BlockingTransport = context::*BlockingTransport;
+    if (!memory_range.valid(state.stream::*u8, $size_of(tcp.Stream)) ||
+        memory_range.overlap(state::*u8, $size_of(BlockingTransport),
+            state.stream::*u8, $size_of(tcp.Stream)) ||
+        io_runtime.aliases(state.runtime, state::*u8,
+            $size_of(BlockingTransport)) ||
+        io_runtime.aliases(state.runtime, state.stream::*u8,
+            $size_of(tcp.Stream))) { ret true; }
+    ret memory_range.overlap(state::*u8, $size_of(BlockingTransport),
+            data, len) ||
+        memory_range.overlap(state.stream::*u8, $size_of(tcp.Stream),
+            data, len) || io_runtime.aliases(state.runtime, data, len);
 }
 
 fun submit(state: *BlockingTransport, scope: *cancel.Scope,
@@ -191,6 +212,7 @@ fun main(argc: i64, argv: **u8) i64 {
         stream: ?socket};
     var lower: transport.Transport = transport.Transport{runtime: ?owner,
         context: (?blocking)::ptr, context_size: $size_of(BlockingTransport),
+        aliases_state: blocking_aliases_state,
         submit_read: blocking_read,
         submit_write: blocking_write, submit_shutdown: blocking_shutdown,
         submit_close: blocking_close, submit_abort: blocking_close};
