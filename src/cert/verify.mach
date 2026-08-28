@@ -172,11 +172,18 @@ fun dns_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
         constraint.data == nil) { ret false; }
     var value_start: usize = 0;
     var value_len: usize = value.len;
+    var constraint_start: usize = 0;
     var constraint_len: usize = constraint.len;
     if (value_len > 0 && value.data[value_len - 1] == '.') { value_len = value_len - 1; }
     if (constraint_len > 0 && constraint.data[constraint_len - 1] == '.') {
         constraint_len = constraint_len - 1;
     }
+    val subdomains_only: bool = constraint_len > 0 && constraint.data[0] == '.';
+    if (subdomains_only) {
+        constraint_start = 1;
+        constraint_len = constraint_len - 1;
+    }
+    if (constraint_len == 0) { ret false; }
     if (value_len > 2 && value.data[0] == '*' && value.data[1] == '.') {
         value_start = 2;
         value_len = value_len - 2;
@@ -186,13 +193,14 @@ fun dns_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
     var i: usize = 0;
     for (i < constraint_len) {
         var first: u8 = value.data[offset + i];
-        var second: u8 = constraint.data[i];
+        var second: u8 = constraint.data[constraint_start + i];
         if (first >= 'A' && first <= 'Z') { first = first + ('a' - 'A'); }
         if (second >= 'A' && second <= 'Z') { second = second + ('a' - 'A'); }
         if (first != second) { ret false; }
         i = i + 1;
     }
-    ret value_len == constraint_len || value.data[offset - 1] == '.';
+    if (value_len == constraint_len) { ret !subdomains_only; }
+    ret offset > value_start && value.data[offset - 1] == '.';
 }
 
 fun ip_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
@@ -486,6 +494,10 @@ test "cert.verify: dns subtrees are label-bound" {
             contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
         !dns_within(contracts.Bytes{data: "*.example.com"::*u8, len: 13},
             contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
+        !dns_within(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+            contracts.Bytes{data: ".example.com"::*u8, len: 12}) ||
+        dns_within(contracts.Bytes{data: "example.com"::*u8, len: 11},
+            contracts.Bytes{data: ".example.com"::*u8, len: 12}) ||
         dns_within(contracts.Bytes{data: "badexample.com"::*u8, len: 14},
             contracts.Bytes{data: "example.com"::*u8, len: 11})) { ret 1; }
     ret 0;

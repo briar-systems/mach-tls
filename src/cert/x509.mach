@@ -735,6 +735,16 @@ fun valid_ia5(value: contracts.Bytes) bool {
     ret true;
 }
 
+fun valid_dns_constraint(value: contracts.Bytes) bool {
+    if (value.len == 0 || value.data == nil) { ret false; }
+    if (value.data[0] != '.') { ret name.valid_reference_dns(value); }
+    if (value.len == 1) { ret false; }
+    ret name.valid_reference_dns(contracts.Bytes{
+        data: ?value.data[1],
+        len: value.len - 1,
+    });
+}
+
 fun valid_oid_content(value: contracts.Bytes) bool {
     if (value.len == 0 || value.data == nil) { ret false; }
     var start: bool = true;
@@ -765,7 +775,7 @@ fun valid_general_name(value: *der.Element, constraints: bool) bool {
         ret valid_ia5(value.content);
     }
     if (value.tag == 0x82) {
-        if (constraints) { ret name.valid_reference_dns(value.content); }
+        if (constraints) { ret valid_dns_constraint(value.content); }
         ret name.valid_presented_dns(value.content);
     }
     if (value.tag == 0xa3) { ret true; }
@@ -1132,6 +1142,26 @@ test "cert.x509: strict utc and generalized time parsing" {
             ?generalized) != contracts.OK || parse_time(?generalized, ?timestamp)) {
         ret 3;
     }
+    ret 0;
+}
+
+test "cert.x509: dns constraints distinguish subdomains" {
+    if (!valid_dns_constraint(contracts.Bytes{
+            data: ".example.com"::*u8,
+            len: 12,
+        }) ||
+        !valid_dns_constraint(contracts.Bytes{
+            data: "example.com"::*u8,
+            len: 11,
+        }) ||
+        valid_dns_constraint(contracts.Bytes{
+            data: "."::*u8,
+            len: 1,
+        }) ||
+        valid_dns_constraint(contracts.Bytes{
+            data: "*.example.com"::*u8,
+            len: 13,
+        })) { ret 1; }
     ret 0;
 }
 
