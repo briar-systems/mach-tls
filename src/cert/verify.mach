@@ -553,3 +553,59 @@ test "cert.verify: construct and validate an ed25519 server path" {
     if (chain(?trust, ?presented, ?options) != error.UNKNOWN_CA) { ret 4; }
     ret 0;
 }
+
+test "cert.verify: enforce constrained intermediate paths" {
+    val root_hex: *u8 = "308201a030820152a00302010202142267bc66531b91dadf304fdec59c264c18c347b5300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74301e170d3236303832383131353235365a170d3336303832353131353235365a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74302a300506032b65700321000de325063608f1f0c6bfb71d0e4262d91bfa490b5077fe75a1619618bb8952f8a3663064301f0603551d230418301680149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d430120603551d130101ff040830060101ff020101300e0603551d0f0101ff040403020106301d0603551d0e041604149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d4300506032b6570034100078ca15fa1f4b60c55b65820eebe354ca8feb43aa41527f122ede1702b2066c2686f8b7109da7dd1496be05421d85addf2ed212f44237b27f1bee6ef4a1b3500"::*u8;
+    val intermediate_hex: *u8 = "308201ea3082019ca0030201020214565d3b85013a07dab2982f008653286b3c20bf43300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74301e170d3236303832383131353235365a170d3238303832373131353235365a3044310b300906035504061302555331133011060355040a0c0a427269617220546573743120301e06035504030c174272696172205465737420496e7465726d656469617465302a300506032b657003210013755291123c4ef7a7a1b670ae6252665b82744352dcb74b8b1a4de63764317fa381a73081a430120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106303e0603551d1e0101ff04343032a01b300d820b6578616d706c652e636f6d300a8708c0000200ffffff00a1133011820f6261642e6578616d706c652e636f6d301d0603551d0e04160414af524845cc1da171c5a89055c9bbbedfab85a42d301f0603551d230418301680149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d4300506032b657003410014af65892f4987e341b4413bf1c7c461c18d25fce4676d670a53c34ec4916168eab9ce7f909fe60359daf628f10c298beb7aa8f2b62a0b5ad06dc50c36035909"::*u8;
+    val leaf_hex: *u8 = "308201ea3082019ca00302010202144a1277e9551691d2e5a62522059fa9542120e0d4300506032b65703044310b300906035504061302555331133011060355040a0c0a427269617220546573743120301e06035504030c174272696172205465737420496e7465726d656469617465301e170d3236303832383131353235365a170d3237303832383131353235365a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b65700321009e92569741727d5f3bb93c07a97a2f5dab4c4602d7db8ed66aa19ee3ebbc13c8a381a73081a4300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301302f0603551d1104283026820f6170692e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d8704c0000201301d0603551d0e0416041469cc98b16d68cc1e111e2bfb47e2485ebbfd8219301f0603551d23041830168014af524845cc1da171c5a89055c9bbbedfab85a42d300506032b657003410039975180668835ac0c31530afbf0da389be222903cf6486dbc2fc1b4f058187478d32f7da01111c291228afa3b39b874b654ff1183f96e588ef81a07500a1306"::*u8;
+    var root_der: [420]u8;
+    var intermediate_der: [494]u8;
+    var leaf_der: [494]u8;
+    if (!decode_hex(root_hex, 840, ?root_der[0], 420) ||
+        !decode_hex(intermediate_hex, 988, ?intermediate_der[0], 494) ||
+        !decode_hex(leaf_hex, 988, ?leaf_der[0], 494)) { ret 1; }
+    var certificates: [2]cert.Certificate = [2]cert.Certificate{
+        cert.Certificate{der: ?leaf_der[0], der_len: 494},
+        cert.Certificate{der: ?intermediate_der[0], der_len: 494},
+    };
+    var anchor: cert.Certificate = cert.Certificate{der: ?root_der[0], der_len: 420};
+    var presented: cert.Chain = cert.Chain{certificates: ?certificates[0], len: 2};
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var options: Options = Options{
+        identity: contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        purpose: SERVER_AUTH,
+        now: 1800000000,
+        max_depth: MAX_CHAIN_DEPTH,
+    };
+    if (chain(?trust, ?presented, ?options) != error.OK) { ret 2; }
+    var parsed_leaf: x509.Certificate;
+    var parsed_intermediate: x509.Certificate;
+    if (x509.parse(contracts.Bytes{data: ?leaf_der[0], len: 494},
+            ?parsed_leaf) != contracts.OK ||
+        x509.parse(contracts.Bytes{data: ?intermediate_der[0], len: 494},
+            ?parsed_intermediate) != contracts.OK ||
+        !parsed_intermediate.extensions.name_constraints_present ||
+        !certificate_names_constrained(?parsed_leaf,
+            parsed_intermediate.extensions.name_constraints)) { ret 3; }
+    var offset: usize = 0;
+    var replaced: bool = false;
+    var occurrence: usize = 0;
+    for (offset + 15 <= 494 && !replaced) {
+        if (leaf_der[offset] == 'a' && leaf_der[offset + 1] == 'p' &&
+            leaf_der[offset + 2] == 'i' && leaf_der[offset + 3] == '.') {
+            occurrence = occurrence + 1;
+            if (occurrence == 2) {
+                leaf_der[offset] = 'b';
+                leaf_der[offset + 1] = 'a';
+                leaf_der[offset + 2] = 'd';
+                replaced = true;
+            }
+        }
+        offset = offset + 1;
+    }
+    if (!replaced || x509.parse(contracts.Bytes{data: ?leaf_der[0], len: 494},
+            ?parsed_leaf) != contracts.OK ||
+        certificate_names_constrained(?parsed_leaf,
+            parsed_intermediate.extensions.name_constraints)) { ret 4; }
+    ret 0;
+}
