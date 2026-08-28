@@ -1,9 +1,6 @@
 # borrowed certificate, key, chain, and trust store contracts
 
-use tls.error;
-use crypto.signature;
 use std.types.size.usize;
-use std.types.string.str;
 
 fwd tls.cert.name;
 fwd tls.cert.x509;
@@ -24,20 +21,10 @@ pub rec Chain {
     len:          usize;
 }
 
-pub rec PrivateKey {
-    format:    KeyFormat;
-    algorithm: signature.Algorithm;
-    der:       *^u8;
-    der_len:   usize;
-}
-
 pub rec TrustStore {
     anchors: *Certificate;
     len:     usize;
 }
-
-# verification covers path building, time, purpose, and server name
-pub def VerifyChainFun: fun(*TrustStore, *Chain, str, u64) error.Error;
 
 test "cert: encoded private key formats are explicit" {
     if (PKCS8_DER == SEC1_DER) { ret 1; }

@@ -162,6 +162,11 @@ fun identity_matches(value: *x509.Certificate,
     ret false;
 }
 
+pub fun server_identity(value: *x509.Certificate,
+    identity: contracts.Bytes) bool {
+    ret identity_matches(value, identity);
+}
+
 fun dns_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
     if (value.len == 0 || constraint.len == 0 || value.data == nil ||
         constraint.data == nil) { ret false; }
