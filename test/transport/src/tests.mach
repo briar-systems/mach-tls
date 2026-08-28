@@ -1,0 +1,164 @@
+# completion transport ownership tests
+
+use std.runtime;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.chrono.time;
+use std.sync.cancel;
+use io_runtime: std.io.runtime;
+use io_error: std.io.error;
+use tls.error;
+use tls.transport;
+
+rec TestTransport {
+    runtime: *io_runtime.Runtime;
+    last_scope: *cancel.Scope;
+    reads: usize;
+    writes: usize;
+    closes: usize;
+}
+
+fun test_submit(context: ptr, scope: *cancel.Scope, kind: io_runtime.Kind, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *TestTransport = context::*TestTransport;
+    val operation: io_runtime.Operation = io_runtime.Operation{kind: kind, resource: 1, buffer: buffer, length: length, offset: 0, context: token_context};
+    ret io_runtime.submit_scoped(state.runtime, scope, operation);
+}
+
+fun test_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *TestTransport = context::*TestTransport;
+    state.last_scope = scope;
+    state.reads = state.reads + 1;
+    ret test_submit(context, scope, io_runtime.READ, buffer, length, token_context);
+}
+
+fun test_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *TestTransport = context::*TestTransport;
+    state.last_scope = scope;
+    state.writes = state.writes + 1;
+    ret test_submit(context, scope, io_runtime.WRITE, buffer, length, token_context);
+}
+
+fun test_close(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *TestTransport = context::*TestTransport;
+    state.last_scope = scope;
+    state.closes = state.closes + 1;
+    ret test_submit(context, scope, io_runtime.CLOSE, nil, 0, token_context);
+}
+
+fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, runtime: *io_runtime.Runtime) {
+    state.runtime = runtime;
+    state.last_scope = nil;
+    state.reads = 0;
+    state.writes = 0;
+    state.closes = 0;
+    adapter.runtime = runtime;
+    adapter.context = state::ptr;
+    adapter.submit_read = test_read;
+    adapter.submit_write = test_write;
+    adapter.submit_close = test_close;
+}
+
+fun take_one(runtime: *io_runtime.Runtime, completion: *io_runtime.Completion) bool {
+    val polled: Result[usize, io_error.Error] = io_runtime.poll(runtime, completion, 1);
+    if (is_err[usize, io_error.Error](polled)) { ret false; }
+    ret unwrap_ok[usize, io_error.Error](polled) == 1;
+}
+
+test "transport: one application write may drive write and read completions" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 8))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, true, time.Time{sec: 999999999, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var application: [8]u8;
+    var wire: [16]u8;
+    val token: transport.Token = transport.Token{index: 4, generation: 7};
+    var operation: transport.Operation;
+    if (!transport.begin(?operation, token, transport.APPLICATION_WRITE, ?scope, ?application[0], 8, 99)) { ret 3; }
+    if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_WRITE, buffer: ?wire[0], length: 16, context: 101})) { ret 4; }
+    val first_lower: io_runtime.Token = operation.lower_token;
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime, first_lower, 5, 0, false))) { ret 5; }
+    var completion: io_runtime.Completion;
+    if (!take_one(?runtime, ?completion) || !transport.accept(?operation, ?completion)) { ret 6; }
+    if (transport.accept(?operation, ?completion)) { ret 7; }
+    val after_write: transport.Snapshot = transport.snapshot(?operation);
+    if (after_write.state != transport.OPERATION_OPEN || after_write.token.index != token.index || after_write.token.generation != token.generation || after_write.last_transport_bytes != 5 || transport_state.last_scope != ?scope) { ret 8; }
+    if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?wire[0], length: 16, context: 102})) { ret 9; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime, operation.lower_token, 9, 0, false))) { ret 10; }
+    if (!take_one(?runtime, ?completion) || !transport.accept(?operation, ?completion)) { ret 11; }
+    if (!transport.advance(?operation, 8) || !transport.finish(?operation, error.OK, false) || transport.finish(?operation, error.OK, false)) { ret 12; }
+    val terminal: transport.Snapshot = transport.snapshot(?operation);
+    if (terminal.state != transport.OPERATION_TERMINAL || terminal.application_bytes != 8 || transport_state.reads != 1 || transport_state.writes != 1) { ret 13; }
+    if (!transport.destroy_operation(?operation) || !cancel.destroy(?scope) || is_err[bool, io_error.Error](io_runtime.close(?runtime)) || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 14; }
+    ret 0;
+}
+
+test "transport: cancellation waits for lower buffer ownership" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 4))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var buffer: [4]u8;
+    var operation: transport.Operation;
+    if (!transport.begin(?operation, transport.Token{index: 1, generation: 1}, transport.APPLICATION_READ, ?scope, ?buffer[0], 4, 0)) { ret 3; }
+    if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?buffer[0], length: 4, context: 0})) { ret 4; }
+    if (transport.finish(?operation, error.CANCELLED, false)) { ret 5; }
+    if (!cancel.cancel(?scope)) { ret 6; }
+    if (transport.snapshot(?operation).state != transport.OPERATION_WAITING || operation.application_buffer != ?buffer[0] || operation.lower_buffer != ?buffer[0]) { ret 7; }
+    var completion: io_runtime.Completion;
+    if (!take_one(?runtime, ?completion) || !transport.accept(?operation, ?completion)) { ret 8; }
+    val terminal: transport.Snapshot = transport.snapshot(?operation);
+    if (terminal.state != transport.OPERATION_TERMINAL || terminal.terminal_error != error.CANCELLED) { ret 9; }
+    if (!transport.destroy_operation(?operation) || operation.application_buffer != nil || operation.lower_buffer != nil || !cancel.destroy(?scope) || is_err[bool, io_error.Error](io_runtime.close(?runtime)) || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 10; }
+    ret 0;
+}
+
+test "transport: eof and close settle once" {
+    var runtime: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?runtime, 8))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter: transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var buffer: [1]u8;
+    var read_operation: transport.Operation;
+    if (!transport.begin(?read_operation, transport.Token{index: 1, generation: 2}, transport.APPLICATION_READ, ?scope, ?buffer[0], 1, 0)) { ret 3; }
+    if (!transport.begin_action(?read_operation, ?adapter, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?buffer[0], length: 1, context: 0})) { ret 4; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime, read_operation.lower_token, 0, 0, true))) { ret 5; }
+    var completion: io_runtime.Completion;
+    if (!take_one(?runtime, ?completion) || !transport.accept(?read_operation, ?completion)) { ret 6; }
+    if (!transport.snapshot(?read_operation).last_end_of_stream || !transport.finish(?read_operation, error.CLOSED, true) || transport.finish(?read_operation, error.CLOSED, true)) { ret 7; }
+    if (!transport.destroy_operation(?read_operation)) { ret 8; }
+    var close_operation: transport.Operation;
+    if (!transport.begin(?close_operation, transport.Token{index: 2, generation: 2}, transport.APPLICATION_CLOSE, ?scope, nil, 0, 0)) { ret 9; }
+    if (!transport.begin_action(?close_operation, ?adapter, transport.Action{kind: transport.TRANSPORT_CLOSE, buffer: nil, length: 0, context: 0})) { ret 10; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime, close_operation.lower_token, 0, 0, false))) { ret 11; }
+    if (!take_one(?runtime, ?completion) || !transport.accept(?close_operation, ?completion)) { ret 12; }
+    if (transport.snapshot(?close_operation).terminal_error != error.OK || transport.finish(?close_operation, error.OK, false)) { ret 13; }
+    if (!transport.destroy_operation(?close_operation) || transport_state.closes != 1 || !cancel.destroy(?scope) || is_err[bool, io_error.Error](io_runtime.close(?runtime)) || is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 14; }
+    ret 0;
+}
+
+test "transport: timeout resolves an idle operation once" {
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 1; }
+    var operation: transport.Operation;
+    if (!transport.begin(?operation, transport.Token{index: 3, generation: 9}, transport.HANDSHAKE, ?scope, nil, 0, 0)) { ret 2; }
+    if (!cancel.timeout(?scope)) { ret 3; }
+    val terminal: transport.Snapshot = transport.snapshot(?operation);
+    if (terminal.state != transport.OPERATION_TERMINAL || terminal.terminal_error != error.TIMEOUT) { ret 4; }
+    if (transport.finish(?operation, error.TIMEOUT, false)) { ret 5; }
+    if (!transport.destroy_operation(?operation) || !cancel.destroy(?scope)) { ret 6; }
+    ret 0;
+}
