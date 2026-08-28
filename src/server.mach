@@ -1813,6 +1813,14 @@ fun build_server_flight(server: *Server) error.Error {
         !queue_secret(server, engine.APPLICATION, engine.SEND,
             SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
     server.output_used = offset;
+    # the peer's transport parameters reach the caller through the event stream,
+    # on the same borrowed-until-complete_event contract the client half uses,
+    # and before HANDSHAKE_COMPLETE so a consumer can gate completion on them.
+    # retain_peer_parameters has already rejected a configured peer that omitted
+    # the extension, so the bytes are present whenever peer_extension is set.
+    if (server.peer_extension != 0 &&
+        !queue_simple(server, engine.PEER_PARAMETERS, engine.HANDSHAKE,
+            0)) { ret error.INTERNAL_ERROR; }
     var disposition: u8 = engine.EARLY_NOT_OFFERED;
     if (server.early_data_offered) { disposition = engine.EARLY_REJECTED; }
     if (!queue_simple(server, engine.EARLY_DATA, engine.HANDSHAKE,
@@ -2827,6 +2835,79 @@ fun exchange(local: *Server, peer: *client.Client) i64 {
     ret 105;
 }
 
+var quic_server_parameters: [64]u8;
+var quic_client_parameters: [64]u8;
+var quic_event_kinds: [64]u8;
+var quic_event_count: usize = 0;
+var quic_seen_parameters: [8]u8;
+var quic_seen_len: usize = 0;
+
+# the same loopback as `exchange`, recording the listener's event sequence and
+# the bytes carried by PEER_PARAMETERS while they are still borrowed
+fun exchange_recording(local: *Server, peer: *client.Client) i64 {
+    var rounds: usize = 0;
+    quic_event_count = 0;
+    quic_seen_len = 0;
+    for (rounds < 64) {
+        var progressed: bool = false;
+        var event: engine.Event;
+        for (next_event(local, ?event)) {
+            progressed = true;
+            if (quic_event_count < 64) {
+                quic_event_kinds[quic_event_count] = event.kind;
+                quic_event_count = quic_event_count + 1;
+            }
+            if (event.kind == engine.PEER_PARAMETERS) {
+                var i: usize = 0;
+                for (i < event.data.len && i < 8) {
+                    quic_seen_parameters[i] = event.data.data[i];
+                    i = i + 1;
+                }
+                quic_seen_len = event.data.len;
+            }
+            if (event.kind == engine.CRYPTO) {
+                val fed: engine.Result = client.ingest(peer, event.level,
+                    event.data.data, event.data.len);
+                if (fed.status == engine.FAILED) { ret 100; }
+            }
+            if (!complete_event(local, event.token, true)) { ret 101; }
+        }
+        var peer_event: engine.Event;
+        for (client.next_event(peer, ?peer_event)) {
+            progressed = true;
+            if (peer_event.kind == engine.CRYPTO) {
+                val fed: engine.Result = ingest(local, peer_event.level,
+                    peer_event.data.data, peer_event.data.len);
+                if (fed.status == engine.FAILED) { ret 102; }
+            }
+            if (!client.complete_event(peer, peer_event.token, true)) { ret 103; }
+        }
+        if (snapshot(local).status == engine.COMPLETE &&
+            client.snapshot(peer).status == engine.COMPLETE) {
+            # drain what the listener queued in the round that completed it,
+            # so the recorded sequence ends at HANDSHAKE_COMPLETE
+            var tail: engine.Event;
+            for (next_event(local, ?tail)) {
+                if (quic_event_count < 64) {
+                    quic_event_kinds[quic_event_count] = tail.kind;
+                    quic_event_count = quic_event_count + 1;
+                }
+                if (!complete_event(local, tail.token, true)) { ret 106; }
+            }
+            ret 0;
+        }
+        if (!progressed) {
+            poll(local);
+            client.poll(peer);
+            if (!pending(local) && !client.snapshot(peer).output_pending) {
+                ret 104;
+            }
+        }
+        rounds = rounds + 1;
+    }
+    ret 105;
+}
+
 test "server: a complete tls 1.3 handshake authenticates the mach client" {
     var owner: secret.Allocator = secret.system_allocator();
     var chain_storage: [1]cert.Certificate;
@@ -2975,6 +3056,148 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     if (credentials.retire_store(?store, ?retired) != contracts.OK ||
         !credentials.reclaimable(retired)) { ret 38; }
     if (keys.destroy_private(?key) != contracts.OK) { ret 39; }
+    ret 0;
+}
+
+test "server: quic transport parameters reach the caller as an event" {
+    var owner: secret.Allocator = secret.system_allocator();
+    var chain_storage: [1]cert.Certificate;
+    var key: keys.PrivateKey;
+    var identity: credentials.Identity;
+    if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
+        ret 1;
+    }
+    var generation: credentials.Generation = credentials.empty_generation();
+    if (credentials.initialize(?generation, ?identity, 1, 0, nil,
+            false) != contracts.OK) { ret 2; }
+    var store: credentials.Store = credentials.empty_store();
+    if (credentials.initialize_store(?store, ?generation) != contracts.OK) {
+        ret 3;
+    }
+
+    var server_counter: u8 = 3;
+    var server_entropy: secret.Entropy = secret.Entropy{
+        context: ?server_counter, secret_context: nil, fill_fn: test_entropy,
+        initialized: true};
+    var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: "h3"::*u8, len: 2}};
+    var versions: [1]u16 = [1]u16{tls13.VERSION};
+    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256};
+    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+    var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
+        tls13.ED25519};
+    var listener: config.ServerConfig;
+    listener.credentials = ?store;
+    listener.alpn = ?protocols[0];
+    listener.alpn_len = 1;
+    listener.require_alpn = true;
+    listener.versions = ?versions[0];
+    listener.version_len = 1;
+    listener.suites = ?suites[0];
+    listener.suite_len = 1;
+    listener.groups = ?groups[0];
+    listener.group_len = 1;
+    listener.signatures = ?signatures[0];
+    listener.signature_len = 1;
+    listener.entropy = ?server_entropy;
+    listener.entropy_context_size = 1;
+    listener.limits = config.production_limits();
+    listener.limits.max_peer_handshake_bytes = 8192;
+    listener.limits.max_client_hello_bytes = 8192;
+    listener.limits.max_chain_bytes = 4096;
+    listener.limits.max_server_flight_bytes = 8192;
+
+    var server_storage: Storage = Storage{
+        input: ?loopback_server_input[0], input_capacity: 8192,
+        output: ?loopback_server_output[0], output_capacity: 8192,
+        hello: ?loopback_server_hello[0], hello_capacity: 8192,
+        certificates: ?loopback_server_certificates[0], certificate_capacity: 4,
+        peer_parameters: ?quic_server_parameters[0],
+        peer_parameters_capacity: 64};
+    # what the listener sends; the client reads this as its own peer parameters
+    var server_transport: [4]u8 = [4]u8{0x51, 0x52, 0x53, 0x54};
+    var extra: ExtraExtension;
+    extra.kind = QUIC_TRANSPORT_PARAMETERS;
+    extra.data.data = ?server_transport[0];
+    extra.data.len = 4;
+    var listener_engine: Server;
+    if (!init(?listener_engine, ?listener, server_storage, extra,
+            QUIC_TRANSPORT_PARAMETERS) ||
+        start(?listener_engine, 1800000000).status != engine.OK) { ret 4; }
+
+    var anchor: cert.Certificate = cert.Certificate{der: ?loopback_root[0],
+        der_len: 341};
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var client_counter: u8 = 91;
+    var client_entropy: secret.Entropy = secret.Entropy{
+        context: ?client_counter, secret_context: nil, fill_fn: test_entropy,
+        initialized: true};
+    var dialer: config.ClientConfig;
+    dialer.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+    dialer.alpn = ?protocols[0];
+    dialer.alpn_len = 1;
+    dialer.trust = ?trust;
+    dialer.versions = ?versions[0];
+    dialer.version_len = 1;
+    dialer.suites = ?suites[0];
+    dialer.suite_len = 1;
+    dialer.groups = ?groups[0];
+    dialer.group_len = 1;
+    dialer.signatures = ?signatures[0];
+    dialer.signature_len = 1;
+    dialer.client_identity = nil;
+    dialer.entropy = ?client_entropy;
+    dialer.entropy_context_size = 1;
+    dialer.limits = config.production_limits();
+    dialer.limits.max_peer_handshake_bytes = 8192;
+    var client_storage: client.Storage = client.Storage{
+        input: ?loopback_client_input[0], input_capacity: 8192,
+        output: ?loopback_client_output[0], output_capacity: 8192,
+        hello: ?loopback_client_hello[0], hello_capacity: 8192,
+        certificates: ?loopback_client_certificates[0], certificate_capacity: 4,
+        peer_parameters: ?quic_client_parameters[0],
+        peer_parameters_capacity: 64};
+    # what the client sends; the listener must surface exactly these bytes
+    var client_transport: [4]u8 = [4]u8{0x11, 0x22, 0x33, 0x44};
+    var client_extra: client.ExtraExtension;
+    client_extra.kind = client.QUIC_TRANSPORT_PARAMETERS;
+    client_extra.data.data = ?client_transport[0];
+    client_extra.data.len = 4;
+    var dialer_engine: client.Client;
+    if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra,
+            client.QUIC_TRANSPORT_PARAMETERS) ||
+        client.start(?dialer_engine, 1800000000).status != engine.OK) { ret 5; }
+
+    val exchanged: i64 = exchange_recording(?listener_engine, ?dialer_engine);
+    if (exchanged != 0) { ret 10 + exchanged::i32; }
+
+    # the event was delivered, carrying the peer's exact bytes while borrowed
+    if (quic_seen_len != 4) { ret 6; }
+    if (quic_seen_parameters[0] != 0x11 || quic_seen_parameters[1] != 0x22 ||
+        quic_seen_parameters[2] != 0x33 ||
+        quic_seen_parameters[3] != 0x44) { ret 7; }
+
+    # and it arrived before completion, so a consumer may gate on it
+    var parameters_at: usize = 64;
+    var complete_at: usize = 64;
+    var i: usize = 0;
+    for (i < quic_event_count) {
+        if (quic_event_kinds[i] == engine.PEER_PARAMETERS &&
+            parameters_at == 64) { parameters_at = i; }
+        if (quic_event_kinds[i] == engine.HANDSHAKE_COMPLETE &&
+            complete_at == 64) { complete_at = i; }
+        i = i + 1;
+    }
+    if (parameters_at == 64 || complete_at == 64) { ret 8; }
+    if (parameters_at >= complete_at) { ret 9; }
+
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) {
+        ret 40;
+    }
+    var retired: *credentials.Generation = nil;
+    if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 41; }
+    if (keys.destroy_private(?key) != contracts.OK) { ret 42; }
     ret 0;
 }
 
