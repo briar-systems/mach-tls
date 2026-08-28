@@ -59,6 +59,8 @@ pub val EARLY_ACCEPTED: u8 = 2;
 pub val EARLY_REJECTED: u8 = 3;
 pub val AUTHENTICATED: u8 = 1;
 pub val AUTHENTICATION_FAILED: u8 = 2;
+pub val RESTART_RETRY: u8 = 1;
+pub val RESTART_VERSION_NEGOTIATION: u8 = 2;
 
 pub val MAX_KEY_SHARE: usize = 65;
 pub val MAX_PUBLIC_KEY: usize = 512;
@@ -614,6 +616,23 @@ pub fun start(client: *Client, verification_time: i64) Result {
     }
     val failure: error.Error = build_client_hello(client, false);
     if (failure != error.OK) { ret fail(client, failure, record.INTERNAL_ERROR_ALERT); }
+    ret result(OK, error.OK, 0, client.output_len);
+}
+
+pub fun restart(client: *Client, reason: u8) Result {
+    if (client == nil || client.config == nil || client.state != EXPECT_SERVER_HELLO ||
+        client.server_hello_seen || client.event_active || client.hello_len == 0 ||
+        (reason != RESTART_RETRY && reason != RESTART_VERSION_NEGOTIATION)) {
+        ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    client.input_len = 0;
+    client.input_read = 0;
+    if (!client.output_pending) {
+        copy_bytes(client.storage.output, client.storage.hello, client.hello_len);
+        client.output_len = client.hello_len;
+        client.output_level = INITIAL;
+        client.output_pending = true;
+    }
     ret result(OK, error.OK, 0, client.output_len);
 }
 
@@ -1698,6 +1717,16 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
         destroy(?value)) { ret 3; }
     val hello_token: u64 = value.active_event.token;
     if (!complete_event(?value, hello_token, true)) { ret 4; }
+    if (restart(?value, RESTART_VERSION_NEGOTIATION).status != OK ||
+        !next_event(?value, ?event) || event.kind != CRYPTO ||
+        event.level != INITIAL || !bytes_equal(event.data,
+            contracts.Bytes{data: value.storage.hello, len: value.hello_len}) ||
+        !complete_event(?value, event.token, true) ||
+        restart(?value, RESTART_RETRY).status != OK ||
+        !next_event(?value, ?event) || event.kind != CRYPTO ||
+        !bytes_equal(event.data,
+            contracts.Bytes{data: value.storage.hello, len: value.hello_len}) ||
+        !complete_event(?value, event.token, true)) { ret 39; }
 
     var retry_extensions: [12]u8 = [12]u8{
         0, 43, 0, 2, 3, 4,

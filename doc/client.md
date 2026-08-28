@@ -100,6 +100,8 @@ A QUIC connection adapter can implement its handshake protocol directly over
 - CRYPTO ingress calls `ingest` at the matching level.
 - CRYPTO egress retains the event until all bytes are accepted by the QUIC
   crypto-stream owner.
+- QUIC Retry and version negotiation call `restart`, which republishes the exact
+  retained ClientHello at Initial offset zero without regenerating TLS state.
 - traffic-secret events install packet and header protection for the indicated
   level and direction before acknowledgement.
 - peer transport parameters use `ExtraExtension` and `PEER_PARAMETERS`.
