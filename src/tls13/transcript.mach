@@ -1,0 +1,423 @@
+# tls 1.3 transcript lifecycle and hello retry rewrite
+
+use crypto.contracts;
+use crypto.hash;
+use tls.error;
+use tls.handshake;
+use tls.handshake.codec;
+use tls.tls13;
+use tls.tls13.key_schedule;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub def State: u8;
+
+pub val EMPTY:     State = 0;
+pub val ACTIVE:    State = 1;
+pub val FINALIZED: State = 2;
+pub val DESTROYED: State = 3;
+
+pub val SHA256_MAX_BYTES: u64 = 0x1fffffffffffffff;
+
+pub rec Transcript {
+    sha256:     hash.Sha256;
+    sha384:     hash.Sha384;
+    algorithm:  key_schedule.HashAlgorithm;
+    state:      State;
+    total:      u64;
+    retry_used: bool;
+    frame_count: usize;
+    first_type: handshake.MessageType;
+    last_type:  handshake.MessageType;
+    unframed:   bool;
+}
+
+fun mapped(failure: contracts.Error) error.Error {
+    if (failure == contracts.OK) { ret error.OK; }
+    if (failure == contracts.OUTPUT_TOO_SMALL) { ret error.RESOURCE_LIMIT; }
+    if (failure == contracts.INVALID_INPUT || failure == contracts.INVALID_STATE) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    ret error.INTERNAL_ERROR;
+}
+
+fun mapped_operation(operation: contracts.Operation) error.Error {
+    ret mapped(operation.error);
+}
+
+pub fun empty() Transcript {
+    ret Transcript{
+        sha256: hash.empty_sha256(),
+        sha384: hash.empty_sha384(),
+        algorithm: 0,
+        state: EMPTY,
+        total: 0,
+        retry_used: false,
+        frame_count: 0,
+        first_type: 0,
+        last_type: 0,
+        unframed: false,
+    };
+}
+
+pub fun digest_size(value: *Transcript) usize {
+    if (value == nil) { ret 0; }
+    ret key_schedule.hash_size(value.algorithm);
+}
+
+fun reset_context(value: *Transcript) error.Error {
+    var failure: contracts.Error;
+    if (value.algorithm == key_schedule.SHA256) {
+        failure = hash.destroy_sha256(?value.sha256);
+        if (failure == contracts.OK) { failure = hash.init_sha256(?value.sha256); }
+    } or (value.algorithm == key_schedule.SHA384) {
+        failure = hash.destroy_sha384(?value.sha384);
+        if (failure == contracts.OK) { failure = hash.init_sha384(?value.sha384); }
+    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    if (failure != contracts.OK) { ret mapped(failure); }
+    value.total = 0;
+    ret error.OK;
+}
+
+pub fun init(value: *Transcript,
+    algorithm: key_schedule.HashAlgorithm) error.Error {
+    if (value == nil || (value.state != EMPTY && value.state != DESTROYED)) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    if (key_schedule.hash_size(algorithm) == 0) { ret error.UNSUPPORTED_ALGORITHM; }
+    hash.destroy_sha256(?value.sha256);
+    hash.destroy_sha384(?value.sha384);
+    value.algorithm = algorithm;
+    value.total = 0;
+    value.retry_used = false;
+    value.frame_count = 0;
+    value.first_type = 0;
+    value.last_type = 0;
+    value.unframed = false;
+    val failure: error.Error = reset_context(value);
+    if (failure != error.OK) {
+        value.algorithm = 0;
+        value.state = DESTROYED;
+        ret failure;
+    }
+    value.state = ACTIVE;
+    ret error.OK;
+}
+
+pub fun init_for_suite(value: *Transcript,
+    suite: tls13.CipherSuite) error.Error {
+    ret init(value, key_schedule.algorithm_for_suite(suite));
+}
+
+fun append(value: *Transcript, input: contracts.Bytes) error.Error {
+    if (value == nil || value.state != ACTIVE
+        || (input.len != 0 && input.data == nil)) { ret error.ILLEGAL_PARAMETER; }
+    val amount: u64 = input.len::u64;
+    if ((value.algorithm == key_schedule.SHA256
+            && amount > SHA256_MAX_BYTES - value.total)
+        || (value.algorithm == key_schedule.SHA384
+            && amount > 0xffffffffffffffff - value.total)) {
+        ret error.RESOURCE_LIMIT;
+    }
+    var failure: contracts.Error;
+    if (value.algorithm == key_schedule.SHA256) {
+        failure = hash.update_sha256(?value.sha256, input);
+    } or (value.algorithm == key_schedule.SHA384) {
+        failure = hash.update_sha384(?value.sha384, input);
+    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    if (failure != contracts.OK) { ret mapped(failure); }
+    value.total = value.total + amount;
+    ret error.OK;
+}
+
+pub fun update(value: *Transcript, input: contracts.Bytes) error.Error {
+    val failure: error.Error = append(value, input);
+    if (failure == error.OK && input.len != 0) { value.unframed = true; }
+    ret failure;
+}
+
+pub fun update_frame(value: *Transcript, encoded: contracts.Bytes) error.Error {
+    if (encoded.data == nil || encoded.len < handshake.HEADER_SIZE) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    var message: handshake.Message;
+    val parsed: handshake.Progress = handshake.parse(encoded.data, encoded.len,
+        handshake.MAX_BODY_SIZE, ?message);
+    if (parsed.status != handshake.COMPLETE || parsed.consumed != encoded.len) {
+        if (parsed.error != error.OK) { ret parsed.error; }
+        ret error.DECODE_ERROR;
+    }
+    val failure: error.Error = append(value, encoded);
+    if (failure != error.OK) { ret failure; }
+    if (value.frame_count == 0) { value.first_type = message.header.message_type; }
+    value.frame_count = value.frame_count + 1;
+    value.last_type = message.header.message_type;
+    ret error.OK;
+}
+
+# use a dedicated transcript so the complete client hello can advance the main transcript
+pub fun update_binder_client_hello(value: *Transcript, encoded: contracts.Bytes,
+    after_retry: bool) error.Error {
+    var prefix: contracts.Bytes;
+    val failure: error.Error = codec.client_hello_binder_prefix(encoded,
+        after_retry, ?prefix);
+    if (failure != error.OK) { ret failure; }
+    ret update(value, prefix);
+}
+
+pub fun snapshot(value: *Transcript, output: contracts.Buffer) error.Error {
+    if (value == nil || value.state != ACTIVE) { ret error.ILLEGAL_PARAMETER; }
+    var operation: contracts.Operation;
+    if (value.algorithm == key_schedule.SHA256) {
+        operation = hash.snapshot_sha256(?value.sha256, output);
+    } or (value.algorithm == key_schedule.SHA384) {
+        operation = hash.snapshot_sha384(?value.sha384, output);
+    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    ret mapped_operation(operation);
+}
+
+pub fun final(value: *Transcript, output: contracts.Buffer) error.Error {
+    if (value == nil || value.state != ACTIVE) { ret error.ILLEGAL_PARAMETER; }
+    var operation: contracts.Operation;
+    if (value.algorithm == key_schedule.SHA256) {
+        operation = hash.final_sha256(?value.sha256, output);
+    } or (value.algorithm == key_schedule.SHA384) {
+        operation = hash.final_sha384(?value.sha384, output);
+    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    val failure: error.Error = mapped_operation(operation);
+    if (failure == error.OK) { value.state = FINALIZED; }
+    ret failure;
+}
+
+pub fun rewrite_for_retry(value: *Transcript,
+    hello_retry_request: contracts.Bytes) error.Error {
+    if (value == nil || value.state != ACTIVE || value.retry_used || value.unframed
+        || value.frame_count != 1 || value.first_type != handshake.CLIENT_HELLO
+        || hello_retry_request.data == nil
+        || hello_retry_request.len < handshake.HEADER_SIZE) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    var message: handshake.Message;
+    val parsed: handshake.Progress = handshake.parse(hello_retry_request.data,
+        hello_retry_request.len, handshake.MAX_BODY_SIZE, ?message);
+    if (parsed.status != handshake.COMPLETE || parsed.consumed != hello_retry_request.len) {
+        if (parsed.error != error.OK) { ret parsed.error; }
+        ret error.DECODE_ERROR;
+    }
+    var server: codec.ServerHello;
+    val decoded: error.Error = codec.decode_server_hello(?message, ?server);
+    if (decoded != error.OK) { ret decoded; }
+    if (!server.retry) { ret error.ILLEGAL_PARAMETER; }
+
+    var prior: [48]u8;
+    val size: usize = digest_size(value);
+    var failure: error.Error = snapshot(value,
+        contracts.Buffer{data: ?prior[0], capacity: size});
+    if (failure != error.OK) { ret failure; }
+    var synthetic: [52]u8;
+    val encoded_hash: handshake.Progress = codec.encode_message_hash(
+        contracts.Bytes{data: ?prior[0], len: size},
+        contracts.Buffer{data: ?synthetic[0], capacity: 52});
+    if (encoded_hash.status != handshake.COMPLETE) { ret error.INTERNAL_ERROR; }
+    failure = reset_context(value);
+    if (failure == error.OK) {
+        failure = append(value,
+            contracts.Bytes{data: ?synthetic[0], len: encoded_hash.produced});
+    }
+    if (failure == error.OK) { failure = append(value, hello_retry_request); }
+    var i: usize = 0;
+    for (i < 48) { prior[i] = 0; i = i + 1; }
+    for (i < 52) { synthetic[i] = 0; i = i + 1; }
+    if (failure != error.OK) {
+        hash.destroy_sha256(?value.sha256);
+        hash.destroy_sha384(?value.sha384);
+        value.algorithm = 0;
+        value.state = DESTROYED;
+        value.total = 0;
+        value.retry_used = false;
+        value.frame_count = 0;
+        value.first_type = 0;
+        value.last_type = 0;
+        value.unframed = false;
+        ret failure;
+    }
+    value.retry_used = true;
+    value.frame_count = 2;
+    value.first_type = handshake.MESSAGE_HASH;
+    value.last_type = handshake.SERVER_HELLO;
+    value.unframed = false;
+    ret error.OK;
+}
+
+pub fun destroy(value: *Transcript) {
+    if (value == nil) { ret; }
+    hash.destroy_sha256(?value.sha256);
+    hash.destroy_sha384(?value.sha384);
+    value.algorithm = 0;
+    value.state = DESTROYED;
+    value.total = 0;
+    value.retry_used = false;
+    value.frame_count = 0;
+    value.first_type = 0;
+    value.last_type = 0;
+    value.unframed = false;
+}
+
+fun bytes_match(actual: *u8, expected: *u8, length: usize) bool {
+    if (actual == nil || expected == nil) { ret false; }
+    var i: usize = 0;
+    for (i < length) {
+        if (actual[i] != expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "transcript: fragmented snapshots and consuming finals are exact" {
+    var value: Transcript = empty();
+    if (init_for_suite(?value, tls13.AES_128_GCM_SHA256) != error.OK) { ret 1; }
+    if (update(?value, contracts.Bytes{data: "a"::*u8, len: 1}) != error.OK
+        || update(?value, contracts.Bytes{data: "bc"::*u8, len: 2}) != error.OK) { ret 2; }
+    var output: [48]u8;
+    var expected256: [32]u8 = [32]u8{
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad,
+    };
+    if (snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 32}) != error.OK
+        || !bytes_match(?output[0], ?expected256[0], 32)
+        || value.state != ACTIVE || value.total != 3) { ret 3; }
+    if (final(?value, contracts.Buffer{data: ?output[0], capacity: 32}) != error.OK
+        || !bytes_match(?output[0], ?expected256[0], 32)
+        || value.state != FINALIZED
+        || update(?value, contracts.Bytes{data: nil, len: 0}) != error.ILLEGAL_PARAMETER) {
+        ret 4;
+    }
+    destroy(?value);
+    if (init(?value, key_schedule.SHA384) != error.OK
+        || update(?value, contracts.Bytes{data: "abc"::*u8, len: 3}) != error.OK) { ret 5; }
+    var expected384: [48]u8 = [48]u8{
+        0xcb, 0x00, 0x75, 0x3f, 0x45, 0xa3, 0x5e, 0x8b,
+        0xb5, 0xa0, 0x3d, 0x69, 0x9a, 0xc6, 0x50, 0x07,
+        0x27, 0x2c, 0x32, 0xab, 0x0e, 0xde, 0xd1, 0x63,
+        0x1a, 0x8b, 0x60, 0x5a, 0x43, 0xff, 0x5b, 0xed,
+        0x80, 0x86, 0x07, 0x2b, 0xa1, 0xe7, 0xcc, 0x23,
+        0x58, 0xba, 0xec, 0xa1, 0x34, 0xc8, 0x25, 0xa7,
+    };
+    if (snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 47})
+            != error.RESOURCE_LIMIT
+        || snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 48}) != error.OK
+        || !bytes_match(?output[0], ?expected384[0], 48)) { ret 6; }
+    destroy(?value);
+    ret 0;
+}
+
+test "transcript: complete frames reject truncation and trailing bytes" {
+    var body: [3]u8 = [3]u8{1, 2, 3};
+    var wire: [8]u8;
+    val encoded: handshake.Progress = handshake.serialize(handshake.CERTIFICATE_VERIFY,
+        contracts.Bytes{data: ?body[0], len: 3},
+        contracts.Buffer{data: ?wire[0], capacity: 8});
+    var value: Transcript = empty();
+    if (init(?value, key_schedule.SHA256) != error.OK) { ret 1; }
+    var i: usize = 0;
+    for (i < encoded.produced) {
+        if (update_frame(?value, contracts.Bytes{data: ?wire[0], len: i})
+            == error.OK) { ret 2; }
+        if (value.total != 0) { ret 3; }
+        i = i + 1;
+    }
+    wire[encoded.produced] = 0;
+    if (update_frame(?value,
+        contracts.Bytes{data: ?wire[0], len: encoded.produced + 1}) != error.DECODE_ERROR
+        || value.total != 0) { ret 4; }
+    if (update_frame(?value,
+        contracts.Bytes{data: ?wire[0], len: encoded.produced}) != error.OK
+        || value.total != encoded.produced::u64) { ret 5; }
+    destroy(?value);
+    ret 0;
+}
+
+test "transcript: rfc 8448 hello retry rewrite is exact and single-use" {
+    var client_hello: [180]u8 = [180]u8{
+        0x01, 0x00, 0x00, 0xb0, 0x03, 0x03, 0xb0, 0xb1,
+        0xc5, 0xa5, 0xaa, 0x37, 0xc5, 0x91, 0x9f, 0x2e,
+        0xd1, 0xd5, 0xc6, 0xff, 0xf7, 0xfc, 0xb7, 0x84,
+        0x97, 0x16, 0x94, 0x5a, 0x2b, 0x8c, 0xee, 0x92,
+        0x58, 0xa3, 0x46, 0x67, 0x7b, 0x6f, 0x00, 0x00,
+        0x06, 0x13, 0x01, 0x13, 0x03, 0x13, 0x02, 0x01,
+        0x00, 0x00, 0x81, 0x00, 0x00, 0x00, 0x0b, 0x00,
+        0x09, 0x00, 0x00, 0x06, 0x73, 0x65, 0x72, 0x76,
+        0x65, 0x72, 0xff, 0x01, 0x00, 0x01, 0x00, 0x00,
+        0x0a, 0x00, 0x08, 0x00, 0x06, 0x00, 0x1d, 0x00,
+        0x17, 0x00, 0x18, 0x00, 0x33, 0x00, 0x26, 0x00,
+        0x24, 0x00, 0x1d, 0x00, 0x20, 0xe8, 0xe8, 0xe3,
+        0xf3, 0xb9, 0x3a, 0x25, 0xed, 0x97, 0xa1, 0x4a,
+        0x7d, 0xca, 0xcb, 0x8a, 0x27, 0x2c, 0x62, 0x88,
+        0xe5, 0x85, 0xc6, 0x48, 0x4d, 0x05, 0x26, 0x2f,
+        0xca, 0xd0, 0x62, 0xad, 0x1f, 0x00, 0x2b, 0x00,
+        0x03, 0x02, 0x03, 0x04, 0x00, 0x0d, 0x00, 0x20,
+        0x00, 0x1e, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03,
+        0x02, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06,
+        0x04, 0x01, 0x05, 0x01, 0x06, 0x01, 0x02, 0x01,
+        0x04, 0x02, 0x05, 0x02, 0x06, 0x02, 0x02, 0x02,
+        0x00, 0x2d, 0x00, 0x02, 0x01, 0x01, 0x00, 0x1c,
+        0x00, 0x02, 0x40, 0x01,
+    };
+    var retry: [176]u8 = [176]u8{
+        0x02, 0x00, 0x00, 0xac, 0x03, 0x03, 0xcf, 0x21,
+        0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d,
+        0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91, 0xc2, 0xa2,
+        0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e,
+        0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c, 0x00, 0x13,
+        0x01, 0x00, 0x00, 0x84, 0x00, 0x33, 0x00, 0x02,
+        0x00, 0x17, 0x00, 0x2c, 0x00, 0x74, 0x00, 0x72,
+        0x71, 0xdc, 0xd0, 0x4b, 0xb8, 0x8b, 0xc3, 0x18,
+        0x91, 0x19, 0x39, 0x8a, 0x00, 0x00, 0x00, 0x00,
+        0xee, 0xfa, 0xfc, 0x76, 0xc1, 0x46, 0xb8, 0x23,
+        0xb0, 0x96, 0xf8, 0xaa, 0xca, 0xd3, 0x65, 0xdd,
+        0x00, 0x30, 0x95, 0x3f, 0x4e, 0xdf, 0x62, 0x56,
+        0x36, 0xe5, 0xf2, 0x1b, 0xb2, 0xe2, 0x3f, 0xcc,
+        0x65, 0x4b, 0x1b, 0x5b, 0x40, 0x31, 0x8d, 0x10,
+        0xd1, 0x37, 0xab, 0xcb, 0xb8, 0x75, 0x74, 0xe3,
+        0x6e, 0x8a, 0x1f, 0x02, 0x5f, 0x7d, 0xfa, 0x5d,
+        0x6e, 0x50, 0x78, 0x1b, 0x5e, 0xda, 0x4a, 0xa1,
+        0x5b, 0x0c, 0x8b, 0xe7, 0x78, 0x25, 0x7d, 0x16,
+        0xaa, 0x30, 0x30, 0xe9, 0xe7, 0x84, 0x1d, 0xd9,
+        0xe4, 0xc0, 0x34, 0x22, 0x67, 0xe8, 0xca, 0x0c,
+        0xaf, 0x57, 0x1f, 0xb2, 0xb7, 0xcf, 0xf0, 0xf9,
+        0x34, 0xb0, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04,
+    };
+    var expected: [32]u8 = [32]u8{
+        0x74, 0xee, 0xc0, 0x4d, 0x09, 0xc9, 0x26, 0xe8,
+        0x6c, 0x06, 0x47, 0xc3, 0x7b, 0xa4, 0xdc, 0x18,
+        0xd2, 0x77, 0xee, 0xc3, 0x33, 0x7e, 0x46, 0x08,
+        0xc4, 0xd8, 0x29, 0xb7, 0x7e, 0x2f, 0xd2, 0xb3,
+    };
+    var value: Transcript = empty();
+    if (init(?value, key_schedule.SHA256) != error.OK
+        || update_frame(?value,
+            contracts.Bytes{data: ?client_hello[0], len: 180}) != error.OK
+        || rewrite_for_retry(?value,
+            contracts.Bytes{data: ?retry[0], len: 176}) != error.OK) { ret 1; }
+    var output: [32]u8;
+    if (snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 32}) != error.OK
+        || !bytes_match(?output[0], ?expected[0], 32)
+        || value.total != 212 || !value.retry_used) { ret 2; }
+    if (rewrite_for_retry(?value,
+        contracts.Bytes{data: ?retry[0], len: 176}) != error.ILLEGAL_PARAMETER) { ret 3; }
+    retry[6] = 0;
+    var untouched: Transcript = empty();
+    if (init(?untouched, key_schedule.SHA256) != error.OK
+        || update_frame(?untouched,
+            contracts.Bytes{data: ?client_hello[0], len: 180}) != error.OK) { ret 4; }
+    if (rewrite_for_retry(?untouched,
+            contracts.Bytes{data: ?retry[0], len: 176}) == error.OK
+        || untouched.total != 180 || untouched.retry_used) { ret 5; }
+    destroy(?untouched);
+    destroy(?value);
+    ret 0;
+}
