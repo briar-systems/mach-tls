@@ -190,7 +190,8 @@ fun main(argc: i64, argv: **u8) i64 {
     var blocking: BlockingTransport = BlockingTransport{runtime: ?owner,
         stream: ?socket};
     var lower: transport.Transport = transport.Transport{runtime: ?owner,
-        context: (?blocking)::ptr, submit_read: blocking_read,
+        context: (?blocking)::ptr, context_size: $size_of(BlockingTransport),
+        submit_read: blocking_read,
         submit_write: blocking_write, submit_shutdown: blocking_shutdown,
         submit_close: blocking_close, submit_abort: blocking_close};
 
@@ -223,7 +224,8 @@ fun main(argc: i64, argv: **u8) i64 {
         server_name: contracts.Bytes{data: nil, len: 0}, chain: client_chain,
         private_key: ?client_key};
     var configuration: config.ClientConfig;
-    configuration.server_name = "api.example.com";
+    configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
     configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
     configuration.trust = ?trust;
     configuration.versions = ?versions[0]; configuration.version_len = 1;
@@ -241,9 +243,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var certificates: [8]cert.Certificate;
     var wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
     var wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-    var plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
-    var content: [record.MAX_PLAINTEXT]^u8;
-    var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+    var secret_storage: [stream.SECRET_STORAGE_BYTES]^u8;
     var storage: stream.Storage;
     storage.handshake = client.Storage{input: ?handshake_input[0],
         input_capacity: 65536, output: ?handshake_output[0],
@@ -253,12 +253,8 @@ fun main(argc: i64, argv: **u8) i64 {
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.plaintext = ?plaintext[0];
-    storage.plaintext_capacity = record.MAX_INNER_PLAINTEXT;
-    storage.content = ?content[0];
-    storage.content_capacity = record.MAX_PLAINTEXT;
-    storage.scratch = ?scratch[0];
-    storage.scratch_capacity = record.MAX_INNER_PLAINTEXT;
+    storage.secret = ?secret_storage[0];
+    storage.secret_capacity = stream.SECRET_STORAGE_BYTES;
 
     var scope: cancel.Scope;
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }

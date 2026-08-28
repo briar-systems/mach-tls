@@ -7,12 +7,18 @@ first layer directly and does not make either package depend on the other.
 
 ## Configuration and bounds
 
-`config.ClientConfig` borrows all configuration for the lifetime of the client.
-It requires one TLS 1.3 version, one to three supported cipher suites, one or two
-supported groups, one to four supported signature schemes, at least one ALPN
-name, a bounded trust store, an operating-system or application entropy source,
-and explicit finite limits. SNI is required and is always authenticated against
-the leaf certificate subject alternative name.
+`client.init` snapshots the `config.ClientConfig`, entropy, trust-store, and
+optional identity descriptors. The arrays, certificate encodings, private key,
+ALPN bytes, and extension bytes reached through those descriptors remain
+immutable caller-owned borrows for the lifetime of the client. Mutation of an
+outer descriptor after initialization cannot redirect a live handshake. The
+server name is an explicit bounded byte view, so validation and SNI encoding do
+not depend on a terminator scan. The configuration requires one TLS 1.3 version,
+one to three supported cipher
+suites, one or two supported groups, one to four supported signature schemes,
+at least one ALPN name, a bounded trust store, an operating-system or
+application entropy source, and explicit finite limits. SNI is required and is
+always authenticated against the leaf certificate subject alternative name.
 
 An optional client identity is validated against its private key during
 initialization. Its chain and key remain caller-owned until the client is
@@ -22,8 +28,11 @@ Certificate, CertificateVerify, and Finished under one exact transcript.
 
 `client.Storage` holds all variable-size handshake state. The input, output,
 ClientHello retention, parsed certificate array, and optional peer-extension
-retention buffers are caller-owned. Every capacity is validated before any
-handshake state is published. A single handshake message can use at most
+retention buffers are caller-owned. Every range must be representable and every
+mutable region must be disjoint. Configuration and extension input cannot
+overlap those regions. Every pointer range and array product is validated before
+the first nested descriptor is traversed or handshake state is published. A
+single handshake message can use at most
 `limits.max_handshake_bytes`. Consumed prefixes are compacted so the bound does
 not accidentally apply to the cumulative lifetime of a connection.
 
@@ -114,13 +123,24 @@ the only ownership acknowledgement between the two layers.
 
 ## Secure stream operations
 
-`tls.stream` borrows a valid `tls.transport.Transport` and caller-owned
-`stream.Storage`. `connect` combines initialization and handshake. Separate
+`tls.stream` snapshots a valid `tls.transport.Transport` descriptor and retains
+its bounded callback context. The descriptor, runtime, context, application
+buffers, scopes, completions, and TLS storage are rejected when their public
+ranges overlap. Its caller-owned `stream.Storage` has disjoint public
+handshake and wire regions plus one secret-welded arena of exactly partitioned
+plaintext, content, and AEAD scratch regions. One arena makes secret subrange
+aliasing unrepresentable without exposing secret storage through a public
+address. `connect` combines initialization and handshake. Separate
 `handshake`, `read`, `write`, `alert`, `half_close`, and `close` operations are
 also available. Every operation retains its application token, cancellation
 scope, deadline, and application buffer through terminal resolution. The caller
 must inspect the terminal snapshot and call `destroy_operation` before starting
-the next operation.
+the next operation. Application buffers, cancellation scopes, completions, wire
+storage, and operation state have disjoint ownership while active.
+
+Submission callbacks run outside the operation lock. The operation enters an
+explicit submitting state first, so synchronous inspection cannot deadlock and
+cancellation cannot release a buffer before a returned lower token settles.
 
 The stream serializes application operations over one ordered transport. Read
 and write record sequence numbers remain independent. Each operation can submit
@@ -144,7 +164,7 @@ without close_notify is an unclean terminal failure.
 
 `stream.destroy` is rejected while a lower completion or client event still owns
 storage. It destroys terminal operation state, both record ciphers, and the
-client, then wipes the full secret plaintext, content, and AEAD scratch buffers.
+client, then wipes the complete secret arena in one operation.
 
 ## Validation
 
