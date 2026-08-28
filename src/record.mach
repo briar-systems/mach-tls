@@ -9,6 +9,7 @@ use crypto.aead.aes_gcm;
 use chacha: crypto.aead.chacha20_poly1305;
 use crypto.contracts;
 use tls_error: tls.error;
+use tls.memory_range;
 
 pub def ContentType: u8;
 
@@ -173,7 +174,24 @@ pub fun valid_tls13_alert(value: AlertDescription) bool {
 }
 
 fun warning_alert(protocol: Protocol, value: AlertDescription) bool {
-    ret protocol == TLS12 && (value == CLOSE_NOTIFY || value == USER_CANCELED_ALERT || value == NO_RENEGOTIATION_ALERT);
+    ret value == CLOSE_NOTIFY || value == USER_CANCELED_ALERT ||
+        (protocol == TLS12 && value == NO_RENEGOTIATION_ALERT);
+}
+
+fun cipher_owner_data(cipher: *Cipher) *u8 {
+    if (cipher == nil) { ret nil; }
+    val address: usize = (?cipher.protocol)::usize;
+    val offset: usize = $offset_of(Cipher, protocol);
+    if (address < offset) { ret nil; }
+    val data: *u8 = (address - offset)::*u8;
+    if (!memory_range.valid(data, $size_of(Cipher))) { ret nil; }
+    ret data;
+}
+
+fun cipher_owner_overlaps(cipher: *Cipher, data: *u8, len: usize) bool {
+    val owner: *u8 = cipher_owner_data(cipher);
+    ret owner == nil || !memory_range.valid(data, len) ||
+        memory_range.overlap(owner, $size_of(Cipher), data, len);
 }
 
 fun zero_public(data: *u8, length: usize) {
@@ -278,7 +296,9 @@ pub fun encode_plain(content_type: ContentType, protocol: Protocol, content: con
         ret result;
     }
     result.required = HEADER_SIZE + content.len;
-    if (output.data == nil || output.capacity < result.required) {
+    if (output.data == nil || output.capacity < result.required ||
+        memory_range.overlap(output.data, result.required,
+            content.data, content.len)) {
         result.error = tls_error.RESOURCE_LIMIT;
         ret result;
     }
@@ -352,7 +372,7 @@ fun valid_aead(value: Aead) bool {
 }
 
 pub fun destroy(cipher: *Cipher) {
-    if (cipher == nil) { ret; }
+    if (cipher_owner_data(cipher) == nil) { ret; }
     ct.zeroize(?cipher.key[0], 32);
     var i: usize = 0;
     for (i < 12) { cipher.iv[i] = 0; i = i + 1; }
@@ -369,22 +389,32 @@ pub fun destroy(cipher: *Cipher) {
 }
 
 pub fun install(cipher: *Cipher, protocol: Protocol, algorithm: Aead, key: contracts.SecretBytes, iv: contracts.Bytes) bool {
-    if (cipher == nil || (protocol != TLS12 && protocol != TLS13) || !valid_aead(algorithm)
+    if (cipher_owner_data(cipher) == nil ||
+        (protocol != TLS12 && protocol != TLS13) || !valid_aead(algorithm)
         || key.data == nil || key.len != algorithm.key_size || iv.data == nil) {
         ret false;
     }
     var expected_iv: usize = 12;
     if (protocol == TLS12 && (algorithm.kind == AES_128_GCM || algorithm.kind == AES_256_GCM)) { expected_iv = 4; }
     if (iv.len != expected_iv) { ret false; }
+    var staged_key: [32]^u8;
+    var staged_iv: [12]u8;
+    var i: usize = 0;
+    for (i < key.len) { staged_key[i] = key.data[i]; i = i + 1; }
+    i = 0;
+    for (i < iv.len) { staged_iv[i] = iv.data[i]; i = i + 1; }
     destroy(cipher);
     cipher.protocol = protocol;
     cipher.aead = algorithm;
     cipher.key_len = key.len;
     cipher.iv_len = iv.len;
-    var i: usize = 0;
-    for (i < key.len) { cipher.key[i] = key.data[i]; i = i + 1; }
     i = 0;
-    for (i < iv.len) { cipher.iv[i] = iv.data[i]; i = i + 1; }
+    for (i < key.len) { cipher.key[i] = staged_key[i]; i = i + 1; }
+    i = 0;
+    for (i < iv.len) { cipher.iv[i] = staged_iv[i]; i = i + 1; }
+    ct.zeroize(?staged_key[0], 32);
+    i = 0;
+    for (i < 12) { staged_iv[i] = 0; i = i + 1; }
     cipher.sequence = 0;
     cipher.installed = true;
     cipher.failed = false;
@@ -440,7 +470,8 @@ pub fun seal(
     scratch: contracts.SecretBuffer,
     output: contracts.Buffer,
 ) Sealed {
-    if (cipher == nil || !cipher.installed || cipher.failed || !valid_aead(cipher.aead)) {
+    if (cipher_owner_data(cipher) == nil || !cipher.installed || cipher.failed ||
+        !valid_aead(cipher.aead)) {
         ret seal_failure(tls_error.ILLEGAL_PARAMETER, NO_ALERT, 0);
     }
     if (!sequence_available(cipher)) { ret seal_failure(tls_error.SEQUENCE_EXHAUSTED, INTERNAL_ERROR_ALERT, 0); }
@@ -466,7 +497,9 @@ pub fun seal(
         val inner_length: usize = content.len + 1 + padding;
         val encrypted_length: usize = inner_length + TAG_SIZE;
         val required: usize = HEADER_SIZE + encrypted_length;
-        if (scratch.data == nil || scratch.capacity < inner_length || output.data == nil || output.capacity < required) {
+        if (scratch.data == nil || scratch.capacity < inner_length ||
+            output.data == nil || output.capacity < required ||
+            cipher_owner_overlaps(cipher, output.data, required)) {
             ret seal_failure(tls_error.RESOURCE_LIMIT, NO_ALERT, required);
         }
         var i: usize = 0;
@@ -499,7 +532,10 @@ pub fun seal(
     if (cipher.aead.kind == AES_128_GCM || cipher.aead.kind == AES_256_GCM) { explicit_length = TLS12_AES_EXPLICIT_NONCE; }
     val encrypted_length: usize = explicit_length + content.len + TAG_SIZE;
     val required: usize = HEADER_SIZE + encrypted_length;
-    if (output.data == nil || output.capacity < required) { ret seal_failure(tls_error.RESOURCE_LIMIT, NO_ALERT, required); }
+    if (output.data == nil || output.capacity < required ||
+        cipher_owner_overlaps(cipher, output.data, required)) {
+        ret seal_failure(tls_error.RESOURCE_LIMIT, NO_ALERT, required);
+    }
     var aad: [13]u8;
     make_tls12_aad(cipher.sequence, content_type, content.len, ?aad[0]);
     val operation: contracts.Operation = cipher.aead.seal(
@@ -545,7 +581,8 @@ fun inspect_inner(data: *^u8, length: usize, has_content: *bool,
 }
 
 pub fun open(cipher: *Cipher, input: *u8, length: usize, output: contracts.SecretBuffer) Opened {
-    if (cipher == nil || !cipher.installed || cipher.failed || !valid_aead(cipher.aead)) {
+    if (cipher_owner_data(cipher) == nil || !cipher.installed || cipher.failed ||
+        !valid_aead(cipher.aead) || cipher_owner_overlaps(cipher, input, length)) {
         ret open_failure(PARSE_FAILED, tls_error.ILLEGAL_PARAMETER, NO_ALERT, 0, 0);
     }
     if (!sequence_available(cipher)) {
@@ -1046,11 +1083,87 @@ test "record: sequence exhaustion and key transitions are explicit" {
 test "record: alert encoding and decoding preserve protocol rules" {
     var wire: [16]u8;
     val encoded: Sealed = encode_alert(TLS13, CLOSE_NOTIFY, contracts.Buffer{data: ?wire[0], capacity: 16});
-    if (encoded.error != tls_error.OK || encoded.written != 7 || wire[5] != FATAL || wire[6] != CLOSE_NOTIFY) { ret 1; }
+    if (encoded.error != tls_error.OK || encoded.written != 7 ||
+        wire[5] != WARNING || wire[6] != CLOSE_NOTIFY) { ret 1; }
     var message: AlertMessage;
     if (decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.OK || message.description != CLOSE_NOTIFY) { ret 2; }
+    val canceled: Sealed = encode_alert(TLS13, USER_CANCELED_ALERT,
+        contracts.Buffer{data: ?wire[0], capacity: 16});
+    if (canceled.error != tls_error.OK || wire[5] != WARNING ||
+        decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.OK ||
+        message.fatal) { ret 4; }
     wire[5] = 3;
     if (decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.DECODE_ERROR) { ret 3; }
+    ret 0;
+}
+
+test "record: installation stages self-aliased key and iv" {
+    var key: [16]^u8;
+    var iv: [12]u8;
+    test_key(?key[0], 16);
+    var i: usize = 0;
+    for (i < 12) { iv[i] = (0x80 + i)::u8; i = i + 1; }
+    var cipher: Cipher;
+    val algorithm: Aead = aead(AES_128_GCM, fake_seal, fake_open);
+    if (!install(?cipher, TLS13, algorithm,
+            contracts.SecretBytes{data: ?key[0], len: 16},
+            contracts.Bytes{data: ?iv[0], len: 12})) { ret 1; }
+    var expected_key: [16]u8;
+    var expected_iv: [12]u8;
+    i = 0;
+    for (i < 16) { expected_key[i] = cipher.key[i]:^; i = i + 1; }
+    i = 0;
+    for (i < 12) { expected_iv[i] = cipher.iv[i]; i = i + 1; }
+    if (!install(?cipher, TLS13, algorithm,
+            contracts.SecretBytes{data: ?cipher.key[0], len: 16},
+            contracts.Bytes{data: ?cipher.iv[0], len: 12})) { ret 2; }
+    i = 0;
+    for (i < 16) {
+        if (cipher.key[i]:^ != expected_key[i]) { ret 3; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 12) {
+        if (cipher.iv[i] != expected_iv[i]) { ret 4; }
+        i = i + 1;
+    }
+    destroy(?cipher);
+    ret 0;
+}
+
+test "record: public inputs and outputs cannot alias cipher ownership" {
+    var key: [16]^u8;
+    var iv: [12]u8;
+    test_key(?key[0], 16);
+    var cipher: Cipher;
+    if (!install(?cipher, TLS13, aes_128_gcm(),
+            contracts.SecretBytes{data: ?key[0], len: 16},
+            contracts.Bytes{data: ?iv[0], len: 12})) { ret 1; }
+    var content: [1]^u8 = [1]^u8{1};
+    var scratch: [2]^u8;
+    val sealed: Sealed = seal(?cipher, APPLICATION_DATA,
+        contracts.SecretBytes{data: ?content[0], len: 1}, 0,
+        contracts.SecretBuffer{data: ?scratch[0], capacity: 2},
+        contracts.Buffer{data: (?cipher.protocol)::*u8,
+            capacity: HEADER_SIZE + 1 + TAG_SIZE});
+    if (sealed.error != tls_error.RESOURCE_LIMIT || cipher.sequence != 0 ||
+        cipher.failed) { ret 2; }
+    val opened: Opened = open(?cipher, (?cipher.protocol)::*u8,
+        HEADER_SIZE, contracts.SecretBuffer{data: ?scratch[0], capacity: 2});
+    if (opened.error != tls_error.ILLEGAL_PARAMETER || cipher.sequence != 0 ||
+        cipher.failed) { ret 3; }
+    destroy(?cipher);
+    ret 0;
+}
+
+test "record: plain encoding rejects overlapping public ranges" {
+    var wire: [8]u8 = [8]u8{1, 2, 3, 0, 0, 0, 0, 0};
+    val sealed: Sealed = encode_plain(HANDSHAKE, TLS13,
+        contracts.Bytes{data: ?wire[0], len: 3},
+        contracts.Buffer{data: ?wire[0], capacity: 8});
+    if (sealed.error != tls_error.RESOURCE_LIMIT || sealed.written != 0) {
+        ret 1;
+    }
     ret 0;
 }
 
