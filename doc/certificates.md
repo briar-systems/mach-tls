@@ -4,13 +4,13 @@
 
 ## Supported certificate keys and signatures
 
-Subject public keys support Ed25519, P-256, and RSA with 2048 through 4096-bit moduli. Certificate signatures support Ed25519, ECDSA P-256 with SHA-256, RSA-PSS with SHA-256 or SHA-384, and RSA PKCS #1 v1.5 with SHA-256 or SHA-384 when provided by the pinned `mach-crypto` release. RSA-PSS parameters must select the same supported hash for the message and MGF1 and must use a salt whose length equals the hash length.
+Subject public keys support Ed25519, P-256, and RSA with 2048 through 4096-bit moduli. Certificate signatures support Ed25519, ECDSA P-256 with SHA-256, RSA-PSS with SHA-256 or SHA-384, and RSA PKCS #1 v1.5 with SHA-256 or SHA-384. RSA-PSS parameters must select the same supported hash for the message and MGF1 and must use a salt whose length equals the hash length.
 
 A trust anchor's self-signature is not part of certification path validation. `parse_trust_anchor` therefore accepts an otherwise valid anchor whose outer self-signature algorithm is not supported. Every non-anchor certificate still requires a supported signature algorithm.
 
 ## Path validation
 
-`tls.cert.verify.chain` accepts a leaf-first presented set. Intermediates after the leaf may be unordered. The builder backtracks across issuer candidates and trust anchors up to `MAX_CHAIN_DEPTH`, rejects duplicate presented certificates, checks authority and subject key identifiers when both exist, and authenticates each selected link before publishing success.
+`tls.cert.verify.chain` accepts a leaf-first presented set. Intermediates after the leaf may be unordered. The builder backtracks across issuer candidates and trust anchors up to `MAX_CHAIN_DEPTH` and the caller-selected `max_signature_checks` bound, rejects duplicate presented certificates, checks authority and subject key identifiers when both exist, and authenticates each selected link before publishing success. Signature-budget exhaustion rejects the path without performing another public-key operation.
 
 Validation checks the leaf purpose and every intermediate's extended key usage. TLS 1.3 leaf certificates with a key usage extension must permit digital signatures. Intermediates must carry a critical CA basic constraint and, when key usage is present, `keyCertSign`. Path length excludes the leaf and self-issued rollover certificates as required by RFC 5280.
 

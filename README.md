@@ -40,7 +40,7 @@ TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GC
 
 Certificate parsing is strict DER and publishes only borrowed views after the entire certificate validates. Path construction backtracks across unordered intermediates and trust anchors within an explicit depth bound. It verifies signatures, validity, basic constraints, path length, key usage, extended key usage, authority key identifiers, DNS and IP name constraints, and the requested server or client purpose. Unknown critical extensions fail closed.
 
-Server identities use subject alternative names only. DNS matching is ASCII case-insensitive, permits one complete leftmost wildcard label, and never allows a wildcard to span labels. IP literals are parsed to network bytes and match only `iPAddress` entries. Common-name fallback is intentionally absent.
+Certificate paths authenticate Ed25519, ECDSA P-256 SHA-256, RSA-PSS SHA-256/SHA-384, and RSA PKCS #1 v1.5 SHA-256/SHA-384 signatures within explicit depth and public-key-operation bounds. Server identities use subject alternative names only. DNS matching is ASCII case-insensitive, permits one complete leftmost wildcard label, and never allows a wildcard to span labels. IP literals are parsed to network bytes and match only `iPAddress` entries. Common-name fallback is intentionally absent.
 
 PEM bundle loading validates every block before publishing a chain. Private keys are owned by `mach-crypto` secret allocators and support PKCS #8, SEC 1, and RSA PKCS #1 containers. Credential initialization proves that the private key matches the leaf certificate before publication.
 
