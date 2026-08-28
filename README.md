@@ -41,4 +41,6 @@ directory inside this repository.
 mach dep pull .
 mach build .
 mach test .
+mach dep pull test/transport
+mach test test/transport
 ```
