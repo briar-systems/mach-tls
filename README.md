@@ -59,6 +59,10 @@ TLS 1.2 AES-GCM uses the four-byte fixed IV plus the received eight-byte explici
 
 Opening a record authenticates the complete ciphertext before releasing secret plaintext. Authentication failure clears the full possible plaintext prefix, makes the receive cipher terminal, and emits `bad_record_mac`. Key installation is transactional, key transitions reset sequence state, and destruction zeroizes keys and IVs.
 
+Record providers receive only the exact writable ciphertext or plaintext
+extent. Public and secret inputs validate representable ownership before use,
+including partial secret subrange overlap and cipher-state aliasing.
+
 Checked-in record vectors match independently generated Python cryptography AES-GCM and ChaCha20-Poly1305 output for both protocol versions. Hostile tests cover truncation, fragmentation, malformed headers and inners, record overflow, sequence exhaustion, output retry, invalid alerts, provider failure, authentication failure, and maximum TLS 1.3 padding.
 
 ## TLS 1.3 handshake primitives

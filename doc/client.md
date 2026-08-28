@@ -19,6 +19,11 @@ suites, one or two supported groups, one to four supported signature schemes,
 at least one ALPN name, a bounded trust store, an operating-system or
 application entropy source, and explicit finite limits. SNI is required and is
 always authenticated against the leaf certificate subject alternative name.
+An application entropy source declares the exact size of its public callback
+context with `entropy_context_size`. The context is retained and must contain
+all mutable provider state. TLS rejects secret callback context so provider
+state cannot alias handshake keys or record plaintext through an address that
+ordinary ownership checks cannot inspect.
 
 The limits separate peer input from locally generated output. The
 `max_peer_handshake_bytes` bound includes the four-byte handshake header.
@@ -98,7 +103,10 @@ Rejecting an event makes the client terminal and publishes one internal-error
 alert through the same ownership path.
 
 Entropy callbacks cannot reenter or destroy the active client. Their descriptor,
-configuration pointer, and handshake state must remain stable across the call.
+configuration, storage, output state, and handshake state must remain stable
+across the call. Mutation restores the retained ownership descriptors and fails
+terminally. Any failed or partially successful fill wipes the complete requested
+secret destination before control returns.
 Every public output descriptor is validated and proven disjoint from client,
 storage, callback-context, and retained configuration ownership before event
 state is committed.
@@ -151,10 +159,11 @@ the only ownership acknowledgement between the two layers.
 its bounded callback context. The descriptor, runtime, context, application
 buffers, scopes, completions, and TLS storage are rejected when their public
 ranges overlap. Its caller-owned `stream.Storage` has disjoint public
-handshake and wire regions plus one secret-welded arena of exactly partitioned
-plaintext, content, and AEAD scratch regions. One arena makes secret subrange
-aliasing unrepresentable without exposing secret storage through a public
-address. `connect` combines initialization and handshake. Separate
+handshake and wire regions. The stream owns one internal secret-welded arena and
+derives the incoming plaintext, outgoing content, and AEAD scratch subregions
+itself. Callers cannot supply a hostile secret subrange or overlap record
+plaintext with entropy or identity state. `connect` combines initialization and
+handshake. Separate
 `handshake`, `read`, `write`, `alert`, `half_close`, and `close` operations are
 also available. Every operation retains its application token, cancellation
 scope, deadline, and application buffer through terminal resolution. The caller
@@ -162,11 +171,10 @@ must inspect the terminal snapshot and call `destroy_operation` before starting
 the next operation. Application buffers, cancellation scopes, completions, wire
 storage, and operation state have disjoint ownership while active.
 
-The secret arena requirement is calculated as
-`receive + 2 * send + 2` bytes. This holds one bounded incoming TLSInnerPlaintext
-region, one outgoing content region, and one outgoing TLSInnerPlaintext scratch
-region. Applications using smaller directional record policies do not pay for
-three maximum-size records. The public input and output wire buffers scale to
+The internal secret arena is sized for the complete TLS plaintext envelope and
+partitioned from the configured `receive + 2 * send + 2` requirement. It holds
+one bounded incoming TLSInnerPlaintext region, one outgoing content region, and
+one outgoing TLSInnerPlaintext scratch region. The public input and output wire buffers scale to
 `receive + 22` and `send + 22` bytes respectively, covering the record header,
 TLS 1.3 inner content type, and AEAD tag.
 
@@ -178,7 +186,9 @@ while a callback that reenters on the owning thread is rejected without
 deadlock. A provider descriptor is pinned for every lower submission. If the
 live descriptor changes, the operation retains its lower ownership until the
 matching completion, validates that completion against the pinned provider
-state, then fails terminally.
+state, then fails terminally. Completion fields are snapshotted before the
+provider alias query. Query reentry or mutation is consumed as the matching
+lower completion and resolves to internal error without stranding its buffer.
 
 The stream serializes application operations over one ordered transport. Read
 and write record sequence numbers remain independent. Each operation can submit
@@ -195,7 +205,8 @@ terminal operation is destroyed, `close` on a failed stream submits the distinct
 abortive lower-close callback without attempting another TLS record.
 
 `half_close` writes close_notify completely, shuts down only the lower write
-side, and keeps reads available. Normal `close` writes close_notify completely
+side, and keeps reads available. A later `close` submits the lower close without
+emitting a second close_notify. Normal `close` writes close_notify completely
 before the configured lower close. A fatal local alert moves the stream to
 `FAILED`. A received close_notify resolves a read as clean end of stream. EOF
 without close_notify is an unclean terminal failure.
@@ -219,7 +230,8 @@ stale event acknowledgements, bounded configuration, record fragmentation at
 every byte, partial writes, cancellation, zero progress, half-close ordering,
 abortive cleanup, and destruction.
 
-The external harness performs real TCP handshakes and secure closure against
-OpenSSL and GnuTLS. Its checked-in test credentials cover Ed25519, ECDSA P-256,
+The external harness performs real TCP handshakes, bidirectional application
+records, pre-cancelled and pre-timed-out reads, half-close, and final close
+against OpenSSL and GnuTLS. Its checked-in test credentials cover Ed25519, ECDSA P-256,
 RSA-PSS authentication, required client authentication, X25519, P-256 retry, and
 all three TLS 1.3 cipher suites. See [`../test/interop/README.md`](../test/interop/README.md).

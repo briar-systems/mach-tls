@@ -294,9 +294,59 @@ fun main(argc: i64, argv: **u8) i64 {
         negotiated.selected_alpn.data[1] != '2') { ret 42; }
     if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 43; }
 
+    var application_input: [64]u8;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !cancel.cancel(?scope) ||
+        !stream.read(?secure, ?scope,
+            transport.Token{index: 2, generation: 1},
+            ?application_input[0], 64, 2)) { ret 44; }
+    val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (cancelled.terminal_error != error.CANCELLED ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 45; }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !cancel.timeout(?scope) ||
+        !stream.read(?secure, ?scope,
+            transport.Token{index: 2, generation: 2},
+            ?application_input[0], 64, 3)) { ret 46; }
+    val timed_out: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (timed_out.terminal_error != error.TIMEOUT ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 47; }
+
+    var application_output: [16]u8 = [16]u8{
+        'm', 'a', 'c', 'h', '-', 't', 'l', 's', ' ', 'i', 'n', 't', 'e', 'r', '\n', 0};
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.write(?secure, ?scope,
+            transport.Token{index: 3, generation: 1},
+            ?application_output[0], 15, 4) || !settle(?secure, ?owner)) {
+        ret 48;
+    }
+    val written: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (written.terminal_error != error.OK || written.application_bytes != 15 ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 49; }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.read(?secure, ?scope,
+            transport.Token{index: 4, generation: 1},
+            ?application_input[0], 64, 5) || !settle(?secure, ?owner)) {
+        ret 50;
+    }
+    val read: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (read.terminal_error != error.OK || read.application_bytes == 0 ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 51; }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.half_close(?secure, ?scope,
+            transport.Token{index: 5, generation: 1}, 6) ||
+        !settle(?secure, ?owner)) { ret 52; }
+    val half_closed: transport.Snapshot =
+        transport.snapshot(?secure.operation);
+    if (half_closed.terminal_error != error.OK || !secure.send_closed ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 53; }
+
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
         !stream.close(?secure, ?scope,
-            transport.Token{index: 1, generation: 2}, 2) ||
+            transport.Token{index: 6, generation: 1}, 7) ||
         !settle(?secure, ?owner)) { ret 7; }
     val closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
