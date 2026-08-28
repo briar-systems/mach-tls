@@ -44,6 +44,7 @@ rec TestTransport {
     concurrent_reentry: bool;
     concurrent_blocked: bool;
     reentry_rejected: bool;
+    snapshot_rejected: bool;
     accept_rejected: bool;
     submission_rejected: bool;
     concurrent_entered: i64;
@@ -101,6 +102,8 @@ fun test_submit(context: ptr, scope: *cancel.Scope, kind: io_runtime.Kind, buffe
     val state: *TestTransport = context::*TestTransport;
     if (reentrant_secure != nil) {
         state.reentry_rejected = !stream.destroy(reentrant_secure);
+        state.snapshot_rejected = stream.snapshot(reentrant_secure).state == 0 &&
+            stream.negotiated(reentrant_secure).status == 0;
     }
     if (state.concurrent_reentry) {
         state.concurrent_reentry = false;
@@ -173,6 +176,7 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     state.concurrent_reentry = false;
     state.concurrent_blocked = false;
     state.reentry_rejected = false;
+    state.snapshot_rejected = false;
     state.accept_rejected = false;
     state.submission_rejected = false;
     atomic.store(?state.concurrent_entered, 0);
@@ -551,6 +555,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (synchronous.state != transport.OPERATION_TERMINAL ||
         synchronous.terminal_error != error.INTERNAL_ERROR ||
         failed.state != stream.FAILED || !state.reentry_rejected ||
+        !state.snapshot_rejected ||
         atomic.load(?failed.transition_owner) != 0 ||
         !stream.destroy_operation(?failed) ||
         !stream.destroy(?failed) || !cancel.destroy(?scope)) { ret 9; }
@@ -818,19 +823,21 @@ test "stream: close notify is fully written before write-side shutdown" {
     if (transport.snapshot(?secure.operation).state != transport.OPERATION_TERMINAL ||
         secure.state != stream.OPEN || !secure.send_closed ||
         !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 8; }
-    var received: [1]u8;
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.read(?secure, ?scope,
-            transport.Token{index: 12, generation: 2}, ?received[0], 1, 48) ||
-        is_err[bool, io_error.Error](io_runtime.complete(?runtime,
-            secure.operation.lower_token, 0, 0, true)) ||
-        !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
-        ret 9;
-    }
-    if (transport.snapshot(?secure.operation).terminal_error != error.CLOSED ||
-        !stream.destroy_operation(?secure) || !cancel.destroy(?scope) ||
+    if (!cancel.make_root(?scope, false,
+            time.Time{sec: 0, nsec: 0})) { ret 11; }
+    if (!stream.close(?secure, ?scope,
+            transport.Token{index: 12, generation: 2}, 49)) { ret 13; }
+    if (transport_state.writes != 1) { ret 14; }
+    if (transport_state.closes != 2) { ret 15; }
+    if (secure.pending_action != transport.TRANSPORT_CLOSE) { ret 16; }
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+            secure.operation.lower_token, 0, 0, false)) ||
+        !take_one(?runtime, ?completion) ||
+        !stream.accept(?secure, ?completion) || secure.state != stream.CLOSED ||
+        !stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+        !cancel.destroy(?scope) ||
         is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
-        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 10; }
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 12; }
     ret 0;
 }
 

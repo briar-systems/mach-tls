@@ -2132,12 +2132,15 @@ pub fun complete_event(client: *Client, token: u64, accepted: bool) bool {
 fun close_inner(client: *Client, description: record.AlertDescription) Result {
     if (!client_owner_valid(client) ||
         client.state == DESTROYED || client.state == TERMINAL ||
-        client.state == CLOSING || !record.valid_tls13_alert(description)) {
+        client.state == CLOSING || client.alert_pending ||
+        !record.valid_tls13_alert(description)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     client.pending_alert = description;
     client.alert_pending = true;
-    client.state = CLOSING;
+    if (description != record.USER_CANCELED_ALERT) {
+        client.state = CLOSING;
+    }
     ret result(OK, error.OK, 0, 0);
 }
 
@@ -2235,6 +2238,22 @@ test "client: configuration rejects unbounded and missing ownership" {
     var configuration: config.ClientConfig;
     var storage: Storage;
     if (init(?client, ?configuration, storage, ExtraExtension{}, 0)) { ret 1; }
+    ret 0;
+}
+
+test "client: user canceled warning permits orderly close" {
+    var client: Client;
+    client.state = ESTABLISHED;
+    if (close(?client, record.USER_CANCELED_ALERT).status != OK ||
+        client.state != ESTABLISHED || !client.alert_pending ||
+        close(?client, record.CLOSE_NOTIFY).status != FAILED) { ret 1; }
+    client.event_active = true;
+    client.active_event = Event{token: 1, kind: ALERT,
+        alert: record.USER_CANCELED_ALERT};
+    if (!complete_event(?client, 1, true) || client.alert_pending ||
+        client.state != ESTABLISHED ||
+        close(?client, record.CLOSE_NOTIFY).status != OK ||
+        client.state != CLOSING || !client.alert_pending) { ret 2; }
     ret 0;
 }
 

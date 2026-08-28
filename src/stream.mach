@@ -1010,6 +1010,19 @@ pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
         if (settle_terminal(stream)) { ret leave(stream, true); }
         ret leave(stream, drive_owned(stream));
     }
+    if (stream != nil && stream.state == OPEN && stream.send_closed &&
+        operation_available(stream) &&
+        operation_inputs_valid(stream, scope, nil, 0) &&
+        transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
+            scope, nil, 0, context)) {
+        stream.control = CONTROL_CLOSE;
+        stream.control_alert = record.CLOSE_NOTIFY;
+        stream.control_record_sent = true;
+        stream.wire_output_len = 0;
+        stream.wire_output_sent = 0;
+        if (settle_terminal(stream)) { ret leave(stream, true); }
+        ret leave(stream, drive_owned(stream));
+    }
     ret leave(stream, begin_control(stream, scope, token, CONTROL_CLOSE,
         record.CLOSE_NOTIFY, context));
 }
@@ -1030,8 +1043,10 @@ pub fun connect(stream: *Stream, configuration: *config.ClientConfig,
 }
 
 pub fun negotiated(stream: *Stream) client.Snapshot {
-    if (stream_owner_data(stream) == nil) { ret client.Snapshot{}; }
-    ret client.snapshot(?stream.client);
+    if (!enter(stream)) { ret client.Snapshot{}; }
+    val value: client.Snapshot = client.snapshot(?stream.client);
+    leave(stream, true);
+    ret value;
 }
 
 fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
@@ -1120,13 +1135,14 @@ pub fun accept(stream: *Stream, completion: *runtime.Completion) bool {
 
 pub fun snapshot(stream: *Stream) Snapshot {
     var value: Snapshot;
-    if (stream_owner_data(stream) == nil) { ret value; }
+    if (!enter(stream)) { ret value; }
     value.state = stream.state;
     value.operation = transport.snapshot(?stream.operation);
     value.handshake_complete = stream.handshake_complete;
     value.send_closed = stream.send_closed;
     value.peer_closed = stream.peer_closed;
     value.alert = stream.peer_alert;
+    leave(stream, true);
     ret value;
 }
 
