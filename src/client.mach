@@ -360,6 +360,8 @@ fun config_borrows_valid(value: *config.ClientConfig,
         !memory_range.valid(value.groups::*u8, group_bytes) ||
         !memory_range.valid(value.signatures::*u8, signature_bytes) ||
         !memory_range.valid(value.trust.anchors::*u8, anchor_bytes) ||
+        !memory_range.valid(value.entropy.context::*u8,
+            value.entropy_context_size) ||
         !memory_range.valid(extra.data.data, extra.data.len) ||
         !name.valid_reference_dns(value.server_name)) { ret false; }
     var i: usize = 0;
@@ -460,8 +462,9 @@ fun borrowed_overlaps(value: *config.ClientConfig, extra: ExtraExtension,
         memory_range.overlap(data, len,
             (?value.client_identity.private_key.algorithm)::*u8,
             $size_of(keys.PrivateKey))) { ret true; }
-    if (include_callback_context && value.entropy.context != nil &&
-        memory_range.overlap(data, len, value.entropy.context::*u8, 1)) {
+    if (include_callback_context &&
+        memory_range.overlap(data, len, value.entropy.context::*u8,
+            value.entropy_context_size)) {
         ret true;
     }
     var alpn_bytes: usize = 0;
@@ -557,10 +560,13 @@ fun config_sources_disjoint(client: *Client, value: *config.ClientConfig,
         storage_overlaps(storage, client_owner_data(client), $size_of(Client))) {
         ret false;
     }
-    if (value.entropy.context != nil &&
-        (client_owner_overlaps(client, value.entropy.context::*u8, 1) ||
-        storage_overlaps(storage, value.entropy.context::*u8, 1) ||
-        borrowed_overlaps(value, extra, value.entropy.context::*u8, 1,
+    if (value.entropy_context_size != 0 &&
+        (client_owner_overlaps(client, value.entropy.context::*u8,
+            value.entropy_context_size) ||
+        storage_overlaps(storage, value.entropy.context::*u8,
+            value.entropy_context_size) ||
+        borrowed_overlaps(value, extra, value.entropy.context::*u8,
+            value.entropy_context_size,
             true, false))) {
         ret false;
     }
@@ -682,6 +688,47 @@ fun entropy_equal(first: secret.Entropy, second: secret.Entropy) bool {
         first.fill_fn == second.fill_fn && first.initialized == second.initialized;
 }
 
+fun limits_equal(first: config.Limits, second: config.Limits) bool {
+    ret first.max_receive_record_plaintext ==
+            second.max_receive_record_plaintext &&
+        first.max_send_record_plaintext == second.max_send_record_plaintext &&
+        first.max_peer_handshake_bytes == second.max_peer_handshake_bytes &&
+        first.max_client_hello_bytes == second.max_client_hello_bytes &&
+        first.max_client_flight_bytes == second.max_client_flight_bytes &&
+        first.max_chain_bytes == second.max_chain_bytes &&
+        first.max_ticket_bytes == second.max_ticket_bytes;
+}
+
+fun configuration_equal(first: config.ClientConfig,
+    second: config.ClientConfig) bool {
+    ret first.server_name.data == second.server_name.data &&
+        first.server_name.len == second.server_name.len &&
+        first.alpn == second.alpn && first.alpn_len == second.alpn_len &&
+        first.trust == second.trust && first.versions == second.versions &&
+        first.version_len == second.version_len &&
+        first.suites == second.suites && first.suite_len == second.suite_len &&
+        first.groups == second.groups && first.group_len == second.group_len &&
+        first.signatures == second.signatures &&
+        first.signature_len == second.signature_len &&
+        first.client_identity == second.client_identity &&
+        first.entropy == second.entropy &&
+        first.entropy_context_size == second.entropy_context_size &&
+        limits_equal(first.limits, second.limits);
+}
+
+fun client_storage_equal(first: Storage, second: Storage) bool {
+    ret first.input == second.input &&
+        first.input_capacity == second.input_capacity &&
+        first.output == second.output &&
+        first.output_capacity == second.output_capacity &&
+        first.hello == second.hello &&
+        first.hello_capacity == second.hello_capacity &&
+        first.certificates == second.certificates &&
+        first.certificate_capacity == second.certificate_capacity &&
+        first.peer_parameters == second.peer_parameters &&
+        first.peer_parameters_capacity == second.peer_parameters_capacity;
+}
+
 fun entropy_fill(client: *Client, output: *^u8, length: usize) bool {
     val owner: i64 = os.thread_current_id();
     if (!client_owner_valid(client) || owner <= 0 ||
@@ -690,18 +737,68 @@ fun entropy_fill(client: *Client, output: *^u8, length: usize) bool {
         client.entropy.fill_fn == nil || output == nil) { ret false; }
     val descriptor: secret.Entropy = client.entropy;
     val expected_config: *config.ClientConfig = client.config;
+    val expected_configuration: config.ClientConfig = client.configuration;
+    val expected_storage: Storage = client.storage;
+    val expected_extra: ExtraExtension = client.extra;
+    val expected_peer_extension: u16 = client.peer_extension;
     val expected_state: u8 = client.state;
+    val expected_failure: error.Error = client.failure;
+    val expected_pending_alert: record.AlertDescription = client.pending_alert;
+    val expected_input_len: usize = client.input_len;
+    val expected_input_read: usize = client.input_read;
+    val expected_hello_len: usize = client.hello_len;
+    val expected_output_len: usize = client.output_len;
+    val expected_output_level: Level = client.output_level;
+    val expected_output_pending: bool = client.output_pending;
+    val expected_event_active: bool = client.event_active;
+    val expected_receive_limit: usize = client.receive_record_plaintext;
+    val expected_send_limit: usize = client.send_record_plaintext;
     val status: i64 = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
     val valid: bool = atomic.load(?client.transition_owner) == owner &&
         client.config == expected_config && client.state == expected_state &&
-        entropy_equal(client.entropy, descriptor);
-    if (!valid) {
+        entropy_equal(client.entropy, descriptor) &&
+        configuration_equal(client.configuration, expected_configuration) &&
+        client_storage_equal(client.storage, expected_storage) &&
+        client.extra.kind == expected_extra.kind &&
+        client.extra.data.data == expected_extra.data.data &&
+        client.extra.data.len == expected_extra.data.len &&
+        client.peer_extension == expected_peer_extension &&
+        client.failure == expected_failure &&
+        client.pending_alert == expected_pending_alert &&
+        client.input_len == expected_input_len &&
+        client.input_read == expected_input_read &&
+        client.hello_len == expected_hello_len &&
+        client.output_len == expected_output_len &&
+        client.output_level == expected_output_level &&
+        client.output_pending == expected_output_pending &&
+        client.event_active == expected_event_active &&
+        client.receive_record_plaintext == expected_receive_limit &&
+        client.send_record_plaintext == expected_send_limit;
+    if (!valid || status != 0) {
+        ct.zeroize(output, length);
         client.entropy = descriptor;
+        client.configuration = expected_configuration;
         client.configuration.entropy = ?client.entropy;
+        client.config = ?client.configuration;
+        client.storage = expected_storage;
+        client.extra = expected_extra;
+        client.peer_extension = expected_peer_extension;
+        client.state = expected_state;
+        client.failure = expected_failure;
+        client.pending_alert = expected_pending_alert;
+        client.input_len = expected_input_len;
+        client.input_read = expected_input_read;
+        client.hello_len = expected_hello_len;
+        client.output_len = expected_output_len;
+        client.output_level = expected_output_level;
+        client.output_pending = expected_output_pending;
+        client.event_active = expected_event_active;
+        client.receive_record_plaintext = expected_receive_limit;
+        client.send_record_plaintext = expected_send_limit;
         ret false;
     }
-    ret status == 0;
+    ret true;
 }
 
 fun fill_entropy(client: *Client, output: *u8, length: usize) bool {
@@ -733,6 +830,11 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
     }
     if (value.entropy == nil ||
         !value.entropy.initialized || value.entropy.fill_fn == nil ||
+        value.entropy.secret_context != nil ||
+        ((value.entropy.context == nil) !=
+            (value.entropy_context_size == 0)) ||
+        !memory_range.valid(value.entropy.context::*u8,
+            value.entropy_context_size) ||
         value.server_name.data == nil ||
         value.server_name.len == 0 || value.server_name.len > 253 ||
         value.trust == nil || value.trust.anchors == nil ||
@@ -2298,6 +2400,8 @@ fun deterministic_entropy(context: ptr, secret_context: *^u8,
 
 var reentry_client: *Client;
 var reentry_rejections: usize;
+var hostile_entropy_client: *Client;
+var hostile_entropy_calls: usize;
 
 fun reentrant_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
@@ -2317,6 +2421,23 @@ fun reentrant_entropy(context: ptr, secret_context: *^u8,
         i = i + 1;
     }
     counter[0] = counter[0] + 17;
+    ret 0;
+}
+
+fun hostile_entropy(context: ptr, secret_context: *^u8,
+    destination: *^u8, length: usize) i64 {
+    hostile_entropy_calls = hostile_entropy_calls + 1;
+    var i: usize = 0;
+    for (i < length) {
+        destination[i] = (i + 1)::u8;
+        i = i + 1;
+    }
+    if (hostile_entropy_calls == 3 && hostile_entropy_client != nil) {
+        hostile_entropy_client.storage.output = nil;
+        hostile_entropy_client.configuration.limits.max_client_hello_bytes = 0;
+        hostile_entropy_client.state = DESTROYED;
+        hostile_entropy_client.output_pending = true;
+    }
     ret 0;
 }
 
@@ -2345,6 +2466,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     configuration.groups = ?groups[0]; configuration.group_len = 2;
     configuration.signatures = ?signatures[0]; configuration.signature_len = 1;
     configuration.entropy = ?entropy;
+    configuration.entropy_context_size = 1;
     entropy.fill_fn = reentrant_entropy;
     configuration.limits = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
@@ -2420,6 +2542,31 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     var local_hello: codec.ClientHello;
     if (decode_own_hello(?local_bound_client, ?local_hello) != error.OK ||
         !destroy(?local_bound_client)) { ret 74; }
+    var hostile_descriptor: secret.Entropy = entropy;
+    hostile_descriptor.fill_fn = hostile_entropy;
+    var hostile_configuration: config.ClientConfig = configuration;
+    hostile_configuration.entropy = ?hostile_descriptor;
+    var hostile_client: Client;
+    hostile_entropy_client = ?hostile_client;
+    hostile_entropy_calls = 0;
+    if (!init(?hostile_client, ?hostile_configuration, storage,
+            ExtraExtension{}, 0)) { ret 75; }
+    val hostile_started: Result = start(?hostile_client, 1787875200);
+    if (hostile_started.status != FAILED ||
+        hostile_started.error != error.INTERNAL_ERROR ||
+        hostile_client.storage.output != storage.output ||
+        hostile_client.configuration.limits.max_client_hello_bytes !=
+            configuration.limits.max_client_hello_bytes ||
+        hostile_client.output_pending || hostile_client.state != TERMINAL) {
+        ret 76;
+    }
+    var hostile_key_index: usize = 0;
+    for (hostile_key_index < 32) {
+        if (hostile_client.private_key[hostile_key_index]:^ != 0) { ret 77; }
+        hostile_key_index = hostile_key_index + 1;
+    }
+    if (!destroy(?hostile_client)) { ret 78; }
+    hostile_entropy_client = nil;
     var value: Client;
     reentry_client = ?value;
     reentry_rejections = 0;
@@ -2618,6 +2765,7 @@ test "client: event rejection has one terminal alert ownership path" {
     configuration.groups = ?groups[0]; configuration.group_len = 1;
     configuration.signatures = ?signatures[0]; configuration.signature_len = 1;
     configuration.entropy = ?entropy;
+    configuration.entropy_context_size = 1;
     configuration.limits = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
     configuration.limits.max_ticket_bytes = 4096;
@@ -2666,6 +2814,7 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     configuration.groups = ?groups[0]; configuration.group_len = 1;
     configuration.signatures = ?signatures[0]; configuration.signature_len = 1;
     configuration.entropy = ?entropy;
+    configuration.entropy_context_size = 1;
     configuration.limits = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
     configuration.limits.max_ticket_bytes = 4096;
@@ -2779,6 +2928,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     configuration.signatures = ?signatures[0]; configuration.signature_len = 1;
     configuration.client_identity = ?client_identity;
     configuration.entropy = ?entropy;
+    configuration.entropy_context_size = 1;
     configuration.limits = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
     configuration.limits.max_ticket_bytes = 4096;

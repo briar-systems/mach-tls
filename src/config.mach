@@ -38,6 +38,7 @@ pub rec ClientConfig {
     signature_len:   usize;
     client_identity: *credentials.Identity;
     entropy:         *secret.Entropy;
+    entropy_context_size: usize;
     limits:          Limits;
 }
 

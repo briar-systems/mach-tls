@@ -265,7 +265,6 @@ fun main(argc: i64, argv: **u8) i64 {
     var certificates: [8]cert.Certificate;
     var wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
     var wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-    var secret_storage: [stream.SECRET_STORAGE_BYTES]^u8;
     var storage: stream.Storage;
     storage.handshake = client.Storage{input: ?handshake_input[0],
         input_capacity: 65536, output: ?handshake_output[0],
@@ -275,8 +274,6 @@ fun main(argc: i64, argv: **u8) i64 {
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.secret = ?secret_storage[0];
-    storage.secret_capacity = stream.SECRET_STORAGE_BYTES;
 
     var scope: cancel.Scope;
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }

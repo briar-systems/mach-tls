@@ -194,6 +194,40 @@ fun cipher_owner_overlaps(cipher: *Cipher, data: *u8, len: usize) bool {
         memory_range.overlap(owner, $size_of(Cipher), data, len);
 }
 
+fun secret_overlap(first: *^u8, first_len: usize, second: *^u8,
+    second_len: usize) bool {
+    if (first_len == 0 || second_len == 0) { ret false; }
+    if (first == nil || second == nil) { ret true; }
+    var i: usize = 0;
+    for (i < first_len) {
+        if (?first[i] == second) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < second_len) {
+        if (first == ?second[i]) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun secret_public_overlap(secret: *^u8, secret_len: usize, public: *u8,
+    public_len: usize) bool {
+    if (secret_len == 0 || public_len == 0) { ret false; }
+    if (secret == nil || public == nil) { ret true; }
+    var i: usize = 0;
+    for (i < secret_len) {
+        if (?secret[i] == public) { ret true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < public_len) {
+        if (secret == ?public[i]) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 fun zero_public(data: *u8, length: usize) {
     if (data == nil) { ret; }
     var i: usize = 0;
@@ -406,7 +440,10 @@ pub fun install(cipher: *Cipher, protocol: Protocol, algorithm: Aead, key: contr
         || key.data == nil || key.len != algorithm.key_size ||
         !memory_range.valid(iv.data, iv.len) ||
         memory_range.overlap(cipher_owner_data(cipher), $size_of(Cipher),
-            iv.data, iv.len)) {
+            iv.data, iv.len) ||
+        secret_public_overlap(key.data, key.len, cipher_owner_data(cipher),
+            $size_of(Cipher)) ||
+        secret_public_overlap(key.data, key.len, iv.data, iv.len)) {
         ret false;
     }
     var expected_iv: usize = 12;
@@ -501,6 +538,10 @@ pub fun seal(
     if (content_type == ALERT && !valid_secret_alert(cipher.protocol, content.data)) {
         ret seal_failure(tls_error.DECODE_ERROR, DECODE_ERROR_ALERT, 0);
     }
+    if (secret_public_overlap(content.data, content.len,
+            cipher_owner_data(cipher), $size_of(Cipher))) {
+        ret seal_failure(tls_error.ILLEGAL_PARAMETER, NO_ALERT, 0);
+    }
     var nonce: [12]u8;
     make_nonce(cipher, ?nonce[0]);
     val key: contracts.SecretBytes = contracts.SecretBytes{data: ?cipher.key[0], len: cipher.key_len};
@@ -514,7 +555,15 @@ pub fun seal(
         if (scratch.data == nil || scratch.capacity < inner_length ||
             output.capacity < required ||
             !memory_range.valid(output.data, required) ||
-            cipher_owner_overlaps(cipher, output.data, required)) {
+            cipher_owner_overlaps(cipher, output.data, required) ||
+            secret_overlap(content.data, content.len, scratch.data,
+                inner_length) ||
+            secret_public_overlap(scratch.data, inner_length,
+                cipher_owner_data(cipher), $size_of(Cipher)) ||
+            secret_public_overlap(content.data, content.len, output.data,
+                required) ||
+            secret_public_overlap(scratch.data, inner_length, output.data,
+                required)) {
             ret seal_failure(tls_error.RESOURCE_LIMIT, NO_ALERT, required);
         }
         var i: usize = 0;
@@ -548,7 +597,9 @@ pub fun seal(
     val encrypted_length: usize = explicit_length + content.len + TAG_SIZE;
     val required: usize = HEADER_SIZE + encrypted_length;
     if (output.capacity < required || !memory_range.valid(output.data, required) ||
-        cipher_owner_overlaps(cipher, output.data, required)) {
+        cipher_owner_overlaps(cipher, output.data, required) ||
+        secret_public_overlap(content.data, content.len, output.data,
+            required)) {
         ret seal_failure(tls_error.RESOURCE_LIMIT, NO_ALERT, required);
     }
     var aad: [13]u8;
@@ -624,7 +675,11 @@ pub fun open(cipher: *Cipher, input: *u8, length: usize, output: contracts.Secre
         ret mark_peer_failure(cipher, tls_error.RECORD_OVERFLOW, RECORD_OVERFLOW_ALERT, parsed.frame.consumed, parsed.frame.consumed);
     }
     if ((plaintext_length > 0 && output.data == nil) ||
-        output.capacity < plaintext_length) {
+        output.capacity < plaintext_length ||
+        secret_public_overlap(output.data, plaintext_length,
+            cipher_owner_data(cipher), $size_of(Cipher)) ||
+        secret_public_overlap(output.data, plaintext_length, input,
+            parsed.frame.consumed)) {
         ret open_failure(PARSE_READY, tls_error.RESOURCE_LIMIT, NO_ALERT, 0, plaintext_length);
     }
 
@@ -1515,6 +1570,51 @@ test "record: public ranges validate before access" {
     if (install(?cipher, TLS13, aes_128_gcm(),
             contracts.SecretBytes{data: ?key[0], len: 16},
             contracts.Bytes{data: maximum::*u8, len: 12})) { ret 4; }
+    ret 0;
+}
+
+test "record: secret regions reject partial and cipher ownership aliases" {
+    var key: [16]^u8;
+    test_key(?key[0], 16);
+    var iv: [12]u8;
+    val algorithm: Aead = aead(AES_128_GCM, fake_seal, fake_open);
+    var cipher: Cipher;
+    if (!install(?cipher, TLS13, algorithm,
+            contracts.SecretBytes{data: ?key[0], len: 16},
+            contracts.Bytes{data: ?iv[0], len: 12})) { ret 1; }
+    var shared: [8]^u8;
+    var wire: [64]u8;
+    val partial: Sealed = seal(?cipher, APPLICATION_DATA,
+        contracts.SecretBytes{data: ?shared[0], len: 4}, 0,
+        contracts.SecretBuffer{data: ?shared[1], capacity: 7},
+        contracts.Buffer{data: ?wire[0], capacity: 64});
+    if (partial.error != tls_error.RESOURCE_LIMIT || cipher.sequence != 0) {
+        ret 2;
+    }
+    val owned_content: Sealed = seal(?cipher, APPLICATION_DATA,
+        contracts.SecretBytes{data: ?cipher.key[0], len: 1}, 0,
+        contracts.SecretBuffer{data: ?shared[0], capacity: 8},
+        contracts.Buffer{data: ?wire[0], capacity: 64});
+    if (owned_content.error != tls_error.ILLEGAL_PARAMETER ||
+        cipher.sequence != 0) { ret 3; }
+
+    var sender: Cipher;
+    if (!install(?sender, TLS13, algorithm,
+            contracts.SecretBytes{data: ?key[0], len: 16},
+            contracts.Bytes{data: ?iv[0], len: 12})) { ret 4; }
+    shared[0] = 7;
+    val good: Sealed = seal(?sender, APPLICATION_DATA,
+        contracts.SecretBytes{data: ?shared[0], len: 1}, 0,
+        contracts.SecretBuffer{data: ?shared[1], capacity: 7},
+        contracts.Buffer{data: ?wire[0], capacity: 64});
+    if (good.error != tls_error.OK) { ret 5; }
+    val owned_output: Opened = open(?cipher, ?wire[0], good.written,
+        contracts.SecretBuffer{data: ?cipher.key[0], capacity: 16});
+    if (owned_output.error != tls_error.RESOURCE_LIMIT ||
+        cipher.sequence != 0 || cipher.failed) { ret 6; }
+    if (install(?cipher, TLS13, algorithm,
+            contracts.SecretBytes{data: ?cipher.key[0], len: 16},
+            contracts.Bytes{data: ?iv[0], len: 12})) { ret 7; }
     ret 0;
 }
 

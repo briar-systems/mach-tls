@@ -452,29 +452,22 @@ test "transport: timeout resolves an idle operation once" {
 
 var write_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var write_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var write_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 var cancel_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var cancel_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var cancel_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 var zero_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var zero_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var zero_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 var close_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var close_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var close_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 var fragment_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var fragment_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var fragment_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 var terminal_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var terminal_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var terminal_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 var connect_handshake_input: [4096]u8;
 var connect_handshake_output: [4096]u8;
 var connect_handshake_hello: [4096]u8;
 var connect_certificates: [1]cert.Certificate;
 var connect_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var connect_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var connect_secret: [stream.SECRET_STORAGE_BYTES]^u8;
 
 fun test_entropy(context: ptr, secret_context: *^u8,
     output: *^u8, length: usize) i64 {
@@ -490,7 +483,7 @@ fun test_entropy(context: ptr, secret_context: *^u8,
 }
 
 fun make_open_stream(value: *stream.Stream, adapter: *transport.Transport,
-    wire_input: *u8, wire_output: *u8, secret_storage: *^u8) bool {
+    wire_input: *u8, wire_output: *u8) bool {
     value.transport = adapter;
     value.state = stream.OPEN;
     value.handshake_complete = true;
@@ -500,12 +493,9 @@ fun make_open_stream(value: *stream.Stream, adapter: *transport.Transport,
     value.storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     value.storage.wire_output = wire_output;
     value.storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    value.storage.secret = secret_storage;
-    value.storage.secret_capacity = stream.SECRET_STORAGE_BYTES;
-    value.plaintext = secret_storage;
-    value.content = ?secret_storage[record.MAX_INNER_PLAINTEXT];
-    value.scratch = ?secret_storage[record.MAX_INNER_PLAINTEXT +
-        record.MAX_PLAINTEXT];
+    value.plaintext = ?value.secret[0];
+    value.content = ?value.secret[record.MAX_PLAINTEXT + 1];
+    value.scratch = ?value.secret[record.MAX_PLAINTEXT * 2 + 1];
     var key: [16]^u8;
     var iv: [12]u8;
     var i: usize = 0;
@@ -532,7 +522,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
         !cancel.cancel(?scope)) { ret 2; }
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?adapter, ?terminal_wire_input[0],
-            ?terminal_wire_output[0], ?terminal_secret[0])) { ret 3; }
+            ?terminal_wire_output[0])) { ret 3; }
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope,
             transport.Token{index: 30, generation: 1},
@@ -545,7 +535,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 6; }
     var failed: stream.Stream;
     if (!make_open_stream(?failed, ?adapter, ?terminal_wire_input[0],
-            ?terminal_wire_output[0], ?terminal_secret[0])) { ret 7; }
+            ?terminal_wire_output[0])) { ret 7; }
     state.fail_during_submit = true;
     reentrant_secure = ?failed;
     if (!stream.write(?failed, ?scope,
@@ -564,7 +554,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 11; }
     var concurrent: stream.Stream;
     if (!make_open_stream(?concurrent, ?adapter, ?terminal_wire_input[0],
-            ?terminal_wire_output[0], ?terminal_secret[0])) { ret 12; }
+            ?terminal_wire_output[0])) { ret 12; }
     state.fail_during_submit = false;
     state.concurrent_reentry = true;
     state.reentry_rejected = false;
@@ -588,7 +578,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 16; }
     var drifted: stream.Stream;
     if (!make_open_stream(?drifted, ?adapter, ?terminal_wire_input[0],
-            ?terminal_wire_output[0], ?terminal_secret[0])) { ret 17; }
+            ?terminal_wire_output[0])) { ret 17; }
     state.mutate_descriptor = true;
     state.descriptor = drifted.transport;
     if (!stream.write(?drifted, ?scope,
@@ -642,6 +632,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     configuration.groups = ?groups[0]; configuration.group_len = 1;
     configuration.signatures = ?signatures[0]; configuration.signature_len = 1;
     configuration.entropy = ?entropy_source;
+    configuration.entropy_context_size = 1;
     configuration.limits = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
     var storage: stream.Storage;
@@ -654,23 +645,18 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?connect_wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.secret = ?connect_secret[0];
-    storage.secret_capacity = stream.SECRET_STORAGE_BYTES;
     var exact_configuration: config.ClientConfig = configuration;
     exact_configuration.limits.max_receive_record_plaintext = 63;
     exact_configuration.limits.max_send_record_plaintext = 128;
     var exact_storage: stream.Storage = storage;
-    exact_storage.secret_capacity = 320;
     var exact: stream.Stream;
-    if (stream.init(?exact, ?exact_configuration, exact_storage, ?adapter,
-            client.ExtraExtension{}, 0)) { ret 38; }
-    exact_storage.secret_capacity = 321;
     exact_storage.wire_input_capacity = 85;
     exact_storage.wire_output_capacity = 150;
     if (!stream.init(?exact, ?exact_configuration, exact_storage, ?adapter,
             client.ExtraExtension{}, 0) ||
-        exact.content != ?exact_storage.secret[64] ||
-        exact.scratch != ?exact_storage.secret[192] ||
+        exact.plaintext != ?exact.secret[0] ||
+        exact.content != ?exact.secret[64] ||
+        exact.scratch != ?exact.secret[192] ||
         !stream.destroy(?exact)) { ret 39; }
     var secure: stream.Stream;
     var extra: client.ExtraExtension;
@@ -679,7 +665,8 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     if (secure.state != stream.DESTROYED) { ret 32; }
     if (secure.transport != nil) { ret 33; }
     if (secure.storage.handshake.input != nil) { ret 34; }
-    if (secure.storage.secret != nil) { ret 35; }
+    if (secure.plaintext != nil || secure.content != nil ||
+        secure.scratch != nil) { ret 35; }
     if (secure.client.config != nil) { ret 36; }
     if (stream.destroy(?secure)) { ret 37; }
     if (!cancel.destroy(?scope) ||
@@ -698,7 +685,7 @@ test "stream: partial write retains application ownership until the whole record
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?adapter, ?write_wire_input[0],
-        ?write_wire_output[0], ?write_secret[0])) { ret 3; }
+        ?write_wire_output[0])) { ret 3; }
     var application: [5]u8 = [5]u8{'h', 'e', 'l', 'l', 'o'};
     if (!stream.write(?secure, ?scope, transport.Token{index: 10, generation: 1},
         ?application[0], 5, 44)) { ret 4; }
@@ -733,7 +720,7 @@ test "stream: write cancellation requires an abortive lower close" {
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?adapter, ?cancel_wire_input[0],
-        ?cancel_wire_output[0], ?cancel_secret[0])) { ret 3; }
+        ?cancel_wire_output[0])) { ret 3; }
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope, transport.Token{index: 11, generation: 1},
         ?application[0], 3, 45) || !cancel.cancel(?scope)) { ret 4; }
@@ -769,7 +756,7 @@ test "stream: zero-byte write completion makes sequence reuse impossible" {
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?adapter, ?zero_wire_input[0],
-        ?zero_wire_output[0], ?zero_secret[0])) { ret 3; }
+        ?zero_wire_output[0])) { ret 3; }
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope,
         transport.Token{index: 14, generation: 1}, ?application[0], 3, 50)) {
@@ -808,7 +795,7 @@ test "stream: close notify is fully written before write-side shutdown" {
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?adapter, ?close_wire_input[0],
-        ?close_wire_output[0], ?close_secret[0]) || !stream.half_close(?secure, ?scope,
+        ?close_wire_output[0]) || !stream.half_close(?secure, ?scope,
         transport.Token{index: 12, generation: 1}, 47)) { ret 3; }
     if (transport_state.writes != 1 || transport_state.closes != 0) { ret 4; }
     var completion: io_runtime.Completion;
@@ -851,7 +838,7 @@ test "stream: encrypted records retain read ownership at every byte boundary" {
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?adapter, ?fragment_wire_input[0],
-        ?fragment_wire_output[0], ?fragment_secret[0])) { ret 3; }
+        ?fragment_wire_output[0])) { ret 3; }
 
     var key: [16]^u8;
     var iv: [12]u8;

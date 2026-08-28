@@ -44,8 +44,6 @@ pub rec Storage {
     wire_input_capacity: usize;
     wire_output: *u8;
     wire_output_capacity: usize;
-    secret: *^u8;
-    secret_capacity: usize;
 }
 
 pub rec Snapshot {
@@ -66,6 +64,7 @@ pub rec Stream {
     operation: transport.Operation;
     read_cipher: record.Cipher;
     write_cipher: record.Cipher;
+    secret: [SECRET_STORAGE_BYTES]^u8;
     plaintext: *^u8;
     content: *^u8;
     scratch: *^u8;
@@ -176,11 +175,6 @@ fun storage_regions_disjoint(value: *Storage) bool {
     ret true;
 }
 
-fun secret_storage_valid(value: *Storage) bool {
-    ret value != nil && value.secret != nil &&
-        value.secret_capacity >= SECRET_STORAGE_BYTES;
-}
-
 fun secret_storage_required(stream: *Stream) usize {
     ret stream.receive_record_plaintext + stream.send_record_plaintext * 2 + 2;
 }
@@ -190,7 +184,7 @@ fun wire_storage_required(record_plaintext: usize) usize {
 }
 
 fun storage_valid(value: *Storage, lower: *transport.Transport) bool {
-    if (value == nil || !transport.valid(lower) || value.secret == nil ||
+    if (value == nil || !transport.valid(lower) ||
         !storage_regions_disjoint(value)) {
         ret false;
     }
@@ -860,7 +854,7 @@ fun init_inner(stream: *Stream, configuration: *config.ClientConfig,
     }
     stream.receive_record_plaintext = client.receive_record_limit(?stream.client);
     stream.send_record_plaintext = client.send_record_limit(?stream.client);
-    if (storage.secret_capacity < secret_storage_required(stream) ||
+    if (secret_storage_required(stream) > SECRET_STORAGE_BYTES ||
         storage.wire_input_capacity <
             wire_storage_required(stream.receive_record_plaintext) ||
         storage.wire_output_capacity <
@@ -871,9 +865,9 @@ fun init_inner(stream: *Stream, configuration: *config.ClientConfig,
     stream.lower_transport = lower[0];
     stream.transport = ?stream.lower_transport;
     stream.storage = storage;
-    stream.plaintext = storage.secret;
-    stream.content = ?storage.secret[stream.receive_record_plaintext + 1];
-    stream.scratch = ?storage.secret[stream.receive_record_plaintext +
+    stream.plaintext = ?stream.secret[0];
+    stream.content = ?stream.secret[stream.receive_record_plaintext + 1];
+    stream.scratch = ?stream.secret[stream.receive_record_plaintext +
         stream.send_record_plaintext + 1];
     stream.state = NEW;
     stream.control = CONTROL_NONE;
@@ -1176,7 +1170,7 @@ fun destroy_inner(stream: *Stream) bool {
     record.destroy(?stream.read_cipher);
     record.destroy(?stream.write_cipher);
     if (!client.destroy(?stream.client)) { ret false; }
-    ct.zeroize(stream.storage.secret, stream.storage.secret_capacity);
+    ct.zeroize(?stream.secret[0], SECRET_STORAGE_BYTES);
     stream.transport = nil;
     stream.lower_transport = transport.Transport{};
     stream.storage.handshake.input = nil;
@@ -1193,8 +1187,6 @@ fun destroy_inner(stream: *Stream) bool {
     stream.storage.wire_input_capacity = 0;
     stream.storage.wire_output = nil;
     stream.storage.wire_output_capacity = 0;
-    stream.storage.secret = nil;
-    stream.storage.secret_capacity = 0;
     stream.plaintext = nil;
     stream.content = nil;
     stream.scratch = nil;
@@ -1223,7 +1215,6 @@ var range_handshake_hello: [256]u8;
 var range_certificates: [1]cert.Certificate;
 var range_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var range_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var range_secret: [SECRET_STORAGE_BYTES]^u8;
 
 test "stream: storage regions are representable and independently owned" {
     var storage: Storage;
@@ -1237,10 +1228,7 @@ test "stream: storage regions are representable and independently owned" {
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?range_wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.secret = ?range_secret[0];
-    storage.secret_capacity = SECRET_STORAGE_BYTES;
     if (!storage_regions_disjoint(?storage)) { ret 1; }
-    if (!secret_storage_valid(?storage)) { ret 6; }
     var aliased: Storage = storage;
     aliased.wire_output = storage.wire_input;
     if (storage_regions_disjoint(?aliased)) { ret 2; }
@@ -1250,8 +1238,6 @@ test "stream: storage regions are representable and independently owned" {
     var wrapping: Storage = storage;
     wrapping.wire_input = (~(0::usize) - 1)::*u8;
     if (storage_regions_disjoint(?wrapping)) { ret 4; }
-    storage.secret_capacity = SECRET_STORAGE_BYTES - 1;
-    if (secret_storage_valid(?storage)) { ret 5; }
     ret 0;
 }
 
