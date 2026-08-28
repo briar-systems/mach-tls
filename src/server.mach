@@ -29,6 +29,7 @@ use tls.handshake.extensions;
 use tls.handshake.negotiation;
 use tls.memory_range;
 use tls.record;
+use tls.session;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
@@ -38,6 +39,9 @@ pub val MAX_PUBLIC_KEY: usize = 512;
 pub val MAX_SIGNATURE: usize = 512;
 pub val MAX_SIGNED_CONTEXT: usize = 64 + 34 + 1 + 48;
 pub val MAX_QUEUED_EVENTS: usize = 12;
+pub val MAX_TICKETS_PER_CONNECTION: u8 = 4;
+pub val TICKET_MESSAGE_BYTES: usize = 4 + 4 + 4 + 1 + session.NONCE_SIZE + 2 +
+    session.MAX_TICKET_BYTES + 2;
 pub val QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 
 val EXPECT_CLIENT_HELLO: u8 = 1;
@@ -122,6 +126,12 @@ pub rec Server {
     client_certificate_empty: bool;
     authenticated: bool;
     early_data_offered: bool;
+    resumed: bool;
+    psk_index: u16;
+    ticket_state: session.State;
+    binder_transcript: transcript.Transcript;
+    tickets_issued: u8;
+    ticket_nonce: u64;
     peer_leaf: x509.Certificate;
     peer_key_first: [MAX_PUBLIC_KEY]u8;
     peer_key_second: [MAX_PUBLIC_KEY]u8;
@@ -522,6 +532,9 @@ fun configuration_equal(first: config.ServerConfig,
         first.signature_len == second.signature_len &&
         first.entropy == second.entropy &&
         first.entropy_context_size == second.entropy_context_size &&
+        first.tickets == second.tickets && first.replay == second.replay &&
+        first.replay_policy == second.replay_policy &&
+        first.tickets_per_connection == second.tickets_per_connection &&
         limits_equal(first.limits, second.limits);
 }
 
@@ -690,7 +703,20 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         (extra.kind != 0 && reserved_server_extension(extra.kind)) ||
         (peer_extension != 0 &&
         (storage.peer_parameters == nil ||
-            storage.peer_parameters_capacity == 0))) { ret false; }
+            storage.peer_parameters_capacity == 0)) ||
+        value.tickets_per_connection > MAX_TICKETS_PER_CONNECTION ||
+        (value.tickets_per_connection != 0 && value.tickets == nil) ||
+        (value.tickets != nil && !value.tickets.initialized) ||
+        (value.replay_policy != session.REPLAY_PERMISSIVE &&
+            value.replay_policy != session.REPLAY_SINGLE_USE) ||
+        (value.replay_policy == session.REPLAY_SINGLE_USE &&
+            (value.replay == nil || !value.replay.initialized ||
+                value.tickets == nil)) ||
+        (value.replay != nil && !value.replay.initialized)) { ret false; }
+    var ticket_output: usize = 0;
+    if (!memory_range.scaled(value.tickets_per_connection::usize,
+            TICKET_MESSAGE_BYTES, ?ticket_output) ||
+        ticket_output > storage.output_capacity) { ret false; }
     if (value.versions[0] != tls13.VERSION) { ret false; }
     var i: usize = 0;
     for (i < value.suite_len) {
@@ -785,6 +811,12 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
     server.client_certificate_empty = false;
     server.authenticated = false;
     server.early_data_offered = false;
+    server.resumed = false;
+    server.psk_index = 0;
+    server.ticket_state = session.empty_state();
+    server.binder_transcript = transcript.empty();
+    server.tickets_issued = 0;
+    server.ticket_nonce = 0;
     server.peer_leaf = x509.Certificate{};
     server.selected_alpn.data = nil;
     server.selected_alpn.len = 0;
@@ -1029,6 +1061,227 @@ fun record_size_limit(server: *Server, hello: *codec.ClientHello) bool {
     ret true;
 }
 
+fun psk_identity_count(psk: extensions.Extension) usize {
+    if (psk.len < 2) { ret 0; }
+    val identities_len: usize = read_u16(psk.data, 0)::usize;
+    var offset: usize = 2;
+    val end: usize = 2 + identities_len;
+    var count: usize = 0;
+    for (offset + 5 < end) {
+        val identity_len: usize = read_u16(psk.data, offset)::usize;
+        offset = offset + 2 + identity_len + 4;
+        count = count + 1;
+    }
+    ret count;
+}
+
+fun psk_identity_at(psk: extensions.Extension, index: usize,
+    identity: *contracts.Bytes, obfuscated_age: *u32) bool {
+    if (psk.len < 2) { ret false; }
+    val identities_len: usize = read_u16(psk.data, 0)::usize;
+    var offset: usize = 2;
+    val end: usize = 2 + identities_len;
+    var current: usize = 0;
+    for (offset + 5 < end) {
+        val identity_len: usize = read_u16(psk.data, offset)::usize;
+        if (current == index) {
+            identity[0] = contracts.Bytes{data: ?psk.data[offset + 2],
+                len: identity_len};
+            val age_offset: usize = offset + 2 + identity_len;
+            obfuscated_age[0] = (psk.data[age_offset]::u32 << 24) |
+                (psk.data[age_offset + 1]::u32 << 16) |
+                (psk.data[age_offset + 2]::u32 << 8) |
+                psk.data[age_offset + 3]::u32;
+            ret true;
+        }
+        offset = offset + 2 + identity_len + 4;
+        current = current + 1;
+    }
+    ret false;
+}
+
+fun psk_binder_at(psk: extensions.Extension, index: usize,
+    binder: *contracts.Bytes) bool {
+    if (psk.len < 2) { ret false; }
+    val identities_len: usize = read_u16(psk.data, 0)::usize;
+    var offset: usize = 2 + identities_len;
+    if (offset + 2 > psk.len) { ret false; }
+    val binders_len: usize = read_u16(psk.data, offset)::usize;
+    offset = offset + 2;
+    val end: usize = offset + binders_len;
+    if (end > psk.len) { ret false; }
+    var current: usize = 0;
+    for (offset < end) {
+        val binder_len: usize = psk.data[offset]::usize;
+        if (offset + 1 + binder_len > end) { ret false; }
+        if (current == index) {
+            binder[0] = contracts.Bytes{data: ?psk.data[offset + 1],
+                len: binder_len};
+            ret true;
+        }
+        offset = offset + 1 + binder_len;
+        current = current + 1;
+    }
+    ret false;
+}
+
+fun offered_psk_dhe(hello: *codec.ClientHello) bool {
+    var modes: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.PSK_KEY_EXCHANGE_MODES,
+            ?modes)) { ret false; }
+    var i: usize = 1;
+    for (i < modes.len) {
+        if (modes.data[i] == 1) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun configured_suite(server: *Server, suite: tls13.CipherSuite) bool {
+    var i: usize = 0;
+    for (i < server.config.suite_len) {
+        if (server.config.suites[i] == suite) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun ticket_name_matches(server: *Server, state: *session.State) bool {
+    if (state.server_name_len != server.server_name.len) { ret false; }
+    var i: usize = 0;
+    for (i < state.server_name_len) {
+        if (state.server_name[i] != server.server_name.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun binder_matches(first: contracts.Bytes, second: *u8, length: usize) bool {
+    if (first.len != length || first.data == nil) { ret false; }
+    var difference: u8 = 0;
+    var i: usize = 0;
+    for (i < length) {
+        difference = difference | (first.data[i] ^ second[i]);
+        i = i + 1;
+    }
+    ret difference == 0;
+}
+
+# a ticket is accepted only when its key, lifetime, suite, name, binder, and
+# replay policy all admit it; anything short of that is a full handshake
+fun try_resume(server: *Server, hello: *codec.ClientHello,
+    frame: contracts.Bytes, suite: *tls13.CipherSuite) error.Error {
+    server.resumed = false;
+    if (server.config.tickets == nil) { ret error.OK; }
+    var psk: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.PRE_SHARED_KEY, ?psk)) {
+        ret error.OK;
+    }
+    if (!offered_psk_dhe(hello)) { ret error.OK; }
+    val count: usize = psk_identity_count(psk);
+    if (count == 0) { ret error.OK; }
+    var index: usize = 0;
+    for (index < count) {
+        var identity: contracts.Bytes;
+        var obfuscated_age: u32 = 0;
+        var state: session.State;
+        if (psk_identity_at(psk, index, ?identity, ?obfuscated_age) &&
+            identity.len != 0 &&
+            session.open(server.config.tickets, identity,
+                server.verification_time, ?state)) {
+            val usable: bool = configured_suite(server, state.suite) &&
+                offered_suite_value(hello, state.suite) &&
+                ticket_name_matches(server, ?state);
+            if (usable) {
+                val failure: error.Error = accept_ticket(server, hello, frame,
+                    psk, index, identity, ?state);
+                if (failure != error.OK) {
+                    session.state_destroy(?state);
+                    ret failure;
+                }
+                if (server.resumed) {
+                    @suite = state.suite;
+                    session.state_destroy(?state);
+                    ret error.OK;
+                }
+            }
+            session.state_destroy(?state);
+        }
+        index = index + 1;
+    }
+    ret error.OK;
+}
+
+fun offered_suite_value(hello: *codec.ClientHello,
+    suite: tls13.CipherSuite) bool {
+    var offset: usize = 0;
+    for (offset + 1 < hello.cipher_suites.len) {
+        if (read_u16(hello.cipher_suites.data, offset) == suite) { ret true; }
+        offset = offset + 2;
+    }
+    ret false;
+}
+
+# verify the binder over the truncated client hello on a separate transcript
+fun accept_ticket(server: *Server, hello: *codec.ClientHello,
+    frame: contracts.Bytes, psk: extensions.Extension, index: usize,
+    identity: contracts.Bytes, state: *session.State) error.Error {
+    var offered: contracts.Bytes;
+    if (!psk_binder_at(psk, index, ?offered)) { ret error.ILLEGAL_PARAMETER; }
+    val size: usize = key_schedule.hash_size(
+        key_schedule.algorithm_for_suite(state.suite));
+    if (size == 0 || offered.len != size) { ret error.ILLEGAL_PARAMETER; }
+    var failure: error.Error = key_schedule.init(?server.schedule, state.suite,
+        contracts.SecretBytes{data: ?state.secret[0], len: state.secret_len});
+    if (failure != error.OK) { ret failure; }
+    failure = transcript.init_for_suite(?server.binder_transcript, state.suite);
+    if (failure == error.OK) {
+        failure = transcript.update_binder_client_hello(
+            ?server.binder_transcript, frame, false);
+    }
+    var hash: [48]u8;
+    if (failure == error.OK) {
+        failure = transcript.snapshot(?server.binder_transcript,
+            contracts.Buffer{data: ?hash[0], capacity: 48});
+    }
+    var expected: [48]u8;
+    if (failure == error.OK) {
+        failure = key_schedule.binder(?server.schedule, true,
+            contracts.Bytes{data: ?hash[0], len: size},
+            contracts.Buffer{data: ?expected[0], capacity: 48});
+    }
+    var i: usize = 0;
+    for (i < 48) { hash[i] = 0; i = i + 1; }
+    transcript.destroy(?server.binder_transcript);
+    if (failure != error.OK) {
+        key_schedule.destroy(?server.schedule);
+        i = 0;
+        for (i < 48) { expected[i] = 0; i = i + 1; }
+        ret failure;
+    }
+    val matched: bool = binder_matches(offered, ?expected[0], size);
+    i = 0;
+    for (i < 48) { expected[i] = 0; i = i + 1; }
+    if (!matched) {
+        key_schedule.destroy(?server.schedule);
+        ret error.DECRYPT_ERROR;
+    }
+    # a binder is unique per client hello, so ticket reuse is keyed on the
+    # ticket identity, which is what a single-use policy actually bounds
+    if (server.config.replay_policy == session.REPLAY_SINGLE_USE &&
+        !session.replay_admit(server.config.replay, identity,
+            state.issued_at + state.lifetime_seconds::i64,
+            server.verification_time)) {
+        key_schedule.destroy(?server.schedule);
+        ret error.OK;
+    }
+    server.resumed = true;
+    server.psk_index = index::u16;
+    server.authenticated = state.client_authenticated;
+    server.ticket_state = @state;
+    ret error.OK;
+}
+
 fun retain_peer_parameters(server: *Server, hello: *codec.ClientHello) error.Error {
     if (server.peer_extension == 0) { ret error.OK; }
     var item: extensions.Extension;
@@ -1216,6 +1469,13 @@ fun build_server_hello(server: *Server, peer: contracts.Bytes) error.Error {
     copy_bytes(?extension_bytes[offset + 8], ?server.public_key[0],
         server.public_key_len);
     offset = offset + 8 + server.public_key_len;
+    if (server.resumed) {
+        var selected: [2]u8;
+        write_u16(?selected[0], 0, server.psk_index);
+        offset = put_extension(?extension_bytes[0], offset,
+            extensions.PRE_SHARED_KEY,
+            contracts.Bytes{data: ?selected[0], len: 2});
+    }
     var hello: codec.ServerHello;
     hello.legacy_version = tls13.LEGACY_VERSION;
     hello.random = contracts.Bytes{data: ?server.random[0], len: 32};
@@ -1246,8 +1506,10 @@ fun build_server_hello(server: *Server, peer: contracts.Bytes) error.Error {
         ct.zeroize(?shared[0], 32);
         ret error.HANDSHAKE_FAILURE;
     }
-    failure = key_schedule.init(?server.schedule, server.suite,
-        contracts.SecretBytes{data: nil, len: 0});
+    if (!server.resumed) {
+        failure = key_schedule.init(?server.schedule, server.suite,
+            contracts.SecretBytes{data: nil, len: 0});
+    }
     if (failure == error.OK) {
         failure = key_schedule.advance_handshake(?server.schedule,
             contracts.SecretBytes{data: ?shared[0], len: 32},
@@ -1507,23 +1769,25 @@ fun build_server_flight(server: *Server) error.Error {
     var failure: error.Error = absorb(server, offset, next);
     if (failure != error.OK) { ret failure; }
     offset = next;
-    if (server.client_auth_required) {
-        next = append_certificate_request(server, offset);
+    if (!server.resumed) {
+        if (server.client_auth_required) {
+            next = append_certificate_request(server, offset);
+            if (next == 0) { ret error.RESOURCE_LIMIT; }
+            failure = absorb(server, offset, next);
+            if (failure != error.OK) { ret failure; }
+            offset = next;
+        }
+        next = append_certificate(server, offset);
         if (next == 0) { ret error.RESOURCE_LIMIT; }
         failure = absorb(server, offset, next);
         if (failure != error.OK) { ret failure; }
         offset = next;
+        next = append_certificate_verify(server, offset);
+        if (next == 0) { ret error.INTERNAL_ERROR; }
+        failure = absorb(server, offset, next);
+        if (failure != error.OK) { ret failure; }
+        offset = next;
     }
-    next = append_certificate(server, offset);
-    if (next == 0) { ret error.RESOURCE_LIMIT; }
-    failure = absorb(server, offset, next);
-    if (failure != error.OK) { ret failure; }
-    offset = next;
-    next = append_certificate_verify(server, offset);
-    if (next == 0) { ret error.INTERNAL_ERROR; }
-    failure = absorb(server, offset, next);
-    if (failure != error.OK) { ret failure; }
-    offset = next;
     next = append_finished(server, ?server.schedule.server_handshake_traffic,
         offset);
     if (next == 0) { ret error.INTERNAL_ERROR; }
@@ -1553,7 +1817,7 @@ fun build_server_flight(server: *Server) error.Error {
     if (server.early_data_offered) { disposition = engine.EARLY_REJECTED; }
     if (!queue_simple(server, engine.EARLY_DATA, engine.HANDSHAKE,
             disposition)) { ret error.INTERNAL_ERROR; }
-    if (server.client_auth_required) {
+    if (server.client_auth_required && !server.resumed) {
         server.state = EXPECT_CLIENT_CERTIFICATE;
     } or {
         server.state = EXPECT_CLIENT_FINISHED;
@@ -1616,6 +1880,14 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
     if (after_retry && (selection.retry || selection.group != server.group ||
         selection.suite != server.suite)) { ret error.ILLEGAL_PARAMETER; }
     if (selection.retry) { ret build_hello_retry(server, ?selection); }
+    # a retried hello carries a rewritten transcript, so resumption is only
+    # attempted on the first flight and otherwise falls back to a full handshake
+    if (!after_retry) {
+        var resumed_suite: tls13.CipherSuite = selection.suite;
+        failure = try_resume(server, ?hello, frame, ?resumed_suite);
+        if (failure != error.OK) { ret failure; }
+        if (server.resumed) { selection.suite = resumed_suite; }
+    }
     var peer: contracts.Bytes;
     if (!client_share(?hello, selection.group, ?peer)) {
         ret error.ILLEGAL_PARAMETER;
@@ -1830,10 +2102,141 @@ fun handle_client_finished(server: *Server, frame: contracts.Bytes,
         if (!queue_simple(server, engine.AUTHENTICATION, engine.APPLICATION,
                 disposition)) { ret error.INTERNAL_ERROR; }
     }
+    val issued: error.Error = issue_tickets(server);
+    if (issued != error.OK) { ret issued; }
     if (!queue_simple(server, engine.HANDSHAKE_COMPLETE, engine.APPLICATION,
             0)) { ret error.INTERNAL_ERROR; }
     server.state = ESTABLISHED;
     ret error.OK;
+}
+
+fun ticket_state_for(server: *Server, nonce: contracts.Bytes,
+    output: *session.State) bool {
+    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
+    @output = session.empty_state();
+    if (key_schedule.resumption_psk(?server.schedule, nonce,
+        contracts.SecretBuffer{data: ?output.secret[0],
+            capacity: session.MAX_SECRET}) != error.OK) {
+        session.state_destroy(output);
+        ret false;
+    }
+    output.version = tls13.VERSION;
+    output.suite = server.suite;
+    output.secret_len = size;
+    output.issued_at = server.verification_time;
+    output.lifetime_seconds = server.config.tickets.ticket_lifetime_seconds;
+    output.max_early_data = 0;
+    output.client_authenticated = server.authenticated;
+    output.credential_generation =
+        session.keyring_generation(server.config.tickets);
+    if (server.selected_alpn.len != 0 &&
+        server.selected_alpn.len <= session.MAX_ALPN) {
+        copy_bytes(?output.alpn[0], server.selected_alpn.data,
+            server.selected_alpn.len);
+        output.alpn_len = server.selected_alpn.len;
+    }
+    if (server.server_name.len != 0 &&
+        server.server_name.len <= session.MAX_SERVER_NAME) {
+        copy_bytes(?output.server_name[0], server.server_name.data,
+            server.server_name.len);
+        output.server_name_len = server.server_name.len;
+    }
+    ret true;
+}
+
+# issue the configured number of independent single-nonce tickets
+fun issue_tickets(server: *Server) error.Error {
+    if (server.config.tickets == nil ||
+        server.config.tickets_per_connection == 0) { ret error.OK; }
+    var issued: u8 = 0;
+    for (issued < server.config.tickets_per_connection) {
+        var nonce: [session.NONCE_SIZE]u8;
+        server.ticket_nonce = server.ticket_nonce + 1;
+        var i: usize = 0;
+        for (i < session.NONCE_SIZE) {
+            nonce[i] = (server.ticket_nonce >>
+                ((session.NONCE_SIZE - 1 - i) * 8)::u64)::u8;
+            i = i + 1;
+        }
+        var state: session.State;
+        if (!ticket_state_for(server,
+                contracts.Bytes{data: ?nonce[0], len: session.NONCE_SIZE},
+                ?state)) { ret error.INTERNAL_ERROR; }
+        var age_add: [4]u8;
+        if (!fill_public(server, ?age_add[0], 4)) {
+            session.state_destroy(?state);
+            ret error.INTERNAL_ERROR;
+        }
+        state.age_add = (age_add[0]::u32 << 24) | (age_add[1]::u32 << 16) |
+            (age_add[2]::u32 << 8) | age_add[3]::u32;
+        var sealed: [session.MAX_TICKET_BYTES]u8;
+        val length: usize = session.seal(server.config.tickets, ?state,
+            server.verification_time, ?server.entropy,
+            contracts.Buffer{data: ?sealed[0],
+                capacity: session.MAX_TICKET_BYTES});
+        if (length == 0) {
+            session.state_destroy(?state);
+            ret error.INTERNAL_ERROR;
+        }
+        var message: codec.NewSessionTicket;
+        message.lifetime = state.lifetime_seconds;
+        message.age_add = state.age_add;
+        message.nonce = contracts.Bytes{data: ?nonce[0],
+            len: session.NONCE_SIZE};
+        message.ticket = contracts.Bytes{data: ?sealed[0], len: length};
+        message.extensions = extensions.list(nil, 0,
+            extensions.NEW_SESSION_TICKET);
+        val encoded: handshake.Progress = codec.encode_new_session_ticket(
+            ?message,
+            contracts.Buffer{data: ?server.storage.output[server.output_used],
+                capacity: server.storage.output_capacity - server.output_used});
+        session.state_destroy(?state);
+        if (encoded.status != handshake.COMPLETE) { ret error.RESOURCE_LIMIT; }
+        if (!queue_crypto(server, engine.APPLICATION, server.output_used,
+                encoded.produced)) { ret error.INTERNAL_ERROR; }
+        server.output_used = server.output_used + encoded.produced;
+        server.tickets_issued = server.tickets_issued + 1;
+        issued = issued + 1;
+    }
+    ret error.OK;
+}
+
+fun request_key_update_inner(server: *Server, request: u8) engine.Result {
+    if (!server_owner_valid(server) || server.state != ESTABLISHED ||
+        request > codec.UPDATE_REQUESTED) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (server.queue_head == server.queue_len) { server.output_used = 0; }
+    val encoded: handshake.Progress = codec.encode_key_update(
+        codec.KeyUpdate{request: request},
+        contracts.Buffer{data: ?server.storage.output[server.output_used],
+            capacity: server.storage.output_capacity - server.output_used});
+    if (encoded.status != handshake.COMPLETE) {
+        ret result(engine.FAILED, error.RESOURCE_LIMIT, 0, 0);
+    }
+    val failure: error.Error = key_schedule.update_traffic(?server.schedule,
+        ?server.schedule.server_application_traffic);
+    if (failure != error.OK) {
+        ret fail(server, failure, engine.alert_for(failure));
+    }
+    if (!queue_crypto(server, engine.APPLICATION, server.output_used,
+            encoded.produced) ||
+        !queue_secret(server, engine.APPLICATION, engine.SEND,
+            SEND_APPLICATION)) {
+        ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+    }
+    server.output_used = server.output_used + encoded.produced;
+    ret result(engine.OK, error.OK, 0, 0);
+}
+
+# ask the peer for a fresh send key, and optionally for one of its own
+pub fun request_key_update(server: *Server, request: u8) engine.Result {
+    if (!enter(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    val requested: engine.Result = request_key_update_inner(server, request);
+    leave(server);
+    ret requested;
 }
 
 fun handle_post_handshake(server: *Server,
@@ -2196,7 +2599,9 @@ fun destroy_inner(server: *Server) bool {
     if (!server_owner_valid(server) || server.event_active) { ret false; }
     ct.zeroize(?server.private_key[0], 32);
     transcript.destroy(?server.transcript);
+    transcript.destroy(?server.binder_transcript);
     key_schedule.destroy(?server.schedule);
+    session.state_destroy(?server.ticket_state);
     release_lease(server);
     server.config = nil;
     # empty-literal assignment is not trusted to clear welded pointer fields
@@ -2248,6 +2653,8 @@ fun snapshot_inner(server: *Server) engine.Snapshot {
     value.peer_parameters = server.peer_parameters;
     value.peer_name = server.server_name;
     value.client_auth_requested = server.client_auth_required;
+    value.resumed = server.resumed;
+    value.tickets_issued = server.tickets_issued;
     value.output_pending = pending(server);
     value.event_active = server.event_active;
     value.destroyed = server.state == DESTROYED;
@@ -2939,5 +3346,363 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     if (credentials.retire_store(?store, ?retired) != contracts.OK ||
         !credentials.reclaimable(retired)) { ret 21; }
     if (keys.destroy_private(?key) != contracts.OK) { ret 22; }
+    ret 0;
+}
+
+var resume_server_input: [16384]u8;
+var resume_server_output: [16384]u8;
+var resume_server_hello: [16384]u8;
+var resume_server_certificates: [4]cert.Certificate;
+var resume_client_input: [16384]u8;
+var resume_client_output: [16384]u8;
+var resume_client_hello: [16384]u8;
+var resume_client_certificates: [4]cert.Certificate;
+var resume_ring: session.KeyRing;
+var resume_window: session.ReplayWindow;
+var resume_store: session.ClientStore;
+var resume_listener: config.ServerConfig;
+var resume_dialer: config.ClientConfig;
+var resume_protocols: [1]config.ProtocolName;
+var resume_versions: [1]u16;
+var resume_suites: [1]tls13.CipherSuite;
+var resume_groups: [1]tls13.NamedGroup;
+var resume_signatures: [1]tls13.SignatureScheme;
+var resume_server_entropy: secret.Entropy;
+var resume_client_entropy: secret.Entropy;
+var resume_server_counter: u8;
+var resume_client_counter: u8;
+var resume_anchor: cert.Certificate;
+var resume_trust: cert.TrustStore;
+var resume_chain: [1]cert.Certificate;
+var resume_key: keys.PrivateKey;
+var resume_identity: credentials.Identity;
+var resume_generation: credentials.Generation;
+var resume_store_credentials: credentials.Store;
+
+fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
+    owner: *secret.Allocator, now: i64) bool {
+    if (!load_test_credentials(?resume_identity, ?resume_chain[0], ?resume_key,
+            owner)) { ret false; }
+    resume_generation = credentials.empty_generation();
+    if (credentials.initialize(?resume_generation, ?resume_identity, 1, 0, nil,
+            false) != contracts.OK) { ret false; }
+    resume_store_credentials = credentials.empty_store();
+    if (credentials.initialize_store(?resume_store_credentials,
+            ?resume_generation) != contracts.OK) { ret false; }
+    resume_server_counter = 11;
+    resume_client_counter = 71;
+    resume_server_entropy = secret.Entropy{context: ?resume_server_counter,
+        secret_context: nil, fill_fn: test_entropy, initialized: true};
+    resume_client_entropy = secret.Entropy{context: ?resume_client_counter,
+        secret_context: nil, fill_fn: test_entropy, initialized: true};
+    if (!session.keyring_init(?resume_ring, ?resume_server_entropy, now, 3600,
+            1800, 7200) || !session.replay_init(?resume_window) ||
+        !session.client_store_init(?resume_store)) { ret false; }
+    resume_protocols[0] = config.ProtocolName{data: "h2"::*u8, len: 2};
+    resume_versions[0] = tls13.VERSION;
+    resume_suites[0] = tls13.AES_128_GCM_SHA256;
+    resume_groups[0] = tls13.X25519;
+    resume_signatures[0] = tls13.ED25519;
+    resume_listener = config.ServerConfig{};
+    resume_listener.credentials = ?resume_store_credentials;
+    resume_listener.alpn = ?resume_protocols[0];
+    resume_listener.alpn_len = 1;
+    resume_listener.require_alpn = true;
+    resume_listener.versions = ?resume_versions[0];
+    resume_listener.version_len = 1;
+    resume_listener.suites = ?resume_suites[0];
+    resume_listener.suite_len = 1;
+    resume_listener.groups = ?resume_groups[0];
+    resume_listener.group_len = 1;
+    resume_listener.signatures = ?resume_signatures[0];
+    resume_listener.signature_len = 1;
+    resume_listener.entropy = ?resume_server_entropy;
+    resume_listener.entropy_context_size = 1;
+    resume_listener.tickets = ?resume_ring;
+    resume_listener.replay = ?resume_window;
+    resume_listener.replay_policy = policy;
+    resume_listener.tickets_per_connection = tickets;
+    resume_listener.limits = config.production_limits();
+    resume_listener.limits.max_peer_handshake_bytes = 16384;
+    resume_listener.limits.max_client_hello_bytes = 16384;
+    resume_listener.limits.max_chain_bytes = 4096;
+    resume_listener.limits.max_server_flight_bytes = 8192;
+
+    resume_anchor = cert.Certificate{der: ?loopback_root[0], der_len: 341};
+    resume_trust = cert.TrustStore{anchors: ?resume_anchor, len: 1};
+    resume_dialer = config.ClientConfig{};
+    resume_dialer.client_identity = nil;
+    resume_dialer.server_name = contracts.Bytes{data: "api.example.com"::*u8,
+        len: 15};
+    resume_dialer.alpn = ?resume_protocols[0];
+    resume_dialer.alpn_len = 1;
+    resume_dialer.trust = ?resume_trust;
+    resume_dialer.versions = ?resume_versions[0];
+    resume_dialer.version_len = 1;
+    resume_dialer.suites = ?resume_suites[0];
+    resume_dialer.suite_len = 1;
+    resume_dialer.groups = ?resume_groups[0];
+    resume_dialer.group_len = 1;
+    resume_dialer.signatures = ?resume_signatures[0];
+    resume_dialer.signature_len = 1;
+    resume_dialer.entropy = ?resume_client_entropy;
+    resume_dialer.entropy_context_size = 1;
+    resume_dialer.sessions = ?resume_store;
+    resume_dialer.limits = config.production_limits();
+    resume_dialer.limits.max_peer_handshake_bytes = 16384;
+    resume_dialer.limits.max_client_hello_bytes = 16384;
+    ret true;
+}
+
+fun resume_connect(listener_engine: *Server, dialer_engine: *client.Client,
+    now: i64) i64 {
+    var server_storage: Storage = Storage{
+        input: ?resume_server_input[0], input_capacity: 16384,
+        output: ?resume_server_output[0], output_capacity: 16384,
+        hello: ?resume_server_hello[0], hello_capacity: 16384,
+        certificates: ?resume_server_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0};
+    var extra: ExtraExtension;
+    extra.kind = 0;
+    extra.data.data = nil;
+    extra.data.len = 0;
+    if (!init(listener_engine, ?resume_listener, server_storage, extra, 0) ||
+        start(listener_engine, now).status != engine.OK) { ret 1; }
+    var client_storage: client.Storage = client.Storage{
+        input: ?resume_client_input[0], input_capacity: 16384,
+        output: ?resume_client_output[0], output_capacity: 16384,
+        hello: ?resume_client_hello[0], hello_capacity: 16384,
+        certificates: ?resume_client_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0};
+    var client_extra: client.ExtraExtension;
+    client_extra.kind = 0;
+    client_extra.data.data = nil;
+    client_extra.data.len = 0;
+    if (!client.init(dialer_engine, ?resume_dialer, client_storage,
+            client_extra, 0) ||
+        client.start(dialer_engine, now).status != engine.OK) { ret 2; }
+    val exchanged: i64 = exchange(listener_engine, dialer_engine);
+    if (exchanged != 0) { ret 3; }
+    ret 0;
+}
+
+# drain every queued post-handshake event in both directions
+fun pump_post(local: *Server, peer: *client.Client) i64 {
+    var rounds: usize = 0;
+    for (rounds < 32) {
+        var progressed: bool = false;
+        var event: engine.Event;
+        for (next_event(local, ?event)) {
+            progressed = true;
+            if (event.kind == engine.CRYPTO) {
+                if (client.ingest(peer, event.level, event.data.data,
+                        event.data.len).status == engine.FAILED) { ret 1; }
+            }
+            if (!complete_event(local, event.token, true)) { ret 2; }
+        }
+        var peer_event: engine.Event;
+        for (client.next_event(peer, ?peer_event)) {
+            progressed = true;
+            if (peer_event.kind == engine.CRYPTO) {
+                if (ingest(local, peer_event.level, peer_event.data.data,
+                        peer_event.data.len).status == engine.FAILED) { ret 3; }
+            }
+            if (!client.complete_event(peer, peer_event.token, true)) { ret 4; }
+        }
+        if (!progressed) { ret 0; }
+        rounds = rounds + 1;
+    }
+    ret 5;
+}
+
+fun secrets_match(local: *Server, peer: *client.Client, server_send: bool) bool {
+    val size: usize = key_schedule.hash_size(local.schedule.algorithm);
+    if (size == 0 || size != key_schedule.hash_size(peer.schedule.algorithm)) {
+        ret false;
+    }
+    var mine: contracts.SecretBytes;
+    var theirs: contracts.SecretBytes;
+    if (server_send) {
+        mine = key_schedule.bytes(?local.schedule.server_application_traffic);
+        theirs = key_schedule.bytes(?peer.schedule.server_application_traffic);
+    } or {
+        mine = key_schedule.bytes(?local.schedule.client_application_traffic);
+        theirs = key_schedule.bytes(?peer.schedule.client_application_traffic);
+    }
+    if (mine.len != size || theirs.len != size) { ret false; }
+    var i: usize = 0;
+    for (i < size) {
+        if (mine.data[i]:^ != theirs.data[i]:^) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "session: a ticket resumes one connection and a key update rekeys it" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, 1800000000)) {
+        ret 1;
+    }
+    var listener_engine: Server;
+    var dialer_engine: client.Client;
+    val first: i64 = resume_connect(?listener_engine, ?dialer_engine,
+        1800000000);
+    if (first != 0) { ret 10 + first::i32; }
+    if (snapshot(?listener_engine).resumed ||
+        client.snapshot(?dialer_engine).resumed) { ret 2; }
+    if (snapshot(?listener_engine).tickets_issued != 2) { ret 3; }
+    val drained: i64 = pump_post(?listener_engine, ?dialer_engine);
+    if (drained != 0) { ret 20 + drained::i32; }
+    if (session.client_store_count(?resume_store) != 2) { ret 4; }
+
+    # a key update rekeys the sending direction on both sides
+    if (!secrets_match(?listener_engine, ?dialer_engine, true)) { ret 5; }
+    if (request_key_update(?listener_engine,
+            codec.UPDATE_NOT_REQUESTED).status != engine.OK) { ret 6; }
+    val updated: i64 = pump_post(?listener_engine, ?dialer_engine);
+    if (updated != 0) { ret 30 + updated::i32; }
+    if (!secrets_match(?listener_engine, ?dialer_engine, true)) { ret 7; }
+    if (!secrets_match(?listener_engine, ?dialer_engine, false)) { ret 8; }
+    # the client initiates one too, and the peer answers it
+    if (client.request_key_update(?dialer_engine,
+            codec.UPDATE_REQUESTED).status != engine.OK) { ret 9; }
+    val answered: i64 = pump_post(?listener_engine, ?dialer_engine);
+    if (answered != 0) { ret 40 + answered::i32; }
+    if (!secrets_match(?listener_engine, ?dialer_engine, false) ||
+        !secrets_match(?listener_engine, ?dialer_engine, true)) { ret 50; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) {
+        ret 51;
+    }
+
+    # the retained ticket resumes a fresh pair of engines
+    var second_listener: Server;
+    var second_dialer: client.Client;
+    val second: i64 = resume_connect(?second_listener, ?second_dialer,
+        1800000100);
+    if (second != 0) { ret 60 + second::i32; }
+    val server_view: engine.Snapshot = snapshot(?second_listener);
+    val client_view: engine.Snapshot = client.snapshot(?second_dialer);
+    if (!server_view.resumed || !client_view.resumed) { ret 52; }
+    if (!client_view.authenticated) { ret 53; }
+    if (server_view.suite != tls13.AES_128_GCM_SHA256) { ret 54; }
+    if (server_view.selected_alpn.len != 2) { ret 55; }
+    if (!secrets_match(?second_listener, ?second_dialer, true) ||
+        !secrets_match(?second_listener, ?second_dialer, false)) { ret 56; }
+    if (session.client_store_count(?resume_store) != 1) { ret 57; }
+    if (!destroy(?second_listener) || !client.destroy(?second_dialer)) {
+        ret 58;
+    }
+
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 59; }
+    ret 0;
+}
+
+test "session: replay control, rotation overlap, and long sessions hold" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, 1800000000)) {
+        ret 1;
+    }
+    var listener_engine: Server;
+    var dialer_engine: client.Client;
+    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) != 0) {
+        ret 2;
+    }
+    if (pump_post(?listener_engine, ?dialer_engine) != 0) { ret 3; }
+    if (session.client_store_count(?resume_store) != 1) { ret 4; }
+
+    # one long session survives repeated rekeying in both directions
+    var rounds: usize = 0;
+    for (rounds < 32) {
+        if (request_key_update(?listener_engine,
+                codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
+            pump_post(?listener_engine, ?dialer_engine) != 0 ||
+            !secrets_match(?listener_engine, ?dialer_engine, true)) { ret 5; }
+        if (client.request_key_update(?dialer_engine,
+                codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
+            pump_post(?listener_engine, ?dialer_engine) != 0 ||
+            !secrets_match(?listener_engine, ?dialer_engine, false)) { ret 6; }
+        rounds = rounds + 1;
+    }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 7; }
+
+    # keep a copy of the ticket so the same one can be presented twice
+    var kept: session.Ticket;
+    if (!session.client_store_take(?resume_store,
+            contracts.Bytes{data: "api.example.com"::*u8, len: 15}, 1800000000,
+            ?kept)) { ret 8; }
+    var offered: session.Ticket = kept;
+    offered.valid = true;
+    if (!session.client_store_save(?resume_store, ?offered)) { ret 9; }
+
+    var second_listener: Server;
+    var second_dialer: client.Client;
+    if (resume_connect(?second_listener, ?second_dialer, 1800000100) != 0) {
+        ret 10;
+    }
+    if (!snapshot(?second_listener).resumed) { ret 11; }
+    if (!destroy(?second_listener) || !client.destroy(?second_dialer)) {
+        ret 12;
+    }
+
+    # presenting the very same ticket again is refused and falls back
+    offered = kept;
+    offered.valid = true;
+    if (!session.client_store_save(?resume_store, ?offered)) { ret 13; }
+    var third_listener: Server;
+    var third_dialer: client.Client;
+    if (resume_connect(?third_listener, ?third_dialer, 1800000200) != 0) {
+        ret 14;
+    }
+    if (snapshot(?third_listener).resumed ||
+        client.snapshot(?third_dialer).resumed) { ret 15; }
+    if (snapshot(?third_listener).status != engine.COMPLETE ||
+        client.snapshot(?third_dialer).status != engine.COMPLETE) { ret 16; }
+    if (!client.snapshot(?third_dialer).authenticated) { ret 17; }
+    if (!destroy(?third_listener) || !client.destroy(?third_dialer)) { ret 18; }
+
+    # a ticket sealed before rotation still resumes inside the overlap
+    resume_listener.replay_policy = session.REPLAY_PERMISSIVE;
+    if (!session.keyring_rotate(?resume_ring, ?resume_server_entropy,
+            1800000300)) { ret 19; }
+    if (session.keyring_openable(?resume_ring, 1800000300) != 2) { ret 20; }
+    offered = kept;
+    offered.valid = true;
+    if (!session.client_store_save(?resume_store, ?offered)) { ret 21; }
+    var fourth_listener: Server;
+    var fourth_dialer: client.Client;
+    if (resume_connect(?fourth_listener, ?fourth_dialer, 1800000400) != 0) {
+        ret 22;
+    }
+    if (!snapshot(?fourth_listener).resumed) { ret 23; }
+    if (!destroy(?fourth_listener) || !client.destroy(?fourth_dialer)) {
+        ret 24;
+    }
+
+    # past the overlap the retired key is gone and the ticket cannot resume
+    offered = kept;
+    offered.valid = true;
+    if (!session.client_store_save(?resume_store, ?offered)) { ret 25; }
+    var fifth_listener: Server;
+    var fifth_dialer: client.Client;
+    if (resume_connect(?fifth_listener, ?fifth_dialer, 1800002200) != 0) {
+        ret 26;
+    }
+    if (snapshot(?fifth_listener).resumed) { ret 27; }
+    if (snapshot(?fifth_listener).status != engine.COMPLETE) { ret 28; }
+    if (!destroy(?fifth_listener) || !client.destroy(?fifth_dialer)) { ret 29; }
+
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.ticket_destroy(?kept);
+    session.ticket_destroy(?offered);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 30; }
     ret 0;
 }

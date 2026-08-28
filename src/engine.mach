@@ -81,6 +81,8 @@ pub rec Snapshot {
     peer_parameters: contracts.Bytes;
     peer_name: contracts.Bytes;
     client_auth_requested: bool;
+    resumed: bool;
+    tickets_issued: u8;
     output_pending: bool;
     event_active: bool;
     destroyed: bool;
@@ -127,6 +129,8 @@ pub fun empty_snapshot() Snapshot {
     value.peer_name.data = nil;
     value.peer_name.len = 0;
     value.client_auth_requested = false;
+    value.resumed = false;
+    value.tickets_issued = 0;
     value.output_pending = false;
     value.event_active = false;
     value.destroyed = false;

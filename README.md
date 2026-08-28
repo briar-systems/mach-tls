@@ -25,7 +25,7 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls13.transcript` owns SHA-256 and SHA-384 transcript lifecycle and retry rewrites.
 - `tls.tls13.key_schedule` implements the complete TLS 1.3 HKDF schedule and traffic derivation.
 - `tls.state` defines client and server connection state.
-- `tls.session` defines bounded session ticket storage.
+- `tls.session` implements ticket keys and rotation, sealed session state, bounded replay control, and bounded client ticket storage.
 - `tls.client` implements the incremental TLS 1.3 client handshake.
 - `tls.server` implements the incremental TLS 1.3 server handshake and
   credential selection.
@@ -45,6 +45,8 @@ TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GC
 The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction.
 
 The TLS 1.3 server is complete. It selects credentials by SNI with exact, wildcard, and default precedence, negotiates ALPN, suites, groups, and signatures against the leased private key, issues at most one HelloRetryRequest, requests and verifies optional client authentication, and answers invalid ClientHellos with protocol-correct alerts and bounded work. Certificate rotation retires a generation without disturbing any established connection.
+
+Session resumption is implemented for both roles. A server seals sessions under a rotating ticket key with an exact retirement overlap, verifies PSK binders on a separate transcript, and can require a ticket to be single-use. A client retains tickets in a bounded store and offers one PSK per connection. Either role can initiate a post-handshake key update. Early data is not implemented and is never offered. The contract is in [`doc/sessions.md`](doc/sessions.md).
 
 `tls.engine` defines the one handshake-engine contract both roles implement, so `tls.stream` drives either over the same records and the same transport. A stream borrows a caller-owned engine and never destroys it. `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contracts and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md) and [`doc/server.md`](doc/server.md).
 
