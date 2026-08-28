@@ -123,6 +123,34 @@ mach build . --all-targets --profile release --verify-ir
 linux-x86_64, linux-arm64, linux-riscv64, windows-x86_64, darwin-x86_64, and
 darwin-aarch64, at both profiles, with the IR verifier enabled.
 
+## What interoperability legs structurally cannot cover
+
+The matrix runs TLS over TCP against OpenSSL and GnuTLS. Neither is a QUIC
+peer, so neither reads `quic_transport_parameters`, and to both of them the
+extension is opaque passthrough. Nothing in the matrix depends on the event
+that carries it existing at all.
+
+That is not a hole to plug with more legs, it is a property of the peers. The
+server's `PEER_PARAMETERS` event was never queued, its render arm in
+`next_event` was unreachable, and the defect survived sixteen green server legs
+and a full six-target release matrix before a QUIC consumer found it (#17).
+
+The class is wider than that one event: **anything a consumer reaches through
+the event stream rather than through the record stream is invisible to
+TLS-over-TCP interop.** What closes it is driving both roles' engines against
+each other in process with the consumer's configuration applied, asserting on
+`next_event` delivery and ordering. `tls.client` and `tls.server` each carry
+such a test for the transport-parameters event, and each fails if the queue
+site is removed.
+
+Two rules follow, for anyone extending this package:
+
+- an event that only one role emits is a defect until proven otherwise, and the
+  proof belongs in an in-process test of both roles, not in a new interop leg
+- a `snapshot()` assertion is never sufficient evidence that an event is
+  delivered. The snapshot for the transport parameters returned the right bytes
+  the whole time the event did not exist
+
 ## Not covered here
 
 These are real gaps, named so nobody has to discover them:
@@ -144,5 +172,9 @@ These are real gaps, named so nobody has to discover them:
   implementations and against each other, and the TLS 1.2 PRF is checked against
   a published vector, but nothing compares our wire output byte for byte against
   another stack's for the same inputs.
+- **QUIC-shaped peers in the interop matrix.** The in-process tests above cover
+  the event surface a QUIC adapter binds to, but no external QUIC
+  implementation is driven from this repository. mach-quic exercises it from
+  the consumer side.
 - **Native execution on non-x86_64 targets.** The other five targets are built
   and IR-verified but not run; this machine is linux-x86_64.
