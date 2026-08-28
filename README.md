@@ -11,7 +11,7 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls12` and `tls.tls13` define protocol and algorithm registry values.
 - `tls.config` defines bounded client and server configuration.
 - `tls.cert` defines borrowed certificate, key, chain, and trust store contracts.
-- `tls.transport` isolates TLS from sockets and other byte transports.
+- `tls.transport` provides completion-based TLS operation ownership and ordered-byte adapters.
 - `tls.record` defines record framing and limits.
 - `tls.handshake` defines handshake framing and progress.
 - `tls.state` defines client and server connection state.
@@ -21,8 +21,11 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 
 ## Status
 
-This revision is contract scaffolding. It does not expose connect, accept,
-handshake, read, or write operations and cannot create a TLS connection yet.
+The transport layer is implemented against the shared `mach-std` completion runtime. It retains stable application tokens, borrowed buffers, cancellation scopes, and their deadlines until terminal resolution. One application operation may sequence any required transport reads and writes without exposing readiness states. Partial completions, EOF, timeout, cancellation, and close have one terminal ownership path.
+
+A native TCP adapter is included. QUIC handshake streams implement the same submission callbacks without creating a dependency from TLS back to QUIC.
+
+Protocol record, handshake, certificate, and secure-stream work remains under the subsequent implementation issues. This revision does not yet expose a complete TLS connection.
 
 Mach constant-time support is technically capable of implementing this package.
 Production assurance will be accumulated through official vectors,
