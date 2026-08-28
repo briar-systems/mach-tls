@@ -23,6 +23,7 @@ use tls.cert.credentials;
 use tls.cert.load;
 use tls.client;
 use tls.config;
+use tls.engine;
 use tls.error;
 use tls.record;
 use tls.stream;
@@ -265,11 +266,13 @@ fun main(argc: i64, argv: **u8) i64 {
     var certificates: [8]cert.Certificate;
     var wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
     var wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    var core_storage: client.Storage = client.Storage{
+        input: ?handshake_input[0], input_capacity: 65536,
+        output: ?handshake_output[0], output_capacity: 65536,
+        hello: ?hello[0], hello_capacity: 65536,
+        certificates: ?certificates[0], certificate_capacity: 8,
+        peer_parameters: nil, peer_parameters_capacity: 0};
     var storage: stream.Storage;
-    storage.handshake = client.Storage{input: ?handshake_input[0],
-        input_capacity: 65536, output: ?handshake_output[0],
-        output_capacity: 65536, hello: ?hello[0], hello_capacity: 65536,
-        certificates: ?certificates[0], certificate_capacity: 8};
     storage.wire_input = ?wire_input[0];
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?wire_output[0];
@@ -278,13 +281,16 @@ fun main(argc: i64, argv: **u8) i64 {
     var scope: cancel.Scope;
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }
     var secure: stream.Stream;
+    var core: client.Client;
     var empty_extra: client.ExtraExtension;
-    if (!stream.connect(?secure, ?configuration, storage, ?lower,
-        empty_extra, 0, ?scope,
+    if (!client.init(?core, ?configuration, core_storage, empty_extra, 0)) {
+        ret 10;
+    }
+    if (!stream.connect(?secure, ?core, storage, ?lower, ?scope,
         transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
         !settle(?secure, ?owner)) { ret 5; }
     val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
-    val negotiated: client.Snapshot = stream.negotiated(?secure);
+    val negotiated: engine.Snapshot = stream.negotiated(?secure);
     if (handshake.terminal_error != error.OK) {
         ret 20 + handshake.terminal_error::i64;
     }
@@ -350,7 +356,8 @@ fun main(argc: i64, argv: **u8) i64 {
         !settle(?secure, ?owner)) { ret 7; }
     val closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
-        !stream.destroy(?secure) || !cancel.destroy(?scope) ||
+        !stream.destroy(?secure) || !client.destroy(?core) ||
+        !cancel.destroy(?scope) ||
         keys.destroy_private(?client_key) != contracts.OK ||
         is_err[bool, io_error.Error](io_runtime.close(?owner)) ||
         is_err[bool, io_error.Error](io_runtime.destroy(?owner))) { ret 8; }

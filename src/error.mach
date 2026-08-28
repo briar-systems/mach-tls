@@ -26,6 +26,8 @@ pub val MISSING_EXTENSION:     Error = 20;
 pub val UNSUPPORTED_EXTENSION: Error = 21;
 pub val NO_APPLICATION_PROTOCOL: Error = 22;
 pub val DECRYPT_ERROR:         Error = 23;
+pub val UNRECOGNIZED_NAME:     Error = 24;
+pub val CERTIFICATE_REQUIRED:  Error = 25;
 
 test "error: terminal results are distinct" {
     if (CANCELLED == TIMEOUT) { ret 1; }
@@ -34,5 +36,7 @@ test "error: terminal results are distinct" {
     if (RECORD_OVERFLOW == SEQUENCE_EXHAUSTED) { ret 1; }
     if (PROTOCOL_VERSION == MISSING_EXTENSION) { ret 1; }
     if (UNSUPPORTED_EXTENSION == NO_APPLICATION_PROTOCOL) { ret 1; }
+    if (UNRECOGNIZED_NAME == CERTIFICATE_REQUIRED) { ret 1; }
+    if (UNRECOGNIZED_NAME == DECRYPT_ERROR) { ret 1; }
     ret 0;
 }

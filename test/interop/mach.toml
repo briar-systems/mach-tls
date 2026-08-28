@@ -52,5 +52,13 @@ targets = ["*"]
 link = []
 need = []
 
+[artifact.tls-server-interop]
+kind = "bin"
+entry = "server_main.mach"
+out = "bin/tls-server-interop"
+targets = ["*"]
+link = []
+need = []
+
 [dep.tls]
 path = "../.."

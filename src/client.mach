@@ -20,6 +20,7 @@ use tls.cert.name;
 use tls.cert.verify;
 use tls.cert.x509;
 use tls.config;
+use tls.engine;
 use tls.error;
 use tls.handshake;
 use tls.handshake.codec;
@@ -32,36 +33,36 @@ use tls.tls13.key_schedule;
 use tls.tls13.transcript;
 
 pub def Level: u8;
-pub val INITIAL: Level = 1;
-pub val HANDSHAKE: Level = 2;
-pub val APPLICATION: Level = 3;
+pub val INITIAL: Level = engine.INITIAL;
+pub val HANDSHAKE: Level = engine.HANDSHAKE;
+pub val APPLICATION: Level = engine.APPLICATION;
 
 pub def Direction: u8;
-pub val SEND: Direction = 1;
-pub val RECEIVE: Direction = 2;
+pub val SEND: Direction = engine.SEND;
+pub val RECEIVE: Direction = engine.RECEIVE;
 
 pub def EventKind: u8;
-pub val CRYPTO: EventKind = 1;
-pub val TRAFFIC_SECRET: EventKind = 2;
-pub val PEER_PARAMETERS: EventKind = 3;
-pub val EARLY_DATA: EventKind = 4;
-pub val AUTHENTICATION: EventKind = 5;
-pub val HANDSHAKE_COMPLETE: EventKind = 6;
-pub val ALERT: EventKind = 7;
+pub val CRYPTO: EventKind = engine.CRYPTO;
+pub val TRAFFIC_SECRET: EventKind = engine.TRAFFIC_SECRET;
+pub val PEER_PARAMETERS: EventKind = engine.PEER_PARAMETERS;
+pub val EARLY_DATA: EventKind = engine.EARLY_DATA;
+pub val AUTHENTICATION: EventKind = engine.AUTHENTICATION;
+pub val HANDSHAKE_COMPLETE: EventKind = engine.HANDSHAKE_COMPLETE;
+pub val ALERT: EventKind = engine.ALERT;
 
 pub def Status: u8;
-pub val OK: Status = 1;
-pub val MORE: Status = 2;
-pub val BLOCKED: Status = 3;
-pub val COMPLETE: Status = 4;
-pub val FAILED: Status = 5;
-pub val CLOSED: Status = 6;
+pub val OK: Status = engine.OK;
+pub val MORE: Status = engine.MORE;
+pub val BLOCKED: Status = engine.BLOCKED;
+pub val COMPLETE: Status = engine.COMPLETE;
+pub val FAILED: Status = engine.FAILED;
+pub val CLOSED: Status = engine.CLOSED;
 
-pub val EARLY_NOT_OFFERED: u8 = 1;
-pub val EARLY_ACCEPTED: u8 = 2;
-pub val EARLY_REJECTED: u8 = 3;
-pub val AUTHENTICATED: u8 = 1;
-pub val AUTHENTICATION_FAILED: u8 = 2;
+pub val EARLY_NOT_OFFERED: u8 = engine.EARLY_NOT_OFFERED;
+pub val EARLY_ACCEPTED: u8 = engine.EARLY_ACCEPTED;
+pub val EARLY_REJECTED: u8 = engine.EARLY_REJECTED;
+pub val AUTHENTICATED: u8 = engine.AUTHENTICATED;
+pub val AUTHENTICATION_FAILED: u8 = engine.AUTHENTICATION_FAILED;
 pub val RESTART_RETRY: u8 = 1;
 pub val RESTART_VERSION_NEGOTIATION: u8 = 2;
 
@@ -100,42 +101,6 @@ pub rec Storage {
     certificate_capacity: usize;
     peer_parameters: *u8;
     peer_parameters_capacity: usize;
-}
-
-pub rec Result {
-    status: Status;
-    error: error.Error;
-    consumed: usize;
-    required: usize;
-}
-
-# event data and secrets remain borrowed until complete_event
-pub rec Event {
-    token: u64;
-    kind: EventKind;
-    level: Level;
-    direction: Direction;
-    suite: tls13.CipherSuite;
-    generation: u64;
-    data: contracts.Bytes;
-    secret: contracts.SecretBytes;
-    disposition: u8;
-    alert: record.AlertDescription;
-}
-
-pub rec Snapshot {
-    status: Status;
-    error: error.Error;
-    suite: tls13.CipherSuite;
-    group: tls13.NamedGroup;
-    retry_count: u8;
-    authenticated: bool;
-    selected_alpn: contracts.Bytes;
-    peer_parameters: contracts.Bytes;
-    client_auth_requested: bool;
-    output_pending: bool;
-    event_active: bool;
-    destroyed: bool;
 }
 
 pub rec Client {
@@ -191,7 +156,7 @@ pub rec Client {
     update_send_after_output: bool;
     event_active: bool;
     event_generation: u64;
-    active_event: Event;
+    active_event: engine.Event;
     secret_generation: [6]u64;
     transition_owner: i64;
     receive_record_plaintext: usize;
@@ -201,19 +166,16 @@ pub rec Client {
 }
 
 fun result(status: Status, failure: error.Error, consumed: usize,
-    required: usize) Result {
-    ret Result{status: status, error: failure, consumed: consumed,
-        required: required};
+    required: usize) engine.Result {
+    ret engine.result(status, failure, consumed, required);
 }
 
 fun valid_level(level: Level) bool {
-    ret level >= INITIAL && level <= APPLICATION;
+    ret engine.valid_level(level);
 }
 
 fun next_generation(value: u64) u64 {
-    var next: u64 = value + 1;
-    if (next == 0) { next = 1; }
-    ret next;
+    ret engine.next_generation(value);
 }
 
 fun write_u16(data: *u8, offset: usize, value: u16) {
@@ -695,6 +657,7 @@ fun limits_equal(first: config.Limits, second: config.Limits) bool {
         first.max_peer_handshake_bytes == second.max_peer_handshake_bytes &&
         first.max_client_hello_bytes == second.max_client_hello_bytes &&
         first.max_client_flight_bytes == second.max_client_flight_bytes &&
+        first.max_server_flight_bytes == second.max_server_flight_bytes &&
         first.max_chain_bytes == second.max_chain_bytes &&
         first.max_ticket_bytes == second.max_ticket_bytes;
 }
@@ -1184,7 +1147,7 @@ fun build_client_hello(client: *Client, after_retry: bool) error.Error {
 }
 
 fun fail(client: *Client, failure: error.Error,
-    alert: record.AlertDescription) Result {
+    alert: record.AlertDescription) engine.Result {
     if (client != nil && client.state != DESTROYED) {
         client.failure = failure;
         client.pending_alert = alert;
@@ -1205,7 +1168,7 @@ fun fail(client: *Client, failure: error.Error,
     ret result(FAILED, failure, 0, 0);
 }
 
-fun start_inner(client: *Client, verification_time: i64) Result {
+fun start_inner(client: *Client, verification_time: i64) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state != EXPECT_SERVER_HELLO ||
         client.output_pending || client.hello_len != 0) {
@@ -1222,16 +1185,16 @@ fun start_inner(client: *Client, verification_time: i64) Result {
     ret result(OK, error.OK, 0, client.output_len);
 }
 
-pub fun start(client: *Client, verification_time: i64) Result {
+pub fun start(client: *Client, verification_time: i64) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val started: Result = start_inner(client, verification_time);
+    val started: engine.Result = start_inner(client, verification_time);
     leave(client);
     ret started;
 }
 
-fun restart_inner(client: *Client, reason: u8) Result {
+fun restart_inner(client: *Client, reason: u8) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state != EXPECT_SERVER_HELLO ||
         client.server_hello_seen || client.event_active || client.hello_len == 0 ||
@@ -1249,11 +1212,11 @@ fun restart_inner(client: *Client, reason: u8) Result {
     ret result(OK, error.OK, 0, client.output_len);
 }
 
-pub fun restart(client: *Client, reason: u8) Result {
+pub fun restart(client: *Client, reason: u8) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val restarted: Result = restart_inner(client, reason);
+    val restarted: engine.Result = restart_inner(client, reason);
     leave(client);
     ret restarted;
 }
@@ -1399,22 +1362,7 @@ fun handle_server_hello(client: *Client, frame: contracts.Bytes,
 }
 
 fun alert_for(failure: error.Error) record.AlertDescription {
-    if (failure == error.UNEXPECTED_MESSAGE) { ret record.UNEXPECTED_MESSAGE_ALERT; }
-    if (failure == error.DECODE_ERROR) { ret record.DECODE_ERROR_ALERT; }
-    if (failure == error.ILLEGAL_PARAMETER) { ret record.ILLEGAL_PARAMETER_ALERT; }
-    if (failure == error.BAD_CERTIFICATE || failure == error.HOSTNAME_MISMATCH) {
-        ret record.BAD_CERTIFICATE_ALERT;
-    }
-    if (failure == error.CERTIFICATE_EXPIRED) { ret record.CERTIFICATE_EXPIRED_ALERT; }
-    if (failure == error.UNKNOWN_CA) { ret record.UNKNOWN_CA_ALERT; }
-    if (failure == error.DECRYPT_ERROR) { ret record.DECRYPT_ERROR_ALERT; }
-    if (failure == error.NO_APPLICATION_PROTOCOL) { ret record.NO_APPLICATION_PROTOCOL_ALERT; }
-    if (failure == error.MISSING_EXTENSION) { ret record.MISSING_EXTENSION_ALERT; }
-    if (failure == error.UNSUPPORTED_EXTENSION) { ret record.UNSUPPORTED_EXTENSION_ALERT; }
-    if (failure == error.HANDSHAKE_FAILURE || failure == error.UNSUPPORTED_ALGORITHM) {
-        ret record.HANDSHAKE_FAILURE_ALERT;
-    }
-    ret record.INTERNAL_ERROR_ALERT;
+    ret engine.alert_for(failure);
 }
 
 fun alpn_offered(client: *Client, value: contracts.Bytes) bool {
@@ -1965,7 +1913,7 @@ fun process_frame(client: *Client, frame: contracts.Bytes,
     ret error.UNEXPECTED_MESSAGE;
 }
 
-fun drive(client: *Client, level: Level) Result {
+fun drive(client: *Client, level: Level) engine.Result {
     for (true) {
         if (client.output_pending || client.event_active) {
             ret result(BLOCKED, error.OK, 0, 0);
@@ -2020,7 +1968,7 @@ fun compact_input(client: *Client) {
 }
 
 fun ingest_inner(client: *Client, level: Level, data: *u8,
-    length: usize) Result {
+    length: usize) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || !valid_level(level) ||
         client.state == DESTROYED || client.state == TERMINAL ||
@@ -2048,22 +1996,22 @@ fun ingest_inner(client: *Client, level: Level, data: *u8,
         copy_bytes(?client.storage.input[client.input_len], data, length);
         client.input_len = client.input_len + length;
     }
-    var progress: Result = drive(client, level);
+    var progress: engine.Result = drive(client, level);
     progress.consumed = length;
     ret progress;
 }
 
 pub fun ingest(client: *Client, level: Level, data: *u8,
-    length: usize) Result {
+    length: usize) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: Result = ingest_inner(client, level, data, length);
+    val progress: engine.Result = ingest_inner(client, level, data, length);
     leave(client);
     ret progress;
 }
 
-fun poll_inner(client: *Client) Result {
+fun poll_inner(client: *Client) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state == DESTROYED ||
         client.state == TERMINAL) {
@@ -2075,11 +2023,11 @@ fun poll_inner(client: *Client) Result {
     ret drive(client, level);
 }
 
-pub fun poll(client: *Client) Result {
+pub fun poll(client: *Client) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: Result = poll_inner(client);
+    val progress: engine.Result = poll_inner(client);
     leave(client);
     ret progress;
 }
@@ -2092,15 +2040,15 @@ fun pending(client: *Client) bool {
         client.complete_pending || client.alert_pending;
 }
 
-fun next_event_inner(client: *Client, output: *Event) bool {
+fun next_event_inner(client: *Client, output: *engine.Event) bool {
     if (!client_owner_valid(client) || output == nil ||
-        !memory_range.valid((?output.token)::*u8, $size_of(Event)) ||
-        client_owner_overlaps(client, (?output.token)::*u8, $size_of(Event)) ||
-        storage_overlaps(?client.storage, (?output.token)::*u8, $size_of(Event)) ||
+        !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
+        client_owner_overlaps(client, (?output.token)::*u8, $size_of(engine.Event)) ||
+        storage_overlaps(?client.storage, (?output.token)::*u8, $size_of(engine.Event)) ||
         borrowed_overlaps(client.config, client.extra, (?output.token)::*u8,
-            $size_of(Event), true, true) || client.event_active ||
+            $size_of(engine.Event), true, true) || client.event_active ||
         client.state == DESTROYED || !pending(client)) { ret false; }
-    var event: Event = Event{};
+    var event: engine.Event = engine.empty_event();
     event.token = next_generation(client.event_generation);
     event.suite = client.suite;
     var secret_index: usize = 6;
@@ -2165,7 +2113,7 @@ fun next_event_inner(client: *Client, output: *Event) bool {
     ret true;
 }
 
-pub fun next_event(client: *Client, output: *Event) bool {
+pub fun next_event(client: *Client, output: *engine.Event) bool {
     if (!enter(client)) { ret false; }
     val available: bool = next_event_inner(client, output);
     leave(client);
@@ -2231,7 +2179,7 @@ pub fun complete_event(client: *Client, token: u64, accepted: bool) bool {
     ret completed;
 }
 
-fun close_inner(client: *Client, description: record.AlertDescription) Result {
+fun close_inner(client: *Client, description: record.AlertDescription) engine.Result {
     if (!client_owner_valid(client) ||
         client.state == DESTROYED || client.state == TERMINAL ||
         client.state == CLOSING || client.alert_pending ||
@@ -2246,11 +2194,11 @@ fun close_inner(client: *Client, description: record.AlertDescription) Result {
     ret result(OK, error.OK, 0, 0);
 }
 
-pub fun close(client: *Client, description: record.AlertDescription) Result {
+pub fun close(client: *Client, description: record.AlertDescription) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val closed: Result = close_inner(client, description);
+    val closed: engine.Result = close_inner(client, description);
     leave(client);
     ret closed;
 }
@@ -2262,10 +2210,27 @@ fun destroy_inner(client: *Client) bool {
     transcript.destroy(?client.transcript);
     key_schedule.destroy(?client.schedule);
     client.config = nil;
+    # empty-literal assignment is not trusted to clear welded pointer fields
     client.configuration = config.ClientConfig{};
+    client.configuration.server_name.data = nil;
+    client.configuration.alpn = nil;
+    client.configuration.trust = nil;
+    client.configuration.versions = nil;
+    client.configuration.suites = nil;
+    client.configuration.groups = nil;
+    client.configuration.signatures = nil;
+    client.configuration.client_identity = nil;
+    client.configuration.entropy = nil;
     client.entropy = secret.Entropy{};
+    client.entropy.context = nil;
+    client.entropy.secret_context = nil;
+    client.entropy.fill_fn = nil;
     client.trust = cert.TrustStore{};
+    client.trust.anchors = nil;
     client.identity = credentials.Identity{};
+    client.identity.server_name.data = nil;
+    client.identity.chain.certificates = nil;
+    client.identity.private_key = nil;
     client.storage.input = nil;
     client.storage.output = nil;
     client.storage.hello = nil;
@@ -2287,9 +2252,58 @@ pub fun destroy(client: *Client) bool {
     ret destroyed;
 }
 
-fun snapshot_inner(client: *Client) Snapshot {
-    var value: Snapshot;
+fun secret_for(client: *Client, level: Level,
+    direction: Direction) *key_schedule.Secret {
+    if (level == HANDSHAKE && direction == SEND) {
+        ret ?client.schedule.client_handshake_traffic;
+    }
+    if (level == HANDSHAKE && direction == RECEIVE) {
+        ret ?client.schedule.server_handshake_traffic;
+    }
+    if (level == APPLICATION && direction == SEND) {
+        ret ?client.schedule.client_application_traffic;
+    }
+    if (level == APPLICATION && direction == RECEIVE) {
+        ret ?client.schedule.server_application_traffic;
+    }
+    ret nil;
+}
+
+fun traffic_keys_inner(client: *Client, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (!client_owner_valid(client) || event == nil || key_length == nil ||
+        !client.event_active || event.token != client.active_event.token ||
+        client.active_event.kind != TRAFFIC_SECRET) { ret false; }
+    val traffic: *key_schedule.Secret = secret_for(client,
+        client.active_event.level, client.active_event.direction);
+    if (traffic == nil) { ret false; }
+    if (key_schedule.traffic_key(?client.schedule, traffic, key) != error.OK ||
+        key_schedule.traffic_iv(?client.schedule, traffic, iv) != error.OK) {
+        ret false;
+    }
+    @key_length = key_schedule.key_size(client.suite);
+    ret true;
+}
+
+# derive the record keys for the borrowed traffic-secret event
+pub fun traffic_keys(client: *Client, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (!enter(client)) { ret false; }
+    val derived: bool = traffic_keys_inner(client, event, key, iv, key_length);
+    leave(client);
+    ret derived;
+}
+
+fun snapshot_inner(client: *Client) engine.Snapshot {
+    var value: engine.Snapshot = engine.empty_snapshot();
     if (!client_owner_valid(client)) { ret value; }
+    value.role = engine.CLIENT;
+    value.peer_name = contracts.Bytes{data: nil, len: 0};
+    if (client.config != nil && client.state != DESTROYED) {
+        value.peer_name = client.configuration.server_name;
+    }
     value.error = client.failure;
     value.suite = client.suite;
     value.group = client.group;
@@ -2308,9 +2322,9 @@ fun snapshot_inner(client: *Client) Snapshot {
     ret value;
 }
 
-pub fun snapshot(client: *Client) Snapshot {
-    if (!enter(client)) { ret Snapshot{}; }
-    val value: Snapshot = snapshot_inner(client);
+pub fun snapshot(client: *Client) engine.Snapshot {
+    if (!enter(client)) { ret engine.empty_snapshot(); }
+    val value: engine.Snapshot = snapshot_inner(client);
     leave(client);
     ret value;
 }
@@ -2350,7 +2364,7 @@ test "client: user canceled warning permits orderly close" {
         client.state != ESTABLISHED || !client.alert_pending ||
         close(?client, record.CLOSE_NOTIFY).status != FAILED) { ret 1; }
     client.event_active = true;
-    client.active_event = Event{token: 1, kind: ALERT,
+    client.active_event = engine.Event{token: 1, kind: ALERT,
         alert: record.USER_CANCELED_ALERT};
     if (!complete_event(?client, 1, true) || client.alert_pending ||
         client.state != ESTABLISHED ||
@@ -2551,7 +2565,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     hostile_entropy_calls = 0;
     if (!init(?hostile_client, ?hostile_configuration, storage,
             ExtraExtension{}, 0)) { ret 75; }
-    val hostile_started: Result = start(?hostile_client, 1787875200);
+    val hostile_started: engine.Result = start(?hostile_client, 1787875200);
     if (hostile_started.status != FAILED ||
         hostile_started.error != error.INTERNAL_ERROR ||
         hostile_client.storage.output != storage.output ||
@@ -2669,11 +2683,11 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
         !value.config.entropy.initialized || value.config.trust.len != 1) {
         ret 57;
     }
-    val started: Result = start(?value, 1787875200);
+    val started: engine.Result = start(?value, 1787875200);
     if (started.status != OK || !value.output_pending ||
         reentry_rejections < 6 ||
         atomic.load(?value.transition_owner) != 0) { ret 2; }
-    var event: Event;
+    var event: engine.Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO ||
         event.level != INITIAL || event.data.len == 0 ||
         next_event(?value, ?value.active_event) ||
@@ -2714,12 +2728,12 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     if (encoded.status != handshake.COMPLETE) { ret 5; }
     var i: usize = 0;
     for (i < encoded.produced) {
-        val fragmented: Result = ingest(?value, INITIAL, ?wire[i], 1);
+        val fragmented: engine.Result = ingest(?value, INITIAL, ?wire[i], 1);
         if (fragmented.consumed != 1 ||
             (i + 1 < encoded.produced && fragmented.status != MORE)) { ret 6; }
         i = i + 1;
     }
-    val retried: Snapshot = snapshot(?value);
+    val retried: engine.Snapshot = snapshot(?value);
     if (retried.retry_count != 1 || retried.group != tls13.SECP256R1 ||
         !retried.output_pending || value.transcript.frame_count != 3 ||
         !value.transcript.retry_used) { ret 7; }
@@ -2780,7 +2794,7 @@ test "client: event rejection has one terminal alert ownership path" {
     var value: Client;
     if (!init(?value, ?configuration, storage, empty_extra, 0) ||
         start(?value, 1787875200).status != OK) { ret 1; }
-    var event: Event;
+    var event: engine.Event;
     if (!next_event(?value, ?event) || !complete_event(?value, event.token, false)) {
         ret 2;
     }
@@ -2829,11 +2843,11 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     var value: Client;
     if (!init(?value, ?configuration, storage, empty_extra, 0)) { ret 1; }
     if (start(?value, 1787875200).status != OK) { ret 4; }
-    var event: Event;
+    var event: engine.Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO ||
         !complete_event(?value, event.token, true)) { ret 2; }
     var illegal: [4]u8 = [4]u8{handshake.NEW_SESSION_TICKET, 0, 0, 0};
-    val failed: Result = ingest(?value, INITIAL, ?illegal[0], 4);
+    val failed: engine.Result = ingest(?value, INITIAL, ?illegal[0], 4);
     if (failed.status != FAILED || failed.error != error.UNEXPECTED_MESSAGE ||
         !next_event(?value, ?event) || event.kind != ALERT ||
         event.alert != record.UNEXPECTED_MESSAGE_ALERT ||
@@ -2947,7 +2961,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     if (!init(?value, ?configuration, storage, client_extra,
         QUIC_TRANSPORT_PARAMETERS) ||
         start(?value, 1800000000).status != OK) { ret 2; }
-    var event: Event;
+    var event: engine.Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO) { ret 3; }
     var server_transcript: transcript.Transcript = transcript.empty();
     if (transcript.init_for_suite(?server_transcript,
@@ -3079,7 +3093,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     if (encoded.status != handshake.COMPLETE) { ret 201; }
     if (transcript.update_frame(?server_transcript,
         contracts.Bytes{data: ?flight[0], len: encoded.produced}) != error.OK) { ret 202; }
-    val certificate_result: Result = ingest(?value, HANDSHAKE, ?flight[0], encoded.produced);
+    val certificate_result: engine.Result = ingest(?value, HANDSHAKE, ?flight[0], encoded.produced);
     if (certificate_result.status != MORE) { ret 220 + certificate_result.error::i32; }
     i = 0;
     for (i < 4096) { full_input[i] = 0; i = i + 1; }
@@ -3133,7 +3147,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
         contracts.Bytes{data: ?signature_bytes[0], len: 64}) != contracts.OK) { ret 232; }
     if (transcript.update_frame(?server_transcript,
         contracts.Bytes{data: ?flight[0], len: encoded.produced}) != error.OK) { ret 233; }
-    val verify_result: Result = ingest(?value, HANDSHAKE, ?flight[0], encoded.produced);
+    val verify_result: engine.Result = ingest(?value, HANDSHAKE, ?flight[0], encoded.produced);
     if (verify_result.status != MORE) { ret 240 + verify_result.error::i32; }
 
     if (transcript.snapshot(?server_transcript,
@@ -3156,7 +3170,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
             contracts.Bytes{data: ?hash[0], len: 32}) != error.OK) { ret 27; }
     i = 0;
     for (i < encoded.produced) {
-        val fragmented: Result = ingest(?value, HANDSHAKE, ?flight[i], 1);
+        val fragmented: engine.Result = ingest(?value, HANDSHAKE, ?flight[i], 1);
         if (fragmented.consumed != 1 ||
             (i + 1 < encoded.produced && fragmented.status != MORE)) { ret 28; }
         i = i + 1;
