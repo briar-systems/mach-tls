@@ -33,6 +33,7 @@ use tls.engine;
 use tls.error;
 use tls.memory_range;
 use tls.record;
+use tls.session;
 use tls.server;
 use tls.stream;
 use tls.tls13;
@@ -218,6 +219,23 @@ var application_input: [512]u8;
 var application_output: [64]u8;
 
 var fixtures: file.Root;
+var option_require_client_auth: bool;
+var option_require_alpn: bool;
+var option_expect_failure: bool;
+var option_expect_alert: usize;
+var option_rotate: bool;
+var option_key_update: bool;
+var option_tickets: u8;
+var option_single_use: bool;
+var option_handshake_only: bool;
+var connection_count: usize;
+var ticket_ring: session.KeyRing;
+var replay_window: session.ReplayWindow;
+var listener_configuration: config.ServerConfig;
+var lower_transport: transport.Transport;
+var blocking_state: BlockingTransport;
+var connection_socket: tcp.Stream;
+var connection_runtime: io_runtime.Runtime;
 
 fun read_fixture(path: str, buffer: *u8, capacity: usize,
     length: *usize) bool {
@@ -312,17 +330,240 @@ fun report(label: str, value: usize) {
     print.print("\n");
 }
 
+
+fun serve_one(index: usize, allocator: *secret.Allocator,
+    trust: *cert.TrustStore, store: *credentials.Store) i64 {
+    blocking_state = BlockingTransport{runtime: ?connection_runtime,
+        stream: ?connection_socket};
+    lower_transport = transport.Transport{runtime: ?connection_runtime,
+        context: (?blocking_state)::ptr,
+        context_size: $size_of(BlockingTransport),
+        aliases_state: blocking_aliases_state,
+        submit_read: blocking_read, submit_write: blocking_write,
+        submit_shutdown: blocking_shutdown, submit_close: blocking_close,
+        submit_abort: blocking_close};
+
+    var core_storage: server.Storage = server.Storage{
+        input: ?handshake_input[0], input_capacity: 65536,
+        output: ?handshake_output[0], output_capacity: 65536,
+        hello: ?retained_hello[0], hello_capacity: 65536,
+        certificates: ?peer_certificates[0], certificate_capacity: 8,
+        peer_parameters: nil, peer_parameters_capacity: 0};
+    var storage: stream.Storage;
+    storage.wire_input = ?wire_input[0];
+    storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    storage.wire_output = ?wire_output[0];
+    storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+
+    var listener_engine: server.Server;
+    var empty_extra: server.ExtraExtension;
+    empty_extra.kind = 0;
+    empty_extra.data.data = nil;
+    empty_extra.data.len = 0;
+    var hello_required: usize = 0;
+    var flight_required: usize = 0;
+    if (!server.storage_requirements(?listener_configuration, empty_extra,
+            ?hello_required, ?flight_required)) {
+        print.print("cannot size server storage\n");
+        ret 10;
+    }
+    if (!server.init(?listener_engine, ?listener_configuration, core_storage,
+            empty_extra, 0)) {
+        report("hello required=", hello_required);
+        report("flight required=", flight_required);
+        print.print("cannot initialize the server engine\n");
+        ret 10;
+    }
+
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 11; }
+    var secure: stream.Stream;
+    if (!stream.serve(?secure, ?listener_engine, storage, ?lower_transport,
+            ?scope, transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+        !settle(?secure, ?connection_runtime)) {
+        print.print("the handshake operation was not accepted\n");
+        ret 12;
+    }
+    val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
+    val negotiated: engine.Snapshot = stream.negotiated(?secure);
+
+    if (option_expect_failure) {
+        if (handshake.terminal_error == error.OK) {
+            print.print("expected a handshake failure\n");
+            ret 13;
+        }
+        val alert: usize = engine.alert_for(negotiated.error)::usize;
+        report("alert=", alert);
+        report("error=", negotiated.error::usize);
+        if (option_expect_alert != 256 && alert != option_expect_alert) {
+            print.print("wrong alert\n");
+            ret 14;
+        }
+        stream.destroy_operation(?secure);
+        stream.destroy(?secure);
+        server.destroy(?listener_engine);
+        ret 0;
+    }
+
+    if (handshake.terminal_error != error.OK) {
+        report("handshake error=", handshake.terminal_error::usize);
+        ret 20;
+    }
+    if (option_require_alpn && (negotiated.selected_alpn.len != 2 ||
+        negotiated.selected_alpn.data[0] != 'h' ||
+        negotiated.selected_alpn.data[1] != '2')) {
+        print.print("alpn was not negotiated\n");
+        ret 21;
+    }
+    if (option_require_client_auth && !negotiated.authenticated) {
+        print.print("the client was not authenticated\n");
+        ret 22;
+    }
+    report("connection=", index);
+    report("suite=", negotiated.suite::usize);
+    report("group=", negotiated.group::usize);
+    report("retries=", negotiated.retry_count::usize);
+    report("tickets=", negotiated.tickets_issued::usize);
+    if (negotiated.resumed) { print.print("resumed=1\n"); }
+    or { print.print("resumed=0\n"); }
+    if (negotiated.peer_name.len != 0) {
+        var name_text: [256]char;
+        var i: usize = 0;
+        for (i < negotiated.peer_name.len) {
+            name_text[i] = negotiated.peer_name.data[i]::char;
+            i = i + 1;
+        }
+        name_text[negotiated.peer_name.len] = 0::char;
+        print.print("name=");
+        print.print(?name_text[0]);
+        print.print("\n");
+    }
+    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 23;
+    }
+
+    var replacement: credentials.Generation = credentials.empty_generation();
+    var retired: *credentials.Generation = nil;
+    if (option_rotate) {
+        if (!load_identity(3, "server-rotated.pem", "server-rotated.key",
+                "api.example.com", 15, allocator)) { ret 24; }
+        rotated_identities[0] = identities[3];
+        if (credentials.initialize(?replacement, ?rotated_identities[0], 1, 0,
+                trust, option_require_client_auth) != contracts.OK ||
+            credentials.rotate(store, ?replacement, ?retired) != contracts.OK ||
+            retired == nil) { ret 25; }
+        if (credentials.reclaimable(retired)) {
+            print.print("a retired generation was reclaimable while leased\n");
+            ret 26;
+        }
+    }
+
+    # a peer that only measures the handshake has already gone away, so this
+    # connection is torn down without attempting another record
+    if (option_handshake_only && index + 1 < connection_count) {
+        if (!stream.destroy(?secure) || !server.destroy(?listener_engine)) {
+            ret 46;
+        }
+        tcp.stream_close(?connection_socket);
+        ret 0;
+    }
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.read(?secure, ?scope,
+            transport.Token{index: 2, generation: 1},
+            ?application_input[0], 512, 2) ||
+        !settle(?secure, ?connection_runtime)) { ret 30; }
+    val read: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (read.terminal_error != error.OK || read.application_bytes == 0) {
+        report("read error=", read.terminal_error::usize);
+        ret 31;
+    }
+    report("read=", read.application_bytes);
+    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 32;
+    }
+
+    if (option_key_update) {
+        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+            !stream.key_update(?secure, ?scope,
+                transport.Token{index: 6, generation: 1}, 0, 6) ||
+            !settle(?secure, ?connection_runtime)) { ret 60; }
+        val updated: transport.Snapshot = transport.snapshot(?secure.operation);
+        if (updated.terminal_error != error.OK) {
+            report("key update error=", updated.terminal_error::usize);
+            ret 61;
+        }
+        if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+            ret 62;
+        }
+        print.print("key-updated\n");
+    }
+
+    application_output[0] = 'm'; application_output[1] = 'a';
+    application_output[2] = 'c'; application_output[3] = 'h';
+    application_output[4] = '-'; application_output[5] = 't';
+    application_output[6] = 'l'; application_output[7] = 's';
+    application_output[8] = ' '; application_output[9] = 's';
+    application_output[10] = 'e'; application_output[11] = 'r';
+    application_output[12] = 'v'; application_output[13] = 'e';
+    application_output[14] = 'r'; application_output[15] = '\n';
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.write(?secure, ?scope,
+            transport.Token{index: 3, generation: 1},
+            ?application_output[0], 16, 3) ||
+        !settle(?secure, ?connection_runtime)) { ret 33; }
+    val written: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (written.terminal_error != error.OK || written.application_bytes != 16) {
+        ret 34;
+    }
+    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 35;
+    }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.half_close(?secure, ?scope,
+            transport.Token{index: 4, generation: 1}, 4) ||
+        !settle(?secure, ?connection_runtime)) { ret 36; }
+    val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (half_closed.terminal_error != error.OK || !secure.send_closed ||
+        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        ret 37;
+    }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.close(?secure, ?scope,
+            transport.Token{index: 5, generation: 1}, 5) ||
+        !settle(?secure, ?connection_runtime)) { ret 38; }
+    val closed: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
+        !stream.destroy(?secure) || !cancel.destroy(?scope)) { ret 39; }
+
+    if (!server.destroy(?listener_engine)) { ret 40; }
+    if (option_rotate) {
+        if (!credentials.reclaimable(retired)) {
+            print.print("a retired generation stayed leased after destroy\n");
+            ret 41;
+        }
+        print.print("rotated\n");
+    }
+    ret 0;
+}
+
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     var port: u16 = 9443;
-    var require_client_auth: bool = false;
-    var require_alpn: bool = true;
+    option_require_client_auth = false;
+    option_require_alpn = true;
+    option_expect_failure = false;
+    option_expect_alert = 256;
+    option_rotate = false;
+    option_key_update = false;
+    option_tickets = 0;
+    option_single_use = false;
+    option_handshake_only = false;
     var prefer_p256: bool = false;
     var suite_choice: usize = 0;
-    var expect_failure: bool = false;
-    var expect_alert: usize = 256;
-    var rotate: bool = false;
     var no_default: bool = false;
+    var connections: usize = 1;
     var identity_choice: str = "server-ed25519";
 
     var argument: i64 = 1;
@@ -332,11 +573,23 @@ fun main(argc: i64, argv: **u8) i64 {
             argument = argument + 1;
             port = parse_number(argv[argument])::u16;
         } or (streq(current, "--require-client-auth"::*u8)) {
-            require_client_auth = true;
+            option_require_client_auth = true;
         } or (streq(current, "--optional-alpn"::*u8)) {
-            require_alpn = false;
+            option_require_alpn = false;
         } or (streq(current, "--groups-p256"::*u8)) {
             prefer_p256 = true;
+        } or (streq(current, "--key-update"::*u8)) {
+            option_key_update = true;
+        } or (streq(current, "--single-use"::*u8)) {
+            option_single_use = true;
+        } or (streq(current, "--handshake-only"::*u8)) {
+            option_handshake_only = true;
+        } or (streq(current, "--tickets"::*u8) && argument + 1 < argc) {
+            argument = argument + 1;
+            option_tickets = parse_number(argv[argument])::u8;
+        } or (streq(current, "--connections"::*u8) && argument + 1 < argc) {
+            argument = argument + 1;
+            connections = parse_number(argv[argument]);
         } or (streq(current, "--suite"::*u8) && argument + 1 < argc) {
             argument = argument + 1;
             suite_choice = parse_number(argv[argument]);
@@ -349,15 +602,17 @@ fun main(argc: i64, argv: **u8) i64 {
             } or { identity_choice = "server-ed25519"; }
         } or (streq(current, "--expect-failure"::*u8) && argument + 1 < argc) {
             argument = argument + 1;
-            expect_failure = true;
-            expect_alert = parse_number(argv[argument]);
+            option_expect_failure = true;
+            option_expect_alert = parse_number(argv[argument]);
         } or (streq(current, "--rotate"::*u8)) {
-            rotate = true;
+            option_rotate = true;
         } or (streq(current, "--no-default"::*u8)) {
             no_default = true;
         }
         argument = argument + 1;
     }
+    if (connections == 0 || connections > 4) { connections = 1; }
+    connection_count = connections;
 
     val opened: Result[file.Root, io_error.Error] = file.root_open(
         "test/interop/fixtures");
@@ -395,11 +650,12 @@ fun main(argc: i64, argv: **u8) i64 {
 
     var generation: credentials.Generation = credentials.empty_generation();
     var trust: *cert.TrustStore = nil;
-    if (require_client_auth) { trust = ?client_trust; }
+    if (option_require_client_auth) { trust = ?client_trust; }
     var default_index: usize = 0;
     if (no_default) { default_index = credentials.NO_DEFAULT; }
     if (credentials.initialize(?generation, ?identities[0], identity_count,
-            default_index, trust, require_client_auth) != contracts.OK) {
+            default_index, trust,
+            option_require_client_auth) != contracts.OK) {
         print.print("cannot publish the credential generation\n");
         ret 5;
     }
@@ -431,26 +687,44 @@ fun main(argc: i64, argv: **u8) i64 {
         tls13.RSA_PSS_RSAE_SHA256, tls13.RSA_PSS_RSAE_SHA384};
     var entropy: secret.Entropy = secret.system_entropy();
 
-    var configuration: config.ServerConfig;
-    configuration.credentials = ?store;
-    configuration.alpn = ?protocols[0];
-    configuration.alpn_len = 1;
-    configuration.require_alpn = require_alpn;
-    configuration.versions = ?versions[0];
-    configuration.version_len = 1;
-    configuration.suites = ?suites[0];
-    configuration.suite_len = suite_len;
-    configuration.groups = ?groups[0];
-    configuration.group_len = group_len;
-    configuration.signatures = ?signatures[0];
-    configuration.signature_len = 4;
-    configuration.entropy = ?entropy;
-    configuration.entropy_context_size = 0;
-    configuration.limits = config.production_limits();
-    configuration.limits.max_peer_handshake_bytes = 65536;
-    configuration.limits.max_client_hello_bytes = 65536;
-    configuration.limits.max_chain_bytes = 32768;
-    configuration.limits.max_server_flight_bytes = 65536;
+    listener_configuration = config.ServerConfig{};
+    listener_configuration.credentials = ?store;
+    listener_configuration.alpn = ?protocols[0];
+    listener_configuration.alpn_len = 1;
+    listener_configuration.require_alpn = option_require_alpn;
+    listener_configuration.versions = ?versions[0];
+    listener_configuration.version_len = 1;
+    listener_configuration.suites = ?suites[0];
+    listener_configuration.suite_len = suite_len;
+    listener_configuration.groups = ?groups[0];
+    listener_configuration.group_len = group_len;
+    listener_configuration.signatures = ?signatures[0];
+    listener_configuration.signature_len = 4;
+    listener_configuration.entropy = ?entropy;
+    listener_configuration.entropy_context_size = 0;
+    listener_configuration.tickets = nil;
+    listener_configuration.replay = nil;
+    listener_configuration.replay_policy = session.REPLAY_PERMISSIVE;
+    listener_configuration.tickets_per_connection = 0;
+    if (option_tickets != 0) {
+        if (!session.keyring_init(?ticket_ring, ?entropy, 1800000000, 3600,
+                1800, 7200)) {
+            print.print("cannot initialize the ticket key ring\n");
+            ret 43;
+        }
+        listener_configuration.tickets = ?ticket_ring;
+        listener_configuration.tickets_per_connection = option_tickets;
+        if (option_single_use) {
+            if (!session.replay_init(?replay_window)) { ret 44; }
+            listener_configuration.replay = ?replay_window;
+            listener_configuration.replay_policy = session.REPLAY_SINGLE_USE;
+        }
+    }
+    listener_configuration.limits = config.production_limits();
+    listener_configuration.limits.max_peer_handshake_bytes = 65536;
+    listener_configuration.limits.max_client_hello_bytes = 65536;
+    listener_configuration.limits.max_chain_bytes = 32768;
+    listener_configuration.limits.max_server_flight_bytes = 65536;
 
     val listening: Result[tcp.Listener, io_error.Error] = tcp.listen(
         ip.endpoint(127, 0, 0, 1, port), 4);
@@ -462,207 +736,25 @@ fun main(argc: i64, argv: **u8) i64 {
         io_error.Error](listening);
     print.print("listening\n");
 
-    val accepted: Result[tcp.Stream, io_error.Error] = tcp.accept(?listener);
-    if (is_err[tcp.Stream, io_error.Error](accepted)) {
-        print.print("cannot accept\n");
-        ret 8;
+    var index: usize = 0;
+    for (index < connections) {
+        val accepted: Result[tcp.Stream, io_error.Error] = tcp.accept(?listener);
+        if (is_err[tcp.Stream, io_error.Error](accepted)) {
+            print.print("cannot accept\n");
+            ret 8;
+        }
+        connection_socket = unwrap_ok[tcp.Stream, io_error.Error](accepted);
+        if (is_err[bool, io_error.Error](io_runtime.make(?connection_runtime,
+                16))) { ret 9; }
+        val served: i64 = serve_one(index, ?allocator, trust, ?store);
+        io_runtime.close(?connection_runtime);
+        io_runtime.destroy(?connection_runtime);
+        if (served != 0) { ret served; }
+        index = index + 1;
     }
-    var socket: tcp.Stream = unwrap_ok[tcp.Stream, io_error.Error](accepted);
     tcp.listener_close(?listener);
-
-    var owner: io_runtime.Runtime;
-    if (is_err[bool, io_error.Error](io_runtime.make(?owner, 16))) { ret 9; }
-    var blocking: BlockingTransport = BlockingTransport{runtime: ?owner,
-        stream: ?socket};
-    var lower: transport.Transport = transport.Transport{runtime: ?owner,
-        context: (?blocking)::ptr, context_size: $size_of(BlockingTransport),
-        aliases_state: blocking_aliases_state,
-        submit_read: blocking_read, submit_write: blocking_write,
-        submit_shutdown: blocking_shutdown, submit_close: blocking_close,
-        submit_abort: blocking_close};
-
-    var core_storage: server.Storage = server.Storage{
-        input: ?handshake_input[0], input_capacity: 65536,
-        output: ?handshake_output[0], output_capacity: 65536,
-        hello: ?retained_hello[0], hello_capacity: 65536,
-        certificates: ?peer_certificates[0], certificate_capacity: 8,
-        peer_parameters: nil, peer_parameters_capacity: 0};
-    var storage: stream.Storage;
-    storage.wire_input = ?wire_input[0];
-    storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.wire_output = ?wire_output[0];
-    storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-
-    var listener_engine: server.Server;
-    var empty_extra: server.ExtraExtension;
-    empty_extra.kind = 0;
-    empty_extra.data.data = nil;
-    empty_extra.data.len = 0;
-    var hello_required: usize = 0;
-    var flight_required: usize = 0;
-    if (!server.storage_requirements(?configuration, empty_extra,
-            ?hello_required, ?flight_required)) {
-        print.print("cannot size server storage\n");
-        ret 10;
-    }
-    if (!server.init(?listener_engine, ?configuration, core_storage,
-            empty_extra, 0)) {
-        report("hello required=", hello_required);
-        report("flight required=", flight_required);
-        report("output capacity=", core_storage.output_capacity);
-        print.print("cannot initialize the server engine\n");
-        ret 10;
-    }
-
-    var scope: cancel.Scope;
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 11; }
-    var secure: stream.Stream;
-    if (!stream.serve(?secure, ?listener_engine, storage, ?lower, ?scope,
-            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
-        !settle(?secure, ?owner)) {
-        print.print("the handshake operation was not accepted\n");
-        ret 12;
-    }
-    val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
-    val negotiated: engine.Snapshot = stream.negotiated(?secure);
-
-    if (expect_failure) {
-        if (handshake.terminal_error == error.OK) {
-            print.print("expected a handshake failure\n");
-            ret 13;
-        }
-        val alert: usize = engine.alert_for(negotiated.error)::usize;
-        report("alert=", alert);
-        report("error=", negotiated.error::usize);
-        if (expect_alert != 256 && alert != expect_alert) {
-            print.print("wrong alert\n");
-            ret 14;
-        }
-        stream.destroy_operation(?secure);
-        stream.destroy(?secure);
-        server.destroy(?listener_engine);
-        ret 0;
-    }
-
-    if (handshake.terminal_error != error.OK) {
-        report("handshake error=", handshake.terminal_error::usize);
-        ret 20;
-    }
-    if (negotiated.selected_alpn.len != 2 ||
-        negotiated.selected_alpn.data[0] != 'h' ||
-        negotiated.selected_alpn.data[1] != '2') {
-        if (require_alpn) {
-            print.print("alpn was not negotiated\n");
-            ret 21;
-        }
-    }
-    if (require_client_auth && !negotiated.authenticated) {
-        print.print("the client was not authenticated\n");
-        ret 22;
-    }
-    report("suite=", negotiated.suite::usize);
-    report("group=", negotiated.group::usize);
-    report("retries=", negotiated.retry_count::usize);
-    report("sni=", negotiated.peer_name.len);
-    if (negotiated.peer_name.len != 0) {
-        var name_text: [256]char;
-        var i: usize = 0;
-        for (i < negotiated.peer_name.len) {
-            name_text[i] = negotiated.peer_name.data[i]::char;
-            i = i + 1;
-        }
-        name_text[negotiated.peer_name.len] = 0::char;
-        print.print("name=");
-        print.print(?name_text[0]);
-        print.print("\n");
-    }
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
-        ret 23;
-    }
-
-    # rotation must not disturb this established connection
-    var replacement: credentials.Generation = credentials.empty_generation();
-    var retired: *credentials.Generation = nil;
-    if (rotate) {
-        if (!load_identity(3, "server-rotated.pem", "server-rotated.key",
-                "api.example.com", 15, ?allocator)) { ret 24; }
-        rotated_identities[0] = identities[3];
-        if (credentials.initialize(?replacement, ?rotated_identities[0], 1, 0,
-                trust, require_client_auth) != contracts.OK ||
-            credentials.rotate(?store, ?replacement, ?retired) != contracts.OK ||
-            retired == nil) { ret 25; }
-        if (credentials.reclaimable(retired)) {
-            print.print("a retired generation was reclaimable while leased\n");
-            ret 26;
-        }
-    }
-
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.read(?secure, ?scope,
-            transport.Token{index: 2, generation: 1},
-            ?application_input[0], 512, 2) || !settle(?secure, ?owner)) {
-        ret 30;
-    }
-    val read: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (read.terminal_error != error.OK || read.application_bytes == 0) {
-        report("read error=", read.terminal_error::usize);
-        ret 31;
-    }
-    report("read=", read.application_bytes);
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
-        ret 32;
-    }
-
-    application_output[0] = 'm'; application_output[1] = 'a';
-    application_output[2] = 'c'; application_output[3] = 'h';
-    application_output[4] = '-'; application_output[5] = 't';
-    application_output[6] = 'l'; application_output[7] = 's';
-    application_output[8] = ' '; application_output[9] = 's';
-    application_output[10] = 'e'; application_output[11] = 'r';
-    application_output[12] = 'v'; application_output[13] = 'e';
-    application_output[14] = 'r'; application_output[15] = '\n';
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.write(?secure, ?scope,
-            transport.Token{index: 3, generation: 1},
-            ?application_output[0], 16, 3) || !settle(?secure, ?owner)) {
-        ret 33;
-    }
-    val written: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (written.terminal_error != error.OK || written.application_bytes != 16) {
-        ret 34;
-    }
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
-        ret 35;
-    }
-
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.half_close(?secure, ?scope,
-            transport.Token{index: 4, generation: 1}, 4) ||
-        !settle(?secure, ?owner)) { ret 36; }
-    val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (half_closed.terminal_error != error.OK || !secure.send_closed ||
-        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
-        ret 37;
-    }
-
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-        !stream.close(?secure, ?scope,
-            transport.Token{index: 5, generation: 1}, 5) ||
-        !settle(?secure, ?owner)) { ret 38; }
-    val closed: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
-        !stream.destroy(?secure) || !cancel.destroy(?scope)) { ret 39; }
-
-    if (!server.destroy(?listener_engine)) { ret 40; }
-    if (rotate) {
-        if (!credentials.reclaimable(retired)) {
-            print.print("a retired generation stayed leased after destroy\n");
-            ret 41;
-        }
-        print.print("rotated\n");
-    }
-    if (is_err[bool, io_error.Error](io_runtime.close(?owner)) ||
-        is_err[bool, io_error.Error](io_runtime.destroy(?owner))) { ret 42; }
+    if (option_tickets != 0) { session.keyring_destroy(?ticket_ring); }
+    if (option_single_use) { session.replay_destroy(?replay_window); }
     file.root_close(?fixtures);
     print.print("ok\n");
     ret 0;

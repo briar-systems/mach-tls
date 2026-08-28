@@ -269,6 +269,16 @@ fun engine_traffic_keys(stream: *Stream, event: *engine.Event,
     ret server.traffic_keys(stream.server, event, key, iv, key_length);
 }
 
+fun engine_request_key_update(stream: *Stream, request: u8) engine.Result {
+    if (!engine_bound(stream)) {
+        ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (stream.role == engine.CLIENT) {
+        ret client.request_key_update(stream.client, request);
+    }
+    ret server.request_key_update(stream.server, request);
+}
+
 fun engine_snapshot(stream: *Stream) engine.Snapshot {
     if (!engine_bound(stream)) { ret engine.empty_snapshot(); }
     if (stream.role == engine.CLIENT) { ret client.snapshot(stream.client); }
@@ -1126,6 +1136,26 @@ pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     }
     ret leave(stream, begin_control(stream, scope, token, CONTROL_CLOSE,
         record.CLOSE_NOTIFY, context));
+}
+
+fun key_update_inner(stream: *Stream, scope: *cancel.Scope,
+    token: transport.Token, request: u8, context: usize) bool {
+    if (stream == nil || stream.state != OPEN || stream.send_closed ||
+        !operation_available(stream) ||
+        !operation_inputs_valid(stream, scope, nil, 0) ||
+        engine_request_key_update(stream, request).status != engine.OK ||
+        !transport.begin(?stream.operation, token, transport.HANDSHAKE, scope,
+            nil, 0, context)) { ret false; }
+    if (settle_terminal(stream)) { ret true; }
+    ret drive_owned(stream);
+}
+
+# post-handshake rekeying reuses the handshake driver: one flight out, one
+# secret transition, and the operation settles
+pub fun key_update(stream: *Stream, scope: *cancel.Scope,
+    token: transport.Token, request: u8, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, key_update_inner(stream, scope, token, request, context));
 }
 
 pub fun connect(stream: *Stream, core: *client.Client, storage: Storage,

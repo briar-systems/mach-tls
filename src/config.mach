@@ -2,6 +2,7 @@
 
 use tls.cert;
 use tls.cert.credentials;
+use tls.session;
 use tls.tls13;
 use crypto.contracts;
 use crypto.secret;
@@ -40,6 +41,7 @@ pub rec ClientConfig {
     client_identity: *credentials.Identity;
     entropy:         *secret.Entropy;
     entropy_context_size: usize;
+    sessions:        *session.ClientStore;
     limits:          Limits;
 }
 
@@ -60,6 +62,10 @@ pub rec ServerConfig {
     signature_len:      usize;
     entropy:            *secret.Entropy;
     entropy_context_size: usize;
+    tickets:            *session.KeyRing;
+    replay:             *session.ReplayWindow;
+    replay_policy:      session.ReplayPolicy;
+    tickets_per_connection: u8;
     limits:             Limits;
 }
 

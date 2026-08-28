@@ -280,3 +280,83 @@ protocol-correct rejections.
 Browser interoperability is not covered here. This machine has no browser
 harness, so the browser criterion is exercised only through the OpenSSL and
 GnuTLS clients above.
+
+# Session resumption and key updates
+
+## Resumption against our server
+
+`--tickets N` issues `N` session tickets per connection and enables resumption.
+`--connections N` accepts `N` connections in sequence so the second one can
+resume. `--single-use` requires each ticket identity to be presented only once.
+`--handshake-only` tears down every connection but the last without an
+application exchange, which is what `gnutls-cli --resume` expects.
+
+OpenSSL saving and reusing a session:
+
+```sh
+# server: --tickets 2 --connections 2
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet \
+  -verify_return_error -sess_out /tmp/sess.pem     # prints resumed=0
+
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet \
+  -verify_return_error -sess_in /tmp/sess.pem      # prints resumed=1
+```
+
+Presenting one ticket twice. Under `--single-use` the third connection prints
+`resumed=0`; under the default policy it prints `resumed=1`:
+
+```sh
+# server: --tickets 1 --single-use --connections 3
+# then -sess_out once and -sess_in twice with the same file
+```
+
+GnuTLS resuming:
+
+```sh
+# server: --tickets 2 --connections 2 --handshake-only
+gnutls-cli --port 9443 127.0.0.1 \
+  --x509cafile test/interop/fixtures/server-root.pem \
+  --priority 'NORMAL:-VERS-ALL:+VERS-TLS1.3' --alpn h2 \
+  --sni-hostname api.example.com --verify-hostname api.example.com --resume
+```
+
+GnuTLS reports `*** This is a resumed session` and the server prints
+`resumed=1` for the second connection.
+
+## Resumption from our client
+
+`tls-client-interop` accepts `--sessions` to retain tickets in a bounded store
+and `--connections N` to dial that many times, reusing the store.
+
+```sh
+openssl s_server -accept 9443 -cert test/interop/fixtures/leaf.pem \
+  -key test/interop/fixtures/leaf.key -tls1_3 -alpn h2 -rev -quiet
+
+test/interop/out/linux-x86_64/debug/bin/tls-client-interop --sessions --connections 2
+```
+
+The second connection prints `resumed=1`.
+
+## Key updates
+
+Both harnesses accept `--key-update`, which performs a post-handshake key update
+after the first application read and then continues the exchange on the new
+keys. A peer that mishandles the update fails the leg.
+
+```sh
+# server: --key-update, driven by either the OpenSSL or the GnuTLS client above
+# client: --key-update, driven by openssl s_server above
+```
+
+## Qualification for the session revision
+
+Against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64: nineteen
+single-connection server legs, four resumption legs, and ten client legs all
+returned exit status zero from the Mach harness. The resumption legs cover
+OpenSSL saving and reusing a ticket issued by our server, a single-use policy
+refusing the second presentation of one ticket while the permissive policy
+accepts it, GnuTLS reporting a resumed session against our server, and our
+client resuming against an OpenSSL server. Key updates were driven mid-session
+in both directions against both peers.
