@@ -30,6 +30,7 @@ pub rec Transport {
     submit_write: SubmitBufferFun;
     submit_shutdown: SubmitCloseFun;
     submit_close: SubmitCloseFun;
+    submit_abort: SubmitCloseFun;
 }
 
 fun invalid(operation: io_error.Operation) io_error.Error {
@@ -42,7 +43,8 @@ pub fun valid(transport: *Transport) bool {
         && transport.submit_read::usize != 0
         && transport.submit_write::usize != 0
         && transport.submit_shutdown::usize != 0
-        && transport.submit_close::usize != 0;
+        && transport.submit_close::usize != 0
+        && transport.submit_abort::usize != 0;
 }
 
 pub fun read(
@@ -93,6 +95,17 @@ pub fun shutdown(
     ret transport.submit_shutdown(transport.context, scope, context);
 }
 
+pub fun abort(
+    transport: *Transport,
+    scope: *cancel.Scope,
+    context: usize,
+) Result[io_runtime.Token, io_error.Error] {
+    if (!valid(transport) || scope == nil) {
+        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+    }
+    ret transport.submit_abort(transport.context, scope, context);
+}
+
 pub rec TcpAdapter {
     driver: *net_async.Driver;
     stream: *tcp.Stream;
@@ -120,6 +133,12 @@ fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) Resul
         token_context);
 }
 
+fun tcp_abort(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val adapter: *TcpAdapter = context::*TcpAdapter;
+    ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream,
+        lifecycle.ABORTIVE, token_context);
+}
+
 pub fun make_tcp(
     transport: *Transport,
     adapter: *TcpAdapter,
@@ -139,6 +158,7 @@ pub fun make_tcp(
     transport.submit_write = tcp_write;
     transport.submit_shutdown = tcp_shutdown;
     transport.submit_close = tcp_close;
+    transport.submit_abort = tcp_abort;
     ret true;
 }
 
@@ -153,6 +173,7 @@ pub val TRANSPORT_READ: ActionKind = 1;
 pub val TRANSPORT_WRITE: ActionKind = 2;
 pub val TRANSPORT_CLOSE: ActionKind = 3;
 pub val TRANSPORT_SHUTDOWN: ActionKind = 4;
+pub val TRANSPORT_ABORT: ActionKind = 5;
 
 pub def OperationState: u8;
 pub val OPERATION_OPEN: OperationState = 1;
@@ -309,6 +330,12 @@ fun action_submission(transport: *Transport, operation: *Operation, action: Acti
         }
         ret shutdown(transport, operation.scope, action.context);
     }
+    if (action.kind == TRANSPORT_ABORT) {
+        if (action.buffer != nil || action.length != 0) {
+            ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+        }
+        ret abort(transport, operation.scope, action.context);
+    }
     ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SUBMIT));
 }
 
@@ -370,7 +397,8 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
         terminal_locked(operation, map_error(completion.error), false, false);
     } or ((lower_kind == TRANSPORT_READ || lower_kind == TRANSPORT_WRITE) && completion.bytes > lower_length) {
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
-    } or (lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN) {
+    } or (lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN ||
+        lower_kind == TRANSPORT_ABORT) {
         terminal_locked(operation, error.OK, false, false);
     }
     mutex.unlock(?operation.lock);
