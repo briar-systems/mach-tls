@@ -15,6 +15,7 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.cert.verify` constructs and verifies bounded certificate paths.
 - `tls.cert.load` loads certificate chains and owned private keys from DER and PEM.
 - `tls.cert.credentials` selects and safely rotates immutable credential generations.
+- `tls.engine` defines the role-independent handshake engine contract.
 - `tls.transport` provides completion-based TLS operation ownership and ordered-byte adapters.
 - `tls.record` implements TLS 1.2 and TLS 1.3 framing, alerts, padding, sequencing, and AEAD protection.
 - `tls.handshake` defines handshake framing and progress.
@@ -25,9 +26,11 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls13.key_schedule` implements the complete TLS 1.3 HKDF schedule and traffic derivation.
 - `tls.state` defines client and server connection state.
 - `tls.session` defines bounded session ticket storage.
-- `tls.client` implements the incremental TLS 1.3 client handshake and its
-  transport-independent event contract.
-- `tls.stream` implements a completion-driven TLS 1.3 secure byte stream.
+- `tls.client` implements the incremental TLS 1.3 client handshake.
+- `tls.server` implements the incremental TLS 1.3 server handshake and
+  credential selection.
+- `tls.stream` implements a completion-driven TLS 1.3 secure byte stream for
+  either role.
 
 `tls.lib` re-exports these modules for consumers that prefer one import.
 
@@ -39,7 +42,11 @@ A native TCP adapter is included. QUIC handshake streams implement the same subm
 
 TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented.
 
-The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction. `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contract and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md). The TLS server state machine remains under a subsequent implementation issue.
+The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction.
+
+The TLS 1.3 server is complete. It selects credentials by SNI with exact, wildcard, and default precedence, negotiates ALPN, suites, groups, and signatures against the leased private key, issues at most one HelloRetryRequest, requests and verifies optional client authentication, and answers invalid ClientHellos with protocol-correct alerts and bounded work. Certificate rotation retires a generation without disturbing any established connection.
+
+`tls.engine` defines the one handshake-engine contract both roles implement, so `tls.stream` drives either over the same records and the same transport. A stream borrows a caller-owned engine and never destroys it. `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contracts and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md) and [`doc/server.md`](doc/server.md).
 
 ## Certificates and credentials
 
@@ -96,6 +103,9 @@ mach test test/transport
 mach dep pull test/interop
 mach build test/interop
 ```
+
+The interoperability project builds two binaries: `tls-client-interop` dials an
+external server and `tls-server-interop` accepts one external client.
 
 External OpenSSL and GnuTLS interoperability commands are in
 [`test/interop/README.md`](test/interop/README.md).

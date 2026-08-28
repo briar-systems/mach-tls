@@ -283,8 +283,9 @@ fun psk_mode(extension: extensions.Extension, mode: u8) bool {
 fun valid_client_combinations(value: *ClientHello) error.Error {
     var versions: extensions.Extension;
     if (!extensions.find(value.extensions, extensions.SUPPORTED_VERSIONS, ?versions)) {
-        ret error.MISSING_EXTENSION;
+        ret error.PROTOCOL_VERSION;
     }
+    if (!extensions.offers_tls13(value.extensions)) { ret error.PROTOCOL_VERSION; }
     var groups: extensions.Extension;
     val has_groups: bool = extensions.find(value.extensions, extensions.SUPPORTED_GROUPS, ?groups);
     var shares: extensions.Extension;

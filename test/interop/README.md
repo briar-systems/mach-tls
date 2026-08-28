@@ -98,3 +98,185 @@ GnuTLS 3.8.13. Every command above returned exit status zero from the Mach
 harness. Each run exchanged the `mach-tls inter` application line and a server
 response before half-close. Both servers also verified the required client
 certificate to the checked-in root.
+
+# TLS 1.3 server interoperability
+
+`tls-server-interop` listens on `127.0.0.1:9443`, accepts one connection, runs
+the TLS 1.3 server handshake, reads one application line, writes
+`mach-tls server`, half-closes, and closes. It prints the negotiated suite,
+group, retry count, and SNI host name, then `ok`. It exits non-zero on any
+failure, so every command below is its own assertion.
+
+Options:
+
+- `--port N` listen elsewhere
+- `--identity ed25519|p256|rsa` choose the credential served for `api.example.com`
+- `--suite 1|2|3` restrict to AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305
+- `--groups-p256` offer only P-256, forcing HelloRetryRequest for an X25519 client
+- `--require-client-auth` request and verify a client certificate to `root.pem`
+- `--optional-alpn` accept a client that offers no matching protocol
+- `--no-default` register no default credential, so an unknown SNI is refused
+- `--rotate` rotate the credential generation while the connection is established
+- `--expect-failure N` require the handshake to fail with alert `N`
+
+Build both harnesses:
+
+```sh
+mach dep pull test/interop
+mach build test/interop
+```
+
+Start the server in one terminal and run the client command in another. The
+server exits after one connection.
+
+```sh
+test/interop/out/linux-x86_64/debug/bin/tls-server-interop [options]
+```
+
+## OpenSSL clients
+
+Ed25519 credential, X25519, AES-128-GCM, SNI and ALPN:
+
+```sh
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem \
+  -alpn h2 -tls1_3 -quiet -verify_return_error
+```
+
+HelloRetryRequest, with the server offering only P-256:
+
+```sh
+# server: --groups-p256
+```
+
+The other two cipher suites, one server run each:
+
+```sh
+# server: --suite 2
+# server: --suite 3
+```
+
+ECDSA P-256 and RSA-PSS credentials:
+
+```sh
+# server: --identity p256
+# server: --identity rsa
+```
+
+SNI selection. The exact name serves `server-alt.pem` and the unmatched name
+falls to the wildcard `server-wild.pem`; `-verify_hostname` fails unless the
+right certificate was chosen:
+
+```sh
+openssl s_client -connect 127.0.0.1:9443 -servername alt.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet \
+  -verify_return_error -verify_hostname alt.example.com
+
+openssl s_client -connect 127.0.0.1:9443 -servername foo.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet \
+  -verify_return_error -verify_hostname foo.example.com
+```
+
+Required and verified client authentication:
+
+```sh
+# server: --require-client-auth
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet \
+  -verify_return_error \
+  -cert test/interop/fixtures/client.pem -key test/interop/fixtures/client.key
+```
+
+Credential rotation while the connection is established. The server rotates
+after the handshake and before the application exchange, asserts that the
+retired generation is not reclaimable while the connection holds its lease,
+completes the exchange on the original credential, and asserts the generation
+becomes reclaimable once the connection is destroyed:
+
+```sh
+# server: --rotate
+```
+
+## GnuTLS client
+
+```sh
+gnutls-cli --port 9443 127.0.0.1 \
+  --x509cafile test/interop/fixtures/server-root.pem \
+  --priority 'NORMAL:-VERS-ALL:+VERS-TLS1.3' \
+  --alpn h2 --sni-hostname api.example.com --verify-hostname api.example.com
+```
+
+## Protocol-correct rejection
+
+Each of these requires the server to fail with the named alert. The server exits
+zero only when the alert matches.
+
+```sh
+# server: --expect-failure 70        protocol_version
+openssl s_client -connect 127.0.0.1:9443 \
+  -CAfile test/interop/fixtures/server-root.pem -tls1_2 -quiet
+
+# server: --expect-failure 70        protocol_version
+gnutls-cli --port 9443 127.0.0.1 \
+  --x509cafile test/interop/fixtures/server-root.pem \
+  --priority 'NORMAL:-VERS-ALL:+VERS-TLS1.2' --insecure
+
+# server: --expect-failure 120       no_application_protocol
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h3 -tls1_3 -quiet
+
+# server: --no-default --expect-failure 112   unrecognized_name
+openssl s_client -connect 127.0.0.1:9443 -servername nowhere.invalid \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet
+
+# server: --require-client-auth --expect-failure 116   certificate_required
+openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
+  -CAfile test/interop/fixtures/server-root.pem -alpn h2 -tls1_3 -quiet
+```
+
+## Server fixtures
+
+The `server-*` fixtures are test material only and are signed by
+`server-root.pem`, whose private key is deliberately not checked in. Regenerate
+the family with:
+
+```sh
+openssl genpkey -algorithm ED25519 -out server-root.key
+openssl req -new -x509 -key server-root.key -out server-root.pem -days 3650 \
+  -subj "/CN=MachTLSServerRoot" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# for each <name>/<san>/<algorithm> below
+openssl genpkey -algorithm ED25519 -out <name>.key
+openssl req -new -key <name>.key -out <name>.csr -subj "/CN=<san>"
+openssl x509 -req -in <name>.csr -CA server-root.pem -CAkey server-root.key \
+  -CAcreateserial -out <name>.pem -days 3650 -copy_extensions copy \
+  -extfile <(printf "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:<san>\n")
+```
+
+| fixture | subject alternative name | key |
+| --- | --- | --- |
+| `server-ed25519` | `api.example.com` | Ed25519 |
+| `server-p256` | `api.example.com` | ECDSA P-256 |
+| `server-rsa` | `api.example.com` | RSA 2048 |
+| `server-alt` | `alt.example.com` | Ed25519 |
+| `server-wild` | `*.example.com` | Ed25519 |
+| `server-rotated` | `api.example.com` | Ed25519 |
+
+The client trust store for `--require-client-auth` is the existing `root.pem`,
+which signs `client.pem`.
+
+## Qualification for this revision
+
+Every command in this file returned exit status zero from the Mach harness
+against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64: eight client legs and
+seventeen server legs. The server legs cover SNI exact, wildcard, and default
+selection, ALPN, all three TLS 1.3 cipher suites, X25519 and P-256 including
+HelloRetryRequest, Ed25519, ECDSA P-256 and RSA-PSS credentials, required client
+authentication, credential rotation during an established connection, and five
+protocol-correct rejections.
+
+Browser interoperability is not covered here. This machine has no browser
+harness, so the browser criterion is exercised only through the OpenSSL and
+GnuTLS clients above.
