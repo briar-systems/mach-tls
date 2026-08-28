@@ -331,6 +331,7 @@ pub rec Operation {
     cancellation_requested: bool;
     cancellation_error: error.Error;
     provider: Transport;
+    provider_owner: *Transport;
     provider_drifted: bool;
     lock: mutex.Mutex;
 }
@@ -422,6 +423,7 @@ pub fun begin(
     operation.cancellation_requested = false;
     operation.cancellation_error = error.OK;
     operation.provider = Transport{};
+    operation.provider_owner = nil;
     operation.provider_drifted = false;
     operation.lock = mutex.make();
     cancel.init_registration(?operation.cancellation);
@@ -513,6 +515,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
         ret false;
     }
     operation.provider = descriptor;
+    operation.provider_owner = transport;
     mutex.unlock(?operation.lock);
 
     val submitted: Result[io_runtime.Token, io_error.Error] =
@@ -526,6 +529,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
     if (is_err[io_runtime.Token, io_error.Error](submitted)) {
         operation.state = OPERATION_OPEN;
         operation.provider = Transport{};
+        operation.provider_owner = nil;
         if (!descriptor_stable) {
             terminal_locked(operation, error.INTERNAL_ERROR, false, false);
         } or (operation.cancellation_requested) {
@@ -543,6 +547,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
     if (lower_token.generation == 0) {
         operation.state = OPERATION_OPEN;
         operation.provider = Transport{};
+        operation.provider_owner = nil;
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
         mutex.unlock(?operation.lock);
         ret false;
@@ -575,6 +580,18 @@ fun completion_matches(operation: *Operation, completion: *io_runtime.Completion
     ret false;
 }
 
+fun completion_equal(first: *io_runtime.Completion,
+    second: *io_runtime.Completion) bool {
+    ret token_equals(first.token, second.token) && first.kind == second.kind &&
+        first.context == second.context && first.bytes == second.bytes &&
+        first.items == second.items && first.resource == second.resource &&
+        first.has_error == second.has_error &&
+        first.error.kind == second.error.kind &&
+        first.error.code == second.error.code &&
+        first.error.operation == second.error.operation &&
+        first.end_of_stream == second.end_of_stream;
+}
+
 fun provider_state_overlaps(descriptor: *Transport, data: *u8,
     len: usize) bool {
     if (descriptor == nil || descriptor.runtime == nil ||
@@ -599,43 +616,44 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
         ret false;
     }
     val provider: Transport = operation.provider;
+    val provider_owner: *Transport = operation.provider_owner;
+    val settled: io_runtime.Completion = @completion;
     operation.state = OPERATION_ACCEPTING;
     mutex.unlock(?operation.lock);
     val aliases_provider: bool = provider_state_overlaps(?provider,
         completion::*u8, $size_of(io_runtime.Completion));
     mutex.lock(?operation.lock);
-    if (operation.state != OPERATION_ACCEPTING ||
-        !completion_matches(operation, completion)) {
-        mutex.unlock(?operation.lock);
-        ret false;
-    }
-    if (aliases_provider) {
-        operation.state = OPERATION_WAITING;
+    if (operation.state != OPERATION_ACCEPTING) {
         mutex.unlock(?operation.lock);
         ret false;
     }
     val lower_kind: ActionKind = operation.lower_kind;
     val lower_length: usize = operation.lower_length;
-    val provider_drifted: bool = operation.provider_drifted;
+    val completion_stable: bool = completion_equal(?settled, completion);
+    val provider_stable: bool = provider_owner != nil &&
+        memory_range.valid(provider_owner::*u8, $size_of(Transport)) &&
+        descriptor_equal(?provider, provider_owner);
+    val provider_drifted: bool = operation.provider_drifted || !provider_stable;
     operation.state = OPERATION_OPEN;
     operation.lower_kind = 0;
     operation.lower_buffer = nil;
     operation.lower_length = 0;
     operation.provider = Transport{};
+    operation.provider_owner = nil;
     operation.provider_drifted = false;
-    operation.last_transport_bytes = completion.bytes;
-    operation.last_end_of_stream = completion.end_of_stream;
+    operation.last_transport_bytes = settled.bytes;
+    operation.last_end_of_stream = settled.end_of_stream;
     if (operation.cancellation_requested) {
         terminal_locked(operation, operation.cancellation_error, false, true);
-    } or (provider_drifted) {
+    } or (aliases_provider || !completion_stable || provider_drifted) {
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
-    } or (completion.has_error) {
-        terminal_locked(operation, map_error(completion.error), false, false);
-    } or ((lower_kind == TRANSPORT_READ || lower_kind == TRANSPORT_WRITE) && completion.bytes > lower_length) {
+    } or (settled.has_error) {
+        terminal_locked(operation, map_error(settled.error), false, false);
+    } or ((lower_kind == TRANSPORT_READ || lower_kind == TRANSPORT_WRITE) && settled.bytes > lower_length) {
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
     } or ((lower_kind == TRANSPORT_CLOSE ||
         lower_kind == TRANSPORT_SHUTDOWN || lower_kind == TRANSPORT_ABORT) &&
-        (completion.bytes != 0 || completion.end_of_stream)) {
+        (settled.bytes != 0 || settled.end_of_stream)) {
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
     } or (lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN ||
         lower_kind == TRANSPORT_ABORT) {
@@ -694,6 +712,7 @@ pub fun destroy_operation(operation: *Operation) bool {
     operation.lower_buffer = nil;
     operation.lower_length = 0;
     operation.provider = Transport{};
+    operation.provider_owner = nil;
     operation.provider_drifted = false;
     operation.state = OPERATION_DESTROYED;
     mutex.unlock(?operation.lock);

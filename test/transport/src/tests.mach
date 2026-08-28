@@ -40,6 +40,7 @@ rec TestTransport {
     cancel_during_submit: bool;
     fail_during_submit: bool;
     mutate_descriptor: bool;
+    mutate_completion: bool;
     concurrent_reentry: bool;
     concurrent_blocked: bool;
     reentry_rejected: bool;
@@ -71,6 +72,14 @@ fun test_aliases_state(context: ptr, data: *u8, len: usize) bool {
         ret true;
     }
     val state: *TestTransport = context::*TestTransport;
+    if (state.mutate_completion && state.reentrant_completion != nil &&
+        data == state.reentrant_completion::*u8 &&
+        len == $size_of(io_runtime.Completion)) {
+        state.reentrant_completion.bytes = state.reentrant_completion.bytes + 1;
+        state.reentrant_completion.items = state.reentrant_completion.items + 1;
+        state.reentrant_completion.end_of_stream =
+            !state.reentrant_completion.end_of_stream;
+    }
     if (state.reentrant_operation != nil &&
         state.reentrant_completion != nil) {
         state.accept_rejected = !transport.accept(state.reentrant_operation,
@@ -160,6 +169,7 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     state.cancel_during_submit = false;
     state.fail_during_submit = false;
     state.mutate_descriptor = false;
+    state.mutate_completion = false;
     state.concurrent_reentry = false;
     state.concurrent_blocked = false;
     state.reentry_rejected = false;
@@ -344,32 +354,55 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
     state.mutate_descriptor = false;
     if (!transport.begin(?operation,
             transport.Token{index: 20, generation: 2},
+            transport.APPLICATION_WRITE, ?scope, ?buffer[0], 4, 0) ||
+        !transport.begin_action(?operation, ?adapter,
+            transport.Action{kind: transport.TRANSPORT_WRITE,
+                buffer: ?buffer[0], length: 4, context: 0})) { ret 7; }
+    adapter.context_size = descriptor_size + 1;
+    if (is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+            operation.lower_token, 4, 0, false)) ||
+        !take_one(?runtime, ?completion) ||
+        !transport.accept(?operation, ?completion) ||
+        transport.snapshot(?operation).terminal_error != error.INTERNAL_ERROR ||
+        operation.lower_buffer != nil || !transport.destroy_operation(?operation)) {
+        ret 8;
+    }
+    adapter.context_size = descriptor_size;
+    if (!transport.begin(?operation,
+            transport.Token{index: 20, generation: 3},
             transport.APPLICATION_CLOSE, ?scope, nil, 0, 0) ||
         !transport.begin_action(?operation, ?adapter,
             transport.Action{kind: transport.TRANSPORT_CLOSE,
                 buffer: nil, length: 0, context: 0}) ||
         is_err[bool, io_error.Error](io_runtime.complete(?runtime,
             operation.lower_token, 0, 0, false)) ||
-        !take_one(?runtime, ?completion)) { ret 7; }
+        !take_one(?runtime, ?completion)) { ret 9; }
     state.completion = completion;
-    if (transport.accept(?operation, ?state.completion)) { ret 11; }
-    if (transport.snapshot(?operation).state != transport.OPERATION_WAITING) {
-        ret 12;
+    if (!transport.accept(?operation, ?state.completion) ||
+        transport.snapshot(?operation).terminal_error != error.INTERNAL_ERROR ||
+        !transport.destroy_operation(?operation)) {
+        ret 10;
     }
-    completion.kind = io_runtime.SHUTDOWN;
-    if (transport.accept(?operation, ?completion)) { ret 8; }
-    completion.kind = io_runtime.CLOSE;
-    completion.bytes = 1;
+    if (!transport.begin(?operation,
+            transport.Token{index: 20, generation: 4},
+            transport.APPLICATION_CLOSE, ?scope, nil, 0, 0) ||
+        !transport.begin_action(?operation, ?adapter,
+            transport.Action{kind: transport.TRANSPORT_CLOSE,
+                buffer: nil, length: 0, context: 0}) ||
+        is_err[bool, io_error.Error](io_runtime.complete(?runtime,
+            operation.lower_token, 0, 0, false)) ||
+        !take_one(?runtime, ?completion)) { ret 11; }
     state.reentrant_operation = ?operation;
     state.reentrant_completion = ?completion;
+    state.mutate_completion = true;
     if (!transport.accept(?operation, ?completion) ||
         transport.snapshot(?operation).terminal_error != error.INTERNAL_ERROR ||
         !state.accept_rejected || !transport.destroy_operation(?operation)) {
-        ret 9;
+        ret 12;
     }
     if (!cancel.destroy(?scope) ||
         is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
-        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 10; }
+        is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 13; }
     ret 0;
 }
 
