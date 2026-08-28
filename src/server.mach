@@ -33,6 +33,7 @@ use tls.session;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
+use tls.validation;
 
 pub val MAX_KEY_SHARE: usize = 65;
 pub val MAX_PUBLIC_KEY: usize = 512;
@@ -3715,5 +3716,126 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
     if (keys.destroy_private(?resume_key) != contracts.OK) { ret 30; }
+    ret 0;
+}
+
+var mutation_input: [8192]u8;
+var mutation_output: [8192]u8;
+var mutation_retained: [8192]u8;
+var mutation_certificates: [4]cert.Certificate;
+var mutation_case: [validation.MAX_CORPUS]u8;
+
+# every outcome of one mutated hello must be a complete, bounded state
+fun feed_mutation(listener: *config.ServerConfig, length: usize) i64 {
+    var storage: Storage = Storage{
+        input: ?mutation_input[0], input_capacity: 8192,
+        output: ?mutation_output[0], output_capacity: 8192,
+        hello: ?mutation_retained[0], hello_capacity: 8192,
+        certificates: ?mutation_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0};
+    var extra: ExtraExtension;
+    extra.kind = 0;
+    extra.data.data = nil;
+    extra.data.len = 0;
+    var value: Server;
+    if (!init(?value, listener, storage, extra, 0) ||
+        start(?value, 1800000000).status != engine.OK) { ret 1; }
+    val fed: engine.Result = ingest(?value, engine.INITIAL,
+        ?mutation_case[0], length);
+    var outcome: i64 = 0;
+    if (fed.status == engine.FAILED) {
+        if (value.queue_len != 1 ||
+            value.queue[0].kind != engine.ALERT ||
+            value.queue[0].alert == record.NO_ALERT) { outcome = 2; }
+        if (outcome == 0 && ingest(?value, engine.INITIAL, ?mutation_case[0],
+                length).status != engine.FAILED) { outcome = 3; }
+        if (outcome == 0 && snapshot(?value).error == error.OK) { outcome = 4; }
+    } or (fed.status == engine.OK) {
+        if (!pending(?value)) { outcome = 5; }
+        var index: usize = 0;
+        for (index < value.queue_len) {
+            val item: Pending = value.queue[index];
+            if (item.kind == engine.CRYPTO &&
+                (item.offset > 8192 || item.length > 8192 - item.offset ||
+                 item.length == 0)) { outcome = 6; }
+            index = index + 1;
+        }
+        if (outcome == 0 && !codec.valid_cipher_suite(value.suite)) {
+            outcome = 7;
+        }
+        if (outcome == 0 && snapshot(?value).status == engine.COMPLETE) {
+            outcome = 8;
+        }
+    } or (fed.status == engine.MORE) {
+        if (pending(?value)) { outcome = 9; }
+    } or { outcome = 10; }
+    destroy(?value);
+    ret outcome;
+}
+
+test "validation: mutated client hellos leave the server in a bounded state" {
+    var owner: secret.Allocator = secret.system_allocator();
+    var chain_storage: [1]cert.Certificate;
+    var key: keys.PrivateKey;
+    var identity: credentials.Identity;
+    if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
+        ret 1;
+    }
+    var generation: credentials.Generation = credentials.empty_generation();
+    if (credentials.initialize(?generation, ?identity, 1, 0, nil,
+            false) != contracts.OK) { ret 2; }
+    var store: credentials.Store = credentials.empty_store();
+    if (credentials.initialize_store(?store, ?generation) != contracts.OK) {
+        ret 3;
+    }
+    var counter: u8 = 17;
+    var entropy: secret.Entropy = secret.Entropy{context: ?counter,
+        secret_context: nil, fill_fn: test_entropy, initialized: true};
+    var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: "h2"::*u8, len: 2}};
+    var versions: [1]u16 = [1]u16{tls13.VERSION};
+    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256};
+    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+    var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
+        tls13.ED25519};
+    var listener: config.ServerConfig;
+    corpus_listener(?listener, ?store, ?protocols[0], ?versions[0], ?suites[0],
+        ?groups[0], ?signatures[0], ?entropy);
+    listener.limits.max_peer_handshake_bytes = 8192;
+    listener.limits.max_client_hello_bytes = 8192;
+
+    var extension_len: usize = extension_server_name(0);
+    extension_len = extension_supported_versions(extension_len, true);
+    extension_len = extension_groups(extension_len, tls13.X25519, false);
+    extension_len = extension_signatures(extension_len);
+    extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
+    extension_len = extension_key_share(extension_len, tls13.X25519, 32);
+    val length: usize = assemble_hello(tls13.LEGACY_VERSION,
+        tls13.AES_128_GCM_SHA256, 1, 0, extension_len);
+    if (length == 0 || length > validation.MAX_CORPUS) { ret 4; }
+
+    var state: u64 = 0xfeedfacecafe;
+    var accepted: usize = 0;
+    var refused: usize = 0;
+    var iteration: usize = 0;
+    for (iteration < 384) {
+        var i: usize = 0;
+        for (i < length) { mutation_case[i] = corpus_hello[i]; i = i + 1; }
+        var mutated: usize = length;
+        var rounds: usize = 1;
+        var applied: usize = 0;
+        for (applied < rounds) {
+            mutated = validation.mutate(?state, ?mutation_case[0], mutated,
+                validation.MAX_CORPUS);
+            applied = applied + 1;
+        }
+        val outcome: i64 = feed_mutation(?listener, mutated);
+        if (outcome != 0) { ret 10 + outcome::i32; }
+        iteration = iteration + 1;
+    }
+    var retired: *credentials.Generation = nil;
+    if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 5; }
+    if (keys.destroy_private(?key) != contracts.OK) { ret 6; }
     ret 0;
 }

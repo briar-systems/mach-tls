@@ -439,3 +439,22 @@ and 6 TLS 1.2 client legs returned exit status zero, and the TLS 1.2 client
 against a TLS 1.3 only server failed as required. The TLS 1.3 legs above were
 re-run unchanged: 19 server legs, 10 client legs, and 4 resumption legs, all
 zero.
+
+# Running the whole matrix
+
+```sh
+mach dep pull test/interop
+mach build test/interop
+./test/interop/run.sh
+```
+
+The runner executes every leg above, prints a pass or FAILED line per leg,
+prints the peer versions and the release evidence, and exits non-zero naming any
+leg that failed. It is the qualification record for a revision, and it is the
+only place the legs are written down once rather than pasted twice.
+
+The qualification recorded for this revision is 53 legs passed, 0 failed,
+against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64.
+
+What the matrix does not cover is written down in
+[`../../doc/validation.md`](../../doc/validation.md).

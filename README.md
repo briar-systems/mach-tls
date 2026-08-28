@@ -35,6 +35,9 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.stream` implements a completion-driven TLS 1.3 secure byte stream for
   either role.
 
+- `tls.validation` holds the deterministic mutation corpora for every parsing
+  surface.
+
 `tls.lib` re-exports these modules for consumers that prefer one import.
 
 ## Status
@@ -111,8 +114,15 @@ mach dep pull test/interop
 mach build test/interop
 ```
 
-The interoperability project builds two binaries: `tls-client-interop` dials an
-external server and `tls-server-interop` accepts one external client.
+The interoperability project builds three binaries: `tls-client-interop` dials
+an external server, `tls-server-interop` accepts external clients, and
+`tls-evidence` prints the supported algorithm matrix from the library's own
+predicates.
+
+`./test/interop/run.sh` runs the complete client and server matrix against
+OpenSSL and GnuTLS, prints the release evidence, and exits non-zero naming any
+leg that failed. What it covers, and what it does not, is in
+[`doc/validation.md`](doc/validation.md).
 
 External OpenSSL and GnuTLS interoperability commands are in
 [`test/interop/README.md`](test/interop/README.md).

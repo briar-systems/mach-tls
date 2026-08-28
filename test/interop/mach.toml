@@ -60,5 +60,13 @@ targets = ["*"]
 link = []
 need = []
 
+[artifact.tls-evidence]
+kind = "bin"
+entry = "evidence_main.mach"
+out = "bin/tls-evidence"
+targets = ["*"]
+link = []
+need = []
+
 [dep.tls]
 path = "../.."

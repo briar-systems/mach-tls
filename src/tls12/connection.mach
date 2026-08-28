@@ -32,6 +32,7 @@ use tls.tls12.prf;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
+use tls.validation;
 
 pub val MAX_POINT: usize = 65;
 pub val MAX_PUBLIC_KEY: usize = 512;
@@ -2643,5 +2644,100 @@ test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?loopback_store, ?retired);
     if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 15; }
+    ret 0;
+}
+
+var mutation_input: [16384]u8;
+var mutation_output: [32768]u8;
+var mutation_hello: [16384]u8;
+var mutation_certificates: [4]cert.Certificate;
+var mutation_case: [validation.MAX_CORPUS]u8;
+
+fun mutation_storage() Storage {
+    ret Storage{input: ?mutation_input[0], input_capacity: 16384,
+        output: ?mutation_output[0], output_capacity: 32768,
+        hello: ?mutation_hello[0], hello_capacity: 16384,
+        certificates: ?mutation_certificates[0], certificate_capacity: 4};
+}
+
+# every outcome of one mutated hello must be a complete, bounded state
+fun feed_mutation(length: usize) i64 {
+    var listener: Connection;
+    if (!init_server(?listener, ?loopback_server_config, mutation_storage()) ||
+        start(?listener, 1800000000).status != engine.OK) { ret 1; }
+    val fed: engine.Result = ingest(?listener, engine.INITIAL,
+        ?mutation_case[0], length);
+    var outcome: i64 = 0;
+    if (fed.status == engine.FAILED) {
+        if (listener.queue_len != 1 ||
+            listener.queue[0].kind != engine.ALERT ||
+            listener.queue[0].alert == record.NO_ALERT) { outcome = 2; }
+        if (outcome == 0 && ingest(?listener, engine.INITIAL,
+                ?mutation_case[0], length).status != engine.FAILED) {
+            outcome = 3;
+        }
+    } or (fed.status == engine.OK) {
+        if (!pending(?listener)) { outcome = 4; }
+        var index: usize = 0;
+        for (index < listener.queue_len) {
+            val item: Pending = listener.queue[index];
+            if (item.kind == engine.CRYPTO &&
+                (item.offset > 32768 || item.length > 32768 - item.offset ||
+                 item.length == 0)) { outcome = 5; }
+            index = index + 1;
+        }
+        if (outcome == 0 && !tls12.valid_suite(listener.suite)) { outcome = 6; }
+        if (outcome == 0 && snapshot(?listener).status == engine.COMPLETE) {
+            outcome = 7;
+        }
+    } or (fed.status == engine.MORE) {
+        if (pending(?listener)) { outcome = 8; }
+    } or { outcome = 9; }
+    destroy(?listener);
+    ret outcome;
+}
+
+test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!loopback_configure(false, ?owner)) { ret 1; }
+    var dialer: Connection;
+    if (!init_client(?dialer, ?loopback_client_config,
+            loopback_storage_client()) ||
+        start(?dialer, 1800000000).status != engine.OK) { ret 2; }
+    val length: usize = dialer.hello_len;
+    if (length == 0 || length > validation.MAX_CORPUS) { ret 3; }
+    var seed_bytes: [2048]u8;
+    if (length > 2048) { ret 4; }
+    var i: usize = 0;
+    for (i < length) { seed_bytes[i] = dialer.storage.hello[i]; i = i + 1; }
+    if (!destroy(?dialer)) { ret 5; }
+
+    var state: u64 = 0x0badc0de1234;
+    var iteration: usize = 0;
+    for (iteration < 256) {
+        i = 0;
+        for (i < length) { mutation_case[i] = seed_bytes[i]; i = i + 1; }
+        val mutated: usize = validation.mutate(?state, ?mutation_case[0],
+            length, validation.MAX_CORPUS);
+        val outcome: i64 = feed_mutation(mutated);
+        if (outcome != 0) { ret 10 + outcome::i32; }
+        iteration = iteration + 1;
+    }
+
+    # a hello at the wrong level or in the wrong state fails closed
+    var wrong: Connection;
+    if (!init_server(?wrong, ?loopback_server_config, mutation_storage()) ||
+        start(?wrong, 1800000000).status != engine.OK) { ret 6; }
+    i = 0;
+    for (i < length) { mutation_case[i] = seed_bytes[i]; i = i + 1; }
+    if (ingest(?wrong, engine.INITIAL, ?mutation_case[0], length).status !=
+        engine.OK) { ret 7; }
+    # a second hello in the same connection is never a renegotiation
+    if (ingest(?wrong, engine.INITIAL, ?mutation_case[0], length).status !=
+        engine.BLOCKED) { ret 8; }
+    if (!destroy(?wrong)) { ret 9; }
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?loopback_store, ?retired);
+    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 30; }
     ret 0;
 }
