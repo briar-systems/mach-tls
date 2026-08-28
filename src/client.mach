@@ -62,6 +62,7 @@ pub val AUTHENTICATION_FAILED: u8 = 2;
 
 pub val MAX_KEY_SHARE: usize = 65;
 pub val MAX_PUBLIC_KEY: usize = 512;
+pub val MAX_TRUST_ANCHORS: usize = 256;
 pub val MAX_SIGNATURE: usize = 512;
 pub val MAX_SIGNED_CONTEXT: usize = 64 + 34 + 1 + 48;
 pub val QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
@@ -253,6 +254,14 @@ fun client_identity_valid(value: *config.ClientConfig) bool {
     ret true;
 }
 
+fun reserved_client_extension(kind: u16) bool {
+    ret kind == extensions.SERVER_NAME || kind == extensions.SUPPORTED_GROUPS ||
+        kind == extensions.SIGNATURE_ALGORITHMS ||
+        kind == extensions.APPLICATION_LAYER_PROTOCOL ||
+        kind == extensions.SUPPORTED_VERSIONS || kind == extensions.KEY_SHARE ||
+        kind == extensions.COOKIE;
+}
+
 fun fill_entropy(client: *Client, output: *u8, length: usize) bool {
     if (client == nil || client.config == nil || client.config.entropy == nil ||
         !client.config.entropy.initialized || output == nil) { ret false; }
@@ -282,9 +291,10 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
     if (value == nil || storage == nil || value.entropy == nil ||
         !value.entropy.initialized || value.server_name == nil ||
         str_len(value.server_name) == 0 || str_len(value.server_name) > 253 ||
-        value.trust == nil || value.trust.len == 0 || value.alpn == nil ||
+        value.trust == nil || value.trust.len == 0 ||
+        value.trust.len > MAX_TRUST_ANCHORS || value.alpn == nil ||
         value.alpn_len == 0 || value.alpn_len > 255 ||
-        value.versions == nil || value.version_len == 0 ||
+        value.versions == nil || value.version_len != 1 ||
         value.suites == nil || value.suite_len == 0 || value.groups == nil ||
         value.group_len == 0 || value.signatures == nil || value.signature_len == 0 ||
         value.suite_len > 3 || value.group_len > 2 || value.signature_len > 4 ||
@@ -297,18 +307,15 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         storage.output_capacity < value.limits.max_handshake_bytes ||
         storage.hello_capacity < value.limits.max_handshake_bytes ||
         (extra.data.len != 0 && extra.data.data == nil) ||
-        extra.data.len > 65531 || (peer_extension != 0 &&
+        extra.data.len > 65531 || (extra.kind == 0 && extra.data.len != 0) ||
+        (extra.kind != 0 && reserved_client_extension(extra.kind)) ||
+        (peer_extension != 0 && peer_extension != extra.kind) ||
+        (peer_extension != 0 &&
         (storage.peer_parameters == nil || storage.peer_parameters_capacity == 0))) {
         ret false;
     }
-    var version_ok: bool = false;
+    if (value.versions[0] != tls13.VERSION) { ret false; }
     var i: usize = 0;
-    for (i < value.version_len) {
-        if (value.versions[i] == tls13.VERSION) { version_ok = true; }
-        i = i + 1;
-    }
-    if (!version_ok) { ret false; }
-    i = 0;
     for (i < value.suite_len) {
         if (!codec.valid_cipher_suite(value.suites[i])) { ret false; }
         var prior: usize = 0;
@@ -462,7 +469,7 @@ fun build_extensions(client: *Client, output: *u8, capacity: usize) usize {
     required = required + 4 + 3;
     required = required + 4 + 2 + 2 + 2 + client.public_key_len;
     if (client.cookie_len != 0) { required = required + 4 + client.cookie_len; }
-    if (client.extra.data.len != 0) { required = required + 4 + client.extra.data.len; }
+    if (client.extra.kind != 0) { required = required + 4 + client.extra.data.len; }
     if (output == nil || capacity < required || required > 65535) { ret 0; }
 
     var offset: usize = 0;
@@ -524,7 +531,7 @@ fun build_extensions(client: *Client, output: *u8, capacity: usize) usize {
         offset = put_extension(output, offset, extensions.COOKIE,
             contracts.Bytes{data: ?client.cookie[0], len: client.cookie_len});
     }
-    if (client.extra.data.len != 0) {
+    if (client.extra.kind != 0) {
         offset = put_extension(output, offset, client.extra.kind, client.extra.data);
     }
     ret offset;
@@ -797,13 +804,7 @@ fun handle_encrypted_extensions(client: *Client, frame: contracts.Bytes,
                 data: ?client.selected_alpn_storage[0], len: selected.len};
             alpn_seen = true;
         } or (item.kind == extensions.SUPPORTED_GROUPS) {
-            var offset: usize = 2;
-            for (offset + 1 < item.len) {
-                if (!offered_group(client, read_u16(item.data, offset))) {
-                    ret error.ILLEGAL_PARAMETER;
-                }
-                offset = offset + 2;
-            }
+            # the server advertises its complete preference set here
         } or (client.peer_extension != 0 && item.kind == client.peer_extension) {
             if (item.len > client.storage.peer_parameters_capacity) {
                 ret error.RESOURCE_LIMIT;
@@ -1593,10 +1594,15 @@ var reject_input: [4096]u8;
 var reject_output: [4096]u8;
 var reject_hello: [4096]u8;
 var reject_certificates: [4]cert.Certificate;
+var hostile_input: [4096]u8;
+var hostile_output: [4096]u8;
+var hostile_hello: [4096]u8;
+var hostile_certificates: [4]cert.Certificate;
 var full_input: [4096]u8;
 var full_output: [4096]u8;
 var full_hello: [4096]u8;
 var full_certificates: [4]cert.Certificate;
+var full_peer_parameters: [16]u8;
 
 #[oblivious]
 fun deterministic_entropy(context: ptr, secret_context: *^u8,
@@ -1669,11 +1675,12 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     if (configuration.limits.max_record_plaintext == 0 ||
         configuration.limits.max_handshake_bytes < 256 ||
         configuration.limits.max_chain_bytes == 0) { ret 37; }
-    var empty_extra: ExtraExtension;
-    if (empty_extra.data.len != 0) { ret 38; }
-    if (!config_valid(?configuration, ?storage, empty_extra,
+    var quic_extra: ExtraExtension;
+    quic_extra.kind = QUIC_TRANSPORT_PARAMETERS;
+    if (quic_extra.data.len != 0) { ret 38; }
+    if (!config_valid(?configuration, ?storage, quic_extra,
         QUIC_TRANSPORT_PARAMETERS)) { ret 32; }
-    if (!init(?value, ?configuration, storage, empty_extra,
+    if (!init(?value, ?configuration, storage, quic_extra,
         QUIC_TRANSPORT_PARAMETERS)) { ret 1; }
     val started: Result = start(?value, 1787875200);
     if (started.status != OK || !value.output_pending) { ret 2; }
@@ -1769,6 +1776,54 @@ test "client: event rejection has one terminal alert ownership path" {
     ret 0;
 }
 
+test "client: wrong-level and out-of-state messages fail closed once" {
+    var entropy_counter: u8 = 5;
+    var entropy: secret.Entropy = secret.Entropy{context: ?entropy_counter,
+        secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
+    var anchor: cert.Certificate = cert.Certificate{der: "x"::*u8, der_len: 1};
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: "h2"::*u8, len: 2}};
+    var versions: [1]u16 = [1]u16{tls13.VERSION};
+    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256};
+    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+    var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
+        tls13.ED25519};
+    var configuration: config.ClientConfig;
+    configuration.server_name = "api.example.com";
+    configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
+    configuration.trust = ?trust;
+    configuration.versions = ?versions[0]; configuration.version_len = 1;
+    configuration.suites = ?suites[0]; configuration.suite_len = 1;
+    configuration.groups = ?groups[0]; configuration.group_len = 1;
+    configuration.signatures = ?signatures[0]; configuration.signature_len = 1;
+    configuration.entropy = ?entropy;
+    configuration.limits = config.production_limits();
+    configuration.limits.max_handshake_bytes = 4096;
+    val storage: Storage = Storage{
+        input: ?hostile_input[0], input_capacity: 4096,
+        output: ?hostile_output[0], output_capacity: 4096,
+        hello: ?hostile_hello[0], hello_capacity: 4096,
+        certificates: ?hostile_certificates[0], certificate_capacity: 4,
+    };
+    var empty_extra: ExtraExtension;
+    var value: Client;
+    if (!init(?value, ?configuration, storage, empty_extra, 0)) { ret 1; }
+    if (start(?value, 1787875200).status != OK) { ret 4; }
+    var event: Event;
+    if (!next_event(?value, ?event) || event.kind != CRYPTO ||
+        !complete_event(?value, event.token, true)) { ret 2; }
+    var illegal: [4]u8 = [4]u8{handshake.NEW_SESSION_TICKET, 0, 0, 0};
+    val failed: Result = ingest(?value, INITIAL, ?illegal[0], 4);
+    if (failed.status != FAILED || failed.error != error.UNEXPECTED_MESSAGE ||
+        !next_event(?value, ?event) || event.kind != ALERT ||
+        event.alert != record.UNEXPECTED_MESSAGE_ALERT ||
+        !complete_event(?value, event.token, true) ||
+        complete_event(?value, event.token, true) || !destroy(?value)) { ret 3; }
+    ret 0;
+}
+
 fun hex_nibble(value: u8, output: *u8) bool {
     if (value >= '0' && value <= '9') { output[0] = value - '0'; ret true; }
     if (value >= 'a' && value <= 'f') { output[0] = value - 'a' + 10; ret true; }
@@ -1826,8 +1881,11 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     };
     var owner: secret.Allocator = secret.system_allocator();
     var client_key: keys.PrivateKey = keys.empty_private();
-    if (load.private_der(contracts.SecretBytes{data: ?key_der[0], len: 48},
-        cert.PKCS8_DER, ?owner, ?client_key) != contracts.OK) { ret 39; }
+    val loaded_key: contracts.Error = load.private_der(
+        contracts.SecretBytes{data: ?key_der[0], len: 48}, cert.PKCS8_DER,
+        ?owner, ?client_key);
+    ct.zeroize(?key_der[0], 48);
+    if (loaded_key != contracts.OK) { ret 39; }
     var client_identity: credentials.Identity = credentials.Identity{
         server_name: contracts.Bytes{data: nil, len: 0},
         chain: client_chain, private_key: ?client_key};
@@ -1858,10 +1916,15 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
         output: ?full_output[0], output_capacity: 4096,
         hello: ?full_hello[0], hello_capacity: 4096,
         certificates: ?full_certificates[0], certificate_capacity: 4,
+        peer_parameters: ?full_peer_parameters[0], peer_parameters_capacity: 16,
     };
-    var empty_extra: ExtraExtension;
+    var client_parameters: [2]u8 = [2]u8{0x01, 0x02};
+    val client_extra: ExtraExtension = ExtraExtension{
+        kind: QUIC_TRANSPORT_PARAMETERS,
+        data: contracts.Bytes{data: ?client_parameters[0], len: 2}};
     var value: Client;
-    if (!init(?value, ?configuration, storage, empty_extra, 0) ||
+    if (!init(?value, ?configuration, storage, client_extra,
+        QUIC_TRANSPORT_PARAMETERS) ||
         start(?value, 1800000000).status != OK) { ret 2; }
     var event: Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO) { ret 3; }
@@ -1943,14 +2006,26 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     }
     if (traffic_events != 2) { ret 17; }
 
-    var encrypted_extensions: [9]u8 = [9]u8{0, 16, 0, 5, 0, 3, 2, 'h', '2'};
+    var encrypted_extensions: [17]u8 = [17]u8{
+        0, 16, 0, 5, 0, 3, 2, 'h', '2',
+        0, 57, 0, 4, 0x11, 0x22, 0x33, 0x44,
+    };
     encoded = codec.encode_extension_message(handshake.ENCRYPTED_EXTENSIONS,
-        extensions.list(?encrypted_extensions[0], 9, extensions.ENCRYPTED_EXTENSIONS),
+        extensions.list(?encrypted_extensions[0], 17,
+            extensions.ENCRYPTED_EXTENSIONS),
         contracts.Buffer{data: ?flight[0], capacity: 1024});
     if (encoded.status != handshake.COMPLETE ||
         transcript.update_frame(?server_transcript,
             contracts.Bytes{data: ?flight[0], len: encoded.produced}) != error.OK ||
         ingest(?value, HANDSHAKE, ?flight[0], encoded.produced).status != OK) { ret 18; }
+    if (!next_event(?value, ?event) || event.kind != PEER_PARAMETERS ||
+        event.data.len != 4 || event.data.data[0] != 0x11 ||
+        !complete_event(?value, event.token, true)) { ret 47; }
+    i = 0;
+    for (i < 4096) { full_input[i] = 0; i = i + 1; }
+    if (snapshot(?value).peer_parameters.len != 4 ||
+        snapshot(?value).peer_parameters.data[3] != 0x44 ||
+        snapshot(?value).selected_alpn.data[0] != 'h') { ret 48; }
     if (!next_event(?value, ?event) || event.kind != EARLY_DATA ||
         event.disposition != EARLY_NOT_OFFERED ||
         !complete_event(?value, event.token, true)) { ret 19; }
