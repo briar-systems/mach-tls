@@ -125,7 +125,8 @@ fun allowed(kind: ExtensionType, context: Context) bool {
         ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS;
     }
     if (kind == STATUS_REQUEST) {
-        ret context == CLIENT_HELLO || context == CERTIFICATE_ENTRY;
+        ret context == CLIENT_HELLO || context == CERTIFICATE_REQUEST
+            || context == CERTIFICATE_ENTRY;
     }
     if (kind == SUPPORTED_GROUPS) {
         ret context == CLIENT_HELLO || context == ENCRYPTED_EXTENSIONS;
@@ -212,6 +213,7 @@ fun valid_server_name(extension: Extension, context: Context) bool {
 }
 
 fun valid_status_request(extension: Extension, context: Context) bool {
+    if (context == CERTIFICATE_REQUEST) { ret extension.len == 0; }
     if (context == CERTIFICATE_ENTRY) {
         if (extension.len < 4 || extension.data[0] != 1) { ret false; }
         ret read_u24(extension.data, 1) == extension.len - 4
@@ -545,6 +547,10 @@ test "extensions: key shares and algorithm vectors enforce structure" {
     if (validate(list(?encoded[0], 42, CLIENT_HELLO)) != error.OK) { ret 1; }
     encoded[9] = 31;
     if (validate(list(?encoded[0], 42, CLIENT_HELLO)) == error.OK) { ret 2; }
+    var status_request: [4]u8 = [4]u8{0, 5, 0, 0};
+    if (validate(list(?status_request[0], 4, CERTIFICATE_REQUEST)) != error.OK) { ret 3; }
+    var nonempty_status: [5]u8 = [5]u8{0, 5, 0, 1, 0};
+    if (validate(list(?nonempty_status[0], 5, CERTIFICATE_REQUEST)) == error.OK) { ret 4; }
     ret 0;
 }
 
