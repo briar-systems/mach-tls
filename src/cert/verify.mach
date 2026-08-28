@@ -1,0 +1,550 @@
+# bounded certificate path construction and verification
+
+use crypto.contracts;
+use crypto.encoding.der;
+use crypto.encoding.keys;
+use crypto.signature;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.cert;
+use tls.cert.name;
+use tls.cert.x509;
+use tls.error;
+
+pub val MAX_CHAIN_DEPTH: usize = 16;
+
+pub def Purpose: u8;
+
+pub val SERVER_AUTH: Purpose = 1;
+pub val CLIENT_AUTH: Purpose = 2;
+
+pub rec Options {
+    identity: contracts.Bytes;
+    purpose: Purpose;
+    now: i64;
+    max_depth: usize;
+}
+
+fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
+    if (first.len != second.len) { ret false; }
+    if (first.len > 0 && (first.data == nil || second.data == nil)) { ret false; }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (first.data[i] != second.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun key_equal(first: *keys.PublicKey, second: *keys.PublicKey) bool {
+    ret first != nil && second != nil && first.algorithm == second.algorithm &&
+        bytes_equal(first.encoded, second.encoded);
+}
+
+fun authority_matches(child: *x509.Certificate,
+    issuer: *x509.Certificate) bool {
+    if (child == nil || issuer == nil ||
+        !x509.name_equal(child.issuer, issuer.subject)) { ret false; }
+    if (child.extensions.authority_key_id_present &&
+        issuer.extensions.subject_key_id_present &&
+        !bytes_equal(child.extensions.authority_key_id,
+            issuer.extensions.subject_key_id)) { ret false; }
+    ret true;
+}
+
+fun verify_signature(child: *x509.Certificate,
+    issuer: *x509.Certificate) error.Error {
+    if (child == nil || issuer == nil) { ret error.BAD_CERTIFICATE; }
+    var status: contracts.Error = contracts.UNSUPPORTED;
+    if (child.signature_algorithm == x509.ED25519) {
+        if (issuer.public_key.algorithm != keys.ED25519) {
+            ret error.BAD_CERTIFICATE;
+        }
+        status = signature.verify_ed25519(issuer.public_key.first,
+            child.tbs, child.signature);
+    } or (child.signature_algorithm == x509.ECDSA_P256_SHA256) {
+        if (issuer.public_key.algorithm != keys.P256) { ret error.BAD_CERTIFICATE; }
+        status = signature.verify_ecdsa_p256_sha256(issuer.public_key.first,
+            child.tbs, child.signature);
+    } or (child.signature_algorithm == x509.RSA_PSS_SHA256 ||
+        child.signature_algorithm == x509.RSA_PSS_SHA384) {
+        if (issuer.public_key.algorithm != keys.RSA) { ret error.BAD_CERTIFICATE; }
+        val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
+            modulus: issuer.public_key.first,
+            exponent: issuer.public_key.second,
+        };
+        if (child.signature_algorithm == x509.RSA_PSS_SHA256) {
+            status = signature.verify_rsa_pss_sha256(public_key,
+                child.tbs, child.signature);
+        } or {
+            status = signature.verify_rsa_pss_sha384(public_key,
+                child.tbs, child.signature);
+        }
+    } or (child.signature_algorithm == x509.RSA_PKCS1_SHA256 ||
+        child.signature_algorithm == x509.RSA_PKCS1_SHA384) {
+        ret error.UNSUPPORTED_ALGORITHM;
+    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
+    if (status != contracts.OK) { ret error.BAD_CERTIFICATE; }
+    ret error.OK;
+}
+
+fun trusted_directly(value: *x509.Certificate,
+    anchor: *x509.Certificate) bool {
+    ret value != nil && anchor != nil &&
+        x509.name_equal(value.subject, anchor.subject) &&
+        key_equal(?value.public_key, ?anchor.public_key);
+}
+
+fun self_issued(value: *x509.Certificate) bool {
+    ret value != nil && x509.name_equal(value.subject, value.issuer);
+}
+
+fun eku_allowed(value: *x509.Certificate, purpose: Purpose) bool {
+    if (value == nil) { ret false; }
+    if (!value.extensions.extended_key_usage_present ||
+        (value.extensions.purposes & x509.PURPOSE_ANY) != 0) { ret true; }
+    if (purpose == SERVER_AUTH) {
+        ret (value.extensions.purposes & x509.PURPOSE_SERVER_AUTH) != 0;
+    }
+    if (purpose == CLIENT_AUTH) {
+        ret (value.extensions.purposes & x509.PURPOSE_CLIENT_AUTH) != 0;
+    }
+    ret false;
+}
+
+fun valid_time(value: *x509.Certificate, now: i64) bool {
+    ret value != nil && now >= value.not_before && now <= value.not_after;
+}
+
+fun ip_like(identity: contracts.Bytes) bool {
+    if (identity.len == 0 || identity.data == nil) { ret false; }
+    var dot: bool = false;
+    var i: usize = 0;
+    for (i < identity.len) {
+        val character: u8 = identity.data[i];
+        if (character == ':') { ret true; }
+        if (character == '.') { dot = true; }
+        or (character < '0' || character > '9') { ret false; }
+        i = i + 1;
+    }
+    ret dot;
+}
+
+fun identity_matches(value: *x509.Certificate,
+    identity: contracts.Bytes) bool {
+    if (value == nil || identity.len == 0 || identity.data == nil ||
+        !value.extensions.subject_alt_name_present) { ret false; }
+    var parsed_ip: [16]u8;
+    val ip: contracts.Operation = name.parse_ip(identity,
+        contracts.Buffer{data: ?parsed_ip[0], capacity: 16});
+    val wants_ip: bool = ip.error == contracts.OK;
+    if (!wants_ip && ip_like(identity)) { ret false; }
+    if (!wants_ip && !name.valid_reference_dns(identity)) { ret false; }
+    var root: der.Element;
+    if (der.exact(value.extensions.subject_alt_name, ?root) != contracts.OK ||
+        root.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(value.extensions.subject_alt_name);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    for (!der.complete(?body)) {
+        var general_name: der.Element;
+        if (der.next(?body, ?general_name) != contracts.OK) { ret false; }
+        if (wants_ip && general_name.tag == 0x87 &&
+            general_name.content.len == ip.written &&
+            bytes_equal(general_name.content,
+                contracts.Bytes{data: ?parsed_ip[0], len: ip.written})) { ret true; }
+        if (!wants_ip && general_name.tag == 0x82 &&
+            name.match_dns(identity, general_name.content)) { ret true; }
+    }
+    ret false;
+}
+
+fun dns_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
+    if (value.len == 0 || constraint.len == 0 || value.data == nil ||
+        constraint.data == nil) { ret false; }
+    var value_start: usize = 0;
+    var value_len: usize = value.len;
+    var constraint_len: usize = constraint.len;
+    if (value_len > 0 && value.data[value_len - 1] == '.') { value_len = value_len - 1; }
+    if (constraint_len > 0 && constraint.data[constraint_len - 1] == '.') {
+        constraint_len = constraint_len - 1;
+    }
+    if (value_len > 2 && value.data[0] == '*' && value.data[1] == '.') {
+        value_start = 2;
+        value_len = value_len - 2;
+    }
+    if (value_len < constraint_len) { ret false; }
+    val offset: usize = value_start + value_len - constraint_len;
+    var i: usize = 0;
+    for (i < constraint_len) {
+        var first: u8 = value.data[offset + i];
+        var second: u8 = constraint.data[i];
+        if (first >= 'A' && first <= 'Z') { first = first + ('a' - 'A'); }
+        if (second >= 'A' && second <= 'Z') { second = second + ('a' - 'A'); }
+        if (first != second) { ret false; }
+        i = i + 1;
+    }
+    ret value_len == constraint_len || value.data[offset - 1] == '.';
+}
+
+fun ip_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
+    if ((value.len != 4 && value.len != 16) ||
+        constraint.len != value.len * 2 || value.data == nil ||
+        constraint.data == nil) { ret false; }
+    var i: usize = 0;
+    for (i < value.len) {
+        val mask: u8 = constraint.data[value.len + i];
+        if ((value.data[i] & mask) != constraint.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun name_matches_constraint(tag: u8, value: contracts.Bytes,
+    base: *der.Element) bool {
+    if (base == nil || base.tag != tag) { ret false; }
+    if (tag == 0x82) { ret dns_within(value, base.content); }
+    if (tag == 0x87) { ret ip_within(value, base.content); }
+    if (tag == 0xa4) { ret x509.name_within(value, base.content); }
+    ret false;
+}
+
+fun constraint_state(constraints: contracts.Bytes, tag: u8,
+    value: contracts.Bytes, permitted_present: *bool,
+    permitted_match: *bool, excluded_match: *bool) bool {
+    if (permitted_present == nil || permitted_match == nil ||
+        excluded_match == nil) { ret false; }
+    var root: der.Element;
+    if (der.exact(constraints, ?root) != contracts.OK ||
+        root.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(constraints);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    for (!der.complete(?body)) {
+        var group: der.Element;
+        if (der.next(?body, ?group) != contracts.OK) { ret false; }
+        val permitted: bool = group.tag == 0xa0;
+        var subtrees: der.Cursor = der.cursor(group.content);
+        for (!der.complete(?subtrees)) {
+            var subtree: der.Element;
+            if (der.next(?subtrees, ?subtree) != contracts.OK ||
+                subtree.tag != der.SEQUENCE) { ret false; }
+            var subtree_parent: der.Cursor = der.cursor(subtree.encoded);
+            var subtree_body: der.Cursor;
+            der.enter(?subtree_parent, ?subtree, ?subtree_body);
+            var base: der.Element;
+            if (der.next(?subtree_body, ?base) != contracts.OK ||
+                !der.complete(?subtree_body)) { ret false; }
+            if (base.tag == tag) {
+                if (tag != 0x82 && tag != 0x87 && tag != 0xa4) { ret false; }
+                if (permitted) {
+                    @permitted_present = true;
+                    if (name_matches_constraint(tag, value, ?base)) {
+                        @permitted_match = true;
+                    }
+                } or (name_matches_constraint(tag, value, ?base)) {
+                    @excluded_match = true;
+                }
+            }
+        }
+    }
+    ret true;
+}
+
+fun constrained_name(constraints: contracts.Bytes, tag: u8,
+    value: contracts.Bytes) bool {
+    var permitted_present: bool = false;
+    var permitted_match: bool = false;
+    var excluded_match: bool = false;
+    if (!constraint_state(constraints, tag, value, ?permitted_present,
+        ?permitted_match, ?excluded_match) || excluded_match) { ret false; }
+    ret !permitted_present || permitted_match;
+}
+
+fun certificate_names_constrained(value: *x509.Certificate,
+    constraints: contracts.Bytes) bool {
+    if (value == nil) { ret false; }
+    if (!value.subject_empty &&
+        !constrained_name(constraints, 0xa4, value.subject)) { ret false; }
+    if (!value.extensions.subject_alt_name_present) { ret true; }
+    var root: der.Element;
+    if (der.exact(value.extensions.subject_alt_name, ?root) != contracts.OK ||
+        root.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(value.extensions.subject_alt_name);
+    var body: der.Cursor;
+    der.enter(?parent, ?root, ?body);
+    for (!der.complete(?body)) {
+        var general_name: der.Element;
+        if (der.next(?body, ?general_name) != contracts.OK) { ret false; }
+        var constrained_value: contracts.Bytes = general_name.content;
+        if (general_name.tag == 0xa4) { constrained_value = general_name.content; }
+        if (!constrained_name(constraints, general_name.tag,
+            constrained_value)) { ret false; }
+    }
+    ret true;
+}
+
+fun validate_path(parsed: *x509.Certificate, path: *usize, path_len: usize,
+    trusted_index_present: bool, options: *Options) error.Error {
+    if (parsed == nil || path == nil || options == nil || path_len == 0) {
+        ret error.INTERNAL_ERROR;
+    }
+    val leaf: *x509.Certificate = ?parsed[path[0]];
+    var ca_limit: usize = path_len;
+    if (trusted_index_present) { ca_limit = ca_limit - 1; }
+    var position: usize = 1;
+    for (position < ca_limit) {
+        val ca: *x509.Certificate = ?parsed[path[position]];
+        if (!valid_time(ca, options.now)) { ret error.CERTIFICATE_EXPIRED; }
+        if (!ca.extensions.basic_constraints_present ||
+            !ca.extensions.basic_constraints_critical || !ca.extensions.ca ||
+            (ca.extensions.key_usage_present &&
+                (ca.extensions.key_usage & x509.KEY_USAGE_KEY_CERT_SIGN) == 0) ||
+            !eku_allowed(ca, options.purpose)) { ret error.BAD_CERTIFICATE; }
+        if (ca.extensions.path_length_present) {
+            var subordinate_ca_count: usize = 0;
+            var subordinate: usize = 1;
+            for (subordinate < position) {
+                val candidate: *x509.Certificate = ?parsed[path[subordinate]];
+                if (!self_issued(candidate)) {
+                    subordinate_ca_count = subordinate_ca_count + 1;
+                }
+                subordinate = subordinate + 1;
+            }
+            if (subordinate_ca_count > ca.extensions.path_length) {
+                ret error.BAD_CERTIFICATE;
+            }
+        }
+        if (ca.extensions.name_constraints_present) {
+            var subordinate: usize = 0;
+            for (subordinate < position) {
+                val candidate: *x509.Certificate = ?parsed[path[subordinate]];
+                if ((subordinate == 0 || !self_issued(candidate)) &&
+                    !certificate_names_constrained(candidate,
+                        ca.extensions.name_constraints)) {
+                    ret error.BAD_CERTIFICATE;
+                }
+                subordinate = subordinate + 1;
+            }
+        }
+        position = position + 1;
+    }
+    ret error.OK;
+}
+
+fun visited(path: *usize, path_len: usize, candidate: usize) bool {
+    var i: usize = 0;
+    for (i < path_len) {
+        if (path[i] == candidate) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun parse_anchor(value: *cert.Certificate,
+    output: *x509.Certificate) bool {
+    ret value != nil && output != nil && value.der != nil && value.der_len > 0 &&
+        x509.parse_trust_anchor(contracts.Bytes{data: value.der, len: value.der_len},
+            output) == contracts.OK;
+}
+
+pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
+    options: *Options) error.Error {
+    if (trust == nil || presented == nil || options == nil ||
+        trust.len == 0 || trust.anchors == nil || presented.len == 0 ||
+        presented.certificates == nil || options.max_depth == 0 ||
+        options.max_depth > MAX_CHAIN_DEPTH || presented.len > options.max_depth ||
+        (options.purpose != SERVER_AUTH && options.purpose != CLIENT_AUTH) ||
+        (options.purpose == SERVER_AUTH &&
+            (options.identity.len == 0 || options.identity.data == nil))) {
+        ret error.BAD_CERTIFICATE;
+    }
+    var parsed: [MAX_CHAIN_DEPTH]x509.Certificate;
+    var i: usize = 0;
+    for (i < presented.len) {
+        val encoded: cert.Certificate = presented.certificates[i];
+        if (encoded.der == nil || encoded.der_len == 0) { ret error.BAD_CERTIFICATE; }
+        val status: contracts.Error = x509.parse(
+            contracts.Bytes{data: encoded.der, len: encoded.der_len}, ?parsed[i]);
+        if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
+        if (status != contracts.OK) { ret error.BAD_CERTIFICATE; }
+        var prior: usize = 0;
+        for (prior < i) {
+            if (bytes_equal(parsed[prior].encoded, parsed[i].encoded)) {
+                ret error.BAD_CERTIFICATE;
+            }
+            prior = prior + 1;
+        }
+        i = i + 1;
+    }
+    val leaf: *x509.Certificate = ?parsed[0];
+    if (!valid_time(leaf, options.now)) { ret error.CERTIFICATE_EXPIRED; }
+    if ((leaf.extensions.key_usage_present &&
+            (leaf.extensions.key_usage & x509.KEY_USAGE_DIGITAL_SIGNATURE) == 0) ||
+        !eku_allowed(leaf, options.purpose)) { ret error.BAD_CERTIFICATE; }
+    if (options.purpose == SERVER_AUTH &&
+        !identity_matches(leaf, options.identity)) { ret error.HOSTNAME_MISMATCH; }
+    var path: [MAX_CHAIN_DEPTH]usize;
+    var next_candidate: [MAX_CHAIN_DEPTH]usize;
+    path[0] = 0;
+    next_candidate[0] = 1;
+    var path_len: usize = 1;
+    var unsupported_seen: bool = false;
+    var invalid_path_seen: bool = false;
+    var expired_path_seen: bool = false;
+    for (path_len > 0) {
+        val current: *x509.Certificate = ?parsed[path[path_len - 1]];
+        var anchor_index: usize = 0;
+        for (anchor_index < trust.len) {
+            var anchor: x509.Certificate;
+            if (!parse_anchor(?trust.anchors[anchor_index], ?anchor)) {
+                ret error.BAD_CERTIFICATE;
+            }
+            if (trusted_directly(current, ?anchor)) {
+                val validation: error.Error = validate_path(?parsed[0], ?path[0],
+                    path_len, true, options);
+                if (validation == error.OK) { ret error.OK; }
+                if (validation == error.CERTIFICATE_EXPIRED) {
+                    expired_path_seen = true;
+                } or { invalid_path_seen = true; }
+            } or (authority_matches(current, ?anchor)) {
+                val signature_status: error.Error = verify_signature(current, ?anchor);
+                if (signature_status == error.OK) {
+                    val validation: error.Error = validate_path(?parsed[0], ?path[0],
+                        path_len, false, options);
+                    if (validation == error.OK) { ret error.OK; }
+                    if (validation == error.CERTIFICATE_EXPIRED) {
+                        expired_path_seen = true;
+                    } or { invalid_path_seen = true; }
+                } or (signature_status == error.UNSUPPORTED_ALGORITHM) {
+                    unsupported_seen = true;
+                }
+            }
+            anchor_index = anchor_index + 1;
+        }
+        val depth: usize = path_len - 1;
+        var candidate: usize = next_candidate[depth];
+        var pushed: bool = false;
+        for (candidate < presented.len && !pushed) {
+            next_candidate[depth] = candidate + 1;
+            if (!visited(?path[0], path_len, candidate) &&
+                authority_matches(current, ?parsed[candidate])) {
+                val signature_status: error.Error = verify_signature(current,
+                    ?parsed[candidate]);
+                if (signature_status == error.OK && path_len < options.max_depth) {
+                    path[path_len] = candidate;
+                    next_candidate[path_len] = 1;
+                    path_len = path_len + 1;
+                    pushed = true;
+                } or (signature_status == error.UNSUPPORTED_ALGORITHM) {
+                    unsupported_seen = true;
+                }
+            }
+            candidate = candidate + 1;
+        }
+        if (!pushed) { path_len = path_len - 1; }
+    }
+    if (expired_path_seen) { ret error.CERTIFICATE_EXPIRED; }
+    if (invalid_path_seen) { ret error.BAD_CERTIFICATE; }
+    if (unsupported_seen) { ret error.UNSUPPORTED_ALGORITHM; }
+    ret error.UNKNOWN_CA;
+}
+
+fun hex_nibble(value: u8, output: *u8) bool {
+    if (output == nil) { ret false; }
+    if (value >= '0' && value <= '9') { @output = value - '0'; ret true; }
+    if (value >= 'a' && value <= 'f') { @output = value - 'a' + 10; ret true; }
+    if (value >= 'A' && value <= 'F') { @output = value - 'A' + 10; ret true; }
+    ret false;
+}
+
+fun decode_hex(input: *u8, input_len: usize, output: *u8,
+    output_len: usize) bool {
+    if (input == nil || output == nil || input_len != output_len * 2) { ret false; }
+    var i: usize = 0;
+    for (i < output_len) {
+        var high: u8 = 0;
+        var low: u8 = 0;
+        if (!hex_nibble(input[i * 2], ?high) ||
+            !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
+        output[i] = (high << 4) | low;
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "cert.verify: dns subtrees are label-bound" {
+    if (!dns_within(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+            contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
+        !dns_within(contracts.Bytes{data: "*.example.com"::*u8, len: 13},
+            contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
+        dns_within(contracts.Bytes{data: "badexample.com"::*u8, len: 14},
+            contracts.Bytes{data: "example.com"::*u8, len: 11})) { ret 1; }
+    ret 0;
+}
+
+test "cert.verify: ip constraints apply address masks" {
+    var address: [4]u8 = [4]u8{192, 0, 2, 42};
+    var subnet: [8]u8 = [8]u8{192, 0, 2, 0, 255, 255, 255, 0};
+    if (!ip_within(contracts.Bytes{data: ?address[0], len: 4},
+            contracts.Bytes{data: ?subnet[0], len: 8})) { ret 1; }
+    address[2] = 3;
+    if (ip_within(contracts.Bytes{data: ?address[0], len: 4},
+            contracts.Bytes{data: ?subnet[0], len: 8})) { ret 2; }
+    ret 0;
+}
+
+test "cert.verify: construct and validate an ed25519 server path" {
+    val root_hex: *u8 = "308201a030820152a003020102021471405daa5cfc944a3170fb55c862eb40dd2a0ebc300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74301e170d3236303832383131333234355a170d3336303832353131333234355a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74302a300506032b6570032100d7342c55486dcf1e6cae80bc777a210b430965bcc370eb18e12a321a94d8714da3663064301f0603551d2304183016801442df368f91a83080e7ab32b86ee59d6e6d9b39fe30120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e0416041442df368f91a83080e7ab32b86ee59d6e6d9b39fe300506032b65700341007e58b16a079d7e5fb30e8d193666138b18cbc7e16371f12f133b9ac354742d5e460d57018adde0f3dc265d07db891f61c24eb208486e79c20191df283a707a09"::*u8;
+    val leaf_hex: *u8 = "308201e230820194a003020102021414524b2bfdd6bfd62cdeed7c1032f372fdd8dbee300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74301e170d3236303832383131333234355a170d3237303832383131333234355a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b65700321002309514831142850f5aa231196d1265ae3210334742f922de1095fc5bdc0fa36a381a73081a4300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301302f0603551d1104283026820f6170692e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d8704c0000201301d0603551d0e041604144dae46833dd56f3990a328fd5addabfd78ec3cd4301f0603551d2304183016801442df368f91a83080e7ab32b86ee59d6e6d9b39fe300506032b6570034100c33f6a8338ece42e26e6708d61a40f9d698c20895803886d09c482d4162bfb6b9c9edbed9f72b3d042d980ef983a297e8b1821b85617bbdd242eed0328ef840b"::*u8;
+    var root_storage: [420]u8;
+    var leaf_storage: [486]u8;
+    if (!decode_hex(root_hex, 840, ?root_storage[0], 420) ||
+        !decode_hex(leaf_hex, 972, ?leaf_storage[0], 486)) { ret 17; }
+    val root_der: *u8 = ?root_storage[0];
+    val leaf_der: *u8 = ?leaf_storage[0];
+    var certificates: [1]cert.Certificate = [1]cert.Certificate{
+        cert.Certificate{der: leaf_der, der_len: 486},
+    };
+    var anchors: [1]cert.Certificate = [1]cert.Certificate{
+        cert.Certificate{der: root_der, der_len: 420},
+    };
+    var presented: cert.Chain = cert.Chain{certificates: ?certificates[0], len: 1};
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchors[0], len: 1};
+    var options: Options = Options{
+        identity: contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        purpose: SERVER_AUTH,
+        now: 1800000000,
+        max_depth: MAX_CHAIN_DEPTH,
+    };
+    var parsed_leaf: x509.Certificate;
+    var parsed_root: x509.Certificate;
+    var leaf_root: der.Element;
+    if (der.exact(contracts.Bytes{data: leaf_der, len: 486}, ?leaf_root) !=
+        contracts.OK) { ret 18; }
+    if (leaf_root.tag != der.SEQUENCE) { ret 19; }
+    if (x509.parse(contracts.Bytes{data: leaf_der, len: 486},
+            ?parsed_leaf) != contracts.OK) { ret 20; }
+    if (x509.parse_trust_anchor(contracts.Bytes{data: root_der, len: 420},
+            ?parsed_root) != contracts.OK) { ret 21; }
+    if (!authority_matches(?parsed_leaf, ?parsed_root)) { ret 22; }
+    if (verify_signature(?parsed_leaf, ?parsed_root) != error.OK) { ret 23; }
+    val verified: error.Error = chain(?trust, ?presented, ?options);
+    if (verified != error.OK) { ret verified::i32; }
+    options.identity = contracts.Bytes{data: "bad.example.net"::*u8, len: 15};
+    if (chain(?trust, ?presented, ?options) != error.HOSTNAME_MISMATCH) { ret 2; }
+    options.identity = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+    options.purpose = CLIENT_AUTH;
+    if (chain(?trust, ?presented, ?options) != error.BAD_CERTIFICATE) { ret 3; }
+    var corrupted: [486]u8;
+    var i: usize = 0;
+    for (i < 486) { corrupted[i] = leaf_der[i]; i = i + 1; }
+    corrupted[485] = corrupted[485] ^ 1;
+    certificates[0].der = ?corrupted[0];
+    options.purpose = SERVER_AUTH;
+    if (chain(?trust, ?presented, ?options) != error.UNKNOWN_CA) { ret 4; }
+    ret 0;
+}
