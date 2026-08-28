@@ -89,10 +89,10 @@ gnutls-serv --port 9443 \
   --x509keyfile test/interop/fixtures/leaf.key \
   --x509cafile test/interop/fixtures/root.pem \
   --priority 'NORMAL:-VERS-ALL:+VERS-TLS1.3' \
-  --alpn h2 --alpn-fatal --require-client-cert --echo
+  --alpn h2 --alpn-fatal --require-client-cert --verify-client-cert --echo
 ```
 
 The qualification recorded for this revision passed with OpenSSL 3.6.3 and
 GnuTLS 3.8.13. Every command above returned exit status zero from the Mach
-harness. OpenSSL also verified the required client certificate to the checked-in
-root.
+harness. Both servers also verified the required client certificate to the
+checked-in root.
