@@ -25,6 +25,9 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls13.key_schedule` implements the complete TLS 1.3 HKDF schedule and traffic derivation.
 - `tls.state` defines client and server connection state.
 - `tls.session` defines bounded session ticket storage.
+- `tls.client` implements the incremental TLS 1.3 client handshake and its
+  transport-independent event contract.
+- `tls.stream` implements a completion-driven TLS 1.3 secure byte stream.
 
 `tls.lib` re-exports these modules for consumers that prefer one import.
 
@@ -34,7 +37,9 @@ The transport layer is implemented against the shared `mach-std` completion runt
 
 A native TCP adapter is included. QUIC handshake streams implement the same submission callbacks without creating a dependency from TLS back to QUIC.
 
-TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented. The client and server connection state machines remain under subsequent implementation issues. This revision does not yet expose a complete TLS connection.
+TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented.
+
+The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction. `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contract and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md). The TLS server state machine remains under a subsequent implementation issue.
 
 ## Certificates and credentials
 
@@ -84,4 +89,9 @@ mach build .
 mach test .
 mach dep pull test/transport
 mach test test/transport
+mach dep pull test/interop
+mach build test/interop
 ```
+
+External OpenSSL and GnuTLS interoperability commands are in
+[`test/interop/README.md`](test/interop/README.md).
