@@ -257,7 +257,7 @@ fun main(argc: i64, argv: **u8) i64 {
     configuration.client_identity = ?client_identity;
     configuration.entropy = ?entropy;
     configuration.limits = config.production_limits();
-    configuration.limits.max_handshake_bytes = 65536;
+    configuration.limits.max_peer_handshake_bytes = 65536;
 
     var handshake_input: [65536]u8;
     var handshake_output: [65536]u8;

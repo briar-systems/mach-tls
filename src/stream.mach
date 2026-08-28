@@ -4,6 +4,8 @@ use crypto.contracts;
 use std.crypto.ct;
 use std.io.runtime;
 use std.sync.cancel;
+use std.sync.atomic;
+use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -27,8 +29,7 @@ pub val CLOSED: State = 5;
 pub val FAILED: State = 6;
 pub val DESTROYED: State = 7;
 
-pub val SECRET_STORAGE_BYTES: usize = record.MAX_INNER_PLAINTEXT +
-    record.MAX_PLAINTEXT + record.MAX_INNER_PLAINTEXT;
+pub val SECRET_STORAGE_BYTES: usize = record.MAX_PLAINTEXT * 3 + 2;
 
 pub def Control: u8;
 val CONTROL_NONE: Control = 0;
@@ -91,6 +92,9 @@ pub rec Stream {
     lower_eof: bool;
     peer_alert: record.AlertDescription;
     ccs_count: usize;
+    transition_owner: i64;
+    receive_record_plaintext: usize;
+    send_record_plaintext: usize;
 }
 
 val REGION_COUNT: usize = 7;
@@ -123,6 +127,22 @@ fun storage_regions(value: *Storage, output: *Region) bool {
         i = i + 1;
     }
     ret true;
+}
+
+fun stream_owner_data(stream: *Stream) *u8 {
+    if (stream == nil) { ret nil; }
+    val address: usize = (?stream.state)::usize;
+    val offset: usize = $offset_of(Stream, state);
+    if (address < offset) { ret nil; }
+    val data: *u8 = (address - offset)::*u8;
+    if (!memory_range.valid(data, $size_of(Stream))) { ret nil; }
+    ret data;
+}
+
+fun stream_owner_overlaps(stream: *Stream, data: *u8, len: usize) bool {
+    val owner: *u8 = stream_owner_data(stream);
+    ret owner == nil || !memory_range.valid(data, len) ||
+        memory_range.overlap(owner, $size_of(Stream), data, len);
 }
 
 fun storage_overlaps(value: *Storage, data: *u8, len: usize) bool {
@@ -161,11 +181,17 @@ fun secret_storage_valid(value: *Storage) bool {
         value.secret_capacity >= SECRET_STORAGE_BYTES;
 }
 
+fun secret_storage_required(stream: *Stream) usize {
+    ret stream.receive_record_plaintext + stream.send_record_plaintext * 2 + 2;
+}
+
+fun wire_storage_required(record_plaintext: usize) usize {
+    ret record.HEADER_SIZE + record_plaintext + 1 + record.TAG_SIZE;
+}
+
 fun storage_valid(value: *Storage, lower: *transport.Transport) bool {
-    if (value == nil || !transport.valid(lower) ||
-        value.wire_input_capacity < record.HEADER_SIZE + record.MAX_CIPHERTEXT ||
-        value.wire_output_capacity < record.HEADER_SIZE + record.MAX_CIPHERTEXT ||
-        !secret_storage_valid(value) || !storage_regions_disjoint(value)) {
+    if (value == nil || !transport.valid(lower) || value.secret == nil ||
+        !storage_regions_disjoint(value)) {
         ret false;
     }
     var regions: [REGION_COUNT]Region;
@@ -179,22 +205,29 @@ fun storage_valid(value: *Storage, lower: *transport.Transport) bool {
     ret true;
 }
 
-fun external_valid(stream: *Stream, data: *u8, len: usize) bool {
-    ret stream != nil && memory_range.valid(data, len) &&
-        !storage_overlaps(?stream.storage, data, len) &&
-        !transport.state_overlaps(stream.transport, data, len);
+fun externally_owned(stream: *Stream, data: *u8, len: usize) bool {
+    if (stream_owner_data(stream) == nil || !memory_range.valid(data, len) ||
+        stream_owner_overlaps(stream, data, len) ||
+        storage_overlaps(?stream.storage, data, len)) { ret false; }
+    ret stream.client.config == nil ||
+        !client.aliases_borrowed(?stream.client, data, len);
 }
 
 fun operation_inputs_valid(stream: *Stream, scope: *cancel.Scope,
     buffer: *u8, len: usize) bool {
-    if (!external_valid(stream, scope::*u8, $size_of(cancel.Scope)) ||
-        !external_valid(stream, buffer, len)) { ret false; }
+    if (!externally_owned(stream, scope::*u8, $size_of(cancel.Scope)) ||
+        !externally_owned(stream, buffer, len) ||
+        transport.state_overlaps(stream.transport, scope::*u8,
+            $size_of(cancel.Scope)) ||
+        transport.state_overlaps(stream.transport, buffer, len)) { ret false; }
     ret !memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer, len);
 }
 
 fun configuration_disjoint(stream: *Stream, storage: *Storage,
     lower: *transport.Transport) bool {
-    if (client.aliases_borrowed(?stream.client, lower::*u8,
+    if (client.aliases_configuration(?stream.client, stream_owner_data(stream),
+            $size_of(Stream)) ||
+        client.aliases_borrowed(?stream.client, lower::*u8,
             $size_of(transport.Transport)) ||
         client.aliases_borrowed(?stream.client, lower.context::*u8,
             lower.context_size) ||
@@ -258,10 +291,47 @@ fun install_secret(stream: *Stream, event: *client.Event) bool {
     ret installed;
 }
 
+fun terminal_requires_failure(stream: *Stream,
+    snapshot: transport.Snapshot) bool {
+    ret stream != nil && snapshot.state == transport.OPERATION_TERMINAL &&
+        snapshot.terminal_error != error.OK &&
+        (stream.pending_action == transport.TRANSPORT_WRITE ||
+        snapshot.kind == transport.APPLICATION_WRITE ||
+        snapshot.kind == transport.HANDSHAKE ||
+        snapshot.kind == transport.APPLICATION_CLOSE);
+}
+
+fun clear_core_event(stream: *Stream) {
+    if (stream.core_event_sending) {
+        client.complete_event(?stream.client, stream.core_event.token, false);
+    }
+    stream.core_event_sending = false;
+    stream.core_event_alert = false;
+    stream.core_event_offset = 0;
+    stream.core_event_chunk = 0;
+}
+
+fun settle_terminal(stream: *Stream) bool {
+    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
+    if (snapshot.state != transport.OPERATION_TERMINAL) { ret false; }
+    clear_core_event(stream);
+    if (terminal_requires_failure(stream, snapshot)) { stream.state = FAILED; }
+    if ((stream.control == CONTROL_CLOSE || stream.control == CONTROL_ABORT) &&
+        (stream.pending_action == transport.TRANSPORT_CLOSE ||
+        stream.pending_action == transport.TRANSPORT_ABORT) &&
+        snapshot.terminal_error == error.OK) { stream.state = CLOSED; }
+    stream.pending_action = 0;
+    ret true;
+}
+
 fun finish(stream: *Stream, failure: error.Error, end_of_stream: bool) bool {
     if (failure != error.OK && failure != error.CANCELLED &&
         failure != error.TIMEOUT) { stream.state = FAILED; }
-    ret transport.finish(?stream.operation, failure, end_of_stream);
+    if (transport.finish(?stream.operation, failure, end_of_stream)) {
+        settle_terminal(stream);
+        ret true;
+    }
+    ret settle_terminal(stream);
 }
 
 fun submit(stream: *Stream, kind: transport.ActionKind, buffer: *u8,
@@ -269,9 +339,8 @@ fun submit(stream: *Stream, kind: transport.ActionKind, buffer: *u8,
     val action: transport.Action = transport.Action{kind: kind, buffer: buffer,
         length: length, context: stream.operation.context};
     if (!transport.begin_action(?stream.operation, stream.transport, action)) {
-        if (transport.snapshot(?stream.operation).state ==
-            transport.OPERATION_TERMINAL) { stream.state = FAILED; }
-        ret false;
+        if (settle_terminal(stream)) { ret true; }
+        ret finish(stream, error.INTERNAL_ERROR, false);
     }
     stream.pending_action = kind;
     ret true;
@@ -296,7 +365,9 @@ fun compact_input(stream: *Stream) {
 
 fun prepare_public_record(stream: *Stream, content_type: record.ContentType,
     content: contracts.Bytes) bool {
-    if (content.len > record.MAX_PLAINTEXT) { ret false; }
+    if (content.len > record.MAX_PLAINTEXT ||
+        (stream.write_cipher.installed &&
+        content.len > stream.send_record_plaintext)) { ret false; }
     var sealed: record.Sealed;
     if (!stream.write_cipher.installed) {
         sealed = record.encode_plain(content_type, record.TLS13, content,
@@ -308,7 +379,7 @@ fun prepare_public_record(stream: *Stream, content_type: record.ContentType,
         sealed = record.seal(?stream.write_cipher, content_type,
             contracts.SecretBytes{data: stream.content, len: content.len}, 0,
             contracts.SecretBuffer{data: stream.scratch,
-                capacity: record.MAX_INNER_PLAINTEXT},
+                capacity: stream.send_record_plaintext + 1},
             contracts.Buffer{data: stream.storage.wire_output,
                 capacity: stream.storage.wire_output_capacity});
         ct.zeroize(stream.content, content.len);
@@ -323,7 +394,8 @@ fun prepare_application_record(stream: *Stream) bool {
     val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
     if (snapshot.application_bytes >= stream.operation.application_length) { ret false; }
     var amount: usize = stream.operation.application_length - snapshot.application_bytes;
-    if (amount > record.MAX_PLAINTEXT) { amount = record.MAX_PLAINTEXT; }
+    val send_limit: usize = stream.send_record_plaintext;
+    if (amount > send_limit) { amount = send_limit; }
     var i: usize = 0;
     for (i < amount) {
         stream.content[i] = stream.operation.application_buffer[
@@ -334,7 +406,7 @@ fun prepare_application_record(stream: *Stream) bool {
         record.APPLICATION_DATA,
         contracts.SecretBytes{data: stream.content, len: amount}, 0,
         contracts.SecretBuffer{data: stream.scratch,
-            capacity: record.MAX_INNER_PLAINTEXT},
+            capacity: send_limit + 1},
         contracts.Buffer{data: stream.storage.wire_output,
             capacity: stream.storage.wire_output_capacity});
     ct.zeroize(stream.content, amount);
@@ -360,7 +432,8 @@ fun prepare_core_fragment(stream: *Stream) bool {
     if (!stream.core_event_sending || stream.core_event.kind != client.CRYPTO ||
         stream.core_event_offset >= stream.core_event.data.len) { ret false; }
     var amount: usize = stream.core_event.data.len - stream.core_event_offset;
-    if (amount > record.MAX_PLAINTEXT) { amount = record.MAX_PLAINTEXT; }
+    val send_limit: usize = stream.send_record_plaintext;
+    if (amount > send_limit) { amount = send_limit; }
     if (!prepare_public_record(stream, record.HANDSHAKE,
         contracts.Bytes{data: ?stream.core_event.data.data[stream.core_event_offset],
             len: amount})) { ret false; }
@@ -371,6 +444,7 @@ fun prepare_core_fragment(stream: *Stream) bool {
 fun handle_core_event(stream: *Stream) bool {
     var event: client.Event;
     if (!client.next_event(?stream.client, ?event)) { ret false; }
+    stream.send_record_plaintext = client.send_record_limit(?stream.client);
     if (event.kind == client.CRYPTO) {
         stream.core_event = event;
         stream.core_event_sending = true;
@@ -412,7 +486,7 @@ fun handle_alert(stream: *Stream, data: *u8, length: usize) bool {
     var alert: record.AlertMessage;
     if (record.decode_alert(record.TLS13, data, length, ?alert) != error.OK) {
         finish(stream, error.DECODE_ERROR, false);
-        ret false;
+        ret true;
     }
     stream.peer_alert = alert.description;
     if (alert.description == record.CLOSE_NOTIFY) {
@@ -422,7 +496,7 @@ fun handle_alert(stream: *Stream, data: *u8, length: usize) bool {
         }
         stream.peer_closed = true;
         finish(stream, error.OK, true);
-    } or {
+    } or (alert.fatal) {
         finish(stream, error.ALERT_RECEIVED, false);
     }
     ret true;
@@ -467,7 +541,13 @@ fun process_record(stream: *Stream) bool {
         input[0] == record.CHANGE_CIPHER_SPEC) {
         val compatibility: record.Parsed = record.inspect(input, available,
             record.TLS13, false);
-        if (compatibility.status == record.PARSE_MORE) { ret false; }
+        if (compatibility.status == record.PARSE_MORE) {
+            if (compatibility.required > stream.storage.wire_input_capacity) {
+                finish(stream, error.RECORD_OVERFLOW, false);
+                ret true;
+            }
+            ret false;
+        }
         if (compatibility.status != record.PARSE_READY ||
             compatibility.frame.length != 1 || compatibility.frame.fragment[0] != 1 ||
             stream.ccs_count >= 8) {
@@ -485,8 +565,19 @@ fun process_record(stream: *Stream) bool {
     var protected: bool = false;
     if (!stream.read_cipher.installed) {
         val parsed: record.Parsed = record.inspect(input, available, record.TLS13, false);
-        if (parsed.status == record.PARSE_MORE) { ret false; }
-        if (parsed.status != record.PARSE_READY) {
+        if (parsed.status == record.PARSE_MORE) {
+            if (parsed.required > stream.storage.wire_input_capacity) {
+                finish(stream, error.RECORD_OVERFLOW, false);
+                ret true;
+            }
+            ret false;
+        }
+        if (parsed.status != record.PARSE_READY ||
+            parsed.frame.length > stream.receive_record_plaintext) {
+            if (parsed.status == record.PARSE_READY) {
+                finish(stream, error.RECORD_OVERFLOW, false);
+                ret true;
+            }
             finish(stream, parsed.error, false);
             ret true;
         }
@@ -496,9 +587,24 @@ fun process_record(stream: *Stream) bool {
         consumed = parsed.frame.consumed;
     } or {
         protected = true;
+        val bounded: record.Parsed = record.inspect(input, available,
+            record.TLS13, true);
+        if (bounded.status == record.PARSE_MORE) {
+            if (bounded.required > stream.storage.wire_input_capacity) {
+                finish(stream, error.RECORD_OVERFLOW, false);
+                ret true;
+            }
+            ret false;
+        }
+        if (bounded.status != record.PARSE_READY ||
+            bounded.frame.length > stream.receive_record_plaintext +
+                1 + record.TAG_SIZE) {
+            finish(stream, error.RECORD_OVERFLOW, false);
+            ret true;
+        }
         val opened: record.Opened = record.open(?stream.read_cipher, input, available,
             contracts.SecretBuffer{data: stream.plaintext,
-                capacity: record.MAX_INNER_PLAINTEXT});
+                capacity: stream.receive_record_plaintext + 1});
         if (opened.status == record.PARSE_MORE) { ret false; }
         if (opened.status != record.PARSE_READY || opened.error != error.OK) {
             finish(stream, opened.error, false);
@@ -507,6 +613,11 @@ fun process_record(stream: *Stream) bool {
         content_type = opened.content_type;
         content_length = opened.written;
         consumed = opened.consumed;
+        if (content_length > stream.receive_record_plaintext) {
+            ct.zeroize(stream.plaintext, content_length);
+            finish(stream, error.RECORD_OVERFLOW, false);
+            ret true;
+        }
     }
     stream.wire_input_read = stream.wire_input_read + consumed;
     if (content_type == record.CHANGE_CIPHER_SPEC) {
@@ -693,33 +804,67 @@ fun drive(stream: *Stream) bool {
     ret drive_control(stream);
 }
 
+fun drive_owned(stream: *Stream) bool {
+    if (settle_terminal(stream)) { ret true; }
+    if (!drive(stream)) {
+        finish(stream, error.INTERNAL_ERROR, false);
+    }
+    settle_terminal(stream);
+    ret true;
+}
+
+fun enter(stream: *Stream) bool {
+    if (stream_owner_data(stream) == nil) { ret false; }
+    val owner: i64 = os.thread_current_id();
+    if (owner <= 0) { ret false; }
+    for (true) {
+        var expected: i64 = atomic.load(?stream.transition_owner);
+        if (expected == owner) { ret false; }
+        if (expected == 0 && atomic.cas(?stream.transition_owner,
+                ?expected, owner)) { ret true; }
+        if (expected != 0) {
+            os.thread_wait(?stream.transition_owner, expected);
+        }
+    }
+}
+
+fun leave(stream: *Stream, accepted: bool) bool {
+    atomic.store(?stream.transition_owner, 0);
+    os.thread_wake(?stream.transition_owner);
+    ret accepted;
+}
+
 fun operation_available(stream: *Stream) bool {
     if (stream == nil) { ret false; }
     val state: transport.OperationState = transport.snapshot(?stream.operation).state;
     ret state == 0 || state == transport.OPERATION_DESTROYED;
 }
 
-fun terminal_requires_failure(stream: *Stream,
-    snapshot: transport.Snapshot) bool {
-    ret stream != nil && snapshot.state == transport.OPERATION_TERMINAL &&
-        snapshot.terminal_error != error.OK &&
-        (stream.pending_action == transport.TRANSPORT_WRITE ||
-        snapshot.kind == transport.APPLICATION_WRITE ||
-        snapshot.kind == transport.HANDSHAKE ||
-        snapshot.kind == transport.APPLICATION_CLOSE);
-}
-
-pub fun init(stream: *Stream, configuration: *config.ClientConfig,
+fun init_inner(stream: *Stream, configuration: *config.ClientConfig,
     storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
     peer_extension: u16) bool {
-    if (stream == nil || (stream.state != 0 && stream.state != DESTROYED) ||
+    if (stream_owner_data(stream) == nil ||
+        (stream.state != 0 && stream.state != DESTROYED) ||
         (stream.operation.state != 0 &&
         stream.operation.state != transport.OPERATION_DESTROYED) ||
         stream.read_cipher.installed || stream.write_cipher.installed ||
         !storage_valid(?storage, lower) ||
+        storage_overlaps(?storage, stream_owner_data(stream), $size_of(Stream)) ||
+        transport.state_overlaps(lower, stream_owner_data(stream),
+            $size_of(Stream)) ||
         !client.init(?stream.client, configuration,
             storage.handshake, extra, peer_extension)) { ret false; }
     if (!configuration_disjoint(stream, ?storage, lower)) {
+        client.destroy(?stream.client);
+        ret false;
+    }
+    stream.receive_record_plaintext = client.receive_record_limit(?stream.client);
+    stream.send_record_plaintext = client.send_record_limit(?stream.client);
+    if (storage.secret_capacity < secret_storage_required(stream) ||
+        storage.wire_input_capacity <
+            wire_storage_required(stream.receive_record_plaintext) ||
+        storage.wire_output_capacity <
+            wire_storage_required(stream.send_record_plaintext)) {
         client.destroy(?stream.client);
         ret false;
     }
@@ -727,9 +872,9 @@ pub fun init(stream: *Stream, configuration: *config.ClientConfig,
     stream.transport = ?stream.lower_transport;
     stream.storage = storage;
     stream.plaintext = storage.secret;
-    stream.content = ?storage.secret[record.MAX_INNER_PLAINTEXT];
-    stream.scratch = ?storage.secret[record.MAX_INNER_PLAINTEXT +
-        record.MAX_PLAINTEXT];
+    stream.content = ?storage.secret[stream.receive_record_plaintext + 1];
+    stream.scratch = ?storage.secret[stream.receive_record_plaintext +
+        stream.send_record_plaintext + 1];
     stream.state = NEW;
     stream.control = CONTROL_NONE;
     stream.pending_action = 0;
@@ -752,40 +897,71 @@ pub fun init(stream: *Stream, configuration: *config.ClientConfig,
     ret true;
 }
 
-pub fun handshake(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+pub fun init(stream: *Stream, configuration: *config.ClientConfig,
+    storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
+    peer_extension: u16) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, init_inner(stream, configuration, storage, lower, extra,
+        peer_extension));
+}
+
+fun handshake_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (stream == nil || stream.state != NEW || !operation_available(stream) ||
         !operation_inputs_valid(stream, scope, nil, 0) ||
         !transport.begin(?stream.operation,
         token, transport.HANDSHAKE, scope, nil, 0, context)) { ret false; }
     stream.state = HANDSHAKING;
+    if (settle_terminal(stream)) { ret true; }
     val started: client.Result = client.start(?stream.client, verification_time);
     if (started.status != client.OK) {
-        ret finish(stream, started.error, false);
+        finish(stream, started.error, false);
+        ret true;
     }
-    ret drive(stream);
+    ret drive_owned(stream);
 }
 
-pub fun read(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+pub fun handshake(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    verification_time: i64, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, handshake_inner(stream, scope, token, verification_time,
+        context));
+}
+
+fun read_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     buffer: *u8, length: usize, context: usize) bool {
     if (stream == nil || stream.state != OPEN || stream.peer_closed ||
         !operation_available(stream) ||
         !operation_inputs_valid(stream, scope, buffer, length) ||
         !transport.begin(?stream.operation, token, transport.APPLICATION_READ,
             scope, buffer, length, context)) { ret false; }
-    if (length == 0) { ret finish(stream, error.OK, false); }
-    ret drive(stream);
+    if (settle_terminal(stream)) { ret true; }
+    if (length == 0) { finish(stream, error.OK, false); ret true; }
+    ret drive_owned(stream);
 }
 
-pub fun write(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+pub fun read(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    buffer: *u8, length: usize, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, read_inner(stream, scope, token, buffer, length, context));
+}
+
+fun write_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     buffer: *u8, length: usize, context: usize) bool {
     if (stream == nil || stream.state != OPEN || stream.send_closed ||
         !operation_available(stream) ||
         !operation_inputs_valid(stream, scope, buffer, length) ||
         !transport.begin(?stream.operation, token, transport.APPLICATION_WRITE,
             scope, buffer, length, context)) { ret false; }
-    if (length == 0) { ret finish(stream, error.OK, false); }
-    ret drive(stream);
+    if (settle_terminal(stream)) { ret true; }
+    if (length == 0) { finish(stream, error.OK, false); ret true; }
+    ret drive_owned(stream);
+}
+
+pub fun write(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
+    buffer: *u8, length: usize, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, write_inner(stream, scope, token, buffer, length, context));
 }
 
 fun begin_control(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
@@ -800,74 +976,72 @@ fun begin_control(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     stream.control_record_sent = false;
     stream.wire_output_len = 0;
     stream.wire_output_sent = 0;
-    ret drive(stream);
+    if (settle_terminal(stream)) { ret true; }
+    ret drive_owned(stream);
 }
 
 pub fun alert(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     description: record.AlertDescription, context: usize) bool {
+    if (!enter(stream)) { ret false; }
     if (description == record.CLOSE_NOTIFY || description == record.NO_ALERT) {
-        ret false;
+        ret leave(stream, false);
     }
-    if (!record.valid_tls13_alert(description)) { ret false; }
-    ret begin_control(stream, scope, token, CONTROL_ALERT, description, context);
+    if (!record.valid_tls13_alert(description)) { ret leave(stream, false); }
+    ret leave(stream, begin_control(stream, scope, token, CONTROL_ALERT,
+        description, context));
 }
 
 pub fun half_close(stream: *Stream, scope: *cancel.Scope,
     token: transport.Token, context: usize) bool {
-    ret begin_control(stream, scope, token, CONTROL_HALF_CLOSE,
-        record.CLOSE_NOTIFY, context);
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, begin_control(stream, scope, token, CONTROL_HALF_CLOSE,
+        record.CLOSE_NOTIFY, context));
 }
 
 pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     context: usize) bool {
+    if (!enter(stream)) { ret false; }
     if (stream != nil && stream.state == FAILED && operation_available(stream) &&
         operation_inputs_valid(stream, scope, nil, 0) &&
         transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
             scope, nil, 0, context)) {
         stream.control = CONTROL_ABORT;
         stream.control_record_sent = true;
-        ret drive(stream);
+        if (settle_terminal(stream)) { ret leave(stream, true); }
+        ret leave(stream, drive_owned(stream));
     }
-    ret begin_control(stream, scope, token, CONTROL_CLOSE,
-        record.CLOSE_NOTIFY, context);
+    ret leave(stream, begin_control(stream, scope, token, CONTROL_CLOSE,
+        record.CLOSE_NOTIFY, context));
 }
 
 pub fun connect(stream: *Stream, configuration: *config.ClientConfig,
     storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
     peer_extension: u16, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
-    if (!init(stream, configuration, storage, lower, extra, peer_extension)) {
-        ret false;
+    if (!enter(stream)) { ret false; }
+    if (!init_inner(stream, configuration, storage, lower, extra, peer_extension)) {
+        ret leave(stream, false);
     }
-    ret handshake(stream, scope, token, verification_time, context);
+    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+        destroy_inner(stream);
+        ret leave(stream, false);
+    }
+    ret leave(stream, true);
 }
 
 pub fun negotiated(stream: *Stream) client.Snapshot {
-    if (stream == nil) { ret client.Snapshot{}; }
+    if (stream_owner_data(stream) == nil) { ret client.Snapshot{}; }
     ret client.snapshot(?stream.client);
 }
 
-pub fun accept(stream: *Stream, completion: *runtime.Completion) bool {
-    if (stream == nil || completion == nil ||
-        !external_valid(stream, completion::*u8, $size_of(runtime.Completion)) ||
+fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
+    if (completion == nil ||
+        !externally_owned(stream, completion::*u8,
+            $size_of(runtime.Completion)) ||
         !transport.accept(?stream.operation,
         completion)) { ret false; }
+    if (settle_terminal(stream)) { ret true; }
     val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
-    if (snapshot.state == transport.OPERATION_TERMINAL) {
-        if (stream.core_event_sending) {
-            client.complete_event(?stream.client, stream.core_event.token, false);
-            stream.core_event_sending = false;
-            stream.core_event_alert = false;
-            stream.core_event_offset = 0;
-            stream.core_event_chunk = 0;
-        }
-        if (terminal_requires_failure(stream, snapshot)) { stream.state = FAILED; }
-        if ((stream.control == CONTROL_CLOSE || stream.control == CONTROL_ABORT) &&
-            (stream.pending_action == transport.TRANSPORT_CLOSE ||
-            stream.pending_action == transport.TRANSPORT_ABORT) &&
-            snapshot.terminal_error == error.OK) { stream.state = CLOSED; }
-        ret true;
-    }
     val action: transport.ActionKind = stream.pending_action;
     stream.pending_action = 0;
     if (action == transport.TRANSPORT_WRITE) {
@@ -935,12 +1109,18 @@ pub fun accept(stream: *Stream, completion: *runtime.Completion) bool {
         }
         if (snapshot.last_end_of_stream) { stream.lower_eof = true; }
     }
-    ret drive(stream);
+    drive_owned(stream);
+    ret true;
+}
+
+pub fun accept(stream: *Stream, completion: *runtime.Completion) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, accept_inner(stream, completion));
 }
 
 pub fun snapshot(stream: *Stream) Snapshot {
     var value: Snapshot;
-    if (stream == nil) { ret value; }
+    if (stream_owner_data(stream) == nil) { ret value; }
     value.state = stream.state;
     value.operation = transport.snapshot(?stream.operation);
     value.handshake_complete = stream.handshake_complete;
@@ -950,20 +1130,31 @@ pub fun snapshot(stream: *Stream) Snapshot {
     ret value;
 }
 
-pub fun destroy_operation(stream: *Stream) bool {
-    if (stream == nil) { ret false; }
+fun destroy_operation_inner(stream: *Stream) bool {
     val current: transport.Snapshot = transport.snapshot(?stream.operation);
-    if (terminal_requires_failure(stream, current)) { stream.state = FAILED; }
+    if (current.state == transport.OPERATION_SUBMITTING ||
+        current.state == transport.OPERATION_WAITING ||
+        current.state == transport.OPERATION_ACCEPTING) {
+        ret false;
+    }
+    settle_terminal(stream);
     ret transport.destroy_operation(?stream.operation);
 }
 
-pub fun destroy(stream: *Stream) bool {
-    if (stream == nil || stream.state == DESTROYED ||
-        transport.snapshot(?stream.operation).state == transport.OPERATION_WAITING ||
+pub fun destroy_operation(stream: *Stream) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, destroy_operation_inner(stream));
+}
+
+fun destroy_inner(stream: *Stream) bool {
+    if (stream.state == DESTROYED ||
         stream.client.event_active) { ret false; }
     val operation_state: transport.OperationState =
         transport.snapshot(?stream.operation).state;
-    if (operation_state == transport.OPERATION_OPEN) { ret false; }
+    if (operation_state == transport.OPERATION_OPEN ||
+        operation_state == transport.OPERATION_WAITING ||
+        operation_state == transport.OPERATION_SUBMITTING ||
+        operation_state == transport.OPERATION_ACCEPTING) { ret false; }
     if (operation_state == transport.OPERATION_TERMINAL &&
         !transport.destroy_operation(?stream.operation)) { ret false; }
     record.destroy(?stream.read_cipher);
@@ -972,14 +1163,32 @@ pub fun destroy(stream: *Stream) bool {
     ct.zeroize(stream.storage.secret, stream.storage.secret_capacity);
     stream.transport = nil;
     stream.lower_transport = transport.Transport{};
+    stream.storage.handshake.input = nil;
+    stream.storage.handshake.input_capacity = 0;
+    stream.storage.handshake.output = nil;
+    stream.storage.handshake.output_capacity = 0;
+    stream.storage.handshake.hello = nil;
+    stream.storage.handshake.hello_capacity = 0;
+    stream.storage.handshake.certificates = nil;
+    stream.storage.handshake.certificate_capacity = 0;
+    stream.storage.handshake.peer_parameters = nil;
+    stream.storage.handshake.peer_parameters_capacity = 0;
     stream.storage.wire_input = nil;
+    stream.storage.wire_input_capacity = 0;
     stream.storage.wire_output = nil;
+    stream.storage.wire_output_capacity = 0;
     stream.storage.secret = nil;
+    stream.storage.secret_capacity = 0;
     stream.plaintext = nil;
     stream.content = nil;
     stream.scratch = nil;
     stream.state = DESTROYED;
     ret true;
+}
+
+pub fun destroy(stream: *Stream) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, destroy_inner(stream));
 }
 
 test "stream: storage bounds reject record truncation surfaces" {
@@ -1027,5 +1236,38 @@ test "stream: storage regions are representable and independently owned" {
     if (storage_regions_disjoint(?wrapping)) { ret 4; }
     storage.secret_capacity = SECRET_STORAGE_BYTES - 1;
     if (secret_storage_valid(?storage)) { ret 5; }
+    ret 0;
+}
+
+test "stream: tls 1.3 user canceled warning keeps the stream open" {
+    var stream: Stream;
+    stream.state = OPEN;
+    stream.handshake_complete = true;
+    var alert: [2]u8 = [2]u8{record.WARNING,
+        record.USER_CANCELED_ALERT};
+    if (!handle_alert(?stream, ?alert[0], 2) || stream.state != OPEN ||
+        stream.peer_closed || stream.peer_alert != record.USER_CANCELED_ALERT) {
+        ret 1;
+    }
+    ret 0;
+}
+
+test "stream: an incomplete record cannot exceed bounded wire storage" {
+    var stream: Stream;
+    stream.state = HANDSHAKING;
+    stream.receive_record_plaintext = 63;
+    stream.storage.wire_input = ?range_wire_input[0];
+    stream.storage.wire_input_capacity = 85;
+    stream.wire_input_len = record.HEADER_SIZE;
+    range_wire_input[0] = record.HANDSHAKE;
+    range_wire_input[1] = 3;
+    range_wire_input[2] = 3;
+    range_wire_input[3] = 0;
+    range_wire_input[4] = 100;
+    if (!process_record(?stream) || stream.state != FAILED ||
+        transport.snapshot(?stream.operation).state !=
+            transport.OPERATION_TERMINAL ||
+        transport.snapshot(?stream.operation).terminal_error !=
+            error.RECORD_OVERFLOW) { ret 1; }
     ret 0;
 }
