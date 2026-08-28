@@ -1,0 +1,296 @@
+# strict ascii dns and textual ip identity matching
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub val MAX_DNS_NAME: usize = 253;
+pub val MAX_DNS_LABEL: usize = 63;
+
+fun ascii_lower(value: u8) u8 {
+    if (value >= 'A' && value <= 'Z') { ret value + ('a' - 'A'); }
+    ret value;
+}
+
+fun dns_length(value: contracts.Bytes) usize {
+    if (value.len == 0 || value.data == nil) { ret 0; }
+    var length: usize = value.len;
+    if (value.data[length - 1] == '.') { length = length - 1; }
+    if (length == 0 || length > MAX_DNS_NAME) { ret 0; }
+    ret length;
+}
+
+fun valid_dns(value: contracts.Bytes, wildcard: bool) bool {
+    val length: usize = dns_length(value);
+    if (length == 0) { ret false; }
+    var label_start: usize = 0;
+    var labels: usize = 0;
+    var i: usize = 0;
+    for (i <= length) {
+        if (i == length || value.data[i] == '.') {
+            val label_len: usize = i - label_start;
+            if (label_len == 0 || label_len > MAX_DNS_LABEL) { ret false; }
+            if (wildcard && labels == 0 && label_len == 1
+                && value.data[label_start] == '*') {
+            } or {
+                if (value.data[label_start] == '-'
+                    || value.data[i - 1] == '-') { ret false; }
+                var j: usize = label_start;
+                for (j < i) {
+                    val character: u8 = value.data[j];
+                    if (!((character >= 'a' && character <= 'z')
+                        || (character >= 'A' && character <= 'Z')
+                        || (character >= '0' && character <= '9')
+                        || character == '-')) { ret false; }
+                    j = j + 1;
+                }
+            }
+            labels = labels + 1;
+            label_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (wildcard && value.data[0] == '*') { ret labels >= 3; }
+    ret true;
+}
+
+pub fun valid_reference_dns(value: contracts.Bytes) bool {
+    ret valid_dns(value, false);
+}
+
+pub fun valid_presented_dns(value: contracts.Bytes) bool {
+    ret valid_dns(value, true);
+}
+
+fun equal_folded(first: *u8, second: *u8, length: usize) bool {
+    var i: usize = 0;
+    for (i < length) {
+        if (ascii_lower(first[i]) != ascii_lower(second[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun match_dns(reference: contracts.Bytes, presented: contracts.Bytes) bool {
+    val reference_len: usize = dns_length(reference);
+    val presented_len: usize = dns_length(presented);
+    if (reference_len == 0 || presented_len == 0
+        || !valid_dns(reference, false) || !valid_dns(presented, true)) { ret false; }
+    if (presented.data[0] != '*') {
+        ret reference_len == presented_len
+            && equal_folded(reference.data, presented.data, reference_len);
+    }
+    if (presented_len < 3 || presented.data[1] != '.') { ret false; }
+    var first_dot: usize = 0;
+    for (first_dot < reference_len && reference.data[first_dot] != '.') {
+        first_dot = first_dot + 1;
+    }
+    if (first_dot == 0 || first_dot == reference_len) { ret false; }
+    val suffix_len: usize = presented_len - 2;
+    if (reference_len - first_dot - 1 != suffix_len) { ret false; }
+    ret equal_folded(?reference.data[first_dot + 1], ?presented.data[2], suffix_len);
+}
+
+fun decimal_octet(data: *u8, start: usize, end: usize, output: *u8) bool {
+    if (data == nil || output == nil || start >= end || end - start > 3) { ret false; }
+    if (end - start > 1 && data[start] == '0') { ret false; }
+    var value: usize = 0;
+    var i: usize = start;
+    for (i < end) {
+        if (data[i] < '0' || data[i] > '9') { ret false; }
+        value = value * 10 + (data[i] - '0')::usize;
+        if (value > 255) { ret false; }
+        i = i + 1;
+    }
+    @output = value::u8;
+    ret true;
+}
+
+fun parse_ipv4_range(data: *u8, start: usize, end: usize, output: *u8) bool {
+    if (data == nil || output == nil || start >= end) { ret false; }
+    var part: usize = 0;
+    var part_start: usize = start;
+    var i: usize = start;
+    for (i <= end) {
+        if (i == end || data[i] == '.') {
+            if (part >= 4 || !decimal_octet(data, part_start, i, ?output[part])) {
+                ret false;
+            }
+            part = part + 1;
+            part_start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret part == 4;
+}
+
+fun hex_digit(value: u8, output: *u8) bool {
+    if (value >= '0' && value <= '9') { @output = value - '0'; ret true; }
+    val lower: u8 = ascii_lower(value);
+    if (lower >= 'a' && lower <= 'f') { @output = lower - 'a' + 10; ret true; }
+    ret false;
+}
+
+fun parse_ipv6(input: contracts.Bytes, output: *u8) bool {
+    if (input.len < 2 || input.data == nil || output == nil) { ret false; }
+    var groups: [8]u16;
+    var count: usize = 0;
+    var compressed: usize = 9;
+    var offset: usize = 0;
+    if (input.data[0] == ':') {
+        if (input.data[1] != ':') { ret false; }
+        compressed = 0;
+        offset = 2;
+    }
+    var done: bool = false;
+    for (offset < input.len && !done) {
+        if (count >= 8 || input.data[offset] == ':') { ret false; }
+        val start: usize = offset;
+        var has_dot: bool = false;
+        for (offset < input.len && input.data[offset] != ':') {
+            if (input.data[offset] == '.') { has_dot = true; }
+            offset = offset + 1;
+        }
+        if (has_dot) {
+            if (offset != input.len || count > 6) { ret false; }
+            var octets: [4]u8;
+            if (!parse_ipv4_range(input.data, start, offset, ?octets[0])) { ret false; }
+            groups[count] = (octets[0]::u16 << 8) | octets[1]::u16;
+            groups[count + 1] = (octets[2]::u16 << 8) | octets[3]::u16;
+            count = count + 2;
+            done = true;
+        } or {
+            val width: usize = offset - start;
+            if (width == 0 || width > 4) { ret false; }
+            var group: u16 = 0;
+            var i: usize = start;
+            for (i < offset) {
+                var digit: u8 = 0;
+                if (!hex_digit(input.data[i], ?digit)) { ret false; }
+                group = (group << 4) | digit::u16;
+                i = i + 1;
+            }
+            groups[count] = group;
+            count = count + 1;
+            if (offset == input.len) { done = true; }
+            or {
+                offset = offset + 1;
+                if (offset == input.len) { ret false; }
+                if (input.data[offset] == ':') {
+                    if (compressed != 9) { ret false; }
+                    compressed = count;
+                    offset = offset + 1;
+                    if (offset == input.len) { done = true; }
+                }
+            }
+        }
+    }
+    if (compressed == 9) {
+        if (count != 8) { ret false; }
+    } or {
+        if (count >= 8) { ret false; }
+        val zeroes: usize = 8 - count;
+        var i: usize = count;
+        for (i > compressed) {
+            groups[i - 1 + zeroes] = groups[i - 1];
+            i = i - 1;
+        }
+        i = compressed;
+        for (i < compressed + zeroes) { groups[i] = 0; i = i + 1; }
+    }
+    var i: usize = 0;
+    for (i < 8) {
+        output[i * 2] = (groups[i] >> 8)::u8;
+        output[i * 2 + 1] = groups[i]::u8;
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun parse_ip(input: contracts.Bytes, output: contracts.Buffer) contracts.Operation {
+    if (input.len == 0 || input.data == nil) {
+        ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
+    }
+    var has_colon: bool = false;
+    var i: usize = 0;
+    for (i < input.len) {
+        if (input.data[i] == ':') { has_colon = true; }
+        if (input.data[i] == '%' || input.data[i] == '[' || input.data[i] == ']') {
+            ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
+        }
+        i = i + 1;
+    }
+    var required: usize = 4;
+    if (has_colon) { required = 16; }
+    if (output.capacity < required) {
+        ret contracts.Operation{error: contracts.OUTPUT_TOO_SMALL, written: 0};
+    }
+    if (output.data == nil) {
+        ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
+    }
+    var parsed: [16]u8;
+    var valid: bool = false;
+    if (has_colon) { valid = parse_ipv6(input, ?parsed[0]); }
+    or { valid = parse_ipv4_range(input.data, 0, input.len, ?parsed[0]); }
+    if (!valid) { ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0}; }
+    i = 0;
+    for (i < required) { output.data[i] = parsed[i]; i = i + 1; }
+    ret contracts.Operation{error: contracts.OK, written: required};
+}
+
+pub fun match_ip(reference: contracts.Bytes, presented: contracts.Bytes) bool {
+    if (presented.len != 4 && presented.len != 16) { ret false; }
+    if (presented.data == nil) { ret false; }
+    var parsed: [16]u8;
+    val operation: contracts.Operation = parse_ip(reference,
+        contracts.Buffer{data: ?parsed[0], capacity: 16});
+    if (operation.error != contracts.OK || operation.written != presented.len) { ret false; }
+    var i: usize = 0;
+    for (i < presented.len) {
+        if (parsed[i] != presented.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "cert.name: dns matching is ascii, label-bound, and wildcard-exact" {
+    if (!match_dns(contracts.Bytes{data: "WWW.Example.COM."::*u8, len: 16},
+            contracts.Bytes{data: "www.example.com"::*u8, len: 15})) { ret 1; }
+    if (!match_dns(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+            contracts.Bytes{data: "*.example.com"::*u8, len: 13})) { ret 2; }
+    if (match_dns(contracts.Bytes{data: "deep.api.example.com"::*u8, len: 20},
+            contracts.Bytes{data: "*.example.com"::*u8, len: 13})
+        || match_dns(contracts.Bytes{data: "example.com"::*u8, len: 11},
+            contracts.Bytes{data: "*.example.com"::*u8, len: 13})
+        || match_dns(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+            contracts.Bytes{data: "a*.example.com"::*u8, len: 14})
+        || match_dns(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+            contracts.Bytes{data: "*.com"::*u8, len: 5})) { ret 3; }
+    ret 0;
+}
+
+test "cert.name: ipv4 and ipv6 normalize to exact address bytes" {
+    var output: [16]u8;
+    var operation: contracts.Operation = parse_ip(
+        contracts.Bytes{data: "192.0.2.1"::*u8, len: 9},
+        contracts.Buffer{data: ?output[0], capacity: 16});
+    if (operation.error != contracts.OK || operation.written != 4
+        || output[0] != 192 || output[3] != 1) { ret 1; }
+    operation = parse_ip(contracts.Bytes{data: "2001:db8::192.0.2.1"::*u8, len: 19},
+        contracts.Buffer{data: ?output[0], capacity: 16});
+    if (operation.error != contracts.OK || operation.written != 16
+        || output[0] != 0x20 || output[1] != 0x01 || output[2] != 0x0d
+        || output[3] != 0xb8 || output[12] != 192 || output[15] != 1) { ret 2; }
+    var expected: [16]u8 = [16]u8{
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 192, 0, 2, 1,
+    };
+    if (!match_ip(contracts.Bytes{data: "2001:0DB8:0:0:0:0:C000:0201"::*u8, len: 27},
+            contracts.Bytes{data: ?expected[0], len: 16})
+        || parse_ip(contracts.Bytes{data: "192.00.2.1"::*u8, len: 10},
+            contracts.Buffer{data: ?output[0], capacity: 16}).error == contracts.OK
+        || parse_ip(contracts.Bytes{data: "2001:::1"::*u8, len: 8},
+            contracts.Buffer{data: ?output[0], capacity: 16}).error == contracts.OK) { ret 3; }
+    ret 0;
+}

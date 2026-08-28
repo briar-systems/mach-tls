@@ -1,6 +1,7 @@
 # bounded client and server configuration
 
 use tls.cert;
+use tls.cert.credentials;
 use tls.tls13;
 use std.types.bool.bool;
 use std.types.size.usize;
@@ -35,8 +36,7 @@ pub rec ClientConfig {
 }
 
 pub rec ServerConfig {
-    cert_chain:         *cert.Chain;
-    private_key:        cert.PrivateKey;
+    credentials:        *credentials.Store;
     alpn:               *ProtocolName;
     alpn_len:           usize;
     versions:           *u16;

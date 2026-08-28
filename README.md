@@ -10,7 +10,11 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 
 - `tls.tls12` and `tls.tls13` define protocol and algorithm registry values.
 - `tls.config` defines bounded client and server configuration.
-- `tls.cert` defines borrowed certificate, key, chain, and trust store contracts.
+- `tls.cert` defines borrowed certificate, chain, and trust store contracts.
+- `tls.cert.x509` parses strict borrowed X.509 certificate views.
+- `tls.cert.verify` constructs and verifies bounded certificate paths.
+- `tls.cert.load` loads certificate chains and owned private keys from DER and PEM.
+- `tls.cert.credentials` selects and safely rotates immutable credential generations.
 - `tls.transport` provides completion-based TLS operation ownership and ordered-byte adapters.
 - `tls.record` implements TLS 1.2 and TLS 1.3 framing, alerts, padding, sequencing, and AEAD protection.
 - `tls.handshake` defines handshake framing and progress.
@@ -30,7 +34,17 @@ The transport layer is implemented against the shared `mach-std` completion runt
 
 A native TCP adapter is included. QUIC handshake streams implement the same submission callbacks without creating a dependency from TLS back to QUIC.
 
-TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. Certificate verification and the client and server connection state machines remain under subsequent implementation issues. This revision does not yet expose a complete TLS connection.
+TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented. The client and server connection state machines remain under subsequent implementation issues. This revision does not yet expose a complete TLS connection.
+
+## Certificates and credentials
+
+Certificate parsing is strict DER and publishes only borrowed views after the entire certificate validates. Path construction backtracks across unordered intermediates and trust anchors within an explicit depth bound. It verifies signatures, validity, basic constraints, path length, key usage, extended key usage, authority key identifiers, DNS and IP name constraints, and the requested server or client purpose. Unknown critical extensions fail closed.
+
+Certificate paths authenticate Ed25519, ECDSA P-256 SHA-256, RSA-PSS SHA-256/SHA-384, and RSA PKCS #1 v1.5 SHA-256/SHA-384 signatures within explicit depth and public-key-operation bounds. Server identities use subject alternative names only. DNS matching is ASCII case-insensitive, permits one complete leftmost wildcard label, and never allows a wildcard to span labels. IP literals are parsed to network bytes and match only `iPAddress` entries. Common-name fallback is intentionally absent.
+
+PEM bundle loading validates every block before publishing a chain. Private keys are owned by `mach-crypto` secret allocators and support PKCS #8, SEC 1, and RSA PKCS #1 containers. Credential initialization proves that the private key matches the leaf certificate before publication.
+
+Credential generations are immutable after initialization and can be published by only one store. A rotation retires the old generation while leases held by active handshakes remain valid. The caller may reclaim certificate arrays, trust anchors, and private keys only after the retired generation reports that it is reclaimable. The complete contract and supported algorithms are in [`doc/certificates.md`](doc/certificates.md).
 
 ## Record protection
 
