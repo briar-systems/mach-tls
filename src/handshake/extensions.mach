@@ -558,7 +558,31 @@ test "extensions: psk identities and binders have matching cardinality" {
     var i: usize = 0;
     for (i < 32) { psk[16 + i] = i::u8; i = i + 1; }
     if (validate(list(?psk[0], 48, CLIENT_HELLO)) != error.OK) { ret 1; }
+    i = 1;
+    for (i < 48) {
+        if (validate(list(?psk[0], i, CLIENT_HELLO)) == error.OK) { ret 2; }
+        i = i + 1;
+    }
     psk[15] = 31;
-    if (validate(list(?psk[0], 48, CLIENT_HELLO)) == error.OK) { ret 2; }
+    if (validate(list(?psk[0], 48, CLIENT_HELLO)) == error.OK) { ret 3; }
+    psk[15] = 32;
+    psk[3] = 45;
+    if (validate(list(?psk[0], 48, CLIENT_HELLO)) == error.OK) { ret 4; }
+    psk[3] = 44;
+    psk[5] = 8;
+    if (validate(list(?psk[0], 48, CLIENT_HELLO)) == error.OK) { ret 5; }
+    psk[5] = 7;
+    psk[14] = 32;
+    if (validate(list(?psk[0], 48, CLIENT_HELLO)) == error.OK) { ret 6; }
+    psk[14] = 33;
+    var out_of_order: [55]u8;
+    i = 0;
+    for (i < 48) { out_of_order[i] = psk[i]; i = i + 1; }
+    out_of_order[48] = 0; out_of_order[49] = 43;
+    out_of_order[50] = 0; out_of_order[51] = 3;
+    out_of_order[52] = 2; out_of_order[53] = 3; out_of_order[54] = 4;
+    if (validate(list(?out_of_order[0], 55, CLIENT_HELLO)) != error.ILLEGAL_PARAMETER) {
+        ret 7;
+    }
     ret 0;
 }
