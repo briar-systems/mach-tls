@@ -635,6 +635,28 @@ fun client_hello_requirement(value: *config.ClientConfig,
     ret true;
 }
 
+fun client_extension_requirement(value: *config.ClientConfig,
+    extra: ExtraExtension, output: *usize) bool {
+    if (output == nil) { ret false; }
+    var required: usize = 0;
+    if (!add_size(?required, 9 + value.server_name.len) ||
+        !add_size(?required, 6 + value.group_len * 2) ||
+        !add_size(?required, 6 + value.signature_len * 2)) { ret false; }
+    var alpn: usize = 6;
+    var i: usize = 0;
+    for (i < value.alpn_len) {
+        if (!add_size(?alpn, 1 + value.alpn[i].len)) { ret false; }
+        i = i + 1;
+    }
+    if (!add_size(?required, alpn) || !add_size(?required, 7) ||
+        !add_size(?required, 10 + MAX_KEY_SHARE) ||
+        !add_size(?required, 262) || !add_size(?required, 6)) { ret false; }
+    if (extra.kind != 0 &&
+        !add_size(?required, 4 + extra.data.len)) { ret false; }
+    @output = required;
+    ret true;
+}
+
 fun client_flight_requirement(value: *config.ClientConfig,
     output: *usize) bool {
     if (output == nil) { ret false; }
@@ -710,7 +732,8 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         ret false;
     }
     if (value.entropy == nil ||
-        !value.entropy.initialized || value.server_name.data == nil ||
+        !value.entropy.initialized || value.entropy.fill_fn == nil ||
+        value.server_name.data == nil ||
         value.server_name.len == 0 || value.server_name.len > 253 ||
         value.trust == nil || value.trust.anchors == nil ||
         value.trust.len == 0 ||
@@ -801,8 +824,11 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
     if (!client_identity_valid(value)) { ret false; }
     var hello_required: usize = 0;
     var flight_required: usize = 0;
+    var extension_required: usize = 0;
     if (!client_hello_requirement(value, extra, ?hello_required) ||
         !client_flight_requirement(value, ?flight_required) ||
+        !client_extension_requirement(value, extra, ?extension_required) ||
+        extension_required > 65535 ||
         hello_required > value.limits.max_client_hello_bytes ||
         flight_required > value.limits.max_client_flight_bytes ||
         storage.hello_capacity < hello_required ||
@@ -1134,7 +1160,7 @@ fun decode_own_hello(client: *Client, output: *codec.ClientHello) error.Error {
     var message: handshake.Message;
     val parsed: handshake.Progress = handshake.parse(client.storage.hello,
         client.hello_len,
-        client.config.limits.max_peer_handshake_bytes - handshake.HEADER_SIZE,
+        client.config.limits.max_client_hello_bytes - handshake.HEADER_SIZE,
         ?message);
     if (parsed.status != handshake.COMPLETE || parsed.consumed != client.hello_len) {
         ret error.INTERNAL_ERROR;
@@ -2218,6 +2244,11 @@ var retry_hello: [4096]u8;
 var retry_certificates: [4]cert.Certificate;
 var retry_peer_parameters: [4096]u8;
 var production_input: [1048576]u8;
+var oversized_extension: [65500]u8;
+var oversized_input: [70000]u8;
+var oversized_output: [70000]u8;
+var oversized_hello: [70000]u8;
+var oversized_certificates: [4]cert.Certificate;
 var reject_input: [4096]u8;
 var reject_output: [4096]u8;
 var reject_hello: [4096]u8;
@@ -2335,6 +2366,41 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     bounded_configuration.limits.max_client_flight_bytes = exact_flight - 1;
     if (config_valid(?bounded_configuration, ?storage,
             ExtraExtension{}, 0)) { ret 70; }
+    bounded_configuration = configuration;
+    var missing_fill_entropy: secret.Entropy = entropy;
+    missing_fill_entropy.fill_fn = nil;
+    bounded_configuration.entropy = ?missing_fill_entropy;
+    if (config_valid(?bounded_configuration, ?storage,
+            ExtraExtension{}, 0)) { ret 71; }
+    var oversized_configuration: config.ClientConfig = configuration;
+    oversized_configuration.limits.max_peer_handshake_bytes = 70000;
+    oversized_configuration.limits.max_client_hello_bytes = 70000;
+    var oversized_storage: Storage = Storage{
+        input: ?oversized_input[0], input_capacity: 70000,
+        output: ?oversized_output[0], output_capacity: 70000,
+        hello: ?oversized_hello[0], hello_capacity: 70000,
+        certificates: ?oversized_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0,
+    };
+    val oversized_extra: ExtraExtension = ExtraExtension{kind: 0xffa5,
+        data: contracts.Bytes{data: ?oversized_extension[0], len: 65500}};
+    var oversized_client: Client;
+    if (init(?oversized_client, ?oversized_configuration,
+            oversized_storage, oversized_extra, 0) ||
+        oversized_client.state != 0) { ret 72; }
+    var local_bound_configuration: config.ClientConfig = configuration;
+    local_bound_configuration.limits.max_peer_handshake_bytes = 64;
+    var local_bound_client: Client;
+    if (!init(?local_bound_client, ?local_bound_configuration, storage,
+            ExtraExtension{}, 0) ||
+        start(?local_bound_client, 1787875200).status != OK ||
+        local_bound_client.hello_len <=
+            local_bound_configuration.limits.max_peer_handshake_bytes) {
+        ret 73;
+    }
+    var local_hello: codec.ClientHello;
+    if (decode_own_hello(?local_bound_client, ?local_hello) != error.OK ||
+        !destroy(?local_bound_client)) { ret 74; }
     var value: Client;
     reentry_client = ?value;
     reentry_rejections = 0;
