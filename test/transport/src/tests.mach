@@ -15,6 +15,7 @@ use std.sync.atomic;
 use std.sync.thread;
 use io_runtime: std.io.runtime;
 use io_error: std.io.error;
+use tls.engine;
 use tls.error;
 use tls.record;
 use tls.stream;
@@ -23,6 +24,7 @@ use tls.memory_range;
 use tls.client;
 use tls.config;
 use tls.cert;
+use tls.cert.credentials;
 use tls.tls13;
 use crypto.contracts;
 use crypto.secret;
@@ -482,8 +484,81 @@ fun test_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
-fun make_open_stream(value: *stream.Stream, adapter: *transport.Transport,
-    wire_input: *u8, wire_output: *u8) bool {
+var open_handshake_input: [4096]u8;
+var open_handshake_output: [4096]u8;
+var open_handshake_hello: [4096]u8;
+var open_certificates: [1]cert.Certificate;
+var open_entropy_counter: u8;
+var open_anchor: cert.Certificate;
+var open_trust: cert.TrustStore;
+var open_protocols: [1]config.ProtocolName;
+var open_versions: [1]u16;
+var open_suites: [1]tls13.CipherSuite;
+var open_groups: [1]tls13.NamedGroup;
+var open_signatures: [1]tls13.SignatureScheme;
+var open_entropy: secret.Entropy;
+var open_configuration: config.ClientConfig;
+var open_identity: credentials.Identity;
+var core_a: client.Client;
+var core_b: client.Client;
+var core_c: client.Client;
+var core_d: client.Client;
+
+# an open stream still borrows a real engine, so ownership queries stay honest
+fun make_test_client(core: *client.Client) bool {
+    client.destroy(core);
+    open_entropy_counter = 1;
+    open_entropy = secret.Entropy{context: ?open_entropy_counter,
+        secret_context: nil, fill_fn: test_entropy, initialized: true};
+    open_anchor = cert.Certificate{der: "x"::*u8, der_len: 1};
+    open_trust = cert.TrustStore{anchors: ?open_anchor, len: 1};
+    open_protocols[0] = config.ProtocolName{data: "h2"::*u8, len: 2};
+    open_versions[0] = tls13.VERSION;
+    open_suites[0] = tls13.AES_128_GCM_SHA256;
+    open_groups[0] = tls13.X25519;
+    open_signatures[0] = tls13.ED25519;
+    open_configuration = config.ClientConfig{};
+    open_configuration.client_identity = nil;
+    open_configuration.server_name = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15};
+    open_configuration.alpn = ?open_protocols[0];
+    open_configuration.alpn_len = 1;
+    open_configuration.trust = ?open_trust;
+    open_configuration.versions = ?open_versions[0];
+    open_configuration.version_len = 1;
+    open_configuration.suites = ?open_suites[0];
+    open_configuration.suite_len = 1;
+    open_configuration.groups = ?open_groups[0];
+    open_configuration.group_len = 1;
+    open_configuration.signatures = ?open_signatures[0];
+    open_configuration.signature_len = 1;
+    open_configuration.entropy = ?open_entropy;
+    open_configuration.entropy_context_size = 1;
+    open_configuration.limits = config.production_limits();
+    open_configuration.limits.max_peer_handshake_bytes = 4096;
+    var storage: client.Storage;
+    storage.input = ?open_handshake_input[0];
+    storage.input_capacity = 4096;
+    storage.output = ?open_handshake_output[0];
+    storage.output_capacity = 4096;
+    storage.hello = ?open_handshake_hello[0];
+    storage.hello_capacity = 4096;
+    storage.certificates = ?open_certificates[0];
+    storage.certificate_capacity = 1;
+    storage.peer_parameters = nil;
+    storage.peer_parameters_capacity = 0;
+    var extra: client.ExtraExtension;
+    extra.kind = 0;
+    extra.data.data = nil;
+    extra.data.len = 0;
+    ret client.init(core, ?open_configuration, storage, extra, 0);
+}
+
+fun make_open_stream(value: *stream.Stream, core: *client.Client,
+    adapter: *transport.Transport, wire_input: *u8, wire_output: *u8) bool {
+    if (!make_test_client(core)) { ret false; }
+    value.role = engine.CLIENT;
+    value.client = core;
     value.transport = adapter;
     value.state = stream.OPEN;
     value.handshake_complete = true;
@@ -521,7 +596,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
         !cancel.cancel(?scope)) { ret 2; }
     var secure: stream.Stream;
-    if (!make_open_stream(?secure, ?adapter, ?terminal_wire_input[0],
+    if (!make_open_stream(?secure, ?core_a, ?adapter, ?terminal_wire_input[0],
             ?terminal_wire_output[0])) { ret 3; }
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope,
@@ -534,7 +609,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
 
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 6; }
     var failed: stream.Stream;
-    if (!make_open_stream(?failed, ?adapter, ?terminal_wire_input[0],
+    if (!make_open_stream(?failed, ?core_b, ?adapter, ?terminal_wire_input[0],
             ?terminal_wire_output[0])) { ret 7; }
     state.fail_during_submit = true;
     reentrant_secure = ?failed;
@@ -542,18 +617,20 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
             transport.Token{index: 30, generation: 2},
             ?application[0], 3, 0)) { ret 8; }
     val synchronous: transport.Snapshot = transport.snapshot(?failed.operation);
-    if (synchronous.state != transport.OPERATION_TERMINAL ||
-        synchronous.terminal_error != error.INTERNAL_ERROR ||
-        failed.state != stream.FAILED || !state.reentry_rejected ||
-        !state.snapshot_rejected ||
-        atomic.load(?failed.transition_owner) != 0 ||
-        !stream.destroy_operation(?failed) ||
-        !stream.destroy(?failed) || !cancel.destroy(?scope)) { ret 9; }
+    if (synchronous.state != transport.OPERATION_TERMINAL) { ret 90; }
+    if (synchronous.terminal_error != error.INTERNAL_ERROR) { ret 91; }
+    if (failed.state != stream.FAILED) { ret 92; }
+    if (!state.reentry_rejected) { ret 93; }
+    if (!state.snapshot_rejected) { ret 94; }
+    if (atomic.load(?failed.transition_owner) != 0) { ret 95; }
+    if (!stream.destroy_operation(?failed)) { ret 96; }
+    if (!stream.destroy(?failed)) { ret 97; }
+    if (!cancel.destroy(?scope)) { ret 98; }
     reentrant_secure = nil;
 
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 11; }
     var concurrent: stream.Stream;
-    if (!make_open_stream(?concurrent, ?adapter, ?terminal_wire_input[0],
+    if (!make_open_stream(?concurrent, ?core_c, ?adapter, ?terminal_wire_input[0],
             ?terminal_wire_output[0])) { ret 12; }
     state.fail_during_submit = false;
     state.concurrent_reentry = true;
@@ -577,7 +654,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
 
     if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 16; }
     var drifted: stream.Stream;
-    if (!make_open_stream(?drifted, ?adapter, ?terminal_wire_input[0],
+    if (!make_open_stream(?drifted, ?core_d, ?adapter, ?terminal_wire_input[0],
             ?terminal_wire_output[0])) { ret 17; }
     state.mutate_descriptor = true;
     state.descriptor = drifted.transport;
@@ -635,12 +712,13 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     configuration.entropy_context_size = 1;
     configuration.limits = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
-    var storage: stream.Storage;
-    storage.handshake = client.Storage{
+    val core_storage: client.Storage = client.Storage{
         input: ?connect_handshake_input[0], input_capacity: 4096,
         output: ?connect_handshake_output[0], output_capacity: 4096,
         hello: ?connect_handshake_hello[0], hello_capacity: 4096,
-        certificates: ?connect_certificates[0], certificate_capacity: 1};
+        certificates: ?connect_certificates[0], certificate_capacity: 1,
+        peer_parameters: nil, peer_parameters_capacity: 0};
+    var storage: stream.Storage;
     storage.wire_input = ?connect_wire_input[0];
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?connect_wire_output[0];
@@ -652,22 +730,25 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     var exact: stream.Stream;
     exact_storage.wire_input_capacity = 85;
     exact_storage.wire_output_capacity = 150;
-    if (!stream.init(?exact, ?exact_configuration, exact_storage, ?adapter,
+    if (!client.init(?core_a, ?exact_configuration, core_storage,
             client.ExtraExtension{}, 0) ||
+        !stream.init_client(?exact, ?core_a, exact_storage, ?adapter) ||
         exact.plaintext != ?exact.secret[0] ||
         exact.content != ?exact.secret[64] ||
         exact.scratch != ?exact.secret[192] ||
-        !stream.destroy(?exact)) { ret 39; }
+        !stream.destroy(?exact) || !client.destroy(?core_a)) { ret 39; }
     var secure: stream.Stream;
-    var extra: client.ExtraExtension;
-    if (stream.connect(?secure, ?configuration, storage, ?adapter, extra, 0,
+    if (!client.init(?core_b, ?configuration, core_storage,
+            client.ExtraExtension{}, 0)) { ret 30; }
+    if (stream.connect(?secure, ?core_b, storage, ?adapter,
             ?scope, transport.Token{index: 31, generation: 0}, 0, 0)) { ret 31; }
     if (secure.state != stream.DESTROYED) { ret 32; }
     if (secure.transport != nil) { ret 33; }
-    if (secure.storage.handshake.input != nil) { ret 34; }
+    if (secure.storage.wire_input != nil || secure.client != nil ||
+        secure.role != 0) { ret 34; }
     if (secure.plaintext != nil || secure.content != nil ||
         secure.scratch != nil) { ret 35; }
-    if (secure.client.config != nil) { ret 36; }
+    if (!client.destroy(?core_b)) { ret 36; }
     if (stream.destroy(?secure)) { ret 37; }
     if (!cancel.destroy(?scope) ||
         is_err[bool, io_error.Error](io_runtime.close(?runtime)) ||
@@ -684,7 +765,7 @@ test "stream: partial write retains application ownership until the whole record
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
-    if (!make_open_stream(?secure, ?adapter, ?write_wire_input[0],
+    if (!make_open_stream(?secure, ?core_a, ?adapter, ?write_wire_input[0],
         ?write_wire_output[0])) { ret 3; }
     var application: [5]u8 = [5]u8{'h', 'e', 'l', 'l', 'o'};
     if (!stream.write(?secure, ?scope, transport.Token{index: 10, generation: 1},
@@ -719,7 +800,7 @@ test "stream: write cancellation requires an abortive lower close" {
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
-    if (!make_open_stream(?secure, ?adapter, ?cancel_wire_input[0],
+    if (!make_open_stream(?secure, ?core_a, ?adapter, ?cancel_wire_input[0],
         ?cancel_wire_output[0])) { ret 3; }
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope, transport.Token{index: 11, generation: 1},
@@ -755,7 +836,7 @@ test "stream: zero-byte write completion makes sequence reuse impossible" {
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
-    if (!make_open_stream(?secure, ?adapter, ?zero_wire_input[0],
+    if (!make_open_stream(?secure, ?core_a, ?adapter, ?zero_wire_input[0],
         ?zero_wire_output[0])) { ret 3; }
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope,
@@ -794,7 +875,7 @@ test "stream: close notify is fully written before write-side shutdown" {
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
-    if (!make_open_stream(?secure, ?adapter, ?close_wire_input[0],
+    if (!make_open_stream(?secure, ?core_a, ?adapter, ?close_wire_input[0],
         ?close_wire_output[0]) || !stream.half_close(?secure, ?scope,
         transport.Token{index: 12, generation: 1}, 47)) { ret 3; }
     if (transport_state.writes != 1 || transport_state.closes != 0) { ret 4; }
@@ -837,7 +918,7 @@ test "stream: encrypted records retain read ownership at every byte boundary" {
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
-    if (!make_open_stream(?secure, ?adapter, ?fragment_wire_input[0],
+    if (!make_open_stream(?secure, ?core_a, ?adapter, ?fragment_wire_input[0],
         ?fragment_wire_output[0])) { ret 3; }
 
     var key: [16]^u8;
@@ -900,3 +981,5 @@ test "stream: encrypted records retain read ownership at every byte boundary" {
         is_err[bool, io_error.Error](io_runtime.destroy(?runtime))) { ret 15; }
     ret 0;
 }
+
+

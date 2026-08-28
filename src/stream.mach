@@ -13,7 +13,9 @@ use std.types.size.usize;
 use tls.cert;
 use tls.client;
 use tls.config;
+use tls.engine;
 use tls.error;
+use tls.server;
 use tls.memory_range;
 use tls.record;
 use tls.tls13;
@@ -38,8 +40,8 @@ val CONTROL_HALF_CLOSE: Control = 2;
 val CONTROL_CLOSE: Control = 3;
 val CONTROL_ABORT: Control = 4;
 
+# handshake storage belongs to the engine; the stream owns only the wire
 pub rec Storage {
-    handshake: client.Storage;
     wire_input: *u8;
     wire_input_capacity: usize;
     wire_output: *u8;
@@ -56,11 +58,14 @@ pub rec Snapshot {
 }
 
 # one operation is active at a time, while read and write cipher sequences remain independent
+# exactly one engine pointer is set; both are caller-owned and outlive the stream
 pub rec Stream {
     transport: *transport.Transport;
     lower_transport: transport.Transport;
     storage: Storage;
-    client: client.Client;
+    role: engine.Role;
+    client: *client.Client;
+    server: *server.Server;
     operation: transport.Operation;
     read_cipher: record.Cipher;
     write_cipher: record.Cipher;
@@ -78,7 +83,7 @@ pub rec Stream {
     plaintext_len: usize;
     plaintext_read: usize;
     application_chunk: usize;
-    core_event: client.Event;
+    core_event: engine.Event;
     core_event_sending: bool;
     core_event_alert: bool;
     core_event_offset: usize;
@@ -96,7 +101,7 @@ pub rec Stream {
     send_record_plaintext: usize;
 }
 
-val REGION_COUNT: usize = 7;
+val REGION_COUNT: usize = 2;
 
 rec Region {
     data: *u8;
@@ -105,21 +110,8 @@ rec Region {
 
 fun storage_regions(value: *Storage, output: *Region) bool {
     if (value == nil || output == nil) { ret false; }
-    var certificate_bytes: usize = 0;
-    if (!memory_range.scaled(value.handshake.certificate_capacity,
-            $size_of(cert.Certificate), ?certificate_bytes)) { ret false; }
-    output[0] = Region{data: value.handshake.input,
-        len: value.handshake.input_capacity};
-    output[1] = Region{data: value.handshake.output,
-        len: value.handshake.output_capacity};
-    output[2] = Region{data: value.handshake.hello,
-        len: value.handshake.hello_capacity};
-    output[3] = Region{data: value.handshake.certificates::*u8,
-        len: certificate_bytes};
-    output[4] = Region{data: value.handshake.peer_parameters,
-        len: value.handshake.peer_parameters_capacity};
-    output[5] = Region{data: value.wire_input, len: value.wire_input_capacity};
-    output[6] = Region{data: value.wire_output, len: value.wire_output_capacity};
+    output[0] = Region{data: value.wire_input, len: value.wire_input_capacity};
+    output[1] = Region{data: value.wire_output, len: value.wire_output_capacity};
     var i: usize = 0;
     for (i < REGION_COUNT) {
         if (!memory_range.valid(output[i].data, output[i].len)) { ret false; }
@@ -199,12 +191,121 @@ fun storage_valid(value: *Storage, lower: *transport.Transport) bool {
     ret true;
 }
 
+fun engine_bound(stream: *Stream) bool {
+    if (stream == nil) { ret false; }
+    if (stream.role == engine.CLIENT) { ret stream.client != nil; }
+    if (stream.role == engine.SERVER) { ret stream.server != nil; }
+    ret false;
+}
+
+fun engine_aliases_borrowed(stream: *Stream, data: *u8, len: usize) bool {
+    if (!engine_bound(stream)) { ret true; }
+    if (stream.role == engine.CLIENT) {
+        ret client.aliases_borrowed(stream.client, data, len);
+    }
+    ret server.aliases_borrowed(stream.server, data, len);
+}
+
+fun engine_aliases_configuration(stream: *Stream, data: *u8, len: usize) bool {
+    if (!engine_bound(stream)) { ret true; }
+    if (stream.role == engine.CLIENT) {
+        ret client.aliases_configuration(stream.client, data, len);
+    }
+    ret server.aliases_configuration(stream.server, data, len);
+}
+
+fun engine_start(stream: *Stream, verification_time: i64) engine.Result {
+    if (!engine_bound(stream)) {
+        ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (stream.role == engine.CLIENT) {
+        ret client.start(stream.client, verification_time);
+    }
+    ret server.start(stream.server, verification_time);
+}
+
+fun engine_ingest(stream: *Stream, level: engine.Level, data: *u8,
+    length: usize) engine.Result {
+    if (!engine_bound(stream)) {
+        ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (stream.role == engine.CLIENT) {
+        ret client.ingest(stream.client, level, data, length);
+    }
+    ret server.ingest(stream.server, level, data, length);
+}
+
+fun engine_poll(stream: *Stream) engine.Result {
+    if (!engine_bound(stream)) {
+        ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (stream.role == engine.CLIENT) { ret client.poll(stream.client); }
+    ret server.poll(stream.server);
+}
+
+fun engine_next_event(stream: *Stream, output: *engine.Event) bool {
+    if (!engine_bound(stream)) { ret false; }
+    if (stream.role == engine.CLIENT) {
+        ret client.next_event(stream.client, output);
+    }
+    ret server.next_event(stream.server, output);
+}
+
+fun engine_complete_event(stream: *Stream, token: u64, accepted: bool) bool {
+    if (!engine_bound(stream)) { ret false; }
+    if (stream.role == engine.CLIENT) {
+        ret client.complete_event(stream.client, token, accepted);
+    }
+    ret server.complete_event(stream.server, token, accepted);
+}
+
+fun engine_traffic_keys(stream: *Stream, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (!engine_bound(stream)) { ret false; }
+    if (stream.role == engine.CLIENT) {
+        ret client.traffic_keys(stream.client, event, key, iv, key_length);
+    }
+    ret server.traffic_keys(stream.server, event, key, iv, key_length);
+}
+
+fun engine_snapshot(stream: *Stream) engine.Snapshot {
+    if (!engine_bound(stream)) { ret engine.empty_snapshot(); }
+    if (stream.role == engine.CLIENT) { ret client.snapshot(stream.client); }
+    ret server.snapshot(stream.server);
+}
+
+fun engine_receive_limit(stream: *Stream) usize {
+    if (!engine_bound(stream)) { ret 0; }
+    if (stream.role == engine.CLIENT) {
+        ret client.receive_record_limit(stream.client);
+    }
+    ret server.receive_record_limit(stream.server);
+}
+
+fun engine_send_limit(stream: *Stream) usize {
+    if (!engine_bound(stream)) { ret 0; }
+    if (stream.role == engine.CLIENT) {
+        ret client.send_record_limit(stream.client);
+    }
+    ret server.send_record_limit(stream.server);
+}
+
+fun engine_event_active(stream: *Stream) bool {
+    if (!engine_bound(stream)) { ret false; }
+    ret engine_snapshot(stream).event_active;
+}
+
+fun engine_failure(stream: *Stream) error.Error {
+    if (!engine_bound(stream)) { ret error.INTERNAL_ERROR; }
+    ret engine_snapshot(stream).error;
+}
+
 fun externally_owned(stream: *Stream, data: *u8, len: usize) bool {
     if (stream_owner_data(stream) == nil || !memory_range.valid(data, len) ||
         stream_owner_overlaps(stream, data, len) ||
         storage_overlaps(?stream.storage, data, len)) { ret false; }
-    ret stream.client.config == nil ||
-        !client.aliases_borrowed(?stream.client, data, len);
+    ret !engine_aliases_borrowed(stream, data, len);
 }
 
 fun operation_inputs_valid(stream: *Stream, scope: *cancel.Scope,
@@ -219,19 +320,19 @@ fun operation_inputs_valid(stream: *Stream, scope: *cancel.Scope,
 
 fun configuration_disjoint(stream: *Stream, storage: *Storage,
     lower: *transport.Transport) bool {
-    if (client.aliases_configuration(?stream.client, stream_owner_data(stream),
+    if (engine_aliases_configuration(stream, stream_owner_data(stream),
             $size_of(Stream)) ||
-        client.aliases_borrowed(?stream.client, lower::*u8,
+        engine_aliases_borrowed(stream, lower::*u8,
             $size_of(transport.Transport)) ||
-        client.aliases_borrowed(?stream.client, lower.context::*u8,
+        engine_aliases_borrowed(stream, lower.context::*u8,
             lower.context_size) ||
-        client.aliases_borrowed(?stream.client, lower.runtime::*u8,
+        engine_aliases_borrowed(stream, lower.runtime::*u8,
             $size_of(runtime.Runtime))) { ret false; }
     var regions: [REGION_COUNT]Region;
     if (!storage_regions(storage, ?regions[0])) { ret false; }
     var i: usize = 0;
     for (i < REGION_COUNT) {
-        if (client.aliases_borrowed(?stream.client, regions[i].data,
+        if (engine_aliases_borrowed(stream, regions[i].data,
                 regions[i].len)) { ret false; }
         i = i + 1;
     }
@@ -244,44 +345,28 @@ fun algorithm(suite: tls13.CipherSuite) record.Aead {
     ret record.chacha20_poly1305();
 }
 
-fun secret_for(stream: *Stream, event: *client.Event) *key_schedule.Secret {
-    if (event.level == client.HANDSHAKE && event.direction == client.SEND) {
-        ret ?stream.client.schedule.client_handshake_traffic;
-    }
-    if (event.level == client.HANDSHAKE && event.direction == client.RECEIVE) {
-        ret ?stream.client.schedule.server_handshake_traffic;
-    }
-    if (event.level == client.APPLICATION && event.direction == client.SEND) {
-        ret ?stream.client.schedule.client_application_traffic;
-    }
-    if (event.level == client.APPLICATION && event.direction == client.RECEIVE) {
-        ret ?stream.client.schedule.server_application_traffic;
-    }
-    ret nil;
-}
-
-fun install_secret(stream: *Stream, event: *client.Event) bool {
-    val traffic: *key_schedule.Secret = secret_for(stream, event);
-    if (traffic == nil) { ret false; }
-    var key: [32]^u8;
-    var iv: [12]u8;
-    val key_length: usize = key_schedule.key_size(stream.client.suite);
-    if (key_schedule.traffic_key(?stream.client.schedule, traffic,
-            contracts.SecretBuffer{data: ?key[0], capacity: 32}) != error.OK ||
-        key_schedule.traffic_iv(?stream.client.schedule, traffic,
-            contracts.Buffer{data: ?iv[0], capacity: 12}) != error.OK) {
-        ct.zeroize(?key[0], 32);
+fun install_secret(stream: *Stream, event: *engine.Event) bool {
+    var key: [engine.MAX_TRAFFIC_KEY]^u8;
+    var iv: [engine.TRAFFIC_IV_SIZE]u8;
+    var key_length: usize = 0;
+    if (!engine_traffic_keys(stream, event,
+            contracts.SecretBuffer{data: ?key[0],
+                capacity: engine.MAX_TRAFFIC_KEY},
+            contracts.Buffer{data: ?iv[0], capacity: engine.TRAFFIC_IV_SIZE},
+            ?key_length) || key_length == 0 ||
+        key_length > engine.MAX_TRAFFIC_KEY) {
+        ct.zeroize(?key[0], engine.MAX_TRAFFIC_KEY);
         ret false;
     }
     var target: *record.Cipher = ?stream.read_cipher;
-    if (event.direction == client.SEND) { target = ?stream.write_cipher; }
+    if (event.direction == engine.SEND) { target = ?stream.write_cipher; }
     val installed: bool = record.install(target, record.TLS13,
-        algorithm(stream.client.suite),
+        algorithm(event.suite),
         contracts.SecretBytes{data: ?key[0], len: key_length},
-        contracts.Bytes{data: ?iv[0], len: 12});
-    ct.zeroize(?key[0], 32);
+        contracts.Bytes{data: ?iv[0], len: engine.TRAFFIC_IV_SIZE});
+    ct.zeroize(?key[0], engine.MAX_TRAFFIC_KEY);
     var i: usize = 0;
-    for (i < 12) { iv[i] = 0; i = i + 1; }
+    for (i < engine.TRAFFIC_IV_SIZE) { iv[i] = 0; i = i + 1; }
     ret installed;
 }
 
@@ -297,7 +382,7 @@ fun terminal_requires_failure(stream: *Stream,
 
 fun clear_core_event(stream: *Stream) {
     if (stream.core_event_sending) {
-        client.complete_event(?stream.client, stream.core_event.token, false);
+        engine_complete_event(stream, stream.core_event.token, false);
     }
     stream.core_event_sending = false;
     stream.core_event_alert = false;
@@ -423,7 +508,7 @@ fun prepare_alert(stream: *Stream, description: record.AlertDescription) bool {
 }
 
 fun prepare_core_fragment(stream: *Stream) bool {
-    if (!stream.core_event_sending || stream.core_event.kind != client.CRYPTO ||
+    if (!stream.core_event_sending || stream.core_event.kind != engine.CRYPTO ||
         stream.core_event_offset >= stream.core_event.data.len) { ret false; }
     var amount: usize = stream.core_event.data.len - stream.core_event_offset;
     val send_limit: usize = stream.send_record_plaintext;
@@ -436,31 +521,31 @@ fun prepare_core_fragment(stream: *Stream) bool {
 }
 
 fun handle_core_event(stream: *Stream) bool {
-    var event: client.Event;
-    if (!client.next_event(?stream.client, ?event)) { ret false; }
-    stream.send_record_plaintext = client.send_record_limit(?stream.client);
-    if (event.kind == client.CRYPTO) {
+    var event: engine.Event;
+    if (!engine_next_event(stream, ?event)) { ret false; }
+    stream.send_record_plaintext = engine_send_limit(stream);
+    if (event.kind == engine.CRYPTO) {
         stream.core_event = event;
         stream.core_event_sending = true;
         stream.core_event_offset = 0;
         stream.core_event_chunk = 0;
         if (!prepare_core_fragment(stream)) {
-            client.complete_event(?stream.client, event.token, false);
+            engine_complete_event(stream, event.token, false);
             stream.core_event_sending = false;
             finish(stream, error.INTERNAL_ERROR, false);
             ret true;
         }
         ret true;
     }
-    if (event.kind == client.TRAFFIC_SECRET && !install_secret(stream, ?event)) {
-        client.complete_event(?stream.client, event.token, false);
+    if (event.kind == engine.TRAFFIC_SECRET && !install_secret(stream, ?event)) {
+        engine_complete_event(stream, event.token, false);
         finish(stream, error.INTERNAL_ERROR, false);
         ret true;
     }
-    if (event.kind == client.ALERT) {
+    if (event.kind == engine.ALERT) {
         if (!prepare_alert(stream, event.alert)) {
-            client.complete_event(?stream.client, event.token, false);
-            finish(stream, stream.client.failure, false);
+            engine_complete_event(stream, event.token, false);
+            finish(stream, engine_failure(stream), false);
             ret true;
         }
         stream.core_event = event;
@@ -468,11 +553,11 @@ fun handle_core_event(stream: *Stream) bool {
         stream.core_event_alert = true;
         ret true;
     }
-    if (event.kind == client.HANDSHAKE_COMPLETE) {
+    if (event.kind == engine.HANDSHAKE_COMPLETE) {
         stream.handshake_complete = true;
         stream.state = OPEN;
     }
-    client.complete_event(?stream.client, event.token, true);
+    engine_complete_event(stream, event.token, true);
     ret true;
 }
 
@@ -641,17 +726,17 @@ fun process_record(stream: *Stream) bool {
             }
             content = ?revealed[0];
         }
-        var level: client.Level = client.INITIAL;
-        if (protected) { level = client.HANDSHAKE; }
-        if (stream.handshake_complete) { level = client.APPLICATION; }
-        val progress: client.Result = client.ingest(?stream.client, level,
+        var level: engine.Level = engine.INITIAL;
+        if (protected) { level = engine.HANDSHAKE; }
+        if (stream.handshake_complete) { level = engine.APPLICATION; }
+        val progress: engine.Result = engine_ingest(stream, level,
             content, content_length);
         if (protected) {
             ct.zeroize(stream.plaintext, content_length);
             var i: usize = 0;
             for (i < content_length) { revealed[i] = 0; i = i + 1; }
         }
-        if (progress.status == client.FAILED) {
+        if (progress.status == engine.FAILED) {
             if (!handle_core_event(stream)) { finish(stream, progress.error, false); }
         }
         ret true;
@@ -699,8 +784,8 @@ fun drive_handshake(stream: *Stream) bool {
             advanced = true;
         }
         if (!advanced) {
-            val polled: client.Result = client.poll(?stream.client);
-            if (polled.status == client.FAILED) {
+            val polled: engine.Result = engine_poll(stream);
+            if (polled.status == engine.FAILED) {
                 if (handle_core_event(stream)) { advanced = true; }
                 or { ret finish(stream, polled.error, false); }
             }
@@ -834,32 +919,47 @@ fun operation_available(stream: *Stream) bool {
     ret state == 0 || state == transport.OPERATION_DESTROYED;
 }
 
-fun init_inner(stream: *Stream, configuration: *config.ClientConfig,
-    storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
-    peer_extension: u16) bool {
+fun init_inner(stream: *Stream, role: engine.Role,
+    client_engine: *client.Client, server_engine: *server.Server,
+    storage: Storage, lower: *transport.Transport) bool {
     if (stream_owner_data(stream) == nil ||
         (stream.state != 0 && stream.state != DESTROYED) ||
         (stream.operation.state != 0 &&
         stream.operation.state != transport.OPERATION_DESTROYED) ||
         stream.read_cipher.installed || stream.write_cipher.installed ||
+        (role != engine.CLIENT && role != engine.SERVER) ||
+        (role == engine.CLIENT && (client_engine == nil ||
+            server_engine != nil)) ||
+        (role == engine.SERVER && (server_engine == nil ||
+            client_engine != nil)) ||
         !storage_valid(?storage, lower) ||
         storage_overlaps(?storage, stream_owner_data(stream), $size_of(Stream)) ||
         transport.state_overlaps(lower, stream_owner_data(stream),
-            $size_of(Stream)) ||
-        !client.init(?stream.client, configuration,
-            storage.handshake, extra, peer_extension)) { ret false; }
-    if (!configuration_disjoint(stream, ?storage, lower)) {
-        client.destroy(?stream.client);
+            $size_of(Stream))) { ret false; }
+    stream.role = role;
+    stream.client = client_engine;
+    stream.server = server_engine;
+    val ready: engine.Snapshot = engine_snapshot(stream);
+    if (!engine_bound(stream) || ready.role != role || ready.destroyed ||
+        ready.status != engine.MORE || ready.event_active ||
+        ready.output_pending || !configuration_disjoint(stream, ?storage, lower)) {
+        stream.role = 0;
+        stream.client = nil;
+        stream.server = nil;
         ret false;
     }
-    stream.receive_record_plaintext = client.receive_record_limit(?stream.client);
-    stream.send_record_plaintext = client.send_record_limit(?stream.client);
+    stream.receive_record_plaintext = engine_receive_limit(stream);
+    stream.send_record_plaintext = engine_send_limit(stream);
     if (secret_storage_required(stream) > SECRET_STORAGE_BYTES ||
+        stream.receive_record_plaintext == 0 ||
+        stream.send_record_plaintext == 0 ||
         storage.wire_input_capacity <
             wire_storage_required(stream.receive_record_plaintext) ||
         storage.wire_output_capacity <
             wire_storage_required(stream.send_record_plaintext)) {
-        client.destroy(?stream.client);
+        stream.role = 0;
+        stream.client = nil;
+        stream.server = nil;
         ret false;
     }
     stream.lower_transport = lower[0];
@@ -891,12 +991,19 @@ fun init_inner(stream: *Stream, configuration: *config.ClientConfig,
     ret true;
 }
 
-pub fun init(stream: *Stream, configuration: *config.ClientConfig,
-    storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
-    peer_extension: u16) bool {
+# the caller initializes and owns the engine; the stream only borrows it
+pub fun init_client(stream: *Stream, core: *client.Client, storage: Storage,
+    lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
-    ret leave(stream, init_inner(stream, configuration, storage, lower, extra,
-        peer_extension));
+    ret leave(stream, init_inner(stream, engine.CLIENT, core, nil, storage,
+        lower));
+}
+
+pub fun init_server(stream: *Stream, core: *server.Server, storage: Storage,
+    lower: *transport.Transport) bool {
+    if (!enter(stream)) { ret false; }
+    ret leave(stream, init_inner(stream, engine.SERVER, nil, core, storage,
+        lower));
 }
 
 fun handshake_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
@@ -907,8 +1014,8 @@ fun handshake_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Toke
         token, transport.HANDSHAKE, scope, nil, 0, context)) { ret false; }
     stream.state = HANDSHAKING;
     if (settle_terminal(stream)) { ret true; }
-    val started: client.Result = client.start(?stream.client, verification_time);
-    if (started.status != client.OK) {
+    val started: engine.Result = engine_start(stream, verification_time);
+    if (started.status != engine.OK) {
         finish(stream, started.error, false);
         ret true;
     }
@@ -1021,12 +1128,11 @@ pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
         record.CLOSE_NOTIFY, context));
 }
 
-pub fun connect(stream: *Stream, configuration: *config.ClientConfig,
-    storage: Storage, lower: *transport.Transport, extra: client.ExtraExtension,
-    peer_extension: u16, scope: *cancel.Scope, token: transport.Token,
+pub fun connect(stream: *Stream, core: *client.Client, storage: Storage,
+    lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
-    if (!init_inner(stream, configuration, storage, lower, extra, peer_extension)) {
+    if (!init_inner(stream, engine.CLIENT, core, nil, storage, lower)) {
         ret leave(stream, false);
     }
     if (!handshake_inner(stream, scope, token, verification_time, context)) {
@@ -1036,9 +1142,23 @@ pub fun connect(stream: *Stream, configuration: *config.ClientConfig,
     ret leave(stream, true);
 }
 
-pub fun negotiated(stream: *Stream) client.Snapshot {
-    if (!enter(stream)) { ret client.Snapshot{}; }
-    val value: client.Snapshot = client.snapshot(?stream.client);
+pub fun serve(stream: *Stream, core: *server.Server, storage: Storage,
+    lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
+    verification_time: i64, context: usize) bool {
+    if (!enter(stream)) { ret false; }
+    if (!init_inner(stream, engine.SERVER, nil, core, storage, lower)) {
+        ret leave(stream, false);
+    }
+    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+        destroy_inner(stream);
+        ret leave(stream, false);
+    }
+    ret leave(stream, true);
+}
+
+pub fun negotiated(stream: *Stream) engine.Snapshot {
+    if (!enter(stream)) { ret engine.empty_snapshot(); }
+    val value: engine.Snapshot = engine_snapshot(stream);
     leave(stream, true);
     ret value;
 }
@@ -1066,15 +1186,15 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
             stream.wire_output_sent = 0;
             if (stream.core_event_sending) {
                 val alert_event: bool = stream.core_event_alert;
-                if (stream.core_event.kind == client.CRYPTO) {
+                if (stream.core_event.kind == engine.CRYPTO) {
                     stream.core_event_offset = stream.core_event_offset +
                         stream.core_event_chunk;
                     stream.core_event_chunk = 0;
                 }
-                if (stream.core_event.kind == client.CRYPTO &&
+                if (stream.core_event.kind == engine.CRYPTO &&
                     stream.core_event_offset < stream.core_event.data.len) {
                     if (!prepare_core_fragment(stream)) {
-                        client.complete_event(?stream.client,
+                        engine_complete_event(stream,
                             stream.core_event.token, false);
                         stream.core_event_sending = false;
                         finish(stream, error.INTERNAL_ERROR, false);
@@ -1084,9 +1204,9 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
                     stream.core_event_sending = false;
                     stream.core_event_alert = false;
                     stream.core_event_offset = 0;
-                    client.complete_event(?stream.client, stream.core_event.token, true);
+                    engine_complete_event(stream, stream.core_event.token, true);
                     if (alert_event) {
-                        finish(stream, stream.client.failure, false);
+                        finish(stream, engine_failure(stream), false);
                         ret true;
                     }
                 }
@@ -1158,7 +1278,7 @@ pub fun destroy_operation(stream: *Stream) bool {
 
 fun destroy_inner(stream: *Stream) bool {
     if (stream.state == DESTROYED ||
-        stream.client.event_active) { ret false; }
+        engine_event_active(stream)) { ret false; }
     val operation_state: transport.OperationState =
         transport.snapshot(?stream.operation).state;
     if (operation_state == transport.OPERATION_OPEN ||
@@ -1169,20 +1289,12 @@ fun destroy_inner(stream: *Stream) bool {
         !transport.destroy_operation(?stream.operation)) { ret false; }
     record.destroy(?stream.read_cipher);
     record.destroy(?stream.write_cipher);
-    if (!client.destroy(?stream.client)) { ret false; }
     ct.zeroize(?stream.secret[0], SECRET_STORAGE_BYTES);
+    stream.role = 0;
+    stream.client = nil;
+    stream.server = nil;
     stream.transport = nil;
     stream.lower_transport = transport.Transport{};
-    stream.storage.handshake.input = nil;
-    stream.storage.handshake.input_capacity = 0;
-    stream.storage.handshake.output = nil;
-    stream.storage.handshake.output_capacity = 0;
-    stream.storage.handshake.hello = nil;
-    stream.storage.handshake.hello_capacity = 0;
-    stream.storage.handshake.certificates = nil;
-    stream.storage.handshake.certificate_capacity = 0;
-    stream.storage.handshake.peer_parameters = nil;
-    stream.storage.handshake.peer_parameters_capacity = 0;
     stream.storage.wire_input = nil;
     stream.storage.wire_input_capacity = 0;
     stream.storage.wire_output = nil;
@@ -1199,31 +1311,25 @@ pub fun destroy(stream: *Stream) bool {
     ret leave(stream, destroy_inner(stream));
 }
 
-test "stream: storage bounds reject record truncation surfaces" {
+test "stream: an unbound or uninitialized engine cannot take ownership" {
     var stream: Stream;
-    var configuration: config.ClientConfig;
     var storage: Storage;
     var lower: transport.Transport;
-    var extra: client.ExtraExtension;
-    if (init(?stream, ?configuration, storage, ?lower, extra, 0)) { ret 1; }
+    var core: client.Client;
+    var listener: server.Server;
+    if (init_client(?stream, nil, storage, ?lower) ||
+        init_server(?stream, nil, storage, ?lower)) { ret 1; }
+    if (init_client(?stream, ?core, storage, ?lower)) { ret 2; }
+    if (init_server(?stream, ?listener, storage, ?lower)) { ret 3; }
+    if (engine_bound(?stream) || stream.role != 0) { ret 4; }
     ret 0;
 }
 
-var range_handshake_input: [256]u8;
-var range_handshake_output: [256]u8;
-var range_handshake_hello: [256]u8;
-var range_certificates: [1]cert.Certificate;
 var range_wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var range_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 
 test "stream: storage regions are representable and independently owned" {
     var storage: Storage;
-    storage.handshake = client.Storage{input: ?range_handshake_input[0],
-        input_capacity: 256, output: ?range_handshake_output[0],
-        output_capacity: 256, hello: ?range_handshake_hello[0],
-        hello_capacity: 256, certificates: ?range_certificates[0],
-        certificate_capacity: 1, peer_parameters: nil,
-        peer_parameters_capacity: 0};
     storage.wire_input = ?range_wire_input[0];
     storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output = ?range_wire_output[0];

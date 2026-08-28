@@ -1,0 +1,2295 @@
+# incremental tls 1.3 server handshake and credential selection
+
+use crypto.contracts;
+use crypto.encoding.keys;
+use crypto.group.p256;
+use crypto.group.x25519;
+use crypto.secret;
+use crypto.signature;
+use std.crypto.ct;
+use std.sync.atomic;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.cert;
+use tls.cert.credentials;
+use tls.cert.name;
+use tls.cert.verify;
+use tls.cert.x509;
+use tls.config;
+use tls.engine;
+use tls.error;
+use tls.handshake;
+use tls.handshake.codec;
+use tls.handshake.extensions;
+use tls.handshake.negotiation;
+use tls.memory_range;
+use tls.record;
+use tls.tls13;
+use tls.tls13.key_schedule;
+use tls.tls13.transcript;
+
+pub val MAX_KEY_SHARE: usize = 65;
+pub val MAX_PUBLIC_KEY: usize = 512;
+pub val MAX_SIGNATURE: usize = 512;
+pub val MAX_SIGNED_CONTEXT: usize = 64 + 34 + 1 + 48;
+pub val MAX_QUEUED_EVENTS: usize = 12;
+pub val QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
+
+val EXPECT_CLIENT_HELLO: u8 = 1;
+val EXPECT_RETRY_HELLO: u8 = 2;
+val EXPECT_CLIENT_CERTIFICATE: u8 = 3;
+val EXPECT_CLIENT_CERTIFICATE_VERIFY: u8 = 4;
+val EXPECT_CLIENT_FINISHED: u8 = 5;
+val ESTABLISHED: u8 = 6;
+val CLOSING: u8 = 7;
+val TERMINAL: u8 = 8;
+val DESTROYED: u8 = 9;
+
+val SEND_HANDSHAKE: usize = 0;
+val RECEIVE_HANDSHAKE: usize = 1;
+val SEND_APPLICATION: usize = 2;
+val RECEIVE_APPLICATION: usize = 3;
+val NO_SECRET: usize = 4;
+
+pub rec ExtraExtension {
+    kind: u16;
+    data: contracts.Bytes;
+}
+
+# all variable-size handshake storage is caller-owned and remains borrowed
+pub rec Storage {
+    input: *u8;
+    input_capacity: usize;
+    output: *u8;
+    output_capacity: usize;
+    hello: *u8;
+    hello_capacity: usize;
+    certificates: *cert.Certificate;
+    certificate_capacity: usize;
+    peer_parameters: *u8;
+    peer_parameters_capacity: usize;
+}
+
+# an ordered queue keeps interleaved flights and secret transitions explicit
+rec Pending {
+    kind: engine.EventKind;
+    level: engine.Level;
+    direction: engine.Direction;
+    secret_index: usize;
+    offset: usize;
+    length: usize;
+    disposition: u8;
+    alert: record.AlertDescription;
+}
+
+pub rec Server {
+    config: *config.ServerConfig;
+    configuration: config.ServerConfig;
+    entropy: secret.Entropy;
+    storage: Storage;
+    extra: ExtraExtension;
+    peer_extension: u16;
+    transcript: transcript.Transcript;
+    schedule: key_schedule.Schedule;
+    lease: credentials.Lease;
+    lease_held: bool;
+    state: u8;
+    failure: error.Error;
+    pending_alert: record.AlertDescription;
+    suite: tls13.CipherSuite;
+    group: tls13.NamedGroup;
+    signature_scheme: tls13.SignatureScheme;
+    verification_time: i64;
+    input_len: usize;
+    input_read: usize;
+    hello_len: usize;
+    output_used: usize;
+    random: [32]u8;
+    session_id: [32]u8;
+    session_id_len: usize;
+    private_key: [32]^u8;
+    public_key: [MAX_KEY_SHARE]u8;
+    public_key_len: usize;
+    retry_count: u8;
+    client_auth_required: bool;
+    client_trust: *cert.TrustStore;
+    client_certificate_seen: bool;
+    client_certificate_empty: bool;
+    authenticated: bool;
+    early_data_offered: bool;
+    peer_leaf: x509.Certificate;
+    peer_key_first: [MAX_PUBLIC_KEY]u8;
+    peer_key_second: [MAX_PUBLIC_KEY]u8;
+    selected_alpn_storage: [255]u8;
+    selected_alpn: contracts.Bytes;
+    server_name_storage: [253]u8;
+    server_name: contracts.Bytes;
+    peer_parameters: contracts.Bytes;
+    queue: [MAX_QUEUED_EVENTS]Pending;
+    queue_head: usize;
+    queue_len: usize;
+    event_active: bool;
+    event_generation: u64;
+    active_event: engine.Event;
+    secret_generation: [4]u64;
+    transition_owner: i64;
+    receive_record_plaintext: usize;
+    send_record_plaintext: usize;
+    record_limit_seen: bool;
+}
+
+fun result(status: engine.Status, failure: error.Error, consumed: usize,
+    required: usize) engine.Result {
+    ret engine.result(status, failure, consumed, required);
+}
+
+fun write_u16(data: *u8, offset: usize, value: u16) {
+    data[offset] = (value >> 8)::u8;
+    data[offset + 1] = value::u8;
+}
+
+fun write_u24(data: *u8, offset: usize, value: usize) {
+    data[offset] = (value >> 16)::u8;
+    data[offset + 1] = (value >> 8)::u8;
+    data[offset + 2] = value::u8;
+}
+
+fun read_u16(data: *u8, offset: usize) u16 {
+    ret (data[offset]::u16 << 8) | data[offset + 1]::u16;
+}
+
+fun copy_bytes(destination: *u8, source: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        destination[i] = source[i];
+        i = i + 1;
+    }
+}
+
+fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
+    if (first.len != second.len || (first.len != 0 &&
+        (first.data == nil || second.data == nil))) { ret false; }
+    var i: usize = 0;
+    for (i < first.len) {
+        if (first.data[i] != second.data[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun add_size(total: *usize, amount: usize) bool {
+    if (total == nil || amount > ~(0::usize) - @total) { ret false; }
+    @total = @total + amount;
+    ret true;
+}
+
+fun server_owner_valid(server: *Server) bool {
+    if (server == nil) { ret false; }
+    val address: usize = (?server.state)::usize;
+    val offset: usize = $offset_of(Server, state);
+    ret address >= offset && memory_range.valid((address - offset)::*u8,
+        $size_of(Server));
+}
+
+fun server_owner_data(server: *Server) *u8 {
+    if (!server_owner_valid(server)) { ret nil; }
+    ret ((?server.state)::usize - $offset_of(Server, state))::*u8;
+}
+
+fun server_owner_overlaps(server: *Server, data: *u8, len: usize) bool {
+    if (!server_owner_valid(server) || !memory_range.valid(data, len)) {
+        ret true;
+    }
+    ret memory_range.overlap(server_owner_data(server), $size_of(Server), data, len);
+}
+
+fun enter(server: *Server) bool {
+    if (!server_owner_valid(server)) { ret false; }
+    val owner: i64 = os.thread_current_id();
+    if (owner <= 0) { ret false; }
+    for (true) {
+        var expected: i64 = atomic.load(?server.transition_owner);
+        if (expected == owner) { ret false; }
+        if (expected == 0 && atomic.cas(?server.transition_owner,
+                ?expected, owner)) { ret true; }
+        if (expected != 0) {
+            os.thread_wait(?server.transition_owner, expected);
+        }
+    }
+}
+
+fun leave(server: *Server) {
+    atomic.store(?server.transition_owner, 0);
+    os.thread_wake(?server.transition_owner);
+}
+
+# the configuration is secret-welded through its credential store, so its own
+# bytes are reached from the address of a public field
+fun config_data(value: *config.ServerConfig) *u8 {
+    if (value == nil) { ret nil; }
+    val address: usize = (?value.alpn_len)::usize;
+    val offset: usize = $offset_of(config.ServerConfig, alpn_len);
+    if (address < offset) { ret nil; }
+    ret (address - offset)::*u8;
+}
+
+fun config_descriptor_valid(value: *config.ServerConfig) bool {
+    if (value == nil || !memory_range.valid(config_data(value),
+            $size_of(config.ServerConfig))) { ret false; }
+    val entropy: *secret.Entropy = value.entropy;
+    if (entropy == nil || !memory_range.valid((?entropy.context)::*u8,
+            $size_of(secret.Entropy))) { ret false; }
+    if (value.credentials == nil ||
+        !memory_range.valid((?value.credentials.lock)::*u8,
+            $size_of(credentials.Store))) { ret false; }
+    ret true;
+}
+
+fun descriptor_overlaps(value: *config.ServerConfig, data: *u8,
+    len: usize) bool {
+    if (!config_descriptor_valid(value) || !memory_range.valid(data, len)) {
+        ret true;
+    }
+    ret memory_range.overlap(data, len, config_data(value),
+            $size_of(config.ServerConfig)) ||
+        memory_range.overlap(data, len, (?value.entropy.context)::*u8,
+            $size_of(secret.Entropy)) ||
+        memory_range.overlap(data, len, (?value.credentials.lock)::*u8,
+            $size_of(credentials.Store));
+}
+
+fun config_borrows_valid(value: *config.ServerConfig,
+    extra: ExtraExtension) bool {
+    if (!config_descriptor_valid(value)) { ret false; }
+    var alpn_bytes: usize = 0;
+    var version_bytes: usize = 0;
+    var suite_bytes: usize = 0;
+    var group_bytes: usize = 0;
+    var signature_bytes: usize = 0;
+    if (!memory_range.scaled(value.alpn_len, $size_of(config.ProtocolName),
+            ?alpn_bytes) ||
+        !memory_range.scaled(value.version_len, $size_of(u16), ?version_bytes) ||
+        !memory_range.scaled(value.suite_len, $size_of(tls13.CipherSuite),
+            ?suite_bytes) ||
+        !memory_range.scaled(value.group_len, $size_of(tls13.NamedGroup),
+            ?group_bytes) ||
+        !memory_range.scaled(value.signature_len,
+            $size_of(tls13.SignatureScheme), ?signature_bytes) ||
+        !memory_range.valid(value.alpn::*u8, alpn_bytes) ||
+        !memory_range.valid(value.versions::*u8, version_bytes) ||
+        !memory_range.valid(value.suites::*u8, suite_bytes) ||
+        !memory_range.valid(value.groups::*u8, group_bytes) ||
+        !memory_range.valid(value.signatures::*u8, signature_bytes) ||
+        !memory_range.valid(value.entropy.context::*u8,
+            value.entropy_context_size) ||
+        !memory_range.valid(extra.data.data, extra.data.len)) { ret false; }
+    var i: usize = 0;
+    for (i < value.alpn_len) {
+        if (!memory_range.valid(value.alpn[i].data, value.alpn[i].len)) {
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun storage_ranges_valid(storage: *Storage) bool {
+    if (storage == nil) { ret false; }
+    var certificate_bytes: usize = 0;
+    if (!memory_range.scaled(storage.certificate_capacity,
+            $size_of(cert.Certificate), ?certificate_bytes) ||
+        !memory_range.valid(storage.input, storage.input_capacity) ||
+        !memory_range.valid(storage.output, storage.output_capacity) ||
+        !memory_range.valid(storage.hello, storage.hello_capacity) ||
+        !memory_range.valid(storage.certificates::*u8, certificate_bytes) ||
+        !memory_range.valid(storage.peer_parameters,
+            storage.peer_parameters_capacity)) { ret false; }
+    if (memory_range.overlap(storage.input, storage.input_capacity,
+            storage.output, storage.output_capacity) ||
+        memory_range.overlap(storage.input, storage.input_capacity,
+            storage.hello, storage.hello_capacity) ||
+        memory_range.overlap(storage.input, storage.input_capacity,
+            storage.certificates::*u8, certificate_bytes) ||
+        memory_range.overlap(storage.input, storage.input_capacity,
+            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        memory_range.overlap(storage.output, storage.output_capacity,
+            storage.hello, storage.hello_capacity) ||
+        memory_range.overlap(storage.output, storage.output_capacity,
+            storage.certificates::*u8, certificate_bytes) ||
+        memory_range.overlap(storage.output, storage.output_capacity,
+            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        memory_range.overlap(storage.hello, storage.hello_capacity,
+            storage.certificates::*u8, certificate_bytes) ||
+        memory_range.overlap(storage.hello, storage.hello_capacity,
+            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        memory_range.overlap(storage.certificates::*u8, certificate_bytes,
+            storage.peer_parameters, storage.peer_parameters_capacity)) {
+        ret false;
+    }
+    ret true;
+}
+
+fun storage_overlaps(storage: *Storage, data: *u8, len: usize) bool {
+    if (storage == nil || !memory_range.valid(data, len)) { ret true; }
+    var certificate_bytes: usize = 0;
+    if (!memory_range.scaled(storage.certificate_capacity,
+            $size_of(cert.Certificate), ?certificate_bytes)) { ret true; }
+    ret memory_range.overlap(data, len, storage.input, storage.input_capacity) ||
+        memory_range.overlap(data, len, storage.output, storage.output_capacity) ||
+        memory_range.overlap(data, len, storage.hello, storage.hello_capacity) ||
+        memory_range.overlap(data, len, storage.certificates::*u8,
+            certificate_bytes) ||
+        memory_range.overlap(data, len, storage.peer_parameters,
+            storage.peer_parameters_capacity);
+}
+
+fun borrowed_overlaps(value: *config.ServerConfig, extra: ExtraExtension,
+    data: *u8, len: usize, include_local_descriptors: bool,
+    include_callback_context: bool) bool {
+    if (!config_descriptor_valid(value) || !memory_range.valid(data, len)) {
+        ret true;
+    }
+    if (include_local_descriptors && descriptor_overlaps(value, data, len)) {
+        ret true;
+    }
+    if (include_callback_context &&
+        memory_range.overlap(data, len, value.entropy.context::*u8,
+            value.entropy_context_size)) { ret true; }
+    var alpn_bytes: usize = 0;
+    var version_bytes: usize = 0;
+    var suite_bytes: usize = 0;
+    var group_bytes: usize = 0;
+    var signature_bytes: usize = 0;
+    if (!memory_range.scaled(value.alpn_len, $size_of(config.ProtocolName),
+            ?alpn_bytes) ||
+        !memory_range.scaled(value.version_len, $size_of(u16), ?version_bytes) ||
+        !memory_range.scaled(value.suite_len, $size_of(tls13.CipherSuite),
+            ?suite_bytes) ||
+        !memory_range.scaled(value.group_len, $size_of(tls13.NamedGroup),
+            ?group_bytes) ||
+        !memory_range.scaled(value.signature_len,
+            $size_of(tls13.SignatureScheme), ?signature_bytes)) { ret true; }
+    if (memory_range.overlap(data, len, value.alpn::*u8, alpn_bytes) ||
+        memory_range.overlap(data, len, value.versions::*u8, version_bytes) ||
+        memory_range.overlap(data, len, value.suites::*u8, suite_bytes) ||
+        memory_range.overlap(data, len, value.groups::*u8, group_bytes) ||
+        memory_range.overlap(data, len, value.signatures::*u8,
+            signature_bytes) ||
+        memory_range.overlap(data, len, extra.data.data, extra.data.len)) {
+        ret true;
+    }
+    var i: usize = 0;
+    for (i < value.alpn_len) {
+        if (memory_range.overlap(data, len, value.alpn[i].data,
+                value.alpn[i].len)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+pub fun aliases_borrowed(server: *Server, data: *u8, len: usize) bool {
+    if (!server_owner_valid(server) ||
+        atomic.load(?server.transition_owner) != 0 ||
+        server.config != ?server.configuration ||
+        server.state < EXPECT_CLIENT_HELLO || server.state >= DESTROYED) {
+        ret true;
+    }
+    ret server_owner_overlaps(server, data, len) ||
+        storage_overlaps(?server.storage, data, len) ||
+        borrowed_overlaps(server.config, server.extra, data, len, true, true);
+}
+
+pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
+    if (!server_owner_valid(server) ||
+        atomic.load(?server.transition_owner) != 0 ||
+        server.config != ?server.configuration ||
+        server.state < EXPECT_CLIENT_HELLO || server.state >= DESTROYED) {
+        ret true;
+    }
+    ret borrowed_overlaps(server.config, server.extra, data, len, false, true);
+}
+
+fun config_sources_disjoint(server: *Server, value: *config.ServerConfig,
+    storage: *Storage, extra: ExtraExtension) bool {
+    if (!server_owner_valid(server) ||
+        borrowed_overlaps(value, extra, server_owner_data(server),
+            $size_of(Server), true, true) ||
+        storage_overlaps(storage, server_owner_data(server), $size_of(Server))) {
+        ret false;
+    }
+    if (value.entropy_context_size != 0 &&
+        (server_owner_overlaps(server, value.entropy.context::*u8,
+            value.entropy_context_size) ||
+        storage_overlaps(storage, value.entropy.context::*u8,
+            value.entropy_context_size) ||
+        borrowed_overlaps(value, extra, value.entropy.context::*u8,
+            value.entropy_context_size, true, false))) { ret false; }
+    var certificate_bytes: usize = 0;
+    if (!memory_range.scaled(storage.certificate_capacity,
+            $size_of(cert.Certificate), ?certificate_bytes) ||
+        borrowed_overlaps(value, extra, storage.input, storage.input_capacity,
+            true, true) ||
+        borrowed_overlaps(value, extra, storage.output, storage.output_capacity,
+            true, true) ||
+        borrowed_overlaps(value, extra, storage.hello, storage.hello_capacity,
+            true, true) ||
+        borrowed_overlaps(value, extra, storage.certificates::*u8,
+            certificate_bytes, true, true) ||
+        borrowed_overlaps(value, extra, storage.peer_parameters,
+            storage.peer_parameters_capacity, true, true)) { ret false; }
+    ret true;
+}
+
+fun reserved_server_extension(kind: u16) bool {
+    ret kind == extensions.SERVER_NAME || kind == extensions.SUPPORTED_GROUPS ||
+        kind == extensions.APPLICATION_LAYER_PROTOCOL ||
+        kind == extensions.SUPPORTED_VERSIONS || kind == extensions.KEY_SHARE ||
+        kind == extensions.COOKIE || kind == extensions.RECORD_SIZE_LIMIT ||
+        kind == extensions.EARLY_DATA;
+}
+
+# exact server hello output, including the retry form
+fun server_hello_requirement(output: *usize) bool {
+    if (output == nil) { ret false; }
+    var required: usize = 4 + 2 + 32 + 1 + 32 + 2 + 1 + 2;
+    if (!add_size(?required, 6) ||
+        !add_size(?required, 8 + MAX_KEY_SHARE)) { ret false; }
+    @output = required;
+    ret true;
+}
+
+# exact encrypted-extensions through finished output for the widest credential
+fun server_flight_requirement(value: *config.ServerConfig,
+    extra: ExtraExtension, output: *usize) bool {
+    if (output == nil) { ret false; }
+    var encrypted: usize = 6;
+    if (!add_size(?encrypted, 4)) { ret false; }
+    var alpn: usize = 4 + 2 + 1;
+    var i: usize = 0;
+    var widest: usize = 0;
+    for (i < value.alpn_len) {
+        if (value.alpn[i].len > widest) { widest = value.alpn[i].len; }
+        i = i + 1;
+    }
+    if (!add_size(?alpn, widest) || !add_size(?encrypted, alpn) ||
+        !add_size(?encrypted, 6)) { ret false; }
+    if (extra.kind != 0 && !add_size(?encrypted, 4 + extra.data.len)) {
+        ret false;
+    }
+    var required: usize = encrypted;
+    if (!add_size(?required, 4 + 1 + 2 + 4 + 2 + value.signature_len * 2) ||
+        !add_size(?required, 8 + value.limits.max_chain_bytes +
+            5 * verify.MAX_CHAIN_DEPTH) ||
+        !add_size(?required, 8 + MAX_SIGNATURE) ||
+        !add_size(?required, 4 + 48)) { ret false; }
+    @output = required;
+    ret true;
+}
+
+fun entropy_equal(first: secret.Entropy, second: secret.Entropy) bool {
+    ret first.context == second.context &&
+        first.secret_context == second.secret_context &&
+        first.fill_fn == second.fill_fn && first.initialized == second.initialized;
+}
+
+fun limits_equal(first: config.Limits, second: config.Limits) bool {
+    ret first.max_receive_record_plaintext ==
+            second.max_receive_record_plaintext &&
+        first.max_send_record_plaintext == second.max_send_record_plaintext &&
+        first.max_peer_handshake_bytes == second.max_peer_handshake_bytes &&
+        first.max_client_hello_bytes == second.max_client_hello_bytes &&
+        first.max_client_flight_bytes == second.max_client_flight_bytes &&
+        first.max_server_flight_bytes == second.max_server_flight_bytes &&
+        first.max_chain_bytes == second.max_chain_bytes &&
+        first.max_ticket_bytes == second.max_ticket_bytes;
+}
+
+fun configuration_equal(first: config.ServerConfig,
+    second: config.ServerConfig) bool {
+    ret first.credentials == second.credentials &&
+        first.alpn == second.alpn && first.alpn_len == second.alpn_len &&
+        first.require_alpn == second.require_alpn &&
+        first.versions == second.versions &&
+        first.version_len == second.version_len &&
+        first.suites == second.suites && first.suite_len == second.suite_len &&
+        first.groups == second.groups && first.group_len == second.group_len &&
+        first.signatures == second.signatures &&
+        first.signature_len == second.signature_len &&
+        first.entropy == second.entropy &&
+        first.entropy_context_size == second.entropy_context_size &&
+        limits_equal(first.limits, second.limits);
+}
+
+fun server_storage_equal(first: Storage, second: Storage) bool {
+    ret first.input == second.input &&
+        first.input_capacity == second.input_capacity &&
+        first.output == second.output &&
+        first.output_capacity == second.output_capacity &&
+        first.hello == second.hello &&
+        first.hello_capacity == second.hello_capacity &&
+        first.certificates == second.certificates &&
+        first.certificate_capacity == second.certificate_capacity &&
+        first.peer_parameters == second.peer_parameters &&
+        first.peer_parameters_capacity == second.peer_parameters_capacity;
+}
+
+# an entropy callback cannot reenter, redirect, or observe handshake state
+fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
+    val owner: i64 = os.thread_current_id();
+    if (!server_owner_valid(server) || owner <= 0 ||
+        atomic.load(?server.transition_owner) != owner ||
+        server.config != ?server.configuration || !server.entropy.initialized ||
+        server.entropy.fill_fn == nil || output == nil) { ret false; }
+    val descriptor: secret.Entropy = server.entropy;
+    val expected_config: *config.ServerConfig = server.config;
+    val expected_configuration: config.ServerConfig = server.configuration;
+    val expected_storage: Storage = server.storage;
+    val expected_extra: ExtraExtension = server.extra;
+    val expected_peer_extension: u16 = server.peer_extension;
+    val expected_state: u8 = server.state;
+    val expected_failure: error.Error = server.failure;
+    val expected_pending_alert: record.AlertDescription = server.pending_alert;
+    val expected_input_len: usize = server.input_len;
+    val expected_input_read: usize = server.input_read;
+    val expected_hello_len: usize = server.hello_len;
+    val expected_output_used: usize = server.output_used;
+    val expected_queue_head: usize = server.queue_head;
+    val expected_queue_len: usize = server.queue_len;
+    val expected_event_active: bool = server.event_active;
+    val expected_receive_limit: usize = server.receive_record_plaintext;
+    val expected_send_limit: usize = server.send_record_plaintext;
+    val status: i64 = descriptor.fill_fn(descriptor.context,
+        descriptor.secret_context, output, length);
+    val valid: bool = atomic.load(?server.transition_owner) == owner &&
+        server.config == expected_config && server.state == expected_state &&
+        entropy_equal(server.entropy, descriptor) &&
+        configuration_equal(server.configuration, expected_configuration) &&
+        server_storage_equal(server.storage, expected_storage) &&
+        server.extra.kind == expected_extra.kind &&
+        server.extra.data.data == expected_extra.data.data &&
+        server.extra.data.len == expected_extra.data.len &&
+        server.peer_extension == expected_peer_extension &&
+        server.failure == expected_failure &&
+        server.pending_alert == expected_pending_alert &&
+        server.input_len == expected_input_len &&
+        server.input_read == expected_input_read &&
+        server.hello_len == expected_hello_len &&
+        server.output_used == expected_output_used &&
+        server.queue_head == expected_queue_head &&
+        server.queue_len == expected_queue_len &&
+        server.event_active == expected_event_active &&
+        server.receive_record_plaintext == expected_receive_limit &&
+        server.send_record_plaintext == expected_send_limit;
+    if (!valid || status != 0) {
+        ct.zeroize(output, length);
+        server.entropy = descriptor;
+        server.configuration = expected_configuration;
+        server.configuration.entropy = ?server.entropy;
+        server.config = ?server.configuration;
+        server.storage = expected_storage;
+        server.extra = expected_extra;
+        server.peer_extension = expected_peer_extension;
+        server.state = expected_state;
+        server.failure = expected_failure;
+        server.pending_alert = expected_pending_alert;
+        server.input_len = expected_input_len;
+        server.input_read = expected_input_read;
+        server.hello_len = expected_hello_len;
+        server.output_used = expected_output_used;
+        server.queue_head = expected_queue_head;
+        server.queue_len = expected_queue_len;
+        server.event_active = expected_event_active;
+        server.receive_record_plaintext = expected_receive_limit;
+        server.send_record_plaintext = expected_send_limit;
+        ret false;
+    }
+    ret true;
+}
+
+fun fill_public(server: *Server, output: *u8, length: usize) bool {
+    if (!server_owner_valid(server) || server.config == nil || output == nil) {
+        ret false;
+    }
+    var temporary: [MAX_KEY_SHARE]^u8;
+    if (length > MAX_KEY_SHARE || !entropy_fill(server, ?temporary[0], length)) {
+        ct.zeroize(?temporary[0], MAX_KEY_SHARE);
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < length) { output[i] = temporary[i]:^; i = i + 1; }
+    ct.zeroize(?temporary[0], MAX_KEY_SHARE);
+    ret true;
+}
+
+fun fill_private(server: *Server) bool {
+    if (!server_owner_valid(server) || server.config == nil) { ret false; }
+    ct.zeroize(?server.private_key[0], 32);
+    ret entropy_fill(server, ?server.private_key[0], 32);
+}
+
+pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
+    extra: ExtraExtension, peer_extension: u16) bool {
+    if (!config_descriptor_valid(value) || storage == nil ||
+        !storage_ranges_valid(storage) || !config_borrows_valid(value, extra)) {
+        ret false;
+    }
+    if (value.entropy == nil || !value.entropy.initialized ||
+        value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
+        ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
+        !memory_range.valid(value.entropy.context::*u8,
+            value.entropy_context_size) ||
+        value.credentials == nil || !value.credentials.initialized ||
+        (value.alpn_len != 0 && value.alpn == nil) || value.alpn_len > 255 ||
+        (value.require_alpn && value.alpn_len == 0) ||
+        value.versions == nil || value.version_len != 1 ||
+        value.suites == nil || value.suite_len == 0 || value.groups == nil ||
+        value.group_len == 0 || value.signatures == nil ||
+        value.signature_len == 0 || value.suite_len > 3 ||
+        value.group_len > 2 || value.signature_len > 4 ||
+        value.limits.max_receive_record_plaintext < 63 ||
+        value.limits.max_receive_record_plaintext > record.MAX_PLAINTEXT ||
+        value.limits.max_send_record_plaintext == 0 ||
+        value.limits.max_send_record_plaintext > record.MAX_PLAINTEXT ||
+        value.limits.max_peer_handshake_bytes <= handshake.HEADER_SIZE ||
+        value.limits.max_peer_handshake_bytes >
+            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        value.limits.max_client_hello_bytes <= handshake.HEADER_SIZE ||
+        value.limits.max_client_hello_bytes >
+            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        value.limits.max_client_flight_bytes <= handshake.HEADER_SIZE ||
+        value.limits.max_client_flight_bytes >
+            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        value.limits.max_server_flight_bytes <= handshake.HEADER_SIZE ||
+        value.limits.max_server_flight_bytes >
+            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        value.limits.max_chain_bytes == 0 ||
+        value.limits.max_chain_bytes > handshake.MAX_BODY_SIZE ||
+        value.limits.max_ticket_bytes == 0 ||
+        value.limits.max_ticket_bytes > handshake.MAX_BODY_SIZE ||
+        storage.input == nil || storage.output == nil || storage.hello == nil ||
+        storage.certificates == nil || storage.certificate_capacity == 0 ||
+        storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
+        storage.input_capacity < value.limits.max_peer_handshake_bytes ||
+        storage.hello_capacity < value.limits.max_client_hello_bytes ||
+        (extra.data.len != 0 && extra.data.data == nil) ||
+        extra.data.len > 65531 || (extra.kind == 0 && extra.data.len != 0) ||
+        (extra.kind != 0 && reserved_server_extension(extra.kind)) ||
+        (peer_extension != 0 &&
+        (storage.peer_parameters == nil ||
+            storage.peer_parameters_capacity == 0))) { ret false; }
+    if (value.versions[0] != tls13.VERSION) { ret false; }
+    var i: usize = 0;
+    for (i < value.suite_len) {
+        if (!codec.valid_cipher_suite(value.suites[i])) { ret false; }
+        var prior: usize = 0;
+        for (prior < i) {
+            if (value.suites[prior] == value.suites[i]) { ret false; }
+            prior = prior + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < value.group_len) {
+        if (!codec.valid_named_group(value.groups[i])) { ret false; }
+        var prior: usize = 0;
+        for (prior < i) {
+            if (value.groups[prior] == value.groups[i]) { ret false; }
+            prior = prior + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < value.signature_len) {
+        if (!codec.valid_signature_scheme(value.signatures[i])) { ret false; }
+        var prior: usize = 0;
+        for (prior < i) {
+            if (value.signatures[prior] == value.signatures[i]) { ret false; }
+            prior = prior + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < value.alpn_len) {
+        if (value.alpn[i].data == nil || value.alpn[i].len == 0 ||
+            value.alpn[i].len > 255) { ret false; }
+        var prior: usize = 0;
+        for (prior < i) {
+            if (bytes_equal(contracts.Bytes{data: value.alpn[prior].data,
+                    len: value.alpn[prior].len},
+                contracts.Bytes{data: value.alpn[i].data,
+                    len: value.alpn[i].len})) { ret false; }
+            prior = prior + 1;
+        }
+        i = i + 1;
+    }
+    var hello_required: usize = 0;
+    var flight_required: usize = 0;
+    if (!server_hello_requirement(?hello_required) ||
+        !server_flight_requirement(value, extra, ?flight_required) ||
+        flight_required > value.limits.max_server_flight_bytes ||
+        hello_required > storage.output_capacity ||
+        flight_required > storage.output_capacity - hello_required) {
+        ret false;
+    }
+    ret true;
+}
+
+fun init_inner(server: *Server, configuration: *config.ServerConfig,
+    storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
+    if (!server_owner_valid(server) ||
+        (server.state != 0 && server.state != DESTROYED) ||
+        !config_valid(configuration, ?storage, extra, peer_extension) ||
+        !config_sources_disjoint(server, configuration, ?storage, extra)) {
+        ret false;
+    }
+    server.configuration = configuration[0];
+    server.entropy = configuration.entropy[0];
+    server.configuration.entropy = ?server.entropy;
+    server.config = ?server.configuration;
+    server.storage = storage;
+    server.extra = extra;
+    server.peer_extension = peer_extension;
+    server.transcript = transcript.empty();
+    server.lease = credentials.empty_lease();
+    server.lease_held = false;
+    server.state = EXPECT_CLIENT_HELLO;
+    server.failure = error.OK;
+    server.pending_alert = record.NO_ALERT;
+    server.suite = 0;
+    server.group = 0;
+    server.signature_scheme = 0;
+    server.input_len = 0;
+    server.input_read = 0;
+    server.hello_len = 0;
+    server.output_used = 0;
+    server.session_id_len = 0;
+    server.public_key_len = 0;
+    server.retry_count = 0;
+    server.client_auth_required = false;
+    server.client_trust = nil;
+    server.client_certificate_seen = false;
+    server.client_certificate_empty = false;
+    server.authenticated = false;
+    server.early_data_offered = false;
+    server.peer_leaf = x509.Certificate{};
+    server.selected_alpn.data = nil;
+    server.selected_alpn.len = 0;
+    server.server_name.data = nil;
+    server.server_name.len = 0;
+    server.peer_parameters.data = nil;
+    server.peer_parameters.len = 0;
+    server.queue_head = 0;
+    server.queue_len = 0;
+    server.event_active = false;
+    server.receive_record_plaintext =
+        server.config.limits.max_receive_record_plaintext;
+    server.send_record_plaintext = server.config.limits.max_send_record_plaintext;
+    server.record_limit_seen = false;
+    server.event_generation = engine.next_generation(server.event_generation);
+    ct.zeroize(?server.private_key[0], 32);
+    ret true;
+}
+
+pub fun init(server: *Server, configuration: *config.ServerConfig,
+    storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
+    if (!enter(server)) { ret false; }
+    val initialized: bool = init_inner(server, configuration, storage, extra,
+        peer_extension);
+    leave(server);
+    ret initialized;
+}
+
+fun queue_clear(server: *Server) {
+    server.queue_head = 0;
+    server.queue_len = 0;
+}
+
+fun queue_push(server: *Server, item: Pending) bool {
+    if (server.queue_len >= MAX_QUEUED_EVENTS) { ret false; }
+    server.queue[server.queue_len] = item;
+    server.queue_len = server.queue_len + 1;
+    ret true;
+}
+
+fun queue_crypto(server: *Server, level: engine.Level, offset: usize,
+    length: usize) bool {
+    ret queue_push(server, Pending{kind: engine.CRYPTO, level: level,
+        direction: engine.SEND, secret_index: NO_SECRET, offset: offset,
+        length: length, disposition: 0, alert: record.NO_ALERT});
+}
+
+fun queue_secret(server: *Server, level: engine.Level,
+    direction: engine.Direction, secret_index: usize) bool {
+    ret queue_push(server, Pending{kind: engine.TRAFFIC_SECRET, level: level,
+        direction: direction, secret_index: secret_index, offset: 0, length: 0,
+        disposition: 0, alert: record.NO_ALERT});
+}
+
+fun queue_simple(server: *Server, kind: engine.EventKind, level: engine.Level,
+    disposition: u8) bool {
+    ret queue_push(server, Pending{kind: kind, level: level, direction: 0,
+        secret_index: NO_SECRET, offset: 0, length: 0, disposition: disposition,
+        alert: record.NO_ALERT});
+}
+
+fun pending(server: *Server) bool {
+    ret server.queue_head < server.queue_len;
+}
+
+fun release_lease(server: *Server) {
+    if (server.lease_held) {
+        credentials.release(?server.lease);
+        server.lease_held = false;
+    }
+    server.lease = credentials.empty_lease();
+}
+
+fun fail(server: *Server, failure: error.Error,
+    alert: record.AlertDescription) engine.Result {
+    if (server != nil && server.state != DESTROYED) {
+        server.failure = failure;
+        server.pending_alert = alert;
+        queue_clear(server);
+        server.output_used = 0;
+        if (alert != record.NO_ALERT) {
+            queue_push(server, Pending{kind: engine.ALERT, level: 0,
+                direction: 0, secret_index: NO_SECRET, offset: 0, length: 0,
+                disposition: 0, alert: alert});
+        }
+        server.state = TERMINAL;
+    }
+    ret result(engine.FAILED, failure, 0, 0);
+}
+
+fun start_inner(server: *Server, verification_time: i64) engine.Result {
+    if (!server_owner_valid(server) || server.config == nil ||
+        server.state != EXPECT_CLIENT_HELLO || server.hello_len != 0 ||
+        pending(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    server.verification_time = verification_time;
+    if (!fill_public(server, ?server.random[0], 32)) {
+        ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+    }
+    var i: usize = 0;
+    var matches_retry: bool = true;
+    for (i < 32) {
+        if (server.random[i] != codec.HELLO_RETRY_RANDOM[i]) {
+            matches_retry = false;
+        }
+        i = i + 1;
+    }
+    if (matches_retry) {
+        ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+    }
+    ret result(engine.OK, error.OK, 0, handshake.HEADER_SIZE);
+}
+
+pub fun start(server: *Server, verification_time: i64) engine.Result {
+    if (!enter(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    val started: engine.Result = start_inner(server, verification_time);
+    leave(server);
+    ret started;
+}
+
+fun put_extension(output: *u8, offset: usize, kind: u16,
+    body: contracts.Bytes) usize {
+    write_u16(output, offset, kind);
+    write_u16(output, offset + 2, body.len::u16);
+    if (body.len != 0) { copy_bytes(?output[offset + 4], body.data, body.len); }
+    ret offset + 4 + body.len;
+}
+
+fun derive_share(server: *Server, group: tls13.NamedGroup) bool {
+    var attempt: usize = 0;
+    for (attempt < 16) {
+        if (!fill_private(server)) { ret false; }
+        var operation: contracts.Operation;
+        if (group == tls13.X25519) {
+            operation = x25519.derive_public(
+                contracts.SecretBytes{data: ?server.private_key[0], len: 32},
+                contracts.Buffer{data: ?server.public_key[0],
+                    capacity: MAX_KEY_SHARE});
+        } or {
+            operation = p256.derive_public(
+                contracts.SecretBytes{data: ?server.private_key[0], len: 32},
+                contracts.Buffer{data: ?server.public_key[0],
+                    capacity: MAX_KEY_SHARE});
+        }
+        if (operation.error == contracts.OK) {
+            server.group = group;
+            server.public_key_len = operation.written;
+            ret true;
+        }
+        attempt = attempt + 1;
+    }
+    ct.zeroize(?server.private_key[0], 32);
+    ret false;
+}
+
+fun shared_secret(server: *Server, peer: contracts.Bytes, output: *^u8) bool {
+    var operation: contracts.Operation;
+    if (server.group == tls13.X25519) {
+        operation = x25519.agree(
+            contracts.SecretBytes{data: ?server.private_key[0], len: 32}, peer,
+            contracts.SecretBuffer{data: output, capacity: 32});
+    } or {
+        operation = p256.agree(
+            contracts.SecretBytes{data: ?server.private_key[0], len: 32}, peer,
+            contracts.SecretBuffer{data: output, capacity: 32});
+    }
+    ret operation.error == contracts.OK && operation.written == 32;
+}
+
+fun client_share(hello: *codec.ClientHello, group: tls13.NamedGroup,
+    output: *contracts.Bytes) bool {
+    var shares: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.KEY_SHARE, ?shares) ||
+        shares.len < 2) { ret false; }
+    var offset: usize = 2;
+    for (offset + 3 < shares.len) {
+        val current: u16 = read_u16(shares.data, offset);
+        val key_len: usize = read_u16(shares.data, offset + 2)::usize;
+        if (current == group) {
+            output[0] = contracts.Bytes{data: ?shares.data[offset + 4],
+                len: key_len};
+            ret true;
+        }
+        offset = offset + 4 + key_len;
+    }
+    ret false;
+}
+
+fun offered_version(hello: *codec.ClientHello) bool {
+    var versions: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.SUPPORTED_VERSIONS,
+            ?versions) || versions.len < 3) { ret false; }
+    var offset: usize = 1;
+    for (offset + 1 < versions.len) {
+        if (read_u16(versions.data, offset) == tls13.VERSION) { ret true; }
+        offset = offset + 2;
+    }
+    ret false;
+}
+
+fun extract_server_name(hello: *codec.ClientHello,
+    output: *contracts.Bytes) bool {
+    output[0] = contracts.Bytes{data: nil, len: 0};
+    var name_extension: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.SERVER_NAME,
+            ?name_extension) || name_extension.len < 5) { ret true; }
+    val length: usize = read_u16(name_extension.data, 3)::usize;
+    if (name_extension.data[2] != 0 || length == 0 || length > 253 ||
+        name_extension.len != 5 + length) { ret false; }
+    output[0] = contracts.Bytes{data: ?name_extension.data[5], len: length};
+    ret true;
+}
+
+fun retain_server_name(server: *Server, value: contracts.Bytes) {
+    if (value.len == 0 || value.len > 253) {
+        server.server_name = contracts.Bytes{data: nil, len: 0};
+        ret;
+    }
+    copy_bytes(?server.server_name_storage[0], value.data, value.len);
+    server.server_name = contracts.Bytes{data: ?server.server_name_storage[0],
+        len: value.len};
+}
+
+fun scheme_matches_key(scheme: tls13.SignatureScheme,
+    algorithm: keys.Algorithm) bool {
+    if (algorithm == keys.ED25519) { ret scheme == tls13.ED25519; }
+    if (algorithm == keys.P256) { ret scheme == tls13.ECDSA_SECP256R1_SHA256; }
+    if (algorithm == keys.RSA) {
+        ret scheme == tls13.RSA_PSS_RSAE_SHA256 ||
+            scheme == tls13.RSA_PSS_RSAE_SHA384;
+    }
+    ret false;
+}
+
+fun record_size_limit(server: *Server, hello: *codec.ClientHello) bool {
+    var limit_extension: extensions.Extension;
+    server.record_limit_seen = false;
+    if (!extensions.find(hello.extensions, extensions.RECORD_SIZE_LIMIT,
+            ?limit_extension)) { ret true; }
+    if (limit_extension.len != 2) { ret false; }
+    val limit: usize = read_u16(limit_extension.data, 0)::usize - 1;
+    if (limit == 0) { ret false; }
+    if (limit < server.send_record_plaintext) {
+        server.send_record_plaintext = limit;
+    }
+    server.record_limit_seen = true;
+    ret true;
+}
+
+fun retain_peer_parameters(server: *Server, hello: *codec.ClientHello) error.Error {
+    if (server.peer_extension == 0) { ret error.OK; }
+    var item: extensions.Extension;
+    if (!extensions.find(hello.extensions, server.peer_extension, ?item)) {
+        ret error.MISSING_EXTENSION;
+    }
+    if (item.len > server.storage.peer_parameters_capacity) {
+        ret error.RESOURCE_LIMIT;
+    }
+    if (item.len != 0) {
+        copy_bytes(server.storage.peer_parameters, item.data, item.len);
+    }
+    server.peer_parameters = contracts.Bytes{
+        data: server.storage.peer_parameters, len: item.len};
+    ret error.OK;
+}
+
+# a retry hello may change only the key share, cookie, and psk-bound extensions
+fun retry_extension_mutable(kind: u16) bool {
+    ret kind == extensions.KEY_SHARE || kind == extensions.COOKIE ||
+        kind == extensions.PRE_SHARED_KEY || kind == extensions.EARLY_DATA ||
+        kind == extensions.PADDING;
+}
+
+fun find_in(list: extensions.List, kind: u16, output: *extensions.Extension) bool {
+    ret extensions.find(list, kind, output);
+}
+
+fun hello_consistent(first: *codec.ClientHello,
+    second: *codec.ClientHello) bool {
+    if (first.legacy_version != second.legacy_version ||
+        !bytes_equal(first.random, second.random) ||
+        !bytes_equal(first.legacy_session_id, second.legacy_session_id) ||
+        !bytes_equal(first.cipher_suites, second.cipher_suites) ||
+        !bytes_equal(first.compression_methods, second.compression_methods)) {
+        ret false;
+    }
+    var iterator: extensions.Iterator = extensions.iterator(second.extensions);
+    var item: extensions.Extension;
+    for (true) {
+        val status: extensions.NextStatus = extensions.next(?iterator, ?item);
+        if (status == extensions.NEXT_DONE) { brk; }
+        if (status != extensions.NEXT_ITEM) { ret false; }
+        if (retry_extension_mutable(item.kind)) { cnt; }
+        var original: extensions.Extension;
+        if (!find_in(first.extensions, item.kind, ?original) ||
+            !bytes_equal(contracts.Bytes{data: original.data, len: original.len},
+                contracts.Bytes{data: item.data, len: item.len})) { ret false; }
+    }
+    var reverse: extensions.Iterator = extensions.iterator(first.extensions);
+    for (true) {
+        val status: extensions.NextStatus = extensions.next(?reverse, ?item);
+        if (status == extensions.NEXT_DONE) { brk; }
+        if (status != extensions.NEXT_ITEM) { ret false; }
+        if (retry_extension_mutable(item.kind)) { cnt; }
+        var repeated: extensions.Extension;
+        if (!find_in(second.extensions, item.kind, ?repeated)) { ret false; }
+    }
+    ret true;
+}
+
+fun decode_retained_hello(server: *Server, output: *codec.ClientHello) error.Error {
+    var message: handshake.Message;
+    val parsed: handshake.Progress = handshake.parse(server.storage.hello,
+        server.hello_len,
+        server.config.limits.max_client_hello_bytes - handshake.HEADER_SIZE,
+        ?message);
+    if (parsed.status != handshake.COMPLETE ||
+        parsed.consumed != server.hello_len) { ret error.INTERNAL_ERROR; }
+    ret codec.decode_client_hello(?message, false, output);
+}
+
+fun build_policy(server: *Server, schemes: *tls13.SignatureScheme,
+    protocols: *negotiation.Protocol, policy: *negotiation.Policy) bool {
+    val identity: *credentials.Identity = server.lease.identity;
+    if (identity == nil || identity.private_key == nil) { ret false; }
+    val algorithm: keys.Algorithm = identity.private_key.algorithm;
+    var count: usize = 0;
+    var i: usize = 0;
+    for (i < server.config.signature_len) {
+        if (scheme_matches_key(server.config.signatures[i], algorithm)) {
+            schemes[count] = server.config.signatures[i];
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    if (count == 0) { ret false; }
+    i = 0;
+    for (i < server.config.alpn_len) {
+        protocols[i] = negotiation.Protocol{data: server.config.alpn[i].data,
+            len: server.config.alpn[i].len};
+        i = i + 1;
+    }
+    policy.suites = server.config.suites;
+    policy.suite_len = server.config.suite_len;
+    policy.groups = server.config.groups;
+    policy.group_len = server.config.group_len;
+    policy.signatures = schemes;
+    policy.signature_len = count;
+    policy.protocols = protocols;
+    policy.protocol_len = server.config.alpn_len;
+    policy.require_protocol = server.config.require_alpn;
+    ret true;
+}
+
+fun acquire_credentials(server: *Server, requested: contracts.Bytes) error.Error {
+    if (server.lease_held) { ret error.OK; }
+    val status: contracts.Error = credentials.acquire(server.config.credentials,
+        requested, ?server.lease);
+    if (status == contracts.UNSUPPORTED) { ret error.UNRECOGNIZED_NAME; }
+    if (status != contracts.OK || server.lease.identity == nil ||
+        server.lease.generation == nil) { ret error.HANDSHAKE_FAILURE; }
+    server.lease_held = true;
+    server.client_auth_required = server.lease.generation.require_client_auth;
+    server.client_trust = server.lease.generation.client_trust;
+    if (server.client_auth_required && server.client_trust == nil) {
+        ret error.INTERNAL_ERROR;
+    }
+    ret error.OK;
+}
+
+fun build_hello_retry(server: *Server, selection: *negotiation.Selection) error.Error {
+    var extension_bytes: [16]u8;
+    var offset: usize = 0;
+    var version: [2]u8;
+    write_u16(?version[0], 0, tls13.VERSION);
+    offset = put_extension(?extension_bytes[0], offset,
+        extensions.SUPPORTED_VERSIONS,
+        contracts.Bytes{data: ?version[0], len: 2});
+    var group_bytes: [2]u8;
+    write_u16(?group_bytes[0], 0, selection.group);
+    offset = put_extension(?extension_bytes[0], offset, extensions.KEY_SHARE,
+        contracts.Bytes{data: ?group_bytes[0], len: 2});
+    var retry: codec.ServerHello;
+    retry.legacy_version = tls13.LEGACY_VERSION;
+    retry.random = contracts.Bytes{data: ?codec.HELLO_RETRY_RANDOM[0], len: 32};
+    retry.legacy_session_id = contracts.Bytes{data: ?server.session_id[0],
+        len: server.session_id_len};
+    retry.cipher_suite = selection.suite;
+    retry.compression_method = 0;
+    retry.extensions = extensions.list(?extension_bytes[0], offset,
+        extensions.HELLO_RETRY_REQUEST);
+    retry.retry = true;
+    val encoded: handshake.Progress = codec.encode_server_hello(?retry,
+        contracts.Buffer{data: ?server.storage.output[server.output_used],
+            capacity: server.storage.output_capacity - server.output_used});
+    if (encoded.status != handshake.COMPLETE) {
+        if (encoded.error != error.OK) { ret encoded.error; }
+        ret error.RESOURCE_LIMIT;
+    }
+    var failure: error.Error = transcript.init_for_suite(?server.transcript,
+        selection.suite);
+    if (failure == error.OK) {
+        failure = transcript.update_frame(?server.transcript,
+            contracts.Bytes{data: server.storage.hello, len: server.hello_len});
+    }
+    if (failure == error.OK) {
+        failure = transcript.rewrite_for_retry(?server.transcript,
+            contracts.Bytes{data: ?server.storage.output[server.output_used],
+                len: encoded.produced});
+    }
+    if (failure != error.OK) { ret failure; }
+    if (!queue_crypto(server, engine.INITIAL, server.output_used,
+            encoded.produced)) { ret error.INTERNAL_ERROR; }
+    server.output_used = server.output_used + encoded.produced;
+    server.suite = selection.suite;
+    server.group = selection.group;
+    server.retry_count = 1;
+    server.state = EXPECT_RETRY_HELLO;
+    ret error.OK;
+}
+
+fun build_server_hello(server: *Server, peer: contracts.Bytes) error.Error {
+    var extension_bytes: [96]u8;
+    var offset: usize = 0;
+    var version: [2]u8;
+    write_u16(?version[0], 0, tls13.VERSION);
+    offset = put_extension(?extension_bytes[0], offset,
+        extensions.SUPPORTED_VERSIONS,
+        contracts.Bytes{data: ?version[0], len: 2});
+    write_u16(?extension_bytes[0], offset, extensions.KEY_SHARE);
+    write_u16(?extension_bytes[0], offset + 2, (4 + server.public_key_len)::u16);
+    write_u16(?extension_bytes[0], offset + 4, server.group);
+    write_u16(?extension_bytes[0], offset + 6, server.public_key_len::u16);
+    copy_bytes(?extension_bytes[offset + 8], ?server.public_key[0],
+        server.public_key_len);
+    offset = offset + 8 + server.public_key_len;
+    var hello: codec.ServerHello;
+    hello.legacy_version = tls13.LEGACY_VERSION;
+    hello.random = contracts.Bytes{data: ?server.random[0], len: 32};
+    hello.legacy_session_id = contracts.Bytes{data: ?server.session_id[0],
+        len: server.session_id_len};
+    hello.cipher_suite = server.suite;
+    hello.compression_method = 0;
+    hello.extensions = extensions.list(?extension_bytes[0], offset,
+        extensions.SERVER_HELLO);
+    hello.retry = false;
+    val encoded: handshake.Progress = codec.encode_server_hello(?hello,
+        contracts.Buffer{data: ?server.storage.output[server.output_used],
+            capacity: server.storage.output_capacity - server.output_used});
+    if (encoded.status != handshake.COMPLETE) {
+        if (encoded.error != error.OK) { ret encoded.error; }
+        ret error.RESOURCE_LIMIT;
+    }
+    var failure: error.Error = transcript.update_frame(?server.transcript,
+        contracts.Bytes{data: ?server.storage.output[server.output_used],
+            len: encoded.produced});
+    if (failure != error.OK) { ret failure; }
+    var hash: [48]u8;
+    failure = transcript.snapshot(?server.transcript,
+        contracts.Buffer{data: ?hash[0], capacity: 48});
+    if (failure != error.OK) { ret failure; }
+    var shared: [32]^u8;
+    if (!shared_secret(server, peer, ?shared[0])) {
+        ct.zeroize(?shared[0], 32);
+        ret error.HANDSHAKE_FAILURE;
+    }
+    failure = key_schedule.init(?server.schedule, server.suite,
+        contracts.SecretBytes{data: nil, len: 0});
+    if (failure == error.OK) {
+        failure = key_schedule.advance_handshake(?server.schedule,
+            contracts.SecretBytes{data: ?shared[0], len: 32},
+            contracts.Bytes{data: ?hash[0],
+                len: key_schedule.hash_size(server.schedule.algorithm)});
+    }
+    ct.zeroize(?shared[0], 32);
+    var i: usize = 0;
+    for (i < 48) { hash[i] = 0; i = i + 1; }
+    ct.zeroize(?server.private_key[0], 32);
+    if (failure != error.OK) { ret failure; }
+    if (!queue_crypto(server, engine.INITIAL, server.output_used,
+            encoded.produced)) { ret error.INTERNAL_ERROR; }
+    server.output_used = server.output_used + encoded.produced;
+    if (!queue_secret(server, engine.HANDSHAKE, engine.SEND, SEND_HANDSHAKE) ||
+        !queue_secret(server, engine.HANDSHAKE, engine.RECEIVE,
+            RECEIVE_HANDSHAKE)) { ret error.INTERNAL_ERROR; }
+    ret error.OK;
+}
+
+fun append_encrypted_extensions(server: *Server, offset: usize) usize {
+    var extension_bytes: [512]u8;
+    var cursor: usize = 0;
+    if (server.selected_alpn.len != 0) {
+        var alpn_body: [258]u8;
+        write_u16(?alpn_body[0], 0, (1 + server.selected_alpn.len)::u16);
+        alpn_body[2] = server.selected_alpn.len::u8;
+        copy_bytes(?alpn_body[3], server.selected_alpn.data,
+            server.selected_alpn.len);
+        cursor = put_extension(?extension_bytes[0], cursor,
+            extensions.APPLICATION_LAYER_PROTOCOL,
+            contracts.Bytes{data: ?alpn_body[0],
+                len: 3 + server.selected_alpn.len});
+    }
+    if (server.server_name.len != 0) {
+        cursor = put_extension(?extension_bytes[0], cursor,
+            extensions.SERVER_NAME, contracts.Bytes{data: nil, len: 0});
+    }
+    if (server.record_limit_seen) {
+        var limit: [2]u8;
+        write_u16(?limit[0], 0, (server.receive_record_plaintext + 1)::u16);
+        cursor = put_extension(?extension_bytes[0], cursor,
+            extensions.RECORD_SIZE_LIMIT,
+            contracts.Bytes{data: ?limit[0], len: 2});
+    }
+    if (server.extra.kind != 0) {
+        if (4 + server.extra.data.len > 512 - cursor) { ret 0; }
+        cursor = put_extension(?extension_bytes[0], cursor, server.extra.kind,
+            server.extra.data);
+    }
+    val encoded: handshake.Progress = codec.encode_extension_message(
+        handshake.ENCRYPTED_EXTENSIONS,
+        extensions.list(?extension_bytes[0], cursor,
+            extensions.ENCRYPTED_EXTENSIONS),
+        contracts.Buffer{data: ?server.storage.output[offset],
+            capacity: server.storage.output_capacity - offset});
+    if (encoded.status != handshake.COMPLETE) { ret 0; }
+    ret offset + encoded.produced;
+}
+
+fun append_certificate_request(server: *Server, offset: usize) usize {
+    if (!server.client_auth_required) { ret offset; }
+    var extension_bytes: [32]u8;
+    var algorithms: [10]u8;
+    write_u16(?algorithms[0], 0, (server.config.signature_len * 2)::u16);
+    var i: usize = 0;
+    for (i < server.config.signature_len) {
+        write_u16(?algorithms[0], 2 + i * 2, server.config.signatures[i]);
+        i = i + 1;
+    }
+    val cursor: usize = put_extension(?extension_bytes[0], 0,
+        extensions.SIGNATURE_ALGORITHMS,
+        contracts.Bytes{data: ?algorithms[0],
+            len: 2 + server.config.signature_len * 2});
+    var request: codec.CertificateRequest;
+    request.context = contracts.Bytes{data: nil, len: 0};
+    request.extensions = extensions.list(?extension_bytes[0], cursor,
+        extensions.CERTIFICATE_REQUEST);
+    val encoded: handshake.Progress = codec.encode_certificate_request(?request,
+        contracts.Buffer{data: ?server.storage.output[offset],
+            capacity: server.storage.output_capacity - offset});
+    if (encoded.status != handshake.COMPLETE) { ret 0; }
+    ret offset + encoded.produced;
+}
+
+fun append_certificate(server: *Server, offset: usize) usize {
+    val identity: *credentials.Identity = server.lease.identity;
+    if (identity == nil) { ret 0; }
+    var entries_length: usize = 0;
+    var i: usize = 0;
+    for (i < identity.chain.len) {
+        val encoded_length: usize = identity.chain.certificates[i].der_len;
+        if (encoded_length > server.storage.output_capacity ||
+            entries_length > server.storage.output_capacity - encoded_length ||
+            entries_length + encoded_length >
+                server.storage.output_capacity - 5) { ret 0; }
+        entries_length = entries_length + 5 + encoded_length;
+        i = i + 1;
+    }
+    if (entries_length == 0 || offset > server.storage.output_capacity ||
+        entries_length > server.storage.output_capacity - 8) { ret 0; }
+    val required: usize = 8 + entries_length;
+    if (required > server.storage.output_capacity - offset) { ret 0; }
+    server.storage.output[offset] = handshake.CERTIFICATE;
+    write_u24(server.storage.output, offset + 1, 4 + entries_length);
+    server.storage.output[offset + 4] = 0;
+    write_u24(server.storage.output, offset + 5, entries_length);
+    var cursor: usize = offset + 8;
+    i = 0;
+    for (i < identity.chain.len) {
+        val encoded: cert.Certificate = identity.chain.certificates[i];
+        write_u24(server.storage.output, cursor, encoded.der_len);
+        copy_bytes(?server.storage.output[cursor + 3], encoded.der,
+            encoded.der_len);
+        write_u16(server.storage.output, cursor + 3 + encoded.der_len, 0);
+        cursor = cursor + 5 + encoded.der_len;
+        i = i + 1;
+    }
+    ret cursor;
+}
+
+fun certificate_verify_input(server: *Server, from_server: bool,
+    output: *u8) error.Error {
+    var hash: [48]u8;
+    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
+    val failure: error.Error = transcript.snapshot(?server.transcript,
+        contracts.Buffer{data: ?hash[0], capacity: 48});
+    if (failure != error.OK) { ret failure; }
+    var i: usize = 0;
+    for (i < 64) { output[i] = 0x20; i = i + 1; }
+    var context: *u8 = "TLS 1.3, client CertificateVerify"::*u8;
+    if (from_server) { context = "TLS 1.3, server CertificateVerify"::*u8; }
+    copy_bytes(?output[64], context, 33);
+    output[97] = 0;
+    copy_bytes(?output[98], ?hash[0], size);
+    i = 0;
+    for (i < 48) { hash[i] = 0; i = i + 1; }
+    ret error.OK;
+}
+
+fun sign_server(server: *Server, message: contracts.Bytes,
+    output: contracts.Buffer) contracts.Operation {
+    val private_key: *keys.PrivateKey = server.lease.identity.private_key;
+    if (private_key.algorithm == keys.ED25519 ||
+        private_key.algorithm == keys.P256) {
+        var key: contracts.SecretBytes;
+        if (keys.private_bytes(private_key, ?key) != contracts.OK) {
+            ret contracts.Operation{error: contracts.INVALID_KEY, written: 0};
+        }
+        if (private_key.algorithm == keys.ED25519) {
+            ret signature.sign_ed25519(key, message, output);
+        }
+        ret signature.sign_ecdsa_p256_sha256(key, message, output);
+    }
+    var modulus: [512]u8;
+    var exponent: [512]u8;
+    var private_exponent: [512]^u8;
+    val copied: contracts.Error = keys.copy_rsa(private_key,
+        contracts.Buffer{data: ?modulus[0], capacity: 512},
+        contracts.Buffer{data: ?exponent[0], capacity: 512},
+        contracts.SecretBuffer{data: ?private_exponent[0], capacity: 512});
+    if (copied != contracts.OK) {
+        ct.zeroize(?private_exponent[0], 512);
+        ret contracts.Operation{error: copied, written: 0};
+    }
+    var salt: [48]^u8;
+    var salt_length: usize = 48;
+    if (server.signature_scheme == tls13.RSA_PSS_RSAE_SHA256) {
+        salt_length = 32;
+    }
+    if (!entropy_fill(server, ?salt[0], salt_length)) {
+        ct.zeroize(?private_exponent[0], 512);
+        ct.zeroize(?salt[0], 48);
+        ret contracts.Operation{error: contracts.ENTROPY_UNAVAILABLE, written: 0};
+    }
+    val rsa_key: signature.RsaPrivateKey = signature.RsaPrivateKey{
+        modulus: contracts.Bytes{data: ?modulus[0], len: private_key.modulus_len},
+        public_exponent: contracts.Bytes{data: ?exponent[0],
+            len: private_key.exponent_len},
+        private_exponent: contracts.SecretBytes{data: ?private_exponent[0],
+            len: private_key.modulus_len},
+    };
+    var operation: contracts.Operation;
+    if (server.signature_scheme == tls13.RSA_PSS_RSAE_SHA256) {
+        operation = signature.sign_rsa_pss_sha256(rsa_key, message,
+            contracts.SecretBytes{data: ?salt[0], len: 32}, output);
+    } or {
+        operation = signature.sign_rsa_pss_sha384(rsa_key, message,
+            contracts.SecretBytes{data: ?salt[0], len: 48}, output);
+    }
+    ct.zeroize(?private_exponent[0], 512);
+    ct.zeroize(?salt[0], 48);
+    ret operation;
+}
+
+fun append_certificate_verify(server: *Server, offset: usize) usize {
+    var signed: [MAX_SIGNED_CONTEXT]u8;
+    if (certificate_verify_input(server, true, ?signed[0]) != error.OK) { ret 0; }
+    var signature_bytes: [MAX_SIGNATURE]u8;
+    val operation: contracts.Operation = sign_server(server,
+        contracts.Bytes{data: ?signed[0],
+            len: 98 + key_schedule.hash_size(server.schedule.algorithm)},
+        contracts.Buffer{data: ?signature_bytes[0], capacity: MAX_SIGNATURE});
+    var i: usize = 0;
+    for (i < MAX_SIGNED_CONTEXT) { signed[i] = 0; i = i + 1; }
+    if (operation.error != contracts.OK || operation.written == 0 ||
+        8 + operation.written > server.storage.output_capacity - offset) {
+        ret 0;
+    }
+    var value: codec.CertificateVerify;
+    value.scheme = server.signature_scheme;
+    value.signature = contracts.Bytes{data: ?signature_bytes[0],
+        len: operation.written};
+    val encoded: handshake.Progress = codec.encode_certificate_verify(?value,
+        contracts.Buffer{data: ?server.storage.output[offset],
+            capacity: server.storage.output_capacity - offset});
+    i = 0;
+    for (i < MAX_SIGNATURE) { signature_bytes[i] = 0; i = i + 1; }
+    if (encoded.status != handshake.COMPLETE) { ret 0; }
+    ret offset + encoded.produced;
+}
+
+fun append_finished(server: *Server, base: *key_schedule.Secret,
+    offset: usize) usize {
+    var hash: [48]u8;
+    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
+    if (transcript.snapshot(?server.transcript,
+        contracts.Buffer{data: ?hash[0], capacity: 48}) != error.OK) { ret 0; }
+    var verify_data: [48]u8;
+    if (key_schedule.finished(?server.schedule, base,
+        contracts.Bytes{data: ?hash[0], len: size},
+        contracts.Buffer{data: ?verify_data[0], capacity: 48}) != error.OK) {
+        ret 0;
+    }
+    var value: codec.Finished;
+    value.verify_data = contracts.Bytes{data: ?verify_data[0], len: size};
+    val encoded: handshake.Progress = codec.encode_finished(?value,
+        contracts.Buffer{data: ?server.storage.output[offset],
+            capacity: server.storage.output_capacity - offset});
+    var i: usize = 0;
+    for (i < 48) { hash[i] = 0; verify_data[i] = 0; i = i + 1; }
+    if (encoded.status != handshake.COMPLETE) { ret 0; }
+    ret offset + encoded.produced;
+}
+
+fun absorb(server: *Server, start: usize, end: usize) error.Error {
+    if (end <= start) { ret error.INTERNAL_ERROR; }
+    ret transcript.update_frame(?server.transcript,
+        contracts.Bytes{data: ?server.storage.output[start], len: end - start});
+}
+
+fun build_server_flight(server: *Server) error.Error {
+    val flight_start: usize = server.output_used;
+    var offset: usize = flight_start;
+    var next: usize = append_encrypted_extensions(server, offset);
+    if (next == 0) { ret error.RESOURCE_LIMIT; }
+    var failure: error.Error = absorb(server, offset, next);
+    if (failure != error.OK) { ret failure; }
+    offset = next;
+    if (server.client_auth_required) {
+        next = append_certificate_request(server, offset);
+        if (next == 0) { ret error.RESOURCE_LIMIT; }
+        failure = absorb(server, offset, next);
+        if (failure != error.OK) { ret failure; }
+        offset = next;
+    }
+    next = append_certificate(server, offset);
+    if (next == 0) { ret error.RESOURCE_LIMIT; }
+    failure = absorb(server, offset, next);
+    if (failure != error.OK) { ret failure; }
+    offset = next;
+    next = append_certificate_verify(server, offset);
+    if (next == 0) { ret error.INTERNAL_ERROR; }
+    failure = absorb(server, offset, next);
+    if (failure != error.OK) { ret failure; }
+    offset = next;
+    next = append_finished(server, ?server.schedule.server_handshake_traffic,
+        offset);
+    if (next == 0) { ret error.INTERNAL_ERROR; }
+    failure = absorb(server, offset, next);
+    if (failure != error.OK) { ret failure; }
+    offset = next;
+    if (offset - flight_start > server.config.limits.max_server_flight_bytes) {
+        ret error.RESOURCE_LIMIT;
+    }
+    var hash: [48]u8;
+    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
+    failure = transcript.snapshot(?server.transcript,
+        contracts.Buffer{data: ?hash[0], capacity: 48});
+    if (failure == error.OK) {
+        failure = key_schedule.advance_application(?server.schedule,
+            contracts.Bytes{data: ?hash[0], len: size});
+    }
+    var i: usize = 0;
+    for (i < 48) { hash[i] = 0; i = i + 1; }
+    if (failure != error.OK) { ret failure; }
+    if (!queue_crypto(server, engine.HANDSHAKE, flight_start,
+            offset - flight_start) ||
+        !queue_secret(server, engine.APPLICATION, engine.SEND,
+            SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
+    server.output_used = offset;
+    var disposition: u8 = engine.EARLY_NOT_OFFERED;
+    if (server.early_data_offered) { disposition = engine.EARLY_REJECTED; }
+    if (!queue_simple(server, engine.EARLY_DATA, engine.HANDSHAKE,
+            disposition)) { ret error.INTERNAL_ERROR; }
+    if (server.client_auth_required) {
+        server.state = EXPECT_CLIENT_CERTIFICATE;
+    } or {
+        server.state = EXPECT_CLIENT_FINISHED;
+    }
+    ret error.OK;
+}
+
+fun handle_client_hello(server: *Server, frame: contracts.Bytes,
+    message: *handshake.Message) error.Error {
+    val after_retry: bool = server.retry_count != 0;
+    var hello: codec.ClientHello;
+    var failure: error.Error = codec.decode_client_hello(message, after_retry,
+        ?hello);
+    if (failure != error.OK) { ret failure; }
+    if (!offered_version(?hello)) { ret error.PROTOCOL_VERSION; }
+    if (frame.len > server.config.limits.max_client_hello_bytes) {
+        ret error.RESOURCE_LIMIT;
+    }
+    if (!after_retry) {
+        if (frame.len > server.storage.hello_capacity) {
+            ret error.RESOURCE_LIMIT;
+        }
+        copy_bytes(server.storage.hello, frame.data, frame.len);
+        server.hello_len = frame.len;
+        if (hello.legacy_session_id.len > 32) { ret error.ILLEGAL_PARAMETER; }
+        server.session_id_len = hello.legacy_session_id.len;
+        if (server.session_id_len != 0) {
+            copy_bytes(?server.session_id[0], hello.legacy_session_id.data,
+                server.session_id_len);
+        }
+        server.early_data_offered = extensions.contains(hello.extensions,
+            extensions.EARLY_DATA);
+        var requested: contracts.Bytes;
+        if (!extract_server_name(?hello, ?requested)) {
+            ret error.ILLEGAL_PARAMETER;
+        }
+        retain_server_name(server, requested);
+        failure = acquire_credentials(server, server.server_name);
+        if (failure != error.OK) { ret failure; }
+        if (!record_size_limit(server, ?hello)) { ret error.ILLEGAL_PARAMETER; }
+        failure = retain_peer_parameters(server, ?hello);
+        if (failure != error.OK) { ret failure; }
+    } or {
+        var original: codec.ClientHello;
+        failure = decode_retained_hello(server, ?original);
+        if (failure != error.OK) { ret failure; }
+        if (!hello_consistent(?original, ?hello)) {
+            ret error.ILLEGAL_PARAMETER;
+        }
+    }
+    var schemes: [4]tls13.SignatureScheme;
+    var protocols: [255]negotiation.Protocol;
+    var policy: negotiation.Policy;
+    if (!build_policy(server, ?schemes[0], ?protocols[0], ?policy)) {
+        ret error.HANDSHAKE_FAILURE;
+    }
+    var selection: negotiation.Selection;
+    failure = negotiation.negotiate(?hello, ?policy, ?selection);
+    if (failure != error.OK) { ret failure; }
+    if (after_retry && (selection.retry || selection.group != server.group ||
+        selection.suite != server.suite)) { ret error.ILLEGAL_PARAMETER; }
+    if (selection.retry) { ret build_hello_retry(server, ?selection); }
+    var peer: contracts.Bytes;
+    if (!client_share(?hello, selection.group, ?peer)) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    server.suite = selection.suite;
+    server.signature_scheme = selection.signature;
+    if (selection.protocol.len != 0) {
+        copy_bytes(?server.selected_alpn_storage[0], selection.protocol.data,
+            selection.protocol.len);
+        server.selected_alpn = contracts.Bytes{
+            data: ?server.selected_alpn_storage[0], len: selection.protocol.len};
+    }
+    if (!after_retry) {
+        failure = transcript.init_for_suite(?server.transcript, selection.suite);
+        if (failure == error.OK) {
+            failure = transcript.update_frame(?server.transcript, frame);
+        }
+    } or {
+        failure = transcript.update_frame(?server.transcript, frame);
+    }
+    if (failure != error.OK) { ret failure; }
+    if (!derive_share(server, selection.group)) { ret error.INTERNAL_ERROR; }
+    failure = build_server_hello(server, peer);
+    if (failure != error.OK) { ret failure; }
+    ret build_server_flight(server);
+}
+
+fun retain_peer_key(server: *Server) bool {
+    val first: contracts.Bytes = server.peer_leaf.public_key.first;
+    val second: contracts.Bytes = server.peer_leaf.public_key.second;
+    if (first.data == nil || first.len == 0 || first.len > MAX_PUBLIC_KEY ||
+        second.len > MAX_PUBLIC_KEY || (second.len != 0 && second.data == nil)) {
+        ret false;
+    }
+    copy_bytes(?server.peer_key_first[0], first.data, first.len);
+    if (second.len != 0) {
+        copy_bytes(?server.peer_key_second[0], second.data, second.len);
+    }
+    server.peer_leaf.public_key.encoded.data = nil;
+    server.peer_leaf.public_key.encoded.len = 0;
+    server.peer_leaf.public_key.first = contracts.Bytes{
+        data: ?server.peer_key_first[0], len: first.len};
+    server.peer_leaf.public_key.second = contracts.Bytes{
+        data: ?server.peer_key_second[0], len: second.len};
+    ret true;
+}
+
+fun handle_client_certificate(server: *Server, frame: contracts.Bytes,
+    message: *handshake.Message) error.Error {
+    var certificate_message: codec.CertificateMessage;
+    var failure: error.Error = codec.decode_certificate(message, true,
+        ?certificate_message);
+    if (failure != error.OK) { ret failure; }
+    if (certificate_message.context.len != 0) { ret error.ILLEGAL_PARAMETER; }
+    server.client_certificate_seen = true;
+    if (certificate_message.count == 0) {
+        server.client_certificate_empty = true;
+        failure = transcript.update_frame(?server.transcript, frame);
+        if (failure != error.OK) { ret failure; }
+        server.state = EXPECT_CLIENT_FINISHED;
+        ret error.CERTIFICATE_REQUIRED;
+    }
+    if (certificate_message.count > server.storage.certificate_capacity ||
+        certificate_message.count > verify.MAX_CHAIN_DEPTH ||
+        certificate_message.entries.len >
+            server.config.limits.max_chain_bytes) { ret error.BAD_CERTIFICATE; }
+    var iterator: codec.CertificateIterator = codec.certificate_iterator(
+        ?certificate_message);
+    var entry: codec.CertificateEntry;
+    var count: usize = 0;
+    var total: usize = 0;
+    for (true) {
+        val status: extensions.NextStatus = codec.next_certificate(?iterator,
+            ?entry);
+        if (status == extensions.NEXT_DONE) { brk; }
+        if (status != extensions.NEXT_ITEM ||
+            count >= server.storage.certificate_capacity ||
+            entry.certificate.len >
+                server.config.limits.max_chain_bytes - total) {
+            ret error.BAD_CERTIFICATE;
+        }
+        server.storage.certificates[count].der = entry.certificate.data;
+        server.storage.certificates[count].der_len = entry.certificate.len;
+        total = total + entry.certificate.len;
+        count = count + 1;
+    }
+    if (count != certificate_message.count || count == 0) {
+        ret error.BAD_CERTIFICATE;
+    }
+    val chain: cert.Chain = cert.Chain{
+        certificates: server.storage.certificates, len: count};
+    var options: verify.Options;
+    options.identity = contracts.Bytes{data: nil, len: 0};
+    options.purpose = verify.CLIENT_AUTH;
+    options.now = server.verification_time;
+    options.max_depth = verify.MAX_CHAIN_DEPTH;
+    options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
+    failure = verify.chain(server.client_trust, ?chain, ?options);
+    if (failure != error.OK) { ret failure; }
+    if (x509.parse(contracts.Bytes{data: server.storage.certificates[0].der,
+        len: server.storage.certificates[0].der_len},
+        ?server.peer_leaf) != contracts.OK || !retain_peer_key(server)) {
+        ret error.BAD_CERTIFICATE;
+    }
+    failure = transcript.update_frame(?server.transcript, frame);
+    if (failure == error.OK) {
+        server.state = EXPECT_CLIENT_CERTIFICATE_VERIFY;
+    }
+    ret failure;
+}
+
+fun configured_signature(server: *Server, scheme: tls13.SignatureScheme) bool {
+    var i: usize = 0;
+    for (i < server.config.signature_len) {
+        if (server.config.signatures[i] == scheme) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun verify_peer_signature(server: *Server,
+    value: *codec.CertificateVerify) error.Error {
+    if (!configured_signature(server, value.scheme)) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    var signed: [MAX_SIGNED_CONTEXT]u8;
+    var failure: error.Error = certificate_verify_input(server, false,
+        ?signed[0]);
+    if (failure != error.OK) { ret failure; }
+    val message: contracts.Bytes = contracts.Bytes{data: ?signed[0],
+        len: 98 + key_schedule.hash_size(server.schedule.algorithm)};
+    var status: contracts.Error = contracts.UNSUPPORTED;
+    if (value.scheme == tls13.ED25519 &&
+        server.peer_leaf.public_key.algorithm == keys.ED25519) {
+        status = signature.verify_ed25519(server.peer_leaf.public_key.first,
+            message, value.signature);
+    } or (value.scheme == tls13.ECDSA_SECP256R1_SHA256 &&
+        server.peer_leaf.public_key.algorithm == keys.P256) {
+        status = signature.verify_ecdsa_p256_sha256(
+            server.peer_leaf.public_key.first, message, value.signature);
+    } or ((value.scheme == tls13.RSA_PSS_RSAE_SHA256 ||
+        value.scheme == tls13.RSA_PSS_RSAE_SHA384) &&
+        server.peer_leaf.public_key.algorithm == keys.RSA) {
+        val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
+            modulus: server.peer_leaf.public_key.first,
+            exponent: server.peer_leaf.public_key.second,
+        };
+        if (value.scheme == tls13.RSA_PSS_RSAE_SHA256) {
+            status = signature.verify_rsa_pss_sha256(public_key, message,
+                value.signature);
+        } or {
+            status = signature.verify_rsa_pss_sha384(public_key, message,
+                value.signature);
+        }
+    }
+    var i: usize = 0;
+    for (i < MAX_SIGNED_CONTEXT) { signed[i] = 0; i = i + 1; }
+    if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
+    if (status != contracts.OK) { ret error.DECRYPT_ERROR; }
+    ret error.OK;
+}
+
+fun handle_client_certificate_verify(server: *Server, frame: contracts.Bytes,
+    message: *handshake.Message) error.Error {
+    var value: codec.CertificateVerify;
+    var failure: error.Error = codec.decode_certificate_verify(message, ?value);
+    if (failure == error.OK) { failure = verify_peer_signature(server, ?value); }
+    if (failure == error.OK) {
+        failure = transcript.update_frame(?server.transcript, frame);
+    }
+    if (failure == error.OK) {
+        server.authenticated = true;
+        server.state = EXPECT_CLIENT_FINISHED;
+    }
+    ret failure;
+}
+
+fun handle_client_finished(server: *Server, frame: contracts.Bytes,
+    message: *handshake.Message) error.Error {
+    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
+    var value: codec.Finished;
+    var failure: error.Error = codec.decode_finished(message, size, ?value);
+    var hash: [48]u8;
+    if (failure == error.OK) {
+        failure = transcript.snapshot(?server.transcript,
+            contracts.Buffer{data: ?hash[0], capacity: 48});
+    }
+    if (failure == error.OK) {
+        failure = key_schedule.verify_finished(?server.schedule,
+            ?server.schedule.client_handshake_traffic,
+            contracts.Bytes{data: ?hash[0], len: size}, value.verify_data);
+    }
+    if (failure == error.OK) {
+        failure = transcript.update_frame(?server.transcript, frame);
+    }
+    if (failure == error.OK) {
+        failure = transcript.snapshot(?server.transcript,
+            contracts.Buffer{data: ?hash[0], capacity: 48});
+    }
+    if (failure == error.OK) {
+        failure = key_schedule.derive_resumption(?server.schedule,
+            contracts.Bytes{data: ?hash[0], len: size});
+    }
+    var i: usize = 0;
+    for (i < 48) { hash[i] = 0; i = i + 1; }
+    if (failure != error.OK) { ret failure; }
+    if (!queue_secret(server, engine.APPLICATION, engine.RECEIVE,
+            RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
+    if (server.client_auth_required) {
+        var disposition: u8 = engine.AUTHENTICATION_FAILED;
+        if (server.authenticated) { disposition = engine.AUTHENTICATED; }
+        if (!queue_simple(server, engine.AUTHENTICATION, engine.APPLICATION,
+                disposition)) { ret error.INTERNAL_ERROR; }
+    }
+    if (!queue_simple(server, engine.HANDSHAKE_COMPLETE, engine.APPLICATION,
+            0)) { ret error.INTERNAL_ERROR; }
+    server.state = ESTABLISHED;
+    ret error.OK;
+}
+
+fun handle_post_handshake(server: *Server,
+    message: *handshake.Message) error.Error {
+    if (message.header.message_type == handshake.KEY_UPDATE) {
+        if (server.peer_extension == QUIC_TRANSPORT_PARAMETERS) {
+            ret error.UNEXPECTED_MESSAGE;
+        }
+        var update: codec.KeyUpdate;
+        var failure: error.Error = codec.decode_key_update(message, ?update);
+        if (failure != error.OK) { ret failure; }
+        failure = key_schedule.update_traffic(?server.schedule,
+            ?server.schedule.client_application_traffic);
+        if (failure != error.OK) { ret failure; }
+        if (!queue_secret(server, engine.APPLICATION, engine.RECEIVE,
+                RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
+        if (update.request == codec.UPDATE_REQUESTED) {
+            if (server.output_used != 0 && server.queue_len == server.queue_head) {
+                server.output_used = 0;
+            }
+            val encoded: handshake.Progress = codec.encode_key_update(
+                codec.KeyUpdate{request: codec.UPDATE_NOT_REQUESTED},
+                contracts.Buffer{data: ?server.storage.output[server.output_used],
+                    capacity: server.storage.output_capacity - server.output_used});
+            if (encoded.status != handshake.COMPLETE) {
+                ret error.RESOURCE_LIMIT;
+            }
+            failure = key_schedule.update_traffic(?server.schedule,
+                ?server.schedule.server_application_traffic);
+            if (failure != error.OK) { ret failure; }
+            if (!queue_crypto(server, engine.APPLICATION, server.output_used,
+                    encoded.produced) ||
+                !queue_secret(server, engine.APPLICATION, engine.SEND,
+                    SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
+            server.output_used = server.output_used + encoded.produced;
+        }
+        ret error.OK;
+    }
+    ret error.UNEXPECTED_MESSAGE;
+}
+
+fun process_frame(server: *Server, frame: contracts.Bytes,
+    message: *handshake.Message) error.Error {
+    if (server.state == EXPECT_CLIENT_HELLO ||
+        server.state == EXPECT_RETRY_HELLO) {
+        if (message.header.message_type != handshake.CLIENT_HELLO) {
+            ret error.UNEXPECTED_MESSAGE;
+        }
+        ret handle_client_hello(server, frame, message);
+    }
+    if (server.state == EXPECT_CLIENT_CERTIFICATE) {
+        if (message.header.message_type != handshake.CERTIFICATE) {
+            ret error.UNEXPECTED_MESSAGE;
+        }
+        ret handle_client_certificate(server, frame, message);
+    }
+    if (server.state == EXPECT_CLIENT_CERTIFICATE_VERIFY) {
+        if (message.header.message_type != handshake.CERTIFICATE_VERIFY) {
+            ret error.UNEXPECTED_MESSAGE;
+        }
+        ret handle_client_certificate_verify(server, frame, message);
+    }
+    if (server.state == EXPECT_CLIENT_FINISHED) {
+        if (message.header.message_type != handshake.FINISHED) {
+            ret error.UNEXPECTED_MESSAGE;
+        }
+        ret handle_client_finished(server, frame, message);
+    }
+    if (server.state == ESTABLISHED) {
+        ret handle_post_handshake(server, message);
+    }
+    ret error.UNEXPECTED_MESSAGE;
+}
+
+fun drive(server: *Server) engine.Result {
+    for (true) {
+        if (pending(server) || server.event_active) {
+            ret result(engine.BLOCKED, error.OK, 0, 0);
+        }
+        if (server.input_read == server.input_len) {
+            server.input_read = 0;
+            server.input_len = 0;
+            ret result(engine.MORE, error.OK, 0, handshake.HEADER_SIZE);
+        }
+        var message: handshake.Message;
+        val parsed: handshake.Progress = handshake.parse(
+            ?server.storage.input[server.input_read],
+            server.input_len - server.input_read,
+            server.config.limits.max_peer_handshake_bytes - handshake.HEADER_SIZE,
+            ?message);
+        if (parsed.status == handshake.NEED_INPUT) {
+            ret result(engine.MORE, error.OK, 0, parsed.required);
+        }
+        if (parsed.status != handshake.COMPLETE) {
+            ret fail(server, parsed.error, engine.alert_for(parsed.error));
+        }
+        val frame: contracts.Bytes = contracts.Bytes{
+            data: ?server.storage.input[server.input_read], len: parsed.consumed};
+        val failure: error.Error = process_frame(server, frame, ?message);
+        if (failure != error.OK) {
+            ret fail(server, failure, engine.alert_for(failure));
+        }
+        server.input_read = server.input_read + parsed.consumed;
+        if (pending(server)) { ret result(engine.OK, error.OK, 0, 0); }
+    }
+    ret result(engine.FAILED, error.INTERNAL_ERROR, 0, 0);
+}
+
+fun compact_input(server: *Server) {
+    if (server.input_read == 0) { ret; }
+    if (server.input_read == server.input_len) {
+        server.input_read = 0;
+        server.input_len = 0;
+        ret;
+    }
+    val remaining: usize = server.input_len - server.input_read;
+    var i: usize = 0;
+    for (i < remaining) {
+        server.storage.input[i] = server.storage.input[server.input_read + i];
+        i = i + 1;
+    }
+    server.input_read = 0;
+    server.input_len = remaining;
+}
+
+fun expected_level(server: *Server) engine.Level {
+    if (server.state == EXPECT_CLIENT_HELLO ||
+        server.state == EXPECT_RETRY_HELLO) { ret engine.INITIAL; }
+    if (server.state == ESTABLISHED) { ret engine.APPLICATION; }
+    ret engine.HANDSHAKE;
+}
+
+fun ingest_inner(server: *Server, level: engine.Level, data: *u8,
+    length: usize) engine.Result {
+    if (!server_owner_valid(server) || server.config == nil ||
+        !engine.valid_level(level) || server.state == DESTROYED ||
+        server.state == TERMINAL || !memory_range.valid(data, length) ||
+        server_owner_overlaps(server, data, length) ||
+        storage_overlaps(?server.storage, data, length) ||
+        borrowed_overlaps(server.config, server.extra, data, length,
+            true, true)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (pending(server) || server.event_active) {
+        ret result(engine.BLOCKED, error.OK, 0, 0);
+    }
+    compact_input(server);
+    if (level != expected_level(server)) {
+        ret fail(server, error.UNEXPECTED_MESSAGE,
+            record.UNEXPECTED_MESSAGE_ALERT);
+    }
+    if (length > server.storage.input_capacity - server.input_len) {
+        ret fail(server, error.RESOURCE_LIMIT, record.INTERNAL_ERROR_ALERT);
+    }
+    if (length != 0) {
+        copy_bytes(?server.storage.input[server.input_len], data, length);
+        server.input_len = server.input_len + length;
+    }
+    var progress: engine.Result = drive(server);
+    progress.consumed = length;
+    ret progress;
+}
+
+pub fun ingest(server: *Server, level: engine.Level, data: *u8,
+    length: usize) engine.Result {
+    if (!enter(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    val progress: engine.Result = ingest_inner(server, level, data, length);
+    leave(server);
+    ret progress;
+}
+
+fun poll_inner(server: *Server) engine.Result {
+    if (!server_owner_valid(server) || server.config == nil ||
+        server.state == DESTROYED || server.state == TERMINAL) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    ret drive(server);
+}
+
+pub fun poll(server: *Server) engine.Result {
+    if (!enter(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    val progress: engine.Result = poll_inner(server);
+    leave(server);
+    ret progress;
+}
+
+fun secret_for(server: *Server, index: usize) *key_schedule.Secret {
+    if (index == SEND_HANDSHAKE) {
+        ret ?server.schedule.server_handshake_traffic;
+    }
+    if (index == RECEIVE_HANDSHAKE) {
+        ret ?server.schedule.client_handshake_traffic;
+    }
+    if (index == SEND_APPLICATION) {
+        ret ?server.schedule.server_application_traffic;
+    }
+    if (index == RECEIVE_APPLICATION) {
+        ret ?server.schedule.client_application_traffic;
+    }
+    ret nil;
+}
+
+fun next_event_inner(server: *Server, output: *engine.Event) bool {
+    if (!server_owner_valid(server) || output == nil ||
+        !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
+        server_owner_overlaps(server, (?output.token)::*u8,
+            $size_of(engine.Event)) ||
+        storage_overlaps(?server.storage, (?output.token)::*u8,
+            $size_of(engine.Event)) ||
+        borrowed_overlaps(server.config, server.extra, (?output.token)::*u8,
+            $size_of(engine.Event), true, true) || server.event_active ||
+        server.state == DESTROYED || !pending(server)) { ret false; }
+    val item: Pending = server.queue[server.queue_head];
+    var event: engine.Event = engine.empty_event();
+    event.token = engine.next_generation(server.event_generation);
+    event.kind = item.kind;
+    event.level = item.level;
+    event.direction = item.direction;
+    event.suite = server.suite;
+    event.disposition = item.disposition;
+    event.alert = item.alert;
+    if (item.kind == engine.CRYPTO) {
+        if (item.offset > server.storage.output_capacity ||
+            item.length > server.storage.output_capacity - item.offset) {
+            ret false;
+        }
+        event.data = contracts.Bytes{data: ?server.storage.output[item.offset],
+            len: item.length};
+    } or (item.kind == engine.TRAFFIC_SECRET) {
+        val traffic: *key_schedule.Secret = secret_for(server, item.secret_index);
+        if (traffic == nil) { ret false; }
+        event.secret = key_schedule.bytes(traffic);
+        event.generation = engine.next_generation(
+            server.secret_generation[item.secret_index]);
+        server.secret_generation[item.secret_index] = event.generation;
+    } or (item.kind == engine.PEER_PARAMETERS) {
+        event.data = server.peer_parameters;
+    }
+    output[0] = event;
+    server.event_generation = event.token;
+    server.active_event = event;
+    server.event_active = true;
+    ret true;
+}
+
+pub fun next_event(server: *Server, output: *engine.Event) bool {
+    if (!enter(server)) { ret false; }
+    val available: bool = next_event_inner(server, output);
+    leave(server);
+    ret available;
+}
+
+fun complete_event_inner(server: *Server, token: u64, accepted: bool) bool {
+    if (!server_owner_valid(server) || !server.event_active || token == 0 ||
+        token != server.active_event.token) { ret false; }
+    server.event_active = false;
+    if (!accepted) {
+        fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+        ret true;
+    }
+    server.queue_head = server.queue_head + 1;
+    if (server.queue_head >= server.queue_len) {
+        queue_clear(server);
+        server.output_used = 0;
+    }
+    if (server.state == ESTABLISHED && !pending(server) &&
+        server.schedule.stage == key_schedule.APPLICATION &&
+        server.schedule.master_secret.active) {
+        key_schedule.discard_handshake(?server.schedule);
+    }
+    ret true;
+}
+
+pub fun complete_event(server: *Server, token: u64, accepted: bool) bool {
+    if (!enter(server)) { ret false; }
+    val completed: bool = complete_event_inner(server, token, accepted);
+    leave(server);
+    ret completed;
+}
+
+fun traffic_keys_inner(server: *Server, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (!server_owner_valid(server) || event == nil || key_length == nil ||
+        !server.event_active || event.token != server.active_event.token ||
+        server.active_event.kind != engine.TRAFFIC_SECRET) { ret false; }
+    var index: usize = NO_SECRET;
+    if (server.active_event.level == engine.HANDSHAKE &&
+        server.active_event.direction == engine.SEND) { index = SEND_HANDSHAKE; }
+    or (server.active_event.level == engine.HANDSHAKE &&
+        server.active_event.direction == engine.RECEIVE) {
+        index = RECEIVE_HANDSHAKE;
+    }
+    or (server.active_event.level == engine.APPLICATION &&
+        server.active_event.direction == engine.SEND) {
+        index = SEND_APPLICATION;
+    }
+    or (server.active_event.level == engine.APPLICATION &&
+        server.active_event.direction == engine.RECEIVE) {
+        index = RECEIVE_APPLICATION;
+    }
+    val traffic: *key_schedule.Secret = secret_for(server, index);
+    if (traffic == nil) { ret false; }
+    if (key_schedule.traffic_key(?server.schedule, traffic, key) != error.OK ||
+        key_schedule.traffic_iv(?server.schedule, traffic, iv) != error.OK) {
+        ret false;
+    }
+    @key_length = key_schedule.key_size(server.suite);
+    ret true;
+}
+
+pub fun traffic_keys(server: *Server, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (!enter(server)) { ret false; }
+    val derived: bool = traffic_keys_inner(server, event, key, iv, key_length);
+    leave(server);
+    ret derived;
+}
+
+fun close_inner(server: *Server,
+    description: record.AlertDescription) engine.Result {
+    if (!server_owner_valid(server) || server.state == DESTROYED ||
+        server.state == TERMINAL || server.state == CLOSING ||
+        !record.valid_tls13_alert(description)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    var i: usize = server.queue_head;
+    for (i < server.queue_len) {
+        if (server.queue[i].kind == engine.ALERT) {
+            ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+        }
+        i = i + 1;
+    }
+    if (!queue_push(server, Pending{kind: engine.ALERT, level: 0, direction: 0,
+            secret_index: NO_SECRET, offset: 0, length: 0, disposition: 0,
+            alert: description})) {
+        ret result(engine.FAILED, error.RESOURCE_LIMIT, 0, 0);
+    }
+    server.pending_alert = description;
+    if (description != record.USER_CANCELED_ALERT) { server.state = CLOSING; }
+    ret result(engine.OK, error.OK, 0, 0);
+}
+
+pub fun close(server: *Server,
+    description: record.AlertDescription) engine.Result {
+    if (!enter(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    val closed: engine.Result = close_inner(server, description);
+    leave(server);
+    ret closed;
+}
+
+fun destroy_inner(server: *Server) bool {
+    if (!server_owner_valid(server) || server.event_active) { ret false; }
+    ct.zeroize(?server.private_key[0], 32);
+    transcript.destroy(?server.transcript);
+    key_schedule.destroy(?server.schedule);
+    release_lease(server);
+    server.config = nil;
+    # empty-literal assignment is not trusted to clear welded pointer fields
+    server.configuration = config.ServerConfig{};
+    server.configuration.credentials = nil;
+    server.configuration.alpn = nil;
+    server.configuration.versions = nil;
+    server.configuration.suites = nil;
+    server.configuration.groups = nil;
+    server.configuration.signatures = nil;
+    server.configuration.entropy = nil;
+    server.entropy = secret.Entropy{};
+    server.entropy.context = nil;
+    server.entropy.secret_context = nil;
+    server.entropy.fill_fn = nil;
+    server.storage.input = nil;
+    server.storage.output = nil;
+    server.storage.hello = nil;
+    server.storage.certificates = nil;
+    server.storage.peer_parameters = nil;
+    server.extra.data.data = nil;
+    server.peer_parameters.data = nil;
+    server.selected_alpn.data = nil;
+    server.server_name.data = nil;
+    server.client_trust = nil;
+    queue_clear(server);
+    server.output_used = 0;
+    server.state = DESTROYED;
+    ret true;
+}
+
+pub fun destroy(server: *Server) bool {
+    if (!enter(server)) { ret false; }
+    val destroyed: bool = destroy_inner(server);
+    leave(server);
+    ret destroyed;
+}
+
+fun snapshot_inner(server: *Server) engine.Snapshot {
+    var value: engine.Snapshot = engine.empty_snapshot();
+    if (!server_owner_valid(server)) { ret value; }
+    value.role = engine.SERVER;
+    value.error = server.failure;
+    value.suite = server.suite;
+    value.group = server.group;
+    value.retry_count = server.retry_count;
+    value.authenticated = server.authenticated;
+    value.selected_alpn = server.selected_alpn;
+    value.peer_parameters = server.peer_parameters;
+    value.peer_name = server.server_name;
+    value.client_auth_requested = server.client_auth_required;
+    value.output_pending = pending(server);
+    value.event_active = server.event_active;
+    value.destroyed = server.state == DESTROYED;
+    if (server.state == ESTABLISHED) { value.status = engine.COMPLETE; }
+    or (server.state == TERMINAL) { value.status = engine.FAILED; }
+    or (server.state == DESTROYED) { value.status = engine.CLOSED; }
+    or { value.status = engine.MORE; }
+    ret value;
+}
+
+pub fun snapshot(server: *Server) engine.Snapshot {
+    if (!enter(server)) { ret engine.empty_snapshot(); }
+    val value: engine.Snapshot = snapshot_inner(server);
+    leave(server);
+    ret value;
+}
+
+pub fun receive_record_limit(server: *Server) usize {
+    if (!enter(server)) { ret 0; }
+    var limit: usize = 0;
+    if (server.config != nil && server.state != DESTROYED) {
+        limit = server.receive_record_plaintext;
+    }
+    leave(server);
+    ret limit;
+}
+
+pub fun send_record_limit(server: *Server) usize {
+    if (!enter(server)) { ret 0; }
+    var limit: usize = 0;
+    if (server.config != nil && server.state != DESTROYED) {
+        limit = server.send_record_plaintext;
+    }
+    leave(server);
+    ret limit;
+}
+
+test "server: configuration rejects unbounded and missing ownership" {
+    var server: Server;
+    var configuration: config.ServerConfig;
+    var storage: Storage;
+    if (init(?server, ?configuration, storage, ExtraExtension{}, 0)) { ret 1; }
+    if (snapshot(?server).status != engine.MORE ||
+        snapshot(?server).role != engine.SERVER) { ret 2; }
+    if (start(?server, 0).status != engine.FAILED ||
+        ingest(?server, engine.INITIAL, nil, 0).status != engine.FAILED) { ret 3; }
+    ret 0;
+}

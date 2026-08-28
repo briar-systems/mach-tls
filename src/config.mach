@@ -19,6 +19,7 @@ pub rec Limits {
     max_peer_handshake_bytes:     usize;
     max_client_hello_bytes:       usize;
     max_client_flight_bytes:      usize;
+    max_server_flight_bytes:      usize;
     max_chain_bytes:              usize;
     max_ticket_bytes:             usize;
 }
@@ -42,10 +43,13 @@ pub rec ClientConfig {
     limits:          Limits;
 }
 
+# client authentication policy belongs to the published credential generation,
+# so the listener configuration deliberately does not restate it
 pub rec ServerConfig {
     credentials:        *credentials.Store;
     alpn:               *ProtocolName;
     alpn_len:           usize;
+    require_alpn:       bool;
     versions:           *u16;
     version_len:        usize;
     suites:             *tls13.CipherSuite;
@@ -54,7 +58,8 @@ pub rec ServerConfig {
     group_len:          usize;
     signatures:         *tls13.SignatureScheme;
     signature_len:      usize;
-    require_client_auth: bool;
+    entropy:            *secret.Entropy;
+    entropy_context_size: usize;
     limits:             Limits;
 }
 
@@ -65,6 +70,7 @@ pub fun production_limits() Limits {
     limits.max_peer_handshake_bytes = 1048576;
     limits.max_client_hello_bytes = 65536;
     limits.max_client_flight_bytes = 525312;
+    limits.max_server_flight_bytes = 525312;
     limits.max_chain_bytes = 524288;
     limits.max_ticket_bytes = 16384;
     ret limits;
@@ -77,6 +83,7 @@ test "config: default limits are finite and protocol conforming" {
     if (limits.max_peer_handshake_bytes <= 4 ||
         limits.max_client_hello_bytes == 0 ||
         limits.max_client_flight_bytes == 0 ||
+        limits.max_server_flight_bytes == 0 ||
         limits.max_chain_bytes == 0) { ret 1; }
     ret 0;
 }
