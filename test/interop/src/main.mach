@@ -1,0 +1,293 @@
+use crypto.contracts;
+use crypto.encoding.keys;
+use crypto.secret;
+use std.chrono.time;
+use std.crypto.ct;
+use std.net.ip;
+use std.net.tcp;
+use std.runtime;
+use std.sync.cancel;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.Result;
+use std.types.result.is_err;
+use std.types.result.unwrap_err;
+use std.types.result.unwrap_ok;
+use std.types.size.usize;
+use io_error: std.io.error;
+use io_runtime: std.io.runtime;
+use tls.cert;
+use tls.cert.credentials;
+use tls.cert.load;
+use tls.client;
+use tls.config;
+use tls.error;
+use tls.record;
+use tls.stream;
+use tls.tls13;
+use tls.transport;
+
+rec BlockingTransport {
+    runtime: *io_runtime.Runtime;
+    stream: *tcp.Stream;
+}
+
+fun submit(state: *BlockingTransport, scope: *cancel.Scope,
+    kind: io_runtime.Kind, buffer: *u8, length: usize,
+    context: usize) Result[io_runtime.Token, io_error.Error] {
+    val operation: io_runtime.Operation = io_runtime.Operation{kind: kind,
+        resource: state.stream.handle.value, buffer: buffer, length: length,
+        offset: 0, context: context};
+    ret io_runtime.submit_scoped(state.runtime, scope, operation);
+}
+
+fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
+    length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.READ, buffer, length, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val received: Result[usize, io_error.Error] = tcp.stream_read(state.stream,
+        buffer, length);
+    if (is_err[usize, io_error.Error](received)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[usize, io_error.Error](received));
+    } or {
+        val bytes: usize = unwrap_ok[usize, io_error.Error](received);
+        io_runtime.complete(state.runtime, token, bytes,
+            state.stream.handle.value, bytes == 0);
+    }
+    ret submitted;
+}
+
+fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
+    length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.WRITE, buffer, length, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val written: Result[usize, io_error.Error] = tcp.stream_write(state.stream,
+        buffer, length);
+    if (is_err[usize, io_error.Error](written)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[usize, io_error.Error](written));
+    } or {
+        io_runtime.complete(state.runtime, token,
+            unwrap_ok[usize, io_error.Error](written), state.stream.handle.value, false);
+    }
+    ret submitted;
+}
+
+fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.SHUTDOWN, nil, 0, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val stopped: Result[bool, io_error.Error] = tcp.stream_shutdown(state.stream,
+        os.SHUT_WR);
+    if (is_err[bool, io_error.Error](stopped)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[bool, io_error.Error](stopped));
+    } or {
+        io_runtime.complete(state.runtime, token, 0, state.stream.handle.value, false);
+    }
+    ret submitted;
+}
+
+fun blocking_close(context: ptr, scope: *cancel.Scope,
+    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    val state: *BlockingTransport = context::*BlockingTransport;
+    val resource: usize = state.stream.handle.value;
+    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+        io_runtime.CLOSE, nil, 0, token_context);
+    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
+    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+    val closed: Result[bool, io_error.Error] = tcp.stream_close(state.stream);
+    if (is_err[bool, io_error.Error](closed)) {
+        io_runtime.fail(state.runtime, token,
+            unwrap_err[bool, io_error.Error](closed));
+    } or {
+        io_runtime.complete(state.runtime, token, 0, resource, false);
+    }
+    ret submitted;
+}
+
+fun hex_nibble(value: u8, output: *u8) bool {
+    if (value >= '0' && value <= '9') { output[0] = value - '0'; ret true; }
+    if (value >= 'a' && value <= 'f') { output[0] = value - 'a' + 10; ret true; }
+    ret false;
+}
+
+fun decode_hex(input: *u8, length: usize, output: *u8,
+    capacity: usize) bool {
+    if (input == nil || output == nil || (length & 1) != 0 ||
+        length / 2 > capacity) { ret false; }
+    var i: usize = 0;
+    for (i < length / 2) {
+        var high: u8;
+        var low: u8;
+        if (!hex_nibble(input[i * 2], ?high) ||
+            !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
+        output[i] = (high << 4) | low;
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[oblivious]
+fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
+    capacity: usize) bool {
+    if (input == nil || output == nil || (length & 1) != 0 ||
+        length / 2 > capacity) { ret false; }
+    var i: usize = 0;
+    for (i < length / 2) {
+        var high: u8;
+        var low: u8;
+        if (!hex_nibble(input[i * 2], ?high) ||
+            !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
+        output[i] = (high << 4) | low;
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
+    for (transport.snapshot(?secure.operation).state !=
+        transport.OPERATION_TERMINAL) {
+        var completion: io_runtime.Completion;
+        val polled: Result[usize, io_error.Error] = io_runtime.poll(owner,
+            ?completion, 1);
+        if (is_err[usize, io_error.Error](polled) ||
+            unwrap_ok[usize, io_error.Error](polled) != 1 ||
+            !stream.accept(secure, ?completion)) { ret false; }
+    }
+    ret true;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
+    val client_hex: *u8 = "3082016530820117a00302010202147da845f0ef3c4bedac9ebe18bdafc1e948a3424a300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133343832305a170d3237303832383133343832305a30183116301406035504030c0d4d616368544c53436c69656e74302a300506032b657003210033e63a8f44421a42ed9b8120e72beee01e147bde123fe0489ccb27e41993c527a3753073300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070302301d0603551d0e04160414928fd5e4ed358ed2992a33dbb12e18ffade4f16b301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300506032b65700341002a1880fbe668a98aef6514366d6ea77a10f26b8018955f559791658fae49d564d27b240dcd44fa613414aceb9b09d1cec53acc280568a38378c5dcfb032e8a0b"::*u8;
+    val client_key_hex: *u8 = "302e020100300506032b6570042204206dd175e2faad594759fd8fb1cd1eeea1f40d01f11189bfd4a6dda111ebee0935"::*u8;
+    var root_der: [341]u8;
+    var client_der: [361]u8;
+    var client_key_der: [48]^u8;
+    if (!decode_hex(root_hex, 682, ?root_der[0], 341) ||
+        !decode_hex(client_hex, 722, ?client_der[0], 361) ||
+        !decode_secret_hex(client_key_hex, 96, ?client_key_der[0], 48)) { ret 1; }
+    val connected: Result[tcp.Stream, io_error.Error] = tcp.connect(
+        ip.endpoint(127, 0, 0, 1, 9443));
+    if (is_err[tcp.Stream, io_error.Error](connected)) { ret 2; }
+    var socket: tcp.Stream = unwrap_ok[tcp.Stream, io_error.Error](connected);
+    var owner: io_runtime.Runtime;
+    if (is_err[bool, io_error.Error](io_runtime.make(?owner, 16))) { ret 3; }
+    var blocking: BlockingTransport = BlockingTransport{runtime: ?owner,
+        stream: ?socket};
+    var lower: transport.Transport = transport.Transport{runtime: ?owner,
+        context: (?blocking)::ptr, submit_read: blocking_read,
+        submit_write: blocking_write, submit_shutdown: blocking_shutdown,
+        submit_close: blocking_close, submit_abort: blocking_close};
+
+    var anchor: cert.Certificate = cert.Certificate{der: ?root_der[0], der_len: 341};
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
+        config.ProtocolName{data: "h2"::*u8, len: 2}};
+    var versions: [1]u16 = [1]u16{tls13.VERSION};
+    var suites: [3]tls13.CipherSuite = [3]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256, tls13.AES_256_GCM_SHA384,
+        tls13.CHACHA20_POLY1305_SHA256};
+    var groups: [2]tls13.NamedGroup = [2]tls13.NamedGroup{
+        tls13.X25519, tls13.SECP256R1};
+    var signatures: [4]tls13.SignatureScheme = [4]tls13.SignatureScheme{
+        tls13.ED25519, tls13.ECDSA_SECP256R1_SHA256,
+        tls13.RSA_PSS_RSAE_SHA256, tls13.RSA_PSS_RSAE_SHA384};
+    var entropy: secret.Entropy = secret.system_entropy();
+    var allocator: secret.Allocator = secret.system_allocator();
+    var client_key: keys.PrivateKey = keys.empty_private();
+    val loaded_key: contracts.Error = load.private_der(
+        contracts.SecretBytes{data: ?client_key_der[0], len: 48}, cert.PKCS8_DER,
+        ?allocator, ?client_key);
+    ct.zeroize(?client_key_der[0], 48);
+    if (loaded_key != contracts.OK) { ret 9; }
+    var client_certificate: cert.Certificate = cert.Certificate{
+        der: ?client_der[0], der_len: 361};
+    var client_chain: cert.Chain = cert.Chain{
+        certificates: ?client_certificate, len: 1};
+    var client_identity: credentials.Identity = credentials.Identity{
+        server_name: contracts.Bytes{data: nil, len: 0}, chain: client_chain,
+        private_key: ?client_key};
+    var configuration: config.ClientConfig;
+    configuration.server_name = "api.example.com";
+    configuration.alpn = ?protocols[0]; configuration.alpn_len = 1;
+    configuration.trust = ?trust;
+    configuration.versions = ?versions[0]; configuration.version_len = 1;
+    configuration.suites = ?suites[0]; configuration.suite_len = 3;
+    configuration.groups = ?groups[0]; configuration.group_len = 2;
+    configuration.signatures = ?signatures[0]; configuration.signature_len = 4;
+    configuration.client_identity = ?client_identity;
+    configuration.entropy = ?entropy;
+    configuration.limits = config.production_limits();
+    configuration.limits.max_handshake_bytes = 65536;
+
+    var handshake_input: [65536]u8;
+    var handshake_output: [65536]u8;
+    var hello: [65536]u8;
+    var certificates: [8]cert.Certificate;
+    var wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    var wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    var plaintext: [record.MAX_INNER_PLAINTEXT]^u8;
+    var content: [record.MAX_PLAINTEXT]^u8;
+    var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+    var storage: stream.Storage;
+    storage.handshake = client.Storage{input: ?handshake_input[0],
+        input_capacity: 65536, output: ?handshake_output[0],
+        output_capacity: 65536, hello: ?hello[0], hello_capacity: 65536,
+        certificates: ?certificates[0], certificate_capacity: 8};
+    storage.wire_input = ?wire_input[0];
+    storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    storage.wire_output = ?wire_output[0];
+    storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    storage.plaintext = ?plaintext[0];
+    storage.plaintext_capacity = record.MAX_INNER_PLAINTEXT;
+    storage.content = ?content[0];
+    storage.content_capacity = record.MAX_PLAINTEXT;
+    storage.scratch = ?scratch[0];
+    storage.scratch_capacity = record.MAX_INNER_PLAINTEXT;
+
+    var scope: cancel.Scope;
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }
+    var secure: stream.Stream;
+    var empty_extra: client.ExtraExtension;
+    if (!stream.connect(?secure, ?configuration, storage, ?lower,
+        empty_extra, 0, ?scope,
+        transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+        !settle(?secure, ?owner)) { ret 5; }
+    val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
+    val negotiated: client.Snapshot = stream.negotiated(?secure);
+    if (handshake.terminal_error != error.OK) {
+        ret 20 + handshake.terminal_error::i64;
+    }
+    if (!negotiated.authenticated) { ret 40; }
+    if (negotiated.selected_alpn.len != 2) { ret 41; }
+    if (negotiated.selected_alpn.data[0] != 'h' ||
+        negotiated.selected_alpn.data[1] != '2') { ret 42; }
+    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 43; }
+
+    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        !stream.close(?secure, ?scope,
+            transport.Token{index: 1, generation: 2}, 2) ||
+        !settle(?secure, ?owner)) { ret 7; }
+    val closed: transport.Snapshot = transport.snapshot(?secure.operation);
+    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
+        !stream.destroy(?secure) || !cancel.destroy(?scope) ||
+        keys.destroy_private(?client_key) != contracts.OK ||
+        is_err[bool, io_error.Error](io_runtime.close(?owner)) ||
+        is_err[bool, io_error.Error](io_runtime.destroy(?owner))) { ret 8; }
+    ret 0;
+}
