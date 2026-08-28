@@ -1,0 +1,50 @@
+# checked memory ranges for borrowed ownership boundaries
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub fun valid_address(address: usize, len: usize) bool {
+    if (len == 0) { ret true; }
+    if (address == 0) { ret false; }
+    ret len - 1 <= ~(0::usize) - address;
+}
+
+pub fun valid(data: *u8, len: usize) bool {
+    ret valid_address(data::usize, len);
+}
+
+pub fun scaled(count: usize, item_size: usize, output: *usize) bool {
+    if (output == nil || (count != 0 && item_size > ~(0::usize) / count)) {
+        ret false;
+    }
+    @output = count * item_size;
+    ret true;
+}
+
+pub fun overlap_addresses(first: usize, first_len: usize, second: usize,
+    second_len: usize) bool {
+    if (first_len == 0 || second_len == 0) { ret false; }
+    if (!valid_address(first, first_len) ||
+        !valid_address(second, second_len)) { ret true; }
+    ret first <= second + second_len - 1 &&
+        second <= first + first_len - 1;
+}
+
+pub fun overlap(first: *u8, first_len: usize, second: *u8,
+    second_len: usize) bool {
+    ret overlap_addresses(first::usize, first_len, second::usize, second_len);
+}
+
+test "memory range: maximum-address endpoints remain representable" {
+    val maximum: usize = ~(0::usize);
+    if (!valid(1::*u8, maximum) ||
+        !overlap(1::*u8, maximum, maximum::*u8, 1) ||
+        overlap(1::*u8, 1, maximum::*u8, 1) ||
+        valid(maximum::*u8, 2)) { ret 1; }
+    var bytes: usize = 0;
+    if (scaled(maximum, 2, ?bytes) || !scaled(maximum, 1, ?bytes) ||
+        bytes != maximum) { ret 2; }
+    ret 0;
+}

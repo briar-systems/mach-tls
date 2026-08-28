@@ -1,6 +1,6 @@
 [project]
-id = "tls"
-version = "0.1.0"
+id = "tls-client-interop"
+version = "0.0.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -44,18 +44,13 @@ opt = 2
 debug = false
 simd = "scalarize"
 
-[artifact.tls]
-kind = "static"
-entry = "lib.mach"
-out = "lib/tls"
+[artifact.tls-client-interop]
+kind = "bin"
+entry = "main.mach"
+out = "bin/tls-client-interop"
 targets = ["*"]
 link = []
 need = []
 
-[dep.mach-std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.33.0"
-
-[dep.mach-crypto]
-git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.6.0"
+[dep.tls]
+path = "../.."

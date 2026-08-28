@@ -25,6 +25,9 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls13.key_schedule` implements the complete TLS 1.3 HKDF schedule and traffic derivation.
 - `tls.state` defines client and server connection state.
 - `tls.session` defines bounded session ticket storage.
+- `tls.client` implements the incremental TLS 1.3 client handshake and its
+  transport-independent event contract.
+- `tls.stream` implements a completion-driven TLS 1.3 secure byte stream.
 
 `tls.lib` re-exports these modules for consumers that prefer one import.
 
@@ -34,7 +37,9 @@ The transport layer is implemented against the shared `mach-std` completion runt
 
 A native TCP adapter is included. QUIC handshake streams implement the same submission callbacks without creating a dependency from TLS back to QUIC.
 
-TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented. The client and server connection state machines remain under subsequent implementation issues. This revision does not yet expose a complete TLS connection.
+TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented.
+
+The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction. `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contract and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md). The TLS server state machine remains under a subsequent implementation issue.
 
 ## Certificates and credentials
 
@@ -53,6 +58,10 @@ Record parsing is incremental and reports the exact byte requirement without con
 TLS 1.2 AES-GCM uses the four-byte fixed IV plus the received eight-byte explicit nonce. TLS 1.2 ChaCha20-Poly1305 and all TLS 1.3 suites XOR the static IV with the padded sequence number. TLS 1.3 authenticates the outer application-data header and encrypts the inner content type and complete standards-permitted padding envelope.
 
 Opening a record authenticates the complete ciphertext before releasing secret plaintext. Authentication failure clears the full possible plaintext prefix, makes the receive cipher terminal, and emits `bad_record_mac`. Key installation is transactional, key transitions reset sequence state, and destruction zeroizes keys and IVs.
+
+Record providers receive only the exact writable ciphertext or plaintext
+extent. Public and secret inputs validate representable ownership before use,
+including partial secret subrange overlap and cipher-state aliasing.
 
 Checked-in record vectors match independently generated Python cryptography AES-GCM and ChaCha20-Poly1305 output for both protocol versions. Hostile tests cover truncation, fragmentation, malformed headers and inners, record overflow, sequence exhaustion, output retry, invalid alerts, provider failure, authentication failure, and maximum TLS 1.3 padding.
 
@@ -84,4 +93,9 @@ mach build .
 mach test .
 mach dep pull test/transport
 mach test test/transport
+mach dep pull test/interop
+mach build test/interop
 ```
+
+External OpenSSL and GnuTLS interoperability commands are in
+[`test/interop/README.md`](test/interop/README.md).
