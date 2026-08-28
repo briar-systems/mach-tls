@@ -20,6 +20,23 @@ at least one ALPN name, a bounded trust store, an operating-system or
 application entropy source, and explicit finite limits. SNI is required and is
 always authenticated against the leaf certificate subject alternative name.
 
+The limits separate peer input from locally generated output. The
+`max_peer_handshake_bytes` bound includes the four-byte handshake header.
+`max_client_hello_bytes` and `max_client_flight_bytes` independently bound the
+largest configured ClientHello and client authentication flight. Initialization
+calculates exact output requirements from the configured names, extensions,
+chain, signature maximum, retry cookie, and key share. A large peer input policy
+therefore does not force equally large output or ClientHello storage.
+`max_chain_bytes` and `max_ticket_bytes` apply to their specific peer objects.
+
+`max_receive_record_plaintext` and `max_send_record_plaintext` are directional
+content limits. The receive limit is advertised with the RFC 8449
+record_size_limit extension, including the TLS 1.3 inner content-type byte. A
+peer can omit the optional response. If it responds, the effective send limit
+is the smaller of local policy and the peer's returned limit. The minimum
+receive content is 63 bytes, corresponding to the protocol's minimum advertised
+value of 64.
+
 An optional client identity is validated against its private key during
 initialization. Its chain and key remain caller-owned until the client is
 destroyed. A CertificateRequest with no compatible signature scheme produces an
@@ -32,9 +49,9 @@ retention buffers are caller-owned. Every range must be representable and every
 mutable region must be disjoint. Configuration and extension input cannot
 overlap those regions. Every pointer range and array product is validated before
 the first nested descriptor is traversed or handshake state is published. A
-single handshake message can use at most
-`limits.max_handshake_bytes`. Consumed prefixes are compacted so the bound does
-not accidentally apply to the cumulative lifetime of a connection.
+single handshake frame can use at most `limits.max_peer_handshake_bytes`,
+including its header. Consumed prefixes are compacted so the bound does not
+accidentally apply to the cumulative lifetime of a connection.
 
 `client.ExtraExtension.kind == 0` means that no opaque ClientHello extension is
 present. A nonzero kind is present even when its body is empty. If a peer
@@ -53,7 +70,8 @@ reports the exact next byte requirement without publishing partial typed views.
 The client implements these state transitions:
 
 1. ClientHello with SNI, ALPN, supported versions, suites, signatures, groups,
-   one key share, and an optional opaque extension.
+   one key share, an optional record-size limit, and an optional opaque
+   extension.
 2. At most one HelloRetryRequest with the RFC 8446 synthetic message hash,
    retained cookie, a newly generated share, and a suite-stable transcript.
 3. ServerHello and handshake traffic-secret publication after the shared secret
@@ -78,6 +96,12 @@ data, and borrowed secret remain valid until the matching
 `client.complete_event` call. A stale token cannot release a newer event.
 Rejecting an event makes the client terminal and publishes one internal-error
 alert through the same ownership path.
+
+Entropy callbacks cannot reenter or destroy the active client. Their descriptor,
+configuration pointer, and handshake state must remain stable across the call.
+Every public output descriptor is validated and proven disjoint from client,
+storage, callback-context, and retained configuration ownership before event
+state is committed.
 
 The event sequence can contain:
 
@@ -138,9 +162,23 @@ must inspect the terminal snapshot and call `destroy_operation` before starting
 the next operation. Application buffers, cancellation scopes, completions, wire
 storage, and operation state have disjoint ownership while active.
 
+The secret arena requirement is calculated as
+`receive + 2 * send + 2` bytes. This holds one bounded incoming TLSInnerPlaintext
+region, one outgoing content region, and one outgoing TLSInnerPlaintext scratch
+region. Applications using smaller directional record policies do not pay for
+three maximum-size records. The public input and output wire buffers scale to
+`receive + 22` and `send + 22` bytes respectively, covering the record header,
+TLS 1.3 inner content type, and AEAD tag.
+
 Submission callbacks run outside the operation lock. The operation enters an
 explicit submitting state first, so synchronous inspection cannot deadlock and
 cancellation cannot release a buffer before a returned lower token settles.
+Stream transitions use an atomic thread-owner gate. Concurrent callers serialize,
+while a callback that reenters on the owning thread is rejected without
+deadlock. A provider descriptor is pinned for every lower submission. If the
+live descriptor changes, the operation retains its lower ownership until the
+matching completion, validates that completion against the pinned provider
+state, then fails terminally.
 
 The stream serializes application operations over one ordered transport. Read
 and write record sequence numbers remain independent. Each operation can submit
@@ -165,6 +203,11 @@ without close_notify is an unclean terminal failure.
 `stream.destroy` is rejected while a lower completion or client event still owns
 storage. It destroys terminal operation state, both record ciphers, and the
 client, then wipes the complete secret arena in one operation.
+If `connect` initializes successfully but rejects the handshake before an
+application operation takes ownership, it rolls initialization back and clears
+every retained pointer. Once an operation is accepted, including immediate
+cancellation or a synchronous provider error, the call returns accepted and the
+terminal result is reported through its snapshot.
 
 ## Validation
 
