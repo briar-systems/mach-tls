@@ -168,6 +168,10 @@ fun known_alert(value: AlertDescription) bool {
         || value == CERTIFICATE_REQUIRED_ALERT || value == NO_APPLICATION_PROTOCOL_ALERT;
 }
 
+pub fun valid_tls13_alert(value: AlertDescription) bool {
+    ret known_alert(value) && value != NO_RENEGOTIATION_ALERT;
+}
+
 fun warning_alert(protocol: Protocol, value: AlertDescription) bool {
     ret protocol == TLS12 && (value == CLOSE_NOTIFY || value == USER_CANCELED_ALERT || value == NO_RENEGOTIATION_ALERT);
 }

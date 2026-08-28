@@ -1533,7 +1533,7 @@ pub fun complete_event(client: *Client, token: u64, accepted: bool) bool {
 
 pub fun close(client: *Client, description: record.AlertDescription) Result {
     if (client == nil || client.state == DESTROYED || client.state == TERMINAL ||
-        description == record.NO_ALERT) {
+        client.state == CLOSING || !record.valid_tls13_alert(description)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     client.pending_alert = description;

@@ -659,6 +659,7 @@ pub fun alert(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     if (description == record.CLOSE_NOTIFY || description == record.NO_ALERT) {
         ret false;
     }
+    if (!record.valid_tls13_alert(description)) { ret false; }
     ret begin_control(stream, scope, token, CONTROL_ALERT, description, context);
 }
 
