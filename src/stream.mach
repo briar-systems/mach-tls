@@ -11,6 +11,8 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.cert;
+use tls.cert.credentials;
+use tls.cert.x509;
 use tls.client;
 use tls.config;
 use tls.engine;
@@ -1288,9 +1290,22 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
             $size_of(runtime.Completion)) ||
         !transport.accept(?stream.operation,
         completion)) { ret false; }
-    if (settle_terminal(stream)) { ret true; }
     val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
     val action: transport.ActionKind = stream.pending_action;
+    # bytes the transport already settled are physically in wire_input and
+    # belong to the record layer however the operation resolved. accounting for
+    # them before the terminal check is what keeps a cancelled read from
+    # leaving the stream mid-record.
+    if (action == transport.TRANSPORT_READ) {
+        if (snapshot.last_transport_bytes >
+            stream.storage.wire_input_capacity - stream.wire_input_len) {
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        stream.wire_input_len = stream.wire_input_len +
+            snapshot.last_transport_bytes;
+    }
+    if (settle_terminal(stream)) { ret true; }
     stream.pending_action = 0;
     if (action == transport.TRANSPORT_WRITE) {
         if (snapshot.last_end_of_stream || snapshot.last_transport_bytes == 0 ||
@@ -1340,12 +1355,6 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
             }
         }
     } or (action == transport.TRANSPORT_READ) {
-        if (snapshot.last_transport_bytes > stream.storage.wire_input_capacity -
-            stream.wire_input_len) {
-            finish(stream, error.INTERNAL_ERROR, false);
-            ret true;
-        }
-        stream.wire_input_len = stream.wire_input_len + snapshot.last_transport_bytes;
         if (snapshot.last_transport_bytes == 0) {
             if (!snapshot.last_end_of_stream) {
                 finish(stream, error.INTERNAL_ERROR, false);
@@ -1429,6 +1438,33 @@ fun destroy_inner(stream: *Stream) bool {
 pub fun destroy(stream: *Stream) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, destroy_inner(stream));
+}
+
+# Mach refuses to erase a pointer that transitively reaches secret-welded
+# storage, and the failure surfaces as a cast error far from the field that
+# caused it. This pins the types that do erase, so a welded field added to any
+# of them fails here rather than in a consumer.
+#
+# Eight public types deliberately cannot erase, because key material lives
+# inline in them: client.Client, server.Server, Stream, config.ClientConfig,
+# config.ServerConfig, credentials.Identity, engine.Event and
+# tls12.connection.Connection. No consumer needs to erase one today, and
+# mach-quic does not. If one ever must, that is the shape of laurel#27 and the
+# fix is an opaque handle rather than relaxing the weld.
+fun erase_client_storage(value: *client.Storage) ptr { ret value::ptr; }
+fun erase_transport(value: *transport.Transport) ptr { ret value::ptr; }
+fun erase_operation(value: *transport.Operation) ptr { ret value::ptr; }
+fun erase_limits(value: *config.Limits) ptr { ret value::ptr; }
+fun erase_trust_store(value: *cert.TrustStore) ptr { ret value::ptr; }
+fun erase_certificate(value: *cert.Certificate) ptr { ret value::ptr; }
+fun erase_leaf(value: *x509.Certificate) ptr { ret value::ptr; }
+
+test "stream: the unwelded public types erase to the untyped ptr" {
+    if (erase_client_storage(nil) != nil || erase_transport(nil) != nil
+        || erase_operation(nil) != nil || erase_limits(nil) != nil) { ret 1; }
+    if (erase_trust_store(nil) != nil || erase_certificate(nil) != nil
+        || erase_leaf(nil) != nil) { ret 2; }
+    ret 0;
 }
 
 test "stream: an unbound or uninitialized engine cannot take ownership" {
