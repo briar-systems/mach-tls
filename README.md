@@ -99,6 +99,26 @@ Production assurance will be accumulated through official vectors,
 interoperability tests, differential tests, generated-code inspection, leakage
 testing, and independent review.
 
+## Record literals
+
+A record literal leaves every field it does not name holding the previous stack
+frame's contents rather than zero, which covers `T{}` as well as any partial
+form (briar-systems/mach#3108). Clearing a security-bearing record with a
+literal therefore does not clear it.
+
+Name every field of every literal. A record containing an array cannot satisfy
+that, because an array field cannot be named in a literal at all, so those are
+built by declaring `var value: T;` — which does zero the whole record including
+its arrays — and assigning each field. The `no_transport`, `no_client_config`,
+`no_server_config`, `no_entropy`, `no_identity`, `no_trust_store` and
+`no_certificate` constructors exist for exactly this: they return a value
+cleared by declaration, and teardown paths copy from them rather than assigning
+a literal.
+
+`tools/partial_literal_sweep.py` enumerates any literal that breaks the rule.
+It reports zero, and its header records the four ways a sweep like it can be
+wrong while still producing plausible output.
+
 ## Local development
 
 Dependencies use pinned Git tags. Build output uses Mach's default `out/`

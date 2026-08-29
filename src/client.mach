@@ -932,7 +932,7 @@ fun init_inner(client: *Client, configuration: *config.ClientConfig,
         client.identity = configuration.client_identity[0];
         client.configuration.client_identity = ?client.identity;
     } or {
-        client.identity = credentials.Identity{};
+        client.identity = credentials.no_identity();
         client.configuration.client_identity = nil;
     }
     client.config = ?client.configuration;
@@ -955,7 +955,7 @@ fun init_inner(client: *Client, configuration: *config.ClientConfig,
     client.client_auth_requested = false;
     client.client_auth_scheme = 0;
     client.authenticated = false;
-    client.peer_leaf = x509.Certificate{};
+    client.peer_leaf = x509.no_certificate();
     client.peer_parameters.data = nil;
     client.peer_parameters.len = 0;
     client.selected_alpn.data = nil;
@@ -2425,27 +2425,12 @@ fun destroy_inner(client: *Client) bool {
     client.sessions = nil;
     client.offering_psk = false;
     client.config = nil;
-    # empty-literal assignment is not trusted to clear welded pointer fields
-    client.configuration = config.ClientConfig{};
-    client.configuration.server_name.data = nil;
-    client.configuration.alpn = nil;
-    client.configuration.trust = nil;
-    client.configuration.versions = nil;
-    client.configuration.suites = nil;
-    client.configuration.groups = nil;
-    client.configuration.signatures = nil;
-    client.configuration.client_identity = nil;
-    client.configuration.entropy = nil;
-    client.entropy = secret.Entropy{};
-    client.entropy.context = nil;
-    client.entropy.secret_context = nil;
-    client.entropy.fill_fn = nil;
-    client.trust = cert.TrustStore{};
-    client.trust.anchors = nil;
-    client.identity = credentials.Identity{};
-    client.identity.server_name.data = nil;
-    client.identity.chain.certificates = nil;
-    client.identity.private_key = nil;
+    # cleared by declaration, which covers every field rather than the subset
+    # a manual list happens to name (briar-systems/mach#3108)
+    client.configuration = config.no_client_config();
+    client.entropy = config.no_entropy();
+    client.trust = cert.no_trust_store();
+    client.identity = credentials.no_identity();
     client.storage.input = nil;
     client.storage.output = nil;
     client.storage.hello = nil;
@@ -2575,11 +2560,62 @@ pub fun send_record_limit(client: *Client) usize {
     ret limit;
 }
 
+# see the note on the no_* constructors in config.mach
+fun no_extra_extension() ExtraExtension {
+    var value: ExtraExtension;
+    ret value;
+}
+
+# leave a nonzero pattern on the stack the next declaration will occupy, so a
+# field left unset by a literal is observable rather than coincidentally zero
+fun dirty_frame(depth: usize) usize {
+    var scratch: [32]usize;
+    var i: usize = 0;
+    for (i < 32) {
+        scratch[i] = 6510615555426900570;
+        i = i + 1;
+    }
+    if (depth > 0) { ret dirty_frame(depth - 1) + scratch[0]; }
+    ret scratch[31];
+}
+
+# every field, including the ones a manual clear left out: `sessions`, the
+# five lengths, and `entropy_context_size`
+fun configuration_cleared(value: *config.ClientConfig) bool {
+    ret value.server_name.data == nil && value.server_name.len == 0
+        && value.alpn == nil && value.alpn_len == 0 && value.trust == nil
+        && value.versions == nil && value.version_len == 0
+        && value.suites == nil && value.suite_len == 0
+        && value.groups == nil && value.group_len == 0
+        && value.signatures == nil && value.signature_len == 0
+        && value.client_identity == nil && value.entropy == nil
+        && value.entropy_context_size == 0 && value.sessions == nil;
+}
+
+# a destroyed client keeps no callable pointer and no stale bound, on every
+# field rather than the subset a manual clear happened to name
+test "client: destroy leaves no residue in any cleared record" {
+    if (dirty_frame(4) == 0) { ret 1; }
+    val cleared: config.ClientConfig = config.no_client_config();
+    if (!configuration_cleared(?cleared)) { ret 2; }
+    val entropy: secret.Entropy = config.no_entropy();
+    if (entropy.context != nil || entropy.secret_context != nil
+        || entropy.fill_fn != nil || entropy.initialized) { ret 3; }
+    val trust: cert.TrustStore = cert.no_trust_store();
+    if (trust.anchors != nil || trust.len != 0) { ret 4; }
+    val identity: credentials.Identity = credentials.no_identity();
+    if (identity.server_name.data != nil || identity.server_name.len != 0
+        || identity.chain.certificates != nil || identity.private_key != nil) {
+        ret 5;
+    }
+    ret 0;
+}
+
 test "client: configuration rejects unbounded and missing ownership" {
     var client: Client;
     var configuration: config.ClientConfig;
     var storage: Storage;
-    if (init(?client, ?configuration, storage, ExtraExtension{}, 0)) { ret 1; }
+    if (init(?client, ?configuration, storage, no_extra_extension(), 0)) { ret 1; }
     ret 0;
 }
 
@@ -2590,8 +2626,11 @@ test "client: user canceled warning permits orderly close" {
         client.state != ESTABLISHED || !client.alert_pending ||
         close(?client, record.CLOSE_NOTIFY).status != FAILED) { ret 1; }
     client.event_active = true;
-    client.active_event = engine.Event{token: 1, kind: ALERT,
-        alert: record.USER_CANCELED_ALERT};
+    var alert_event: engine.Event;
+    alert_event.token = 1;
+    alert_event.kind = ALERT;
+    alert_event.alert = record.USER_CANCELED_ALERT;
+    client.active_event = alert_event;
     if (!complete_event(?client, 1, true) || client.alert_pending ||
         client.state != ESTABLISHED ||
         close(?client, record.CLOSE_NOTIFY).status != OK ||
@@ -2727,32 +2766,32 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     production_storage.input = ?production_input[0];
     production_storage.input_capacity = 1048576;
     if (!config_valid(?production_configuration, ?production_storage,
-            ExtraExtension{}, 0)) { ret 66; }
+            no_extra_extension(), 0)) { ret 66; }
     var bounded_configuration: config.ClientConfig = configuration;
     bounded_configuration.limits.max_peer_handshake_bytes =
         handshake.HEADER_SIZE;
     if (config_valid(?bounded_configuration, ?storage,
-            ExtraExtension{}, 0)) { ret 67; }
+            no_extra_extension(), 0)) { ret 67; }
     var exact_hello: usize = 0;
     var exact_flight: usize = 0;
-    if (!client_hello_requirement(?configuration, ExtraExtension{},
+    if (!client_hello_requirement(?configuration, no_extra_extension(),
             ?exact_hello) || exact_hello == 0 ||
         !client_flight_requirement(?configuration, ?exact_flight) ||
         exact_flight == 0) { ret 68; }
     bounded_configuration = configuration;
     bounded_configuration.limits.max_client_hello_bytes = exact_hello - 1;
     if (config_valid(?bounded_configuration, ?storage,
-            ExtraExtension{}, 0)) { ret 69; }
+            no_extra_extension(), 0)) { ret 69; }
     bounded_configuration = configuration;
     bounded_configuration.limits.max_client_flight_bytes = exact_flight - 1;
     if (config_valid(?bounded_configuration, ?storage,
-            ExtraExtension{}, 0)) { ret 70; }
+            no_extra_extension(), 0)) { ret 70; }
     bounded_configuration = configuration;
     var missing_fill_entropy: secret.Entropy = entropy;
     missing_fill_entropy.fill_fn = nil;
     bounded_configuration.entropy = ?missing_fill_entropy;
     if (config_valid(?bounded_configuration, ?storage,
-            ExtraExtension{}, 0)) { ret 71; }
+            no_extra_extension(), 0)) { ret 71; }
     var oversized_configuration: config.ClientConfig = configuration;
     oversized_configuration.limits.max_peer_handshake_bytes = 70000;
     oversized_configuration.limits.max_client_hello_bytes = 70000;
@@ -2773,7 +2812,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     local_bound_configuration.limits.max_peer_handshake_bytes = 64;
     var local_bound_client: Client;
     if (!init(?local_bound_client, ?local_bound_configuration, storage,
-            ExtraExtension{}, 0) ||
+            no_extra_extension(), 0) ||
         start(?local_bound_client, 1787875200).status != OK ||
         local_bound_client.hello_len <=
             local_bound_configuration.limits.max_peer_handshake_bytes) {
@@ -2790,7 +2829,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     hostile_entropy_client = ?hostile_client;
     hostile_entropy_calls = 0;
     if (!init(?hostile_client, ?hostile_configuration, storage,
-            ExtraExtension{}, 0)) { ret 75; }
+            no_extra_extension(), 0)) { ret 75; }
     val hostile_started: engine.Result = start(?hostile_client, 1787875200);
     if (hostile_started.status != FAILED ||
         hostile_started.error != error.INTERNAL_ERROR ||

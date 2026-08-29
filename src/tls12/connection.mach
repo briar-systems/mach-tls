@@ -511,7 +511,7 @@ fun reset(value: *Connection, storage: Storage) {
     value.hello_len = 0;
     value.public_key_len = 0;
     value.peer_public_len = 0;
-    value.peer_leaf = x509.Certificate{};
+    value.peer_leaf = x509.no_certificate();
     value.peer_leaf_present = false;
     value.selected_alpn.data = nil;
     value.selected_alpn.len = 0;
@@ -552,7 +552,7 @@ pub fun init_client(value: *Connection, configuration: *config.ClientConfig,
         value.identity = configuration.client_identity[0];
         value.client_configuration.client_identity = ?value.identity;
     } or {
-        value.identity = credentials.Identity{};
+        value.identity = credentials.no_identity();
         value.identity.chain.certificates = nil;
         value.identity.private_key = nil;
         value.client_configuration.client_identity = nil;
@@ -2121,7 +2121,7 @@ pub fun destroy(value: *Connection) bool {
         release_lease(value);
         value.client_config = nil;
         value.server_config = nil;
-        value.client_configuration = config.ClientConfig{};
+        value.client_configuration = config.no_client_config();
         value.client_configuration.alpn = nil;
         value.client_configuration.trust = nil;
         value.client_configuration.versions = nil;
@@ -2131,7 +2131,7 @@ pub fun destroy(value: *Connection) bool {
         value.client_configuration.client_identity = nil;
         value.client_configuration.entropy = nil;
         value.client_configuration.sessions = nil;
-        value.server_configuration = config.ServerConfig{};
+        value.server_configuration = config.no_server_config();
         value.server_configuration.credentials = nil;
         value.server_configuration.alpn = nil;
         value.server_configuration.versions = nil;
@@ -2141,13 +2141,13 @@ pub fun destroy(value: *Connection) bool {
         value.server_configuration.entropy = nil;
         value.server_configuration.tickets = nil;
         value.server_configuration.replay = nil;
-        value.entropy = secret.Entropy{};
+        value.entropy = config.no_entropy();
         value.entropy.context = nil;
         value.entropy.secret_context = nil;
         value.entropy.fill_fn = nil;
-        value.trust = cert.TrustStore{};
+        value.trust = cert.no_trust_store();
         value.trust.anchors = nil;
-        value.identity = credentials.Identity{};
+        value.identity = credentials.no_identity();
         value.identity.chain.certificates = nil;
         value.identity.private_key = nil;
         value.storage.input = nil;
@@ -2343,7 +2343,7 @@ fun loopback_configure(versions_include_tls13: bool,
     loopback_groups[0] = tls13.X25519;
     loopback_signatures[0] = tls13.ED25519;
 
-    loopback_client_config = config.ClientConfig{};
+    loopback_client_config = config.no_client_config();
     loopback_client_config.client_identity = nil;
     loopback_client_config.sessions = nil;
     loopback_client_config.server_name = contracts.Bytes{
@@ -2365,7 +2365,7 @@ fun loopback_configure(versions_include_tls13: bool,
     loopback_client_config.limits.max_peer_handshake_bytes = 16384;
     loopback_client_config.limits.max_chain_bytes = 8192;
 
-    loopback_server_config = config.ServerConfig{};
+    loopback_server_config = config.no_server_config();
     loopback_server_config.tickets = nil;
     loopback_server_config.replay = nil;
     loopback_server_config.credentials = ?loopback_store;

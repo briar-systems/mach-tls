@@ -818,7 +818,7 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
     server.binder_transcript = transcript.empty();
     server.tickets_issued = 0;
     server.ticket_nonce = 0;
-    server.peer_leaf = x509.Certificate{};
+    server.peer_leaf = x509.no_certificate();
     server.selected_alpn.data = nil;
     server.selected_alpn.len = 0;
     server.server_name.data = nil;
@@ -2623,19 +2623,10 @@ fun destroy_inner(server: *Server) bool {
     session.state_destroy(?server.ticket_state);
     release_lease(server);
     server.config = nil;
-    # empty-literal assignment is not trusted to clear welded pointer fields
-    server.configuration = config.ServerConfig{};
-    server.configuration.credentials = nil;
-    server.configuration.alpn = nil;
-    server.configuration.versions = nil;
-    server.configuration.suites = nil;
-    server.configuration.groups = nil;
-    server.configuration.signatures = nil;
-    server.configuration.entropy = nil;
-    server.entropy = secret.Entropy{};
-    server.entropy.context = nil;
-    server.entropy.secret_context = nil;
-    server.entropy.fill_fn = nil;
+    # cleared by declaration, which covers every field rather than the subset
+    # a manual list happens to name (briar-systems/mach#3108)
+    server.configuration = config.no_server_config();
+    server.entropy = config.no_entropy();
     server.storage.input = nil;
     server.storage.output = nil;
     server.storage.hello = nil;
@@ -2712,11 +2703,17 @@ pub fun send_record_limit(server: *Server) usize {
     ret limit;
 }
 
+# see the note on the no_* constructors in config.mach
+fun no_extra_extension() ExtraExtension {
+    var value: ExtraExtension;
+    ret value;
+}
+
 test "server: configuration rejects unbounded and missing ownership" {
     var server: Server;
     var configuration: config.ServerConfig;
     var storage: Storage;
-    if (init(?server, ?configuration, storage, ExtraExtension{}, 0)) { ret 1; }
+    if (init(?server, ?configuration, storage, no_extra_extension(), 0)) { ret 1; }
     if (snapshot(?server).status != engine.MORE ||
         snapshot(?server).role != engine.SERVER) { ret 2; }
     if (start(?server, 0).status != engine.FAILED ||
@@ -3638,7 +3635,7 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     resume_suites[0] = tls13.AES_128_GCM_SHA256;
     resume_groups[0] = tls13.X25519;
     resume_signatures[0] = tls13.ED25519;
-    resume_listener = config.ServerConfig{};
+    resume_listener = config.no_server_config();
     resume_listener.credentials = ?resume_store_credentials;
     resume_listener.alpn = ?resume_protocols[0];
     resume_listener.alpn_len = 1;
@@ -3665,8 +3662,7 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
 
     resume_anchor = cert.Certificate{der: ?loopback_root[0], der_len: 341};
     resume_trust = cert.TrustStore{anchors: ?resume_anchor, len: 1};
-    resume_dialer = config.ClientConfig{};
-    resume_dialer.client_identity = nil;
+    resume_dialer = config.no_client_config();
     resume_dialer.server_name = contracts.Bytes{data: "api.example.com"::*u8,
         len: 15};
     resume_dialer.alpn = ?resume_protocols[0];
