@@ -198,7 +198,13 @@ byte. Outgoing handshake flights and application writes split at the TLS
 plaintext limit and advance application ownership only after the complete record
 has settled.
 
-A cancelled or timed-out read retains safely reusable record input. A cancelled,
+A cancelled or timed-out read retains safely reusable record input. Bytes the
+transport had already settled into wire storage are accounted for before the
+operation resolves, so cancelling a read is a control-flow decision and never a
+data-loss one: the record layer sees every byte that came off the lower
+transport, and the following record still decodes. A caller that pre-empts a
+read to make room for a write may therefore do so at any point without
+corrupting the stream. A cancelled,
 timed-out, zero-progress, or failed write makes the stream `FAILED`, since a
 partially published ciphertext record cannot be retried or skipped. After the
 terminal operation is destroyed, `close` on a failed stream submits the distinct

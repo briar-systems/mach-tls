@@ -1290,9 +1290,22 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
             $size_of(runtime.Completion)) ||
         !transport.accept(?stream.operation,
         completion)) { ret false; }
-    if (settle_terminal(stream)) { ret true; }
     val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
     val action: transport.ActionKind = stream.pending_action;
+    # bytes the transport already settled are physically in wire_input and
+    # belong to the record layer however the operation resolved. accounting for
+    # them before the terminal check is what keeps a cancelled read from
+    # leaving the stream mid-record.
+    if (action == transport.TRANSPORT_READ) {
+        if (snapshot.last_transport_bytes >
+            stream.storage.wire_input_capacity - stream.wire_input_len) {
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        stream.wire_input_len = stream.wire_input_len +
+            snapshot.last_transport_bytes;
+    }
+    if (settle_terminal(stream)) { ret true; }
     stream.pending_action = 0;
     if (action == transport.TRANSPORT_WRITE) {
         if (snapshot.last_end_of_stream || snapshot.last_transport_bytes == 0 ||
@@ -1342,12 +1355,6 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
             }
         }
     } or (action == transport.TRANSPORT_READ) {
-        if (snapshot.last_transport_bytes > stream.storage.wire_input_capacity -
-            stream.wire_input_len) {
-            finish(stream, error.INTERNAL_ERROR, false);
-            ret true;
-        }
-        stream.wire_input_len = stream.wire_input_len + snapshot.last_transport_bytes;
         if (snapshot.last_transport_bytes == 0) {
             if (!snapshot.last_end_of_stream) {
                 finish(stream, error.INTERNAL_ERROR, false);
