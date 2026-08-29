@@ -69,6 +69,24 @@ pub rec ServerConfig {
     limits:             Limits;
 }
 
+# a value cleared by declaration rather than by an empty literal: a record
+# literal leaves every field it does not name holding the previous stack
+# frame's contents (briar-systems/mach#3108)
+pub fun no_client_config() ClientConfig {
+    var value: ClientConfig;
+    ret value;
+}
+
+pub fun no_server_config() ServerConfig {
+    var value: ServerConfig;
+    ret value;
+}
+
+pub fun no_entropy() secret.Entropy {
+    var value: secret.Entropy;
+    ret value;
+}
+
 pub fun production_limits() Limits {
     var limits: Limits;
     limits.max_receive_record_plaintext = 16384;

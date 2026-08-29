@@ -1414,7 +1414,7 @@ fun destroy_inner(stream: *Stream) bool {
     stream.server = nil;
     stream.legacy = nil;
     stream.transport = nil;
-    stream.lower_transport = transport.Transport{};
+    stream.lower_transport = transport.no_transport();
     stream.storage.wire_input = nil;
     stream.storage.wire_input_capacity = 0;
     stream.storage.wire_output = nil;
