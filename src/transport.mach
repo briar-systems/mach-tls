@@ -73,6 +73,14 @@ fun load(transport: *Transport, output: *Transport) bool {
     ret true;
 }
 
+# a value cleared by declaration rather than by an empty literal: a record
+# literal leaves every field it does not name holding the previous stack
+# frame's contents (briar-systems/mach#3108)
+pub fun no_transport() Transport {
+    var value: Transport;
+    ret value;
+}
+
 pub fun valid(transport: *Transport) bool {
     var descriptor: Transport;
     ret load(transport, ?descriptor);
@@ -422,7 +430,7 @@ pub fun begin(
     operation.cancellation_active = false;
     operation.cancellation_requested = false;
     operation.cancellation_error = error.OK;
-    operation.provider = Transport{};
+    operation.provider = no_transport();
     operation.provider_owner = nil;
     operation.provider_drifted = false;
     operation.lock = mutex.make();
@@ -528,7 +536,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
     }
     if (is_err[io_runtime.Token, io_error.Error](submitted)) {
         operation.state = OPERATION_OPEN;
-        operation.provider = Transport{};
+        operation.provider = no_transport();
         operation.provider_owner = nil;
         if (!descriptor_stable) {
             terminal_locked(operation, error.INTERNAL_ERROR, false, false);
@@ -546,7 +554,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
         unwrap_ok[io_runtime.Token, io_error.Error](submitted);
     if (lower_token.generation == 0) {
         operation.state = OPERATION_OPEN;
-        operation.provider = Transport{};
+        operation.provider = no_transport();
         operation.provider_owner = nil;
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
         mutex.unlock(?operation.lock);
@@ -638,7 +646,7 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
     operation.lower_kind = 0;
     operation.lower_buffer = nil;
     operation.lower_length = 0;
-    operation.provider = Transport{};
+    operation.provider = no_transport();
     operation.provider_owner = nil;
     operation.provider_drifted = false;
     operation.last_transport_bytes = settled.bytes;
@@ -711,7 +719,7 @@ pub fun destroy_operation(operation: *Operation) bool {
     operation.application_length = 0;
     operation.lower_buffer = nil;
     operation.lower_length = 0;
-    operation.provider = Transport{};
+    operation.provider = no_transport();
     operation.provider_owner = nil;
     operation.provider_drifted = false;
     operation.state = OPERATION_DESTROYED;

@@ -31,3 +31,11 @@ test "cert: encoded private key formats are explicit" {
     if (SEC1_DER == RSA_PKCS1_DER) { ret 1; }
     ret 0;
 }
+
+# a value cleared by declaration rather than by an empty literal: a record
+# literal leaves every field it does not name holding the previous stack
+# frame's contents (briar-systems/mach#3108)
+pub fun no_trust_store() TrustStore {
+    var value: TrustStore;
+    ret value;
+}
