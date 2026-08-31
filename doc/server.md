@@ -117,9 +117,12 @@ and only after proving the key and exact DNS identity match. Ordinary
 `x509.parse`, normal generation initialization, and all client verification
 continue to reject unknown critical extensions. A selector must choose this
 generation only when `server.offered_alpn_contains` confirms `acme-tls/1` in
-the current ClientHello. Its owner publishes it through a caller-owned
-`credentials.Store`, selects it with `credentials.acquire`, then calls
-`retire_store` before reclaiming it after the transient lease is released.
+the current ClientHello. Its owner initializes one stable caller-owned Store
+with `credentials.initialize_vacant_store`, publishes each challenge with
+`publish_store`, leases it with `acquire`, then calls `withdraw_store` before
+reclaiming it after the final transient lease is released. Publication,
+selection, and withdrawal synchronize through that Store without replacing
+its lock while a selector may be entering it.
 
 ## Failure
 
