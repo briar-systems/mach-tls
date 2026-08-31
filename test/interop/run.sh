@@ -11,7 +11,8 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-BIN="test/interop/out/linux-x86_64/debug/bin"
+PROFILE="${PROFILE:-debug}"
+BIN="test/interop/out/linux-x86_64/$PROFILE/bin"
 SERVER="$BIN/tls-server-interop"
 CLIENT="$BIN/tls-client-interop"
 EVIDENCE="$BIN/tls-evidence"
@@ -219,6 +220,8 @@ client_leg "1.3 client suite chacha20" "" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_3 -alpn h2 -ciphersuites TLS_CHACHA20_POLY1305_SHA256 -rev -quiet"
 client_leg "1.3 client ecdsa p256 server" "" \
   "openssl s_server -accept 9443 -cert $FIX/p256.pem -key $FIX/p256.key -tls1_3 -alpn h2 -rev -quiet"
+client_leg "1.3 client verifies p384 sha384 server" "" \
+  "openssl s_server -accept 9443 -cert $FIX/p384.pem -key $FIX/p384.key -tls1_3 -alpn h2 -sigalgs ecdsa_secp384r1_sha384 -rev -quiet"
 client_leg "1.3 client rsa-pss server" "" \
   "openssl s_server -accept 9443 -cert $FIX/rsa.pem -key $FIX/rsa.key -tls1_3 -alpn h2 -rev -quiet"
 client_leg "1.3 client presents its certificate" "" \
@@ -235,6 +238,8 @@ client_leg "1.2 client ed25519 server" "--tls12" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_2 -alpn h2 -rev -quiet"
 client_leg "1.2 client ecdsa p256 server" "--tls12" \
   "openssl s_server -accept 9443 -cert $FIX/p256.pem -key $FIX/p256.key -tls1_2 -alpn h2 -rev -quiet"
+client_leg "1.2 client verifies p384 sha384 certificate path" "--tls12" \
+  "openssl s_server -accept 9443 -cert $FIX/p384-chain.pem -key $FIX/p256.key -tls1_2 -alpn h2 -cipher ECDHE-ECDSA-AES256-GCM-SHA384 -sigalgs ecdsa_secp256r1_sha256 -rev -quiet"
 client_leg "1.2 client rsa server" "--tls12" \
   "openssl s_server -accept 9443 -cert $FIX/rsa.pem -key $FIX/rsa.key -tls1_2 -alpn h2 -rev -quiet"
 client_leg "1.2 client ecdhe-ecdsa aes256" "--tls12" \
