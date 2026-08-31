@@ -115,8 +115,11 @@ pub fun no_credential_selector() CredentialSelector {
 }
 
 fun selector_valid(value: CredentialSelector) bool {
-    ret (value.select == nil && value.store == nil) ||
-        (value.select != nil && value.store != nil);
+    if (value.select == nil || value.store == nil) {
+        ret value.select == nil && value.store == nil;
+    }
+    ret value.store.initialized &&
+        memory_range.valid((?value.store.lock)::*u8, $size_of(credentials.Store));
 }
 
 pub fun offered_alpn_contains(offer: CredentialOffer, protocol: contracts.Bytes)
@@ -458,7 +461,9 @@ pub fun aliases_borrowed(server: *Server, data: *u8, len: usize) bool {
     }
     ret server_owner_overlaps(server, data, len) ||
         storage_overlaps(?server.storage, data, len) ||
-        borrowed_overlaps(server.config, server.extra, data, len, true, true);
+        borrowed_overlaps(server.config, server.extra, data, len, true, true) ||
+        (server.selector.select != nil && memory_range.overlap(data, len,
+            (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
 }
 
 pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
@@ -468,7 +473,9 @@ pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
         server.state < EXPECT_CLIENT_HELLO || server.state >= DESTROYED) {
         ret true;
     }
-    ret borrowed_overlaps(server.config, server.extra, data, len, false, true);
+    ret borrowed_overlaps(server.config, server.extra, data, len, false, true) ||
+        (server.selector.select != nil && memory_range.overlap(data, len,
+            (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
 }
 
 fun config_sources_disjoint(server: *Server, value: *config.ServerConfig,
@@ -500,6 +507,17 @@ fun config_sources_disjoint(server: *Server, value: *config.ServerConfig,
         borrowed_overlaps(value, extra, storage.peer_parameters,
             storage.peer_parameters_capacity, true, true)) { ret false; }
     ret true;
+}
+
+fun selector_sources_disjoint(server: *Server, value: *config.ServerConfig,
+    storage: *Storage, extra: ExtraExtension,
+    selector: CredentialSelector) bool {
+    if (selector.select == nil) { ret true; }
+    val data: *u8 = (?selector.store.lock)::*u8;
+    val length: usize = $size_of(credentials.Store);
+    ret !server_owner_overlaps(server, data, length) &&
+        !storage_overlaps(storage, data, length) &&
+        !borrowed_overlaps(value, extra, data, length, true, true);
 }
 
 fun reserved_server_extension(kind: u16) bool {
@@ -828,7 +846,8 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
         (server.state != 0 && server.state != DESTROYED) ||
         !config_valid(configuration, ?storage, extra, peer_extension) ||
         !config_sources_disjoint(server, configuration, ?storage, extra) ||
-        !selector_valid(selector)) {
+        !selector_valid(selector) || !selector_sources_disjoint(server,
+            configuration, ?storage, extra, selector)) {
         ret false;
     }
     server.configuration = configuration[0];
