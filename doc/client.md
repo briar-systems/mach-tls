@@ -15,7 +15,7 @@ outer descriptor after initialization cannot redirect a live handshake. The
 server name is an explicit bounded byte view, so validation and SNI encoding do
 not depend on a terminator scan. The configuration requires one TLS 1.3 version,
 one to three supported cipher
-suites, one or two supported groups, one to four supported signature schemes,
+suites, one or two supported groups, one to five supported signature schemes,
 at least one ALPN name, a bounded trust store, an operating-system or
 application entropy source, and explicit finite limits. SNI is required and is
 always authenticated against the leaf certificate subject alternative name.
@@ -238,6 +238,8 @@ abortive cleanup, and destruction.
 
 The external harness performs real TCP handshakes, bidirectional application
 records, pre-cancelled and pre-timed-out reads, half-close, and final close
-against OpenSSL and GnuTLS. Its checked-in test credentials cover Ed25519, ECDSA P-256,
-RSA-PSS authentication, required client authentication, X25519, P-256 retry, and
-all three TLS 1.3 cipher suites. See [`../test/interop/README.md`](../test/interop/README.md).
+against OpenSSL and GnuTLS. Its checked-in test credentials cover Ed25519,
+ECDSA P-256, verification-only ECDSA P-384 peer authentication, RSA-PSS
+authentication, required client authentication, X25519, P-256 retry, and all
+three TLS 1.3 cipher suites. See
+[`../test/interop/README.md`](../test/interop/README.md).

@@ -259,6 +259,8 @@ openssl x509 -req -in <name>.csr -CA server-root.pem -CAkey server-root.key \
 | --- | --- | --- |
 | `server-ed25519` | `api.example.com` | Ed25519 |
 | `server-p256` | `api.example.com` | ECDSA P-256 |
+| `p384` | `api.example.com` | ECDSA P-384, verification-only peer fixture |
+| `p384-chain` | `api.example.com` | P-256 leaf signed by the P-384 test root |
 | `server-rsa` | `api.example.com` | RSA 2048 |
 | `server-alt` | `alt.example.com` | Ed25519 |
 | `server-wild` | `*.example.com` | Ed25519 |

@@ -36,7 +36,7 @@ it does not change the contract or the record layer.
 its bounded arrays. The credential store, ALPN names, version, suite, group, and
 signature arrays remain immutable caller-owned borrows for the lifetime of the
 engine. The configuration requires one TLS 1.3 version, one to three cipher
-suites, one or two groups, one to four signature schemes, an initialized
+suites, one or two groups, one to five signature schemes, an initialized
 credential store, an operating-system or application entropy source, and
 explicit finite limits.
 
@@ -138,7 +138,8 @@ without publishing state, and that a terminal engine refuses further input.
 
 The external harness performs real TCP handshakes against OpenSSL and GnuTLS
 clients covering SNI selection, wildcard selection, ALPN, all three cipher
-suites, X25519 and P-256 including HelloRetryRequest, Ed25519, ECDSA P-256, and
-RSA-PSS credentials, required client authentication, credential rotation during
-an established connection, and the negotiation failures above. See
+suites, X25519 and P-256 including HelloRetryRequest, Ed25519, ECDSA P-256,
+verification-only ECDSA P-384 peer authentication, and RSA-PSS credentials,
+required client authentication, credential rotation during an established
+connection, and the negotiation failures above. See
 [`../test/interop/README.md`](../test/interop/README.md).
