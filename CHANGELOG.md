@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## [0.2.0] - 2026-08-31
 
-- add an ALPN-aware TLS 1.3 server credential selector and an explicit,
-  challenge-only RFC 8737 TLS-ALPN generation contract
+### Added
+
+- An ALPN-aware TLS 1.3 server credential selector with stable transient
+  credential stores and an exact, transactional RFC 8737 challenge contract.
+- Verification-only ECDSA P-384 with SHA-384 for certificate paths and TLS 1.2
+  and TLS 1.3 peer signatures.
+
+### Changed
+
+- `mach-crypto` advances to `v0.7.0` for strict P-384 public-key parsing and
+  signature verification.
+- TLS 1.3 signature policy supports five peer-verification schemes while P-384
+  remains unavailable for local signing and key exchange.
+
+### Fixed
+
+- Ticket-key rotation refuses a full live ring instead of shortening a live
+  ticket's configured overlap.
+- Maximum-size CertificateRequest signature policies use a derived bound and
+  reject undersized output before writing.
