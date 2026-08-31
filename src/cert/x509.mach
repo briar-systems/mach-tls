@@ -61,6 +61,8 @@ pub rec Extensions {
     subject_key_id: contracts.Bytes;
     authority_key_id_present: bool;
     authority_key_id: contracts.Bytes;
+    acme_identifier_present: bool;
+    acme_identifier: contracts.Bytes;
 }
 
 pub rec Certificate {
@@ -102,6 +104,8 @@ fun empty_extensions() Extensions {
         subject_key_id: contracts.Bytes{data: nil, len: 0},
         authority_key_id_present: false,
         authority_key_id: contracts.Bytes{data: nil, len: 0},
+        acme_identifier_present: false,
+        acme_identifier: contracts.Bytes{data: nil, len: 0},
     };
 }
 
@@ -946,7 +950,11 @@ fun extension_count(input: contracts.Bytes, expected: contracts.Bytes) usize {
     ret count;
 }
 
-fun parse_extensions(element: *der.Element, output: *Extensions) bool {
+val OID_ACME_IDENTIFIER: [8]u8 = [8]u8{0x2b, 0x06, 0x01, 0x05, 0x05, 0x07,
+    0x01, 0x1f};
+
+fun parse_extensions(element: *der.Element, output: *Extensions,
+    tls_alpn_challenge: bool) bool {
     if (element == nil || output == nil || element.tag != 0xa3) { ret false; }
     var outer_parent: der.Cursor = der.cursor(element.encoded);
     var outer: der.Cursor;
@@ -1007,13 +1015,20 @@ fun parse_extensions(element: *der.Element, output: *Extensions) bool {
             output.subject_key_id = key_id.content;
         } or (oid_equal(oid.content, (?OID_AUTHORITY_KEY_ID[0]), 3)) {
             if (!parse_authority_key_id(value.content, output)) { ret false; }
+        } or (tls_alpn_challenge && critical &&
+            oid_equal(oid.content, (?OID_ACME_IDENTIFIER[0]), 8)) {
+            var identifier: der.Element;
+            if (!one_element(value.content, der.OCTET_STRING, ?identifier) ||
+                identifier.content.len != 32) { ret false; }
+            output.acme_identifier_present = true;
+            output.acme_identifier = identifier.content;
         } or (critical) { ret false; }
     }
     ret true;
 }
 
 fun parse_with(input: contracts.Bytes, output: *Certificate,
-    trust_anchor: bool) contracts.Error {
+    trust_anchor: bool, tls_alpn_challenge: bool) contracts.Error {
     if (output == nil || input.len == 0 || input.data == nil) {
         ret contracts.INVALID_INPUT;
     }
@@ -1106,11 +1121,14 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
         }
         or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
             saw_extensions = true;
-            if (!parse_extensions(?optional, ?extensions)) { ret contracts.INVALID_INPUT; }
+            if (!parse_extensions(?optional, ?extensions, tls_alpn_challenge)) { ret contracts.INVALID_INPUT; }
         } or { ret contracts.INVALID_INPUT; }
     }
     if (subject_empty && (!extensions.subject_alt_name_present ||
         !extensions.subject_alt_name_critical)) { ret contracts.INVALID_INPUT; }
+    if (tls_alpn_challenge && !extensions.acme_identifier_present) {
+        ret contracts.INVALID_INPUT;
+    }
     output.encoded = input;
     output.tbs = tbs.encoded;
     output.version = version;
@@ -1129,12 +1147,17 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
 }
 
 pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
-    ret parse_with(input, output, false);
+    ret parse_with(input, output, false, false);
+}
+
+pub fun parse_tls_alpn_challenge(input: contracts.Bytes,
+    output: *Certificate) contracts.Error {
+    ret parse_with(input, output, false, true);
 }
 
 pub fun parse_trust_anchor(input: contracts.Bytes,
     output: *Certificate) contracts.Error {
-    ret parse_with(input, output, true);
+    ret parse_with(input, output, true, false);
 }
 
 test "cert.x509: strict utc and generalized time parsing" {

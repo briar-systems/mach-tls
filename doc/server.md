@@ -67,10 +67,13 @@ HelloRetryRequest sentinel. `ingest` at `INITIAL` accepts the ClientHello.
 1. The ClientHello is decoded, its extensions validated for structure,
    placement, uniqueness, and ordering, and TLS 1.3 confirmed in
    `supported_versions`.
-2. The SNI host name is extracted and a credential lease is acquired for it.
-   Exact names outrank the longest matching wildcard, which outranks the
-   configured default. A name with no match and no default fails with
-   `unrecognized_name`.
+2. The SNI host name and complete offered-ALPN list are extracted before a
+   credential lease is acquired. `server.init_with_credential_selector` may
+   inspect both through one borrowed `CredentialOffer` and lease a caller-owned
+   transient generation. The default `server.init` path selects the published
+   store generation by SNI. Exact names outrank the longest matching wildcard,
+   which outranks the configured default. A name with no match and no default
+   fails with `unrecognized_name`.
 3. The lease fixes the certificate, the private key, the client-authentication
    requirement, and the client trust store for the whole connection.
 4. Negotiation selects a suite, a group, a signature scheme compatible with the
@@ -104,6 +107,16 @@ connection therefore keeps the certificate, chain, private key, client trust
 store, and client-authentication requirement it started with, and a rotation
 cannot alter any of them mid-connection. The caller may reclaim the retired
 arrays and keys only after `credentials.reclaimable` returns true.
+
+`credentials.initialize_tls_alpn_challenge` creates the one-identity,
+one-certificate transient generation RFC 8737 requires. It accepts the
+critical `acmeIdentifier` extension only through `x509.parse_tls_alpn_challenge`
+and only after proving the key and exact DNS identity match. Ordinary
+`x509.parse`, normal generation initialization, and all client verification
+continue to reject unknown critical extensions. A selector must choose this
+generation only when `server.offered_alpn_contains` confirms `acme-tls/1` in
+the current ClientHello, and its owner must retain the generation and key until
+the transient lease is released.
 
 ## Failure
 

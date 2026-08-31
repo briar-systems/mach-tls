@@ -92,6 +92,46 @@ rec Pending {
     alert: record.AlertDescription;
 }
 
+# selectors inspect one complete client hello and lease exactly one generation.
+pub rec CredentialOffer {
+    server_name: contracts.Bytes;
+    # the encoded protocol-name list, without its u16 length prefix
+    offered_alpn: contracts.Bytes;
+}
+
+pub def CredentialSelect: fun(ptr, CredentialOffer, *credentials.Lease)
+    contracts.Error;
+
+pub rec CredentialSelector {
+    context: ptr;
+    select: CredentialSelect;
+}
+
+pub fun no_credential_selector() CredentialSelector {
+    var value: CredentialSelector;
+    value.context = nil;
+    value.select = nil;
+    ret value;
+}
+
+pub fun offered_alpn_contains(offer: CredentialOffer, protocol: contracts.Bytes)
+    bool {
+    if (offer.offered_alpn.data == nil || protocol.data == nil || protocol.len == 0) {
+        ret false;
+    }
+    var at: usize = 0;
+    for (at < offer.offered_alpn.len) {
+        val length: usize = offer.offered_alpn.data[at]::usize;
+        if (length == 0 || length > offer.offered_alpn.len - at - 1) { ret false; }
+        if (length == protocol.len && bytes_equal(contracts.Bytes{
+            data: ?offer.offered_alpn.data[at + 1], len: length}, protocol)) {
+            ret true;
+        }
+        at = at + 1 + length;
+    }
+    ret false;
+}
+
 pub rec Server {
     config: *config.ServerConfig;
     configuration: config.ServerConfig;
@@ -103,6 +143,7 @@ pub rec Server {
     schedule: key_schedule.Schedule;
     lease: credentials.Lease;
     lease_held: bool;
+    selector: CredentialSelector;
     state: u8;
     failure: error.Error;
     pending_alert: record.AlertDescription;
@@ -776,7 +817,8 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
 }
 
 fun init_inner(server: *Server, configuration: *config.ServerConfig,
-    storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
+    storage: Storage, extra: ExtraExtension, peer_extension: u16,
+    selector: CredentialSelector) bool {
     if (!server_owner_valid(server) ||
         (server.state != 0 && server.state != DESTROYED) ||
         !config_valid(configuration, ?storage, extra, peer_extension) ||
@@ -793,6 +835,7 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
     server.transcript = transcript.empty();
     server.lease = credentials.empty_lease();
     server.lease_held = false;
+    server.selector = selector;
     server.state = EXPECT_CLIENT_HELLO;
     server.failure = error.OK;
     server.pending_alert = record.NO_ALERT;
@@ -841,7 +884,17 @@ pub fun init(server: *Server, configuration: *config.ServerConfig,
     storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
     if (!enter(server)) { ret false; }
     val initialized: bool = init_inner(server, configuration, storage, extra,
-        peer_extension);
+        peer_extension, no_credential_selector());
+    leave(server);
+    ret initialized;
+}
+
+pub fun init_with_credential_selector(server: *Server,
+    configuration: *config.ServerConfig, storage: Storage, extra: ExtraExtension,
+    peer_extension: u16, selector: CredentialSelector) bool {
+    if (!enter(server)) { ret false; }
+    val initialized: bool = init_inner(server, configuration, storage, extra,
+        peer_extension, selector);
     leave(server);
     ret initialized;
 }
@@ -1023,6 +1076,26 @@ fun extract_server_name(hello: *codec.ClientHello,
     if (name_extension.data[2] != 0 || length == 0 || length > 253 ||
         name_extension.len != 5 + length) { ret false; }
     output[0] = contracts.Bytes{data: ?name_extension.data[5], len: length};
+    ret true;
+}
+
+fun extract_offered_alpn(hello: *codec.ClientHello,
+    output: *contracts.Bytes) bool {
+    output[0] = contracts.Bytes{data: nil, len: 0};
+    var extension: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.APPLICATION_LAYER_PROTOCOL,
+        ?extension)) { ret true; }
+    if (extension.len < 3) { ret false; }
+    val length: usize = read_u16(extension.data, 0)::usize;
+    if (length == 0 || length != extension.len - 2) { ret false; }
+    var at: usize = 2;
+    for (at < extension.len) {
+        val item: usize = extension.data[at]::usize;
+        if (item == 0 || item > extension.len - at - 1) { ret false; }
+        at = at + 1 + item;
+    }
+    if (at != extension.len) { ret false; }
+    output[0] = contracts.Bytes{data: ?extension.data[2], len: length};
     ret true;
 }
 
@@ -1388,10 +1461,17 @@ fun build_policy(server: *Server, schemes: *tls13.SignatureScheme,
     ret true;
 }
 
-fun acquire_credentials(server: *Server, requested: contracts.Bytes) error.Error {
+fun acquire_credentials(server: *Server, requested: contracts.Bytes,
+    offered_alpn: contracts.Bytes) error.Error {
     if (server.lease_held) { ret error.OK; }
-    val status: contracts.Error = credentials.acquire(server.config.credentials,
-        requested, ?server.lease);
+    var status: contracts.Error = contracts.INVALID_STATE;
+    if (server.selector.select == nil) {
+        status = credentials.acquire(server.config.credentials, requested,
+            ?server.lease);
+    } or {
+        status = server.selector.select(server.selector.context, CredentialOffer{
+            server_name: requested, offered_alpn: offered_alpn}, ?server.lease);
+    }
     if (status == contracts.UNSUPPORTED) { ret error.UNRECOGNIZED_NAME; }
     if (status != contracts.OK || server.lease.identity == nil ||
         server.lease.generation == nil) { ret error.HANDSHAKE_FAILURE; }
@@ -1863,8 +1943,12 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
         if (!extract_server_name(?hello, ?requested)) {
             ret error.ILLEGAL_PARAMETER;
         }
+        var offered_alpn: contracts.Bytes;
+        if (!extract_offered_alpn(?hello, ?offered_alpn)) {
+            ret error.ILLEGAL_PARAMETER;
+        }
         retain_server_name(server, requested);
-        failure = acquire_credentials(server, server.server_name);
+        failure = acquire_credentials(server, server.server_name, offered_alpn);
         if (failure != error.OK) { ret failure; }
         if (!record_size_limit(server, ?hello)) { ret error.ILLEGAL_PARAMETER; }
         failure = retain_peer_parameters(server, ?hello);
@@ -4056,5 +4140,22 @@ test "validation: mutated client hellos leave the server in a bounded state" {
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 5; }
     if (keys.destroy_private(?key) != contracts.OK) { ret 6; }
+    ret 0;
+}
+
+test "server: an ALPN-aware selector sees only complete offered protocol names" {
+    var offered: [12]u8 = [12]u8{2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1',
+        '.', '1'};
+    val request: CredentialOffer = CredentialOffer{server_name: contracts.Bytes{
+        data: "site.example"::*u8, len: 12}, offered_alpn: contracts.Bytes{
+        data: ?offered[0], len: 12}};
+    if (!offered_alpn_contains(request, contracts.Bytes{data: "h2"::*u8,
+        len: 2}) || !offered_alpn_contains(request, contracts.Bytes{
+        data: "http/1.1"::*u8, len: 8})) { ret 1; }
+    if (offered_alpn_contains(request, contracts.Bytes{data: "acme-tls/1"::*u8,
+        len: 10})) { ret 2; }
+    offered[3] = 9;
+    if (offered_alpn_contains(request, contracts.Bytes{data: "http/1.1"::*u8,
+        len: 8})) { ret 3; }
     ret 0;
 }
