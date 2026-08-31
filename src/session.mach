@@ -262,7 +262,8 @@ fun ring_prune(ring: *KeyRing, now: i64) {
     }
 }
 
-fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, now: i64) bool {
+fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, now: i64,
+    retire: bool) bool {
     var slot: usize = MAX_TICKET_KEYS;
     var index: usize = 0;
     for (index < MAX_TICKET_KEYS) {
@@ -270,34 +271,54 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, now: i64) bool {
         or { index = index + 1; }
     }
     if (slot == MAX_TICKET_KEYS) {
-        # evict the key that stops opening first
-        var oldest: usize = 0;
-        index = 1;
+        index = 0;
         for (index < MAX_TICKET_KEYS) {
-            if (ring.keys[index].open_until < ring.keys[oldest].open_until) {
-                oldest = index;
+            if (key_expired(?ring.keys[index], now)) {
+                slot = index;
+                index = MAX_TICKET_KEYS;
             }
             index = index + 1;
         }
-        ct.zeroize(?ring.keys[oldest].key[0], TICKET_KEY_SIZE);
-        ring.keys[oldest].active = false;
-        slot = oldest;
-        if (ring.count != 0) { ring.count = ring.count - 1; }
     }
-    if (!fill_public(entropy, ?ring.keys[slot].name[0], KEY_NAME_SIZE) ||
-        !fill_secret(entropy, ?ring.keys[slot].key[0], TICKET_KEY_SIZE)) {
-        ct.zeroize(?ring.keys[slot].key[0], TICKET_KEY_SIZE);
+    var candidate_name: [KEY_NAME_SIZE]u8;
+    var candidate_key: [TICKET_KEY_SIZE]^u8;
+    ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
+    if (slot == MAX_TICKET_KEYS ||
+        !fill_public(entropy, ?candidate_name[0], KEY_NAME_SIZE) ||
+        !fill_secret(entropy, ?candidate_key[0], TICKET_KEY_SIZE)) {
+        ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
+        index = 0;
+        for (index < KEY_NAME_SIZE) { candidate_name[index] = 0; index = index + 1; }
         ret false;
     }
     index = 0;
     for (index < MAX_TICKET_KEYS) {
         if (index != slot && ring.keys[index].active &&
-            names_equal(?ring.keys[index].name[0], ?ring.keys[slot].name[0])) {
-            ct.zeroize(?ring.keys[slot].key[0], TICKET_KEY_SIZE);
+            !key_expired(?ring.keys[index], now) &&
+            names_equal(?ring.keys[index].name[0], ?candidate_name[0])) {
+            ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
+            var clear: usize = 0;
+            for (clear < KEY_NAME_SIZE) {
+                candidate_name[clear] = 0;
+                clear = clear + 1;
+            }
             ret false;
         }
         index = index + 1;
     }
+    if (retire) {
+        index = 0;
+        for (index < MAX_TICKET_KEYS) {
+            if (ring.keys[index].active && ring.keys[index].seal_until > now) {
+                ring.keys[index].seal_until = now;
+                ring.keys[index].open_until = now + ring.overlap_seconds::i64;
+            }
+            index = index + 1;
+        }
+    }
+    ring_prune(ring, now);
+    copy_bytes(?ring.keys[slot].name[0], ?candidate_name[0], KEY_NAME_SIZE);
+    copy_secret(?ring.keys[slot].key[0], ?candidate_key[0], TICKET_KEY_SIZE);
     ring.keys[slot].seal_until = now + ring.seal_lifetime_seconds::i64;
     ring.keys[slot].open_until = ring.keys[slot].seal_until +
         ring.overlap_seconds::i64;
@@ -305,6 +326,9 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, now: i64) bool {
     ring.current = slot;
     ring.count = ring.count + 1;
     ring.generation = ring.generation + 1;
+    ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
+    index = 0;
+    for (index < KEY_NAME_SIZE) { candidate_name[index] = 0; index = index + 1; }
     ret true;
 }
 
@@ -334,7 +358,7 @@ pub fun keyring_init(ring: *KeyRing, entropy: *secret.Entropy, now: i64,
     ring.overlap_seconds = overlap_seconds;
     ring.ticket_lifetime_seconds = ticket_lifetime_seconds;
     ring.lock = mutex.make();
-    if (!ring_mint(ring, entropy, now)) { ret false; }
+    if (!ring_mint(ring, entropy, now, false)) { ret false; }
     ring.initialized = true;
     ret true;
 }
@@ -344,18 +368,7 @@ pub fun keyring_rotate(ring: *KeyRing, entropy: *secret.Entropy,
     now: i64) bool {
     if (ring == nil || !ring.initialized) { ret false; }
     mutex.lock(?ring.lock);
-    var index: usize = 0;
-    for (index < MAX_TICKET_KEYS) {
-        # retirement is exact: a rotated key opens for the configured overlap
-        # and no longer, whatever remained of its original window
-        if (ring.keys[index].active && ring.keys[index].seal_until > now) {
-            ring.keys[index].seal_until = now;
-            ring.keys[index].open_until = now + ring.overlap_seconds::i64;
-        }
-        index = index + 1;
-    }
-    ring_prune(ring, now);
-    val minted: bool = ring_mint(ring, entropy, now);
+    val minted: bool = ring_mint(ring, entropy, now, true);
     mutex.unlock(?ring.lock);
     ret minted;
 }
@@ -855,6 +868,7 @@ pub fun ticket_destroy(value: *Ticket) {
 }
 
 var probe_counter: u8;
+var failing_entropy_calls: u8;
 
 #[oblivious]
 fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
@@ -866,6 +880,143 @@ fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
         i = i + 1;
     }
     counter[0] = counter[0] + 31;
+    ret 0;
+}
+
+#[oblivious]
+fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
+    length: usize) i64 {
+    var i: usize = 0;
+    for (i < length) { output[i] = 0x5a; i = i + 1; }
+    ret -1;
+}
+
+#[oblivious]
+fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
+    length: usize) i64 {
+    var i: usize = 0;
+    for (i < length) { output[i] = 0x5a; i = i + 1; }
+    failing_entropy_calls = failing_entropy_calls + 1;
+    if (failing_entropy_calls == 2) { ret -1; }
+    ret 0;
+}
+
+#[oblivious]
+fun repeating_entropy(context: ptr, secret_context: *^u8, output: *^u8,
+    length: usize) i64 {
+    var i: usize = 0;
+    for (i < length) { output[i] = 0x5a; i = i + 1; }
+    ret 0;
+}
+
+fun rotation_state(issued_at: i64) State {
+    var value: State = empty_state();
+    value.version = tls13.VERSION;
+    value.suite = tls13.AES_128_GCM_SHA256;
+    value.secret_len = 32;
+    var i: usize = 0;
+    for (i < value.secret_len) {
+        value.secret[i] = (0x20 + i)::u8;
+        i = i + 1;
+    }
+    value.issued_at = issued_at;
+    value.lifetime_seconds = 7200;
+    ret value;
+}
+
+test "session: full ticket key ring preserves every live overlap" {
+    probe_counter = 1;
+    var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
+        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+    var ring: KeyRing;
+    if (!keyring_init(?ring, ?entropy, 1000, 3600, 1800, 7200)) { ret 1; }
+    var state: State = rotation_state(1000);
+    var ticket: [MAX_TICKET_BYTES]u8;
+    val length: usize = seal(?ring, ?state, 1000, ?entropy,
+        contracts.Buffer{data: ?ticket[0], capacity: MAX_TICKET_BYTES});
+    if (length == 0) { ret 2; }
+    if (!keyring_rotate(?ring, ?entropy, 1010) ||
+        !keyring_rotate(?ring, ?entropy, 1020) ||
+        !keyring_rotate(?ring, ?entropy, 1030)) { ret 3; }
+    val generation: u64 = keyring_generation(?ring);
+    val current: usize = ring.current;
+    val seal_until: i64 = ring.keys[current].seal_until;
+    val open_until: i64 = ring.keys[current].open_until;
+    val entropy_counter: u8 = probe_counter;
+    if (generation != MAX_TICKET_KEYS::u64 || current >= MAX_TICKET_KEYS ||
+        keyring_openable(?ring, 1040) != MAX_TICKET_KEYS) { ret 4; }
+    if (keyring_rotate(?ring, ?entropy, 1040)) { ret 5; }
+    if (keyring_generation(?ring) != generation || ring.current != current ||
+        ring.keys[current].seal_until != seal_until ||
+        ring.keys[current].open_until != open_until ||
+        probe_counter != entropy_counter ||
+        keyring_openable(?ring, 1040) != MAX_TICKET_KEYS) { ret 6; }
+    var recovered: State;
+    if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, 1040,
+            ?recovered)) { ret 7; }
+
+    if (!keyring_rotate(?ring, ?entropy, 2811)) { ret 8; }
+    if (keyring_generation(?ring) != generation + 1 ||
+        ring.current != 0 || keyring_openable(?ring, 2811) != 4) { ret 9; }
+    keyring_destroy(?ring);
+    state_destroy(?state);
+    state_destroy(?recovered);
+    ret 0;
+}
+
+test "session: ticket key rotation failures leave the ring unchanged" {
+    probe_counter = 1;
+    var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
+        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+    var ring: KeyRing;
+    if (!keyring_init(?ring, ?entropy, 1000, 3600, 1800, 7200)) { ret 1; }
+    var state: State = rotation_state(1000);
+    var ticket: [MAX_TICKET_BYTES]u8;
+    val length: usize = seal(?ring, ?state, 1000, ?entropy,
+        contracts.Buffer{data: ?ticket[0], capacity: MAX_TICKET_BYTES});
+    if (length == 0) { ret 2; }
+    val generation: u64 = keyring_generation(?ring);
+    val current: usize = ring.current;
+    val seal_until: i64 = ring.keys[current].seal_until;
+    val open_until: i64 = ring.keys[current].open_until;
+    entropy.fill_fn = failing_entropy;
+    if (keyring_rotate(?ring, ?entropy, 1010)) { ret 3; }
+    if (keyring_generation(?ring) != generation || ring.current != current ||
+        ring.keys[current].seal_until != seal_until ||
+        ring.keys[current].open_until != open_until ||
+        keyring_openable(?ring, 1010) != 1) { ret 4; }
+    var recovered: State;
+    if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, 1010,
+            ?recovered)) { ret 5; }
+    failing_entropy_calls = 0;
+    entropy.fill_fn = secret_failing_entropy;
+    if (keyring_rotate(?ring, ?entropy, 1010)) { ret 6; }
+    if (keyring_generation(?ring) != generation || ring.current != current ||
+        ring.keys[current].seal_until != seal_until ||
+        ring.keys[current].open_until != open_until ||
+        keyring_openable(?ring, 1010) != 1 ||
+        !open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, 1010,
+            ?recovered)) { ret 7; }
+    keyring_destroy(?ring);
+    state_destroy(?state);
+    state_destroy(?recovered);
+
+    var collision_entropy: secret.Entropy = secret.Entropy{context: nil,
+        secret_context: nil, fill_fn: repeating_entropy, initialized: true};
+    var collision_ring: KeyRing;
+    if (!keyring_init(?collision_ring, ?collision_entropy, 1000, 3600, 1800,
+            7200)) { ret 8; }
+    val collision_generation: u64 = keyring_generation(?collision_ring);
+    val collision_current: usize = collision_ring.current;
+    val collision_seal_until: i64 = collision_ring.keys[collision_current].seal_until;
+    val collision_open_until: i64 = collision_ring.keys[collision_current].open_until;
+    if (keyring_rotate(?collision_ring, ?collision_entropy, 1010)) { ret 9; }
+    if (keyring_generation(?collision_ring) != collision_generation ||
+        collision_ring.current != collision_current ||
+        collision_ring.keys[collision_current].seal_until != collision_seal_until ||
+        collision_ring.keys[collision_current].open_until != collision_open_until ||
+        keyring_openable(?collision_ring, 1010) != 1) { ret 10; }
+    keyring_destroy(?collision_ring);
     ret 0;
 }
 
