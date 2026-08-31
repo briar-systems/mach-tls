@@ -1,0 +1,137 @@
+# tls signature scheme policy and peer verification
+
+use crypto.contracts;
+use crypto.encoding.keys;
+use crypto.signature;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.tls13;
+
+pub val RSA_PKCS1_SHA256: tls13.SignatureScheme = 0x0401;
+pub val RSA_PKCS1_SHA384: tls13.SignatureScheme = 0x0501;
+
+pub fun valid_tls13(scheme: tls13.SignatureScheme) bool {
+    ret scheme == tls13.ECDSA_SECP256R1_SHA256 ||
+        scheme == tls13.ECDSA_SECP384R1_SHA384 || scheme == tls13.ED25519 ||
+        scheme == tls13.RSA_PSS_RSAE_SHA256 ||
+        scheme == tls13.RSA_PSS_RSAE_SHA384;
+}
+
+pub fun valid_tls12(scheme: tls13.SignatureScheme) bool {
+    ret valid_tls13(scheme) || scheme == RSA_PKCS1_SHA256 ||
+        scheme == RSA_PKCS1_SHA384;
+}
+
+pub fun can_sign(scheme: tls13.SignatureScheme,
+    algorithm: keys.Algorithm) bool {
+    if (algorithm == keys.ED25519) { ret scheme == tls13.ED25519; }
+    if (algorithm == keys.P256) {
+        ret scheme == tls13.ECDSA_SECP256R1_SHA256;
+    }
+    if (algorithm == keys.RSA) {
+        ret scheme == tls13.RSA_PSS_RSAE_SHA256 ||
+            scheme == tls13.RSA_PSS_RSAE_SHA384;
+    }
+    ret false;
+}
+
+pub fun verify(scheme: tls13.SignatureScheme, public_key: *keys.PublicKey,
+    message: contracts.Bytes, value: contracts.Bytes) contracts.Error {
+    if (public_key == nil) { ret contracts.INVALID_KEY; }
+    if (scheme == tls13.ED25519 && public_key.algorithm == keys.ED25519) {
+        ret signature.verify_ed25519(public_key.first, message, value);
+    }
+    if (scheme == tls13.ECDSA_SECP256R1_SHA256 &&
+        public_key.algorithm == keys.P256) {
+        ret signature.verify_ecdsa_p256_sha256(public_key.first, message,
+            value);
+    }
+    if (scheme == tls13.ECDSA_SECP384R1_SHA384 &&
+        public_key.algorithm == keys.P384) {
+        ret signature.verify_ecdsa_p384_sha384(
+            public_key.first, message, value);
+    }
+    if (public_key.algorithm != keys.RSA) { ret contracts.UNSUPPORTED; }
+    val rsa_key: signature.RsaPublicKey = signature.RsaPublicKey{
+        modulus: public_key.first,
+        exponent: public_key.second,
+    };
+    if (scheme == tls13.RSA_PSS_RSAE_SHA256) {
+        ret signature.verify_rsa_pss_sha256(rsa_key, message, value);
+    }
+    if (scheme == tls13.RSA_PSS_RSAE_SHA384) {
+        ret signature.verify_rsa_pss_sha384(rsa_key, message, value);
+    }
+    if (scheme == RSA_PKCS1_SHA256) {
+        ret signature.verify_rsa_pkcs1_sha256(rsa_key, message, value);
+    }
+    if (scheme == RSA_PKCS1_SHA384) {
+        ret signature.verify_rsa_pkcs1_sha384(rsa_key, message, value);
+    }
+    ret contracts.UNSUPPORTED;
+}
+
+fun hex_nibble(value: u8) i32 {
+    if (value >= '0' && value <= '9') { ret (value - '0')::i32; }
+    if (value >= 'a' && value <= 'f') { ret (value - 'a' + 10)::i32; }
+    ret -1;
+}
+
+fun decode_hex(text: *u8, length: usize, output: *u8,
+    output_length: usize) bool {
+    if (text == nil || output == nil || length != output_length * 2) {
+        ret false;
+    }
+    var i: usize = 0;
+    for (i < output_length) {
+        val high: i32 = hex_nibble(text[i * 2]);
+        val low: i32 = hex_nibble(text[i * 2 + 1]);
+        if (high < 0 || low < 0) { ret false; }
+        output[i] = ((high << 4) | low)::u8;
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "signature scheme: p-384 verifies peers but is never locally selected" {
+    var public_bytes: [97]u8;
+    var signature_bytes: [103]u8;
+    if (!decode_hex(
+            "043bf701bc9e9d36b4d5f1455343f09126f2564390f2b487365071243c61e6471fb9d2ab74657b82f9086489d9ef0f5cb5d1a358eafbf952e68d533855ccbdaa6ff75b137a5101443199325583552a6295ffe5382d00cfcda30344a9b5b68db855"::*u8,
+            194, ?public_bytes[0], 97) ||
+        !decode_hex(
+            "3065023030ea514fc0d38d8208756f068113c7cada9f66a3b40ea3b313d040d9b57dd41a332795d02cc7d507fcef9faf01a27088023100cc808e504be414f46c9027bcbf78adf067a43922d6fcaa66c4476875fbb7b94efd1f7d5dbe620bfb821c46d549683ad8"::*u8,
+            206, ?signature_bytes[0], 103)) { ret 1; }
+    var public_key: keys.PublicKey;
+    public_key.algorithm = keys.P384;
+    public_key.encoded = contracts.Bytes{data: nil, len: 0};
+    public_key.first = contracts.Bytes{data: ?public_bytes[0], len: 97};
+    public_key.second = contracts.Bytes{data: nil, len: 0};
+    val message: contracts.Bytes = contracts.Bytes{
+        data: "Example of ECDSA with P-384"::*u8,
+        len: 27,
+    };
+    val encoded: contracts.Bytes = contracts.Bytes{
+        data: ?signature_bytes[0],
+        len: 103,
+    };
+    if (!valid_tls13(tls13.ECDSA_SECP384R1_SHA384) ||
+        !valid_tls12(tls13.ECDSA_SECP384R1_SHA384) ||
+        can_sign(tls13.ECDSA_SECP384R1_SHA384, keys.P384) ||
+        verify(tls13.ECDSA_SECP384R1_SHA384, ?public_key, message,
+            encoded) != contracts.OK) { ret 2; }
+    signature_bytes[102] = signature_bytes[102] ^ 1;
+    if (verify(tls13.ECDSA_SECP384R1_SHA384, ?public_key, message,
+            encoded) != contracts.AUTH_FAILED) { ret 3; }
+    signature_bytes[102] = signature_bytes[102] ^ 1;
+    if (verify(tls13.ECDSA_SECP256R1_SHA256, ?public_key, message,
+            encoded) != contracts.UNSUPPORTED ||
+        verify(tls13.ECDSA_SECP384R1_SHA384, nil, message,
+            encoded) != contracts.INVALID_KEY) { ret 4; }
+    public_key.algorithm = keys.P256;
+    if (verify(tls13.ECDSA_SECP384R1_SHA384, ?public_key, message,
+            encoded) != contracts.UNSUPPORTED) { ret 5; }
+    ret 0;
+}

@@ -4,6 +4,7 @@ use crypto.contracts;
 use tls.error;
 use tls.handshake;
 use tls.handshake.extensions;
+use tls.signature_scheme;
 use tls.tls13;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -245,8 +246,7 @@ pub fun valid_named_group(group: tls13.NamedGroup) bool {
 }
 
 pub fun valid_signature_scheme(scheme: tls13.SignatureScheme) bool {
-    ret scheme == tls13.ECDSA_SECP256R1_SHA256 || scheme == tls13.ED25519
-        || scheme == tls13.RSA_PSS_RSAE_SHA256 || scheme == tls13.RSA_PSS_RSAE_SHA384;
+    ret signature_scheme.valid_tls13(scheme);
 }
 
 fun hello_retry_random(random: contracts.Bytes) bool {
@@ -1069,6 +1069,31 @@ test "codec: malformed message bodies fail closed" {
     handshake.parse(?wire[0], encoded.produced, 128, ?message);
     var ticket: NewSessionTicket;
     if (decode_new_session_ticket(?message, ?ticket) == error.OK) { ret 4; }
+    ret 0;
+}
+
+test "codec: p-384 certificate verify preserves signature scheme 0x0503" {
+    var signature_bytes: [8]u8 = [8]u8{0x30, 6, 2, 1, 1, 2, 1, 1};
+    var value: CertificateVerify;
+    value.scheme = tls13.ECDSA_SECP384R1_SHA384;
+    value.signature = contracts.Bytes{data: ?signature_bytes[0], len: 8};
+    var wire: [16]u8;
+    val encoded: handshake.Progress = encode_certificate_verify(?value,
+        contracts.Buffer{data: ?wire[0], capacity: 16});
+    if (encoded.status != handshake.COMPLETE || encoded.produced != 16 ||
+        wire[4] != 0x05 || wire[5] != 0x03) { ret 1; }
+    var message: handshake.Message;
+    if (handshake.parse(?wire[0], 16, 16, ?message).status !=
+        handshake.COMPLETE) { ret 2; }
+    var decoded: CertificateVerify;
+    if (decode_certificate_verify(?message, ?decoded) != error.OK ||
+        decoded.scheme != tls13.ECDSA_SECP384R1_SHA384 ||
+        decoded.signature.len != 8) { ret 3; }
+    wire[5] = 0x04;
+    if (handshake.parse(?wire[0], 16, 16, ?message).status !=
+            handshake.COMPLETE ||
+        decode_certificate_verify(?message, ?decoded) !=
+            error.UNSUPPORTED_ALGORITHM) { ret 4; }
     ret 0;
 }
 

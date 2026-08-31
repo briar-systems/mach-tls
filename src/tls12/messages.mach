@@ -8,6 +8,7 @@ use std.types.size.usize;
 use tls.error;
 use tls.handshake;
 use tls.handshake.extensions;
+use tls.signature_scheme;
 use tls.tls12;
 use tls.tls13;
 
@@ -193,14 +194,11 @@ fun prepare(message_type: handshake.MessageType, body_length: usize,
 }
 
 pub fun valid_signature_scheme(scheme: u16) bool {
-    ret scheme == tls13.ECDSA_SECP256R1_SHA256 || scheme == tls13.ED25519 ||
-        scheme == tls13.RSA_PSS_RSAE_SHA256 ||
-        scheme == tls13.RSA_PSS_RSAE_SHA384 ||
-        scheme == 0x0401 || scheme == 0x0501;
+    ret signature_scheme.valid_tls12(scheme);
 }
 
-pub val RSA_PKCS1_SHA256: u16 = 0x0401;
-pub val RSA_PKCS1_SHA384: u16 = 0x0501;
+pub val RSA_PKCS1_SHA256: u16 = signature_scheme.RSA_PKCS1_SHA256;
+pub val RSA_PKCS1_SHA384: u16 = signature_scheme.RSA_PKCS1_SHA384;
 
 pub fun valid_named_curve(curve: u16) bool {
     ret curve == tls13.X25519 || curve == tls13.SECP256R1;
@@ -726,5 +724,37 @@ test "tls12.codec: the server flight round trips through exact framing" {
     var finished_decoded: Finished;
     if (decode_finished(?message, ?finished_decoded) != error.OK ||
         finished_decoded.verify_data.len != 12) { ret 18; }
+    ret 0;
+}
+
+test "tls12.codec: p-384 server key exchange preserves scheme 0x0503" {
+    var point: [65]u8;
+    point[0] = 4;
+    var i: usize = 1;
+    for (i < 65) { point[i] = i::u8; i = i + 1; }
+    var signature_bytes: [8]u8 = [8]u8{0x30, 6, 2, 1, 1, 2, 1, 1};
+    var exchange: ServerKeyExchange;
+    exchange.curve = tls13.SECP256R1;
+    exchange.public_key = contracts.Bytes{data: ?point[0], len: 65};
+    exchange.scheme = tls13.ECDSA_SECP384R1_SHA384;
+    exchange.signature = contracts.Bytes{data: ?signature_bytes[0], len: 8};
+    var wire: [85]u8;
+    val encoded: handshake.Progress = encode_server_key_exchange(?exchange,
+        contracts.Buffer{data: ?wire[0], capacity: 85});
+    if (encoded.status != handshake.COMPLETE || encoded.produced != 85 ||
+        wire[73] != 0x05 || wire[74] != 0x03) { ret 1; }
+    var message: handshake.Message;
+    if (handshake.parse_version(?wire[0], 85, 85, true, ?message).status !=
+        handshake.COMPLETE) { ret 2; }
+    var decoded: ServerKeyExchange;
+    if (decode_server_key_exchange(?message, ?decoded) != error.OK ||
+        decoded.scheme != tls13.ECDSA_SECP384R1_SHA384 ||
+        decoded.signature.len != 8) { ret 3; }
+    wire[74] = 0x04;
+    if (handshake.parse_version(?wire[0], 85, 85, true, ?message).status !=
+        handshake.COMPLETE) { ret 4; }
+    val rejected: error.Error = decode_server_key_exchange(?message,
+        ?decoded);
+    if (rejected != error.ILLEGAL_PARAMETER) { ret 5; }
     ret 0;
 }

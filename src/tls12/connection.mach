@@ -26,6 +26,7 @@ use tls.handshake;
 use tls.handshake.extensions;
 use tls.memory_range;
 use tls.record;
+use tls.signature_scheme;
 use tls.tls12;
 use tls.tls12.messages;
 use tls.tls12.prf;
@@ -39,7 +40,7 @@ pub val MAX_PUBLIC_KEY: usize = 512;
 pub val MAX_SIGNATURE: usize = 512;
 pub val MAX_SIGNED: usize = 64 + 4 + MAX_POINT;
 pub val MAX_QUEUED_EVENTS: usize = 10;
-pub val MAX_SUPPORTED_SIGNATURES: usize = 6;
+pub val MAX_SUPPORTED_SIGNATURES: usize = 7;
 
 val C_EXPECT_SERVER_HELLO: u8 = 1;
 val C_EXPECT_CERTIFICATE: u8 = 2;
@@ -785,13 +786,7 @@ fun hash_size(value: *Connection) usize {
 }
 
 fun scheme_matches_key(scheme: u16, algorithm: keys.Algorithm) bool {
-    if (algorithm == keys.ED25519) { ret scheme == tls13.ED25519; }
-    if (algorithm == keys.P256) { ret scheme == tls13.ECDSA_SECP256R1_SHA256; }
-    if (algorithm == keys.RSA) {
-        ret scheme == tls13.RSA_PSS_RSAE_SHA256 ||
-            scheme == tls13.RSA_PSS_RSAE_SHA384;
-    }
-    ret false;
+    ret signature_scheme.can_sign(scheme, algorithm);
 }
 
 fun retain_peer_key(value: *Connection) bool {
@@ -818,32 +813,8 @@ fun retain_peer_key(value: *Connection) bool {
 fun verify_peer_signature(value: *Connection, scheme: u16,
     message: contracts.Bytes, signature_bytes: contracts.Bytes) error.Error {
     if (!value.peer_leaf_present) { ret error.BAD_CERTIFICATE; }
-    var status: contracts.Error = contracts.UNSUPPORTED;
-    val algorithm: keys.Algorithm = value.peer_leaf.public_key.algorithm;
-    if (scheme == tls13.ED25519 && algorithm == keys.ED25519) {
-        status = signature.verify_ed25519(value.peer_leaf.public_key.first,
-            message, signature_bytes);
-    } or (scheme == tls13.ECDSA_SECP256R1_SHA256 && algorithm == keys.P256) {
-        status = signature.verify_ecdsa_p256_sha256(
-            value.peer_leaf.public_key.first, message, signature_bytes);
-    } or (algorithm == keys.RSA) {
-        val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
-            modulus: value.peer_leaf.public_key.first,
-            exponent: value.peer_leaf.public_key.second};
-        if (scheme == tls13.RSA_PSS_RSAE_SHA256) {
-            status = signature.verify_rsa_pss_sha256(public_key, message,
-                signature_bytes);
-        } or (scheme == tls13.RSA_PSS_RSAE_SHA384) {
-            status = signature.verify_rsa_pss_sha384(public_key, message,
-                signature_bytes);
-        } or (scheme == messages.RSA_PKCS1_SHA256) {
-            status = signature.verify_rsa_pkcs1_sha256(public_key, message,
-                signature_bytes);
-        } or (scheme == messages.RSA_PKCS1_SHA384) {
-            status = signature.verify_rsa_pkcs1_sha384(public_key, message,
-                signature_bytes);
-        }
-    }
+    val status: contracts.Error = signature_scheme.verify(scheme,
+        ?value.peer_leaf.public_key, message, signature_bytes);
     if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
     if (status != contracts.OK) { ret error.DECRYPT_ERROR; }
     ret error.OK;

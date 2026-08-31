@@ -24,6 +24,7 @@ pub val RSA_PSS_SHA256: SignatureAlgorithm = 3;
 pub val RSA_PSS_SHA384: SignatureAlgorithm = 4;
 pub val RSA_PKCS1_SHA256: SignatureAlgorithm = 5;
 pub val RSA_PKCS1_SHA384: SignatureAlgorithm = 6;
+pub val ECDSA_P384_SHA384: SignatureAlgorithm = 7;
 
 pub val KEY_USAGE_DIGITAL_SIGNATURE: u16 = 1 << 0;
 pub val KEY_USAGE_CONTENT_COMMITMENT: u16 = 1 << 1;
@@ -107,6 +108,10 @@ fun empty_extensions() Extensions {
 
 val OID_ECDSA_SHA256: [8]u8 = [8]u8{
     0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+};
+val OID_ECDSA_SHA384: [8]u8 = [8]u8{
+    0x2a, 0x86, 0x48, 0xce,
+    0x3d, 0x04, 0x03, 0x03,
 };
 val OID_ED25519: [3]u8 = [3]u8{0x2b, 0x65, 0x70};
 val OID_RSA_PSS: [9]u8 = [9]u8{
@@ -289,6 +294,11 @@ fun parse_signature_algorithm(element: *der.Element,
     if (oid_equal(oid.content, (?OID_ECDSA_SHA256[0]), 8)) {
         if (!der.complete(?body)) { ret false; }
         @output = ECDSA_P256_SHA256;
+        ret true;
+    }
+    if (oid_equal(oid.content, (?OID_ECDSA_SHA384[0]), 8)) {
+        if (!der.complete(?body)) { ret false; }
+        @output = ECDSA_P384_SHA384;
         ret true;
     }
     if (oid_equal(oid.content, (?OID_ED25519[0]), 3)) {

@@ -70,6 +70,10 @@ fun verify_signature(child: *x509.Certificate,
         if (issuer.public_key.algorithm != keys.P256) { ret error.BAD_CERTIFICATE; }
         status = signature.verify_ecdsa_p256_sha256(issuer.public_key.first,
             child.tbs, child.signature);
+    } or (child.signature_algorithm == x509.ECDSA_P384_SHA384) {
+        if (issuer.public_key.algorithm != keys.P384) { ret error.BAD_CERTIFICATE; }
+        status = signature.verify_ecdsa_p384_sha384(issuer.public_key.first,
+            child.tbs, child.signature);
     } or (child.signature_algorithm == x509.RSA_PSS_SHA256 ||
         child.signature_algorithm == x509.RSA_PSS_SHA384) {
         if (issuer.public_key.algorithm != keys.RSA) { ret error.BAD_CERTIFICATE; }
@@ -592,6 +596,55 @@ test "cert.verify: construct and validate an ed25519 server path" {
     certificates[0].der = ?corrupted[0];
     options.purpose = SERVER_AUTH;
     if (chain(?trust, ?presented, ?options) != error.BAD_CERTIFICATE) { ret 4; }
+    ret 0;
+}
+
+test "cert.verify: validate an openssl p-384 sha-384 server path" {
+    val root_hex: *u8 = "3082020a30820190a003020102020101300a06082a8648ce3d040303303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f74301e170d3236303833313138353133375a170d3336303832383138353133375a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f743076301006072a8648ce3d020106052b81040022036200047d75bfcce4046b92abec5888d18a67b3c2d605e70401c09dcb4f8cf43f106c2f13854a0afabc9529fa96604f00631141b31294348150ea12cc8e960e8b321a2af2f16f30729a923e40de4f856e10a20bf07dee074f4a272912db48d738abc586a3663064301f0603551d23041830168014ded0082f54cba5a1f86938525c08c2d259399cc830120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e04160414ded0082f54cba5a1f86938525c08c2d259399cc8300a06082a8648ce3d0403030368003065023100e492d957772464ce3b1b9d75c1d71304ad239eac892803114005a7c3ce56c09256e3378f96e84be8187046b66f35c90302301f676226a26fe6b4e93676fe231e30678b846074977d380208b50f84803227b4c4350731458e0e396561754f85dbf7ec"::*u8;
+    val leaf_hex: *u8 = "3082023a308201bfa003020102020102300a06082a8648ce3d040303303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f74301e170d3236303833313138353133375a170d3336303832383138353133375a303d310b300906035504061302555331133011060355040a0c0a427269617220546573743119301706035504030c10703338342e6578616d706c652e636f6d3076301006072a8648ce3d020106052b810400220362000460e486841345cac8f27d9d4b254b0d11bfdb9da68347da398a91cd7d3e1ee8b7c16ed903b67fcc451330b1355c217e673bb23e51b73b6139fec254b3545d4b0887cd057821296e5928013fc52e0c560c012911ced1aaf76b5e431d86c16bcff1a38193308190300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301b0603551d11041430128210703338342e6578616d706c652e636f6d301d0603551d0e04160414a3ad22940126c0e27215aafd77109ba32033c874301f0603551d23041830168014ded0082f54cba5a1f86938525c08c2d259399cc8300a06082a8648ce3d0403030369003066023100c9ae7776a4c755e2a3f95d2b1458a91852267f426c671707a2ed8f67f83b689c91780b83fc27fdd05d9bde5ba3faf615023100e793811cda5833634099a05c8f685e0d0379b5b958edb2337cce29005fe1d3be9a6170c38119f839a81c210634f5b027"::*u8;
+    var root_der: [526]u8;
+    var leaf_der: [574]u8;
+    if (!decode_hex(root_hex, 1052, ?root_der[0], 526) ||
+        !decode_hex(leaf_hex, 1148, ?leaf_der[0], 574)) { ret 1; }
+    var certificates: [1]cert.Certificate = [1]cert.Certificate{
+        cert.Certificate{der: ?leaf_der[0], der_len: 574},
+    };
+    var anchors: [1]cert.Certificate = [1]cert.Certificate{
+        cert.Certificate{der: ?root_der[0], der_len: 526},
+    };
+    var presented: cert.Chain = cert.Chain{
+        certificates: ?certificates[0],
+        len: 1,
+    };
+    var trust: cert.TrustStore = cert.TrustStore{
+        anchors: ?anchors[0],
+        len: 1,
+    };
+    var options: Options = Options{
+        identity: contracts.Bytes{data: "p384.example.com"::*u8, len: 16},
+        purpose: SERVER_AUTH,
+        now: 1800000000,
+        max_depth: MAX_CHAIN_DEPTH,
+        max_signature_checks: MAX_SIGNATURE_CHECKS,
+    };
+    var parsed_leaf: x509.Certificate;
+    var parsed_root: x509.Certificate;
+    if (x509.parse(contracts.Bytes{data: ?leaf_der[0], len: 574},
+            ?parsed_leaf) != contracts.OK ||
+        x509.parse_trust_anchor(contracts.Bytes{data: ?root_der[0], len: 526},
+            ?parsed_root) != contracts.OK ||
+        parsed_leaf.signature_algorithm != x509.ECDSA_P384_SHA384 ||
+        parsed_root.signature_algorithm != x509.ECDSA_P384_SHA384 ||
+        parsed_leaf.public_key.algorithm != keys.P384 ||
+        parsed_root.public_key.algorithm != keys.P384 ||
+        verify_signature(?parsed_leaf, ?parsed_root) != error.OK ||
+        chain(?trust, ?presented, ?options) != error.OK) { ret 2; }
+    parsed_root.public_key.algorithm = keys.P256;
+    if (verify_signature(?parsed_leaf, ?parsed_root) !=
+        error.BAD_CERTIFICATE) { ret 3; }
+    leaf_der[573] = leaf_der[573] ^ 1;
+    if (chain(?trust, ?presented, ?options) !=
+        error.BAD_CERTIFICATE) { ret 4; }
     ret 0;
 }
 

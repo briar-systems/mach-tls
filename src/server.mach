@@ -30,6 +30,7 @@ use tls.handshake.negotiation;
 use tls.memory_range;
 use tls.record;
 use tls.session;
+use tls.signature_scheme;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
@@ -672,8 +673,9 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         value.versions == nil || value.version_len != 1 ||
         value.suites == nil || value.suite_len == 0 || value.groups == nil ||
         value.group_len == 0 || value.signatures == nil ||
-        value.signature_len == 0 || value.suite_len > 3 ||
-        value.group_len > 2 || value.signature_len > 4 ||
+        !config.valid_signature_count(value.signature_len) ||
+        value.suite_len > 3 ||
+        value.group_len > 2 ||
         value.limits.max_receive_record_plaintext < 63 ||
         value.limits.max_receive_record_plaintext > record.MAX_PLAINTEXT ||
         value.limits.max_send_record_plaintext == 0 ||
@@ -1038,13 +1040,7 @@ fun retain_server_name(server: *Server, value: contracts.Bytes) {
 
 fun scheme_matches_key(scheme: tls13.SignatureScheme,
     algorithm: keys.Algorithm) bool {
-    if (algorithm == keys.ED25519) { ret scheme == tls13.ED25519; }
-    if (algorithm == keys.P256) { ret scheme == tls13.ECDSA_SECP256R1_SHA256; }
-    if (algorithm == keys.RSA) {
-        ret scheme == tls13.RSA_PSS_RSAE_SHA256 ||
-            scheme == tls13.RSA_PSS_RSAE_SHA384;
-    }
-    ret false;
+    ret signature_scheme.can_sign(scheme, algorithm);
 }
 
 fun record_size_limit(server: *Server, hello: *codec.ClientHello) bool {
@@ -1877,7 +1873,7 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
             ret error.ILLEGAL_PARAMETER;
         }
     }
-    var schemes: [4]tls13.SignatureScheme;
+    var schemes: [config.MAX_SIGNATURE_SCHEMES]tls13.SignatureScheme;
     var protocols: [255]negotiation.Protocol;
     var policy: negotiation.Policy;
     if (!build_policy(server, ?schemes[0], ?protocols[0], ?policy)) {
@@ -2028,30 +2024,8 @@ fun verify_peer_signature(server: *Server,
     if (failure != error.OK) { ret failure; }
     val message: contracts.Bytes = contracts.Bytes{data: ?signed[0],
         len: 98 + key_schedule.hash_size(server.schedule.algorithm)};
-    var status: contracts.Error = contracts.UNSUPPORTED;
-    if (value.scheme == tls13.ED25519 &&
-        server.peer_leaf.public_key.algorithm == keys.ED25519) {
-        status = signature.verify_ed25519(server.peer_leaf.public_key.first,
-            message, value.signature);
-    } or (value.scheme == tls13.ECDSA_SECP256R1_SHA256 &&
-        server.peer_leaf.public_key.algorithm == keys.P256) {
-        status = signature.verify_ecdsa_p256_sha256(
-            server.peer_leaf.public_key.first, message, value.signature);
-    } or ((value.scheme == tls13.RSA_PSS_RSAE_SHA256 ||
-        value.scheme == tls13.RSA_PSS_RSAE_SHA384) &&
-        server.peer_leaf.public_key.algorithm == keys.RSA) {
-        val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
-            modulus: server.peer_leaf.public_key.first,
-            exponent: server.peer_leaf.public_key.second,
-        };
-        if (value.scheme == tls13.RSA_PSS_RSAE_SHA256) {
-            status = signature.verify_rsa_pss_sha256(public_key, message,
-                value.signature);
-        } or {
-            status = signature.verify_rsa_pss_sha384(public_key, message,
-                value.signature);
-        }
-    }
+    val status: contracts.Error = signature_scheme.verify(value.scheme,
+        ?server.peer_leaf.public_key, message, value.signature);
     var i: usize = 0;
     for (i < MAX_SIGNED_CONTEXT) { signed[i] = 0; i = i + 1; }
     if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
