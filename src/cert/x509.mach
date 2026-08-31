@@ -4,11 +4,13 @@ use crypto.contracts;
 use crypto.encoding.der;
 use crypto.encoding.keys;
 use std.chrono.date;
+use base64: std.encoding.base64;
 use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.str;
 use tls.cert.name;
 
 pub val MAX_SERIAL_SIZE: usize = 20;
@@ -61,6 +63,8 @@ pub rec Extensions {
     subject_key_id: contracts.Bytes;
     authority_key_id_present: bool;
     authority_key_id: contracts.Bytes;
+    acme_identifier_present: bool;
+    acme_identifier: contracts.Bytes;
 }
 
 pub rec Certificate {
@@ -102,6 +106,8 @@ fun empty_extensions() Extensions {
         subject_key_id: contracts.Bytes{data: nil, len: 0},
         authority_key_id_present: false,
         authority_key_id: contracts.Bytes{data: nil, len: 0},
+        acme_identifier_present: false,
+        acme_identifier: contracts.Bytes{data: nil, len: 0},
     };
 }
 
@@ -946,7 +952,11 @@ fun extension_count(input: contracts.Bytes, expected: contracts.Bytes) usize {
     ret count;
 }
 
-fun parse_extensions(element: *der.Element, output: *Extensions) bool {
+val OID_ACME_IDENTIFIER: [8]u8 = [8]u8{0x2b, 0x06, 0x01, 0x05, 0x05, 0x07,
+    0x01, 0x1f};
+
+fun parse_extensions(element: *der.Element, output: *Extensions,
+    tls_alpn_challenge: bool) bool {
     if (element == nil || output == nil || element.tag != 0xa3) { ret false; }
     var outer_parent: der.Cursor = der.cursor(element.encoded);
     var outer: der.Cursor;
@@ -1007,13 +1017,40 @@ fun parse_extensions(element: *der.Element, output: *Extensions) bool {
             output.subject_key_id = key_id.content;
         } or (oid_equal(oid.content, (?OID_AUTHORITY_KEY_ID[0]), 3)) {
             if (!parse_authority_key_id(value.content, output)) { ret false; }
+        } or (tls_alpn_challenge && critical &&
+            oid_equal(oid.content, (?OID_ACME_IDENTIFIER[0]), 8)) {
+            var identifier: der.Element;
+            if (!one_element(value.content, der.OCTET_STRING, ?identifier) ||
+                identifier.content.len != 32) { ret false; }
+            output.acme_identifier_present = true;
+            output.acme_identifier = identifier.content;
         } or (critical) { ret false; }
     }
     ret true;
 }
 
+fun tls_alpn_challenge_dns_name(value: *Extensions,
+    output: *contracts.Bytes) bool {
+    if (value == nil || output == nil || !value.subject_alt_name_present ||
+        value.subject_alt_name.data == nil ||
+        value.subject_alt_name.len == 0) { ret false; }
+    var sequence: der.Element;
+    if (der.exact(value.subject_alt_name, ?sequence) != contracts.OK ||
+        sequence.tag != der.SEQUENCE) { ret false; }
+    var parent: der.Cursor = der.cursor(value.subject_alt_name);
+    var names: der.Cursor;
+    if (der.enter(?parent, ?sequence, ?names) != contracts.OK) { ret false; }
+    var dns_name: der.Element;
+    if (der.next(?names, ?dns_name) != contracts.OK || dns_name.tag != 0x82 ||
+        !der.complete(?names) || dns_name.content.len == 0 ||
+        dns_name.content.data[0] == '*' ||
+        !name.valid_presented_dns(dns_name.content)) { ret false; }
+    @output = dns_name.content;
+    ret true;
+}
+
 fun parse_with(input: contracts.Bytes, output: *Certificate,
-    trust_anchor: bool) contracts.Error {
+    trust_anchor: bool, tls_alpn_challenge: bool) contracts.Error {
     if (output == nil || input.len == 0 || input.data == nil) {
         ret contracts.INVALID_INPUT;
     }
@@ -1106,11 +1143,18 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
         }
         or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
             saw_extensions = true;
-            if (!parse_extensions(?optional, ?extensions)) { ret contracts.INVALID_INPUT; }
+            if (!parse_extensions(?optional, ?extensions, tls_alpn_challenge)) { ret contracts.INVALID_INPUT; }
         } or { ret contracts.INVALID_INPUT; }
     }
     if (subject_empty && (!extensions.subject_alt_name_present ||
         !extensions.subject_alt_name_critical)) { ret contracts.INVALID_INPUT; }
+    if (tls_alpn_challenge) {
+        var challenge_name: contracts.Bytes;
+        if (!extensions.acme_identifier_present ||
+            !tls_alpn_challenge_dns_name(?extensions, ?challenge_name)) {
+            ret contracts.INVALID_INPUT;
+        }
+    }
     output.encoded = input;
     output.tbs = tbs.encoded;
     output.version = version;
@@ -1129,12 +1173,27 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
 }
 
 pub fun parse(input: contracts.Bytes, output: *Certificate) contracts.Error {
-    ret parse_with(input, output, false);
+    ret parse_with(input, output, false, false);
+}
+
+# rfc 8737 requires one non-wildcard dns san equal to the validation name.
+pub fun tls_alpn_challenge_name_matches(value: *Certificate,
+    expected: contracts.Bytes) bool {
+    if (expected.data == nil || expected.len == 0 || expected.data[0] == '*' ||
+        !name.valid_reference_dns(expected)) { ret false; }
+    var presented: contracts.Bytes;
+    ret value != nil && tls_alpn_challenge_dns_name(?value.extensions, ?presented) &&
+        folded_ascii_equal(presented, expected);
+}
+
+pub fun parse_tls_alpn_challenge(input: contracts.Bytes,
+    output: *Certificate) contracts.Error {
+    ret parse_with(input, output, false, true);
 }
 
 pub fun parse_trust_anchor(input: contracts.Bytes,
     output: *Certificate) contracts.Error {
-    ret parse_with(input, output, true);
+    ret parse_with(input, output, true, false);
 }
 
 test "cert.x509: strict utc and generalized time parsing" {
@@ -1213,6 +1272,79 @@ test "cert.x509: distinguished names compare prepared directory strings" {
     second[19] = 'x';
     if (name_equal(contracts.Bytes{data: ?first[0], len: 22},
             contracts.Bytes{data: ?second[0], len: 20})) { ret 2; }
+    ret 0;
+}
+
+test "cert.x509: a tls-alpn challenge has exactly one matching dns san" {
+    var valid: [15]u8 = [15]u8{
+        0x30, 0x0d, 0x82, 0x0b, 'A', 'p', 'i', '.', 'E', 'x', 'a', 'm', 'p',
+        'l', 'e'};
+    var certificate: Certificate;
+    certificate.extensions = empty_extensions();
+    certificate.extensions.subject_alt_name_present = true;
+    certificate.extensions.subject_alt_name = contracts.Bytes{
+        data: ?valid[0], len: 15};
+    if (!tls_alpn_challenge_name_matches(?certificate,
+            contracts.Bytes{data: "api.example"::*u8, len: 11}) ||
+        tls_alpn_challenge_name_matches(?certificate,
+            contracts.Bytes{data: "other.example"::*u8, len: 13})) { ret 1; }
+
+    var wildcard: [13]u8 = [13]u8{
+        0x30, 0x0b, 0x82, 0x09, '*', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'};
+    certificate.extensions.subject_alt_name = contracts.Bytes{
+        data: ?wildcard[0], len: 13};
+    if (tls_alpn_challenge_name_matches(?certificate,
+            contracts.Bytes{data: "www.example"::*u8, len: 11}) ||
+        tls_alpn_challenge_name_matches(?certificate,
+            contracts.Bytes{data: "*.example"::*u8, len: 9})) { ret 2; }
+
+    var multiple: [30]u8 = [30]u8{
+        0x30, 0x1c, 0x82, 0x0b, 'a', 'p', 'i', '.', 'e', 'x', 'a', 'm', 'p',
+        'l', 'e', 0x82, 0x0d, 'o', 't', 'h', 'e', 'r', '.', 'e', 'x', 'a',
+        'm', 'p', 'l', 'e'};
+    certificate.extensions.subject_alt_name = contracts.Bytes{
+        data: ?multiple[0], len: 30};
+    if (tls_alpn_challenge_name_matches(?certificate,
+            contracts.Bytes{data: "api.example"::*u8, len: 11})) { ret 3; }
+    ret 0;
+}
+
+val TLS_ALPN_CERTIFICATE_FIXTURE: str =
+    "MIIBejCCASygAwIBAgIUcOUWr9c1zHTCLeBvrVLI47ZLz74wBQYDK2VwMAwxCjAIBgNVBAMMAWkwHhcNMjYwODMxMjAyMzI1WhcNMjYwOTAxMjAyMzI1WjAMMQowCAYDVQQDDAFpMCowBQYDK2VwAyEAwoSBn3yOAF/HvizR83asMyXsHkJXUq2kj5jt1OpWdTSjgZ8wgZwwHQYDVR0OBBYEFKIrhX8xARkFbY8H5e2vXNJp4J6mMB8GA1UdIwQYMBaAFKIrhX8xARkFbY8H5e2vXNJp4J6mMA8GA1UdEwEB/wQFMAMBAf8wFgYDVR0RBA8wDYILQXBpLkV4YW1wbGUwMQYIKwYBBQUHAR8BAf8EIgQgAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8wBQYDK2VwA0EAPoT1BqwjpSal0uWBHFZYQkf+3m4mC4MOiNQxKWAR6omfSUlBuNSilJG9xZc5OYjefZ1LnWhSx7/us5OymlxlDA==";
+
+test "cert.x509: challenge parsing rejects wildcard and multiple sans transactionally" {
+    var encoded: [382]u8;
+    if (base64.decode(TLS_ALPN_CERTIFICATE_FIXTURE::*u8, 512,
+            ?encoded[0], 382) != 382) { ret 1; }
+    var valid: Certificate;
+    if (parse_tls_alpn_challenge(contracts.Bytes{data: ?encoded[0], len: 382},
+            ?valid) != contracts.OK ||
+        !tls_alpn_challenge_name_matches(?valid,
+            contracts.Bytes{data: "api.example"::*u8, len: 11})) { ret 2; }
+
+    # replace the sole name with an equal-length wildcard without resigning.
+    val wildcard: str = "*.x.example";
+    var i: usize = 0;
+    for (i < 11) { encoded[246 + i] = wildcard[i]; i = i + 1; }
+    var rejected: Certificate;
+    rejected.version = 99;
+    rejected.not_after = 123;
+    rejected.extensions = empty_extensions();
+    rejected.extensions.ca = true;
+    if (parse_tls_alpn_challenge(contracts.Bytes{data: ?encoded[0], len: 382},
+            ?rejected) != contracts.INVALID_INPUT || rejected.version != 99 ||
+        rejected.not_after != 123 || !rejected.extensions.ca) { ret 3; }
+
+    if (base64.decode(TLS_ALPN_CERTIFICATE_FIXTURE::*u8, 512,
+            ?encoded[0], 382) != 382) { ret 4; }
+    val two_names: [13]u8 = [13]u8{
+        0x82, 0x04, 'a', '.', 'i', 'o',
+        0x82, 0x05, 'b', '.', 'd', 'e', 'v'};
+    i = 0;
+    for (i < 13) { encoded[244 + i] = two_names[i]; i = i + 1; }
+    if (parse_tls_alpn_challenge(contracts.Bytes{data: ?encoded[0], len: 382},
+            ?rejected) != contracts.INVALID_INPUT || rejected.version != 99 ||
+        rejected.not_after != 123 || !rejected.extensions.ca) { ret 5; }
     ret 0;
 }
 

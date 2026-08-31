@@ -92,6 +92,64 @@ rec Pending {
     alert: record.AlertDescription;
 }
 
+# selectors inspect one complete client hello and lease exactly one generation.
+pub rec CredentialOffer {
+    server_name: contracts.Bytes;
+    # the encoded protocol-name list, without its u16 length prefix
+    offered_alpn: contracts.Bytes;
+}
+
+pub def CredentialSelect: fun(*credentials.Store, CredentialOffer, *credentials.Lease)
+    contracts.Error;
+
+pub rec CredentialSelector {
+    store: *credentials.Store;
+    select: CredentialSelect;
+}
+
+pub fun no_credential_selector() CredentialSelector {
+    var value: CredentialSelector;
+    value.store = nil;
+    value.select = nil;
+    ret value;
+}
+
+fun selector_valid(value: CredentialSelector) bool {
+    if (value.select == nil || value.store == nil) {
+        ret value.select == nil && value.store == nil;
+    }
+    ret value.store.initialized &&
+        memory_range.valid((?value.store.lock)::*u8, $size_of(credentials.Store));
+}
+
+pub fun offered_alpn_contains(offer: CredentialOffer, protocol: contracts.Bytes)
+    bool {
+    if (offer.offered_alpn.data == nil || protocol.data == nil || protocol.len == 0) {
+        ret false;
+    }
+    var at: usize = 0;
+    for (at < offer.offered_alpn.len) {
+        val length: usize = offer.offered_alpn.data[at]::usize;
+        if (length == 0 || length > offer.offered_alpn.len - at - 1) { ret false; }
+        if (length == protocol.len && bytes_equal(contracts.Bytes{
+            data: ?offer.offered_alpn.data[at + 1], len: length}, protocol)) {
+            ret true;
+        }
+        at = at + 1 + length;
+    }
+    ret false;
+}
+
+pub fun offered_alpn_exactly(offer: CredentialOffer,
+    protocol: contracts.Bytes) bool {
+    if (offer.offered_alpn.data == nil || protocol.data == nil ||
+        protocol.len == 0 || protocol.len > 255 ||
+        offer.offered_alpn.len != protocol.len + 1 ||
+        offer.offered_alpn.data[0] != protocol.len::u8) { ret false; }
+    ret bytes_equal(contracts.Bytes{data: ?offer.offered_alpn.data[1],
+        len: protocol.len}, protocol);
+}
+
 pub rec Server {
     config: *config.ServerConfig;
     configuration: config.ServerConfig;
@@ -103,6 +161,7 @@ pub rec Server {
     schedule: key_schedule.Schedule;
     lease: credentials.Lease;
     lease_held: bool;
+    selector: CredentialSelector;
     state: u8;
     failure: error.Error;
     pending_alert: record.AlertDescription;
@@ -412,7 +471,9 @@ pub fun aliases_borrowed(server: *Server, data: *u8, len: usize) bool {
     }
     ret server_owner_overlaps(server, data, len) ||
         storage_overlaps(?server.storage, data, len) ||
-        borrowed_overlaps(server.config, server.extra, data, len, true, true);
+        borrowed_overlaps(server.config, server.extra, data, len, true, true) ||
+        (server.selector.select != nil && memory_range.overlap(data, len,
+            (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
 }
 
 pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
@@ -422,7 +483,9 @@ pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
         server.state < EXPECT_CLIENT_HELLO || server.state >= DESTROYED) {
         ret true;
     }
-    ret borrowed_overlaps(server.config, server.extra, data, len, false, true);
+    ret borrowed_overlaps(server.config, server.extra, data, len, false, true) ||
+        (server.selector.select != nil && memory_range.overlap(data, len,
+            (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
 }
 
 fun config_sources_disjoint(server: *Server, value: *config.ServerConfig,
@@ -454,6 +517,17 @@ fun config_sources_disjoint(server: *Server, value: *config.ServerConfig,
         borrowed_overlaps(value, extra, storage.peer_parameters,
             storage.peer_parameters_capacity, true, true)) { ret false; }
     ret true;
+}
+
+fun selector_sources_disjoint(server: *Server, value: *config.ServerConfig,
+    storage: *Storage, extra: ExtraExtension,
+    selector: CredentialSelector) bool {
+    if (selector.select == nil) { ret true; }
+    val data: *u8 = (?selector.store.lock)::*u8;
+    val length: usize = $size_of(credentials.Store);
+    ret !server_owner_overlaps(server, data, length) &&
+        !storage_overlaps(storage, data, length) &&
+        !borrowed_overlaps(value, extra, data, length, true, true);
 }
 
 fun reserved_server_extension(kind: u16) bool {
@@ -776,11 +850,14 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
 }
 
 fun init_inner(server: *Server, configuration: *config.ServerConfig,
-    storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
+    storage: Storage, extra: ExtraExtension, peer_extension: u16,
+    selector: CredentialSelector) bool {
     if (!server_owner_valid(server) ||
         (server.state != 0 && server.state != DESTROYED) ||
         !config_valid(configuration, ?storage, extra, peer_extension) ||
-        !config_sources_disjoint(server, configuration, ?storage, extra)) {
+        !config_sources_disjoint(server, configuration, ?storage, extra) ||
+        !selector_valid(selector) || !selector_sources_disjoint(server,
+            configuration, ?storage, extra, selector)) {
         ret false;
     }
     server.configuration = configuration[0];
@@ -793,6 +870,7 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
     server.transcript = transcript.empty();
     server.lease = credentials.empty_lease();
     server.lease_held = false;
+    server.selector = selector;
     server.state = EXPECT_CLIENT_HELLO;
     server.failure = error.OK;
     server.pending_alert = record.NO_ALERT;
@@ -841,7 +919,17 @@ pub fun init(server: *Server, configuration: *config.ServerConfig,
     storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
     if (!enter(server)) { ret false; }
     val initialized: bool = init_inner(server, configuration, storage, extra,
-        peer_extension);
+        peer_extension, no_credential_selector());
+    leave(server);
+    ret initialized;
+}
+
+pub fun init_with_credential_selector(server: *Server,
+    configuration: *config.ServerConfig, storage: Storage, extra: ExtraExtension,
+    peer_extension: u16, selector: CredentialSelector) bool {
+    if (!enter(server)) { ret false; }
+    val initialized: bool = init_inner(server, configuration, storage, extra,
+        peer_extension, selector);
     leave(server);
     ret initialized;
 }
@@ -1023,6 +1111,26 @@ fun extract_server_name(hello: *codec.ClientHello,
     if (name_extension.data[2] != 0 || length == 0 || length > 253 ||
         name_extension.len != 5 + length) { ret false; }
     output[0] = contracts.Bytes{data: ?name_extension.data[5], len: length};
+    ret true;
+}
+
+fun extract_offered_alpn(hello: *codec.ClientHello,
+    output: *contracts.Bytes) bool {
+    output[0] = contracts.Bytes{data: nil, len: 0};
+    var extension: extensions.Extension;
+    if (!extensions.find(hello.extensions, extensions.APPLICATION_LAYER_PROTOCOL,
+        ?extension)) { ret true; }
+    if (extension.len < 3) { ret false; }
+    val length: usize = read_u16(extension.data, 0)::usize;
+    if (length == 0 || length != extension.len - 2) { ret false; }
+    var at: usize = 2;
+    for (at < extension.len) {
+        val item: usize = extension.data[at]::usize;
+        if (item == 0 || item > extension.len - at - 1) { ret false; }
+        at = at + 1 + item;
+    }
+    if (at != extension.len) { ret false; }
+    output[0] = contracts.Bytes{data: ?extension.data[2], len: length};
     ret true;
 }
 
@@ -1388,10 +1496,21 @@ fun build_policy(server: *Server, schemes: *tls13.SignatureScheme,
     ret true;
 }
 
-fun acquire_credentials(server: *Server, requested: contracts.Bytes) error.Error {
+fun acquire_credentials(server: *Server, requested: contracts.Bytes,
+    offered_alpn: contracts.Bytes) error.Error {
     if (server.lease_held) { ret error.OK; }
-    val status: contracts.Error = credentials.acquire(server.config.credentials,
-        requested, ?server.lease);
+    var status: contracts.Error = contracts.INVALID_STATE;
+    if (server.selector.select == nil) {
+        status = credentials.acquire(server.config.credentials, requested,
+            ?server.lease);
+    } or {
+        status = server.selector.select(server.selector.store, CredentialOffer{
+            server_name: requested, offered_alpn: offered_alpn}, ?server.lease);
+        if (status == contracts.UNSUPPORTED) {
+            status = credentials.acquire(server.config.credentials, requested,
+                ?server.lease);
+        }
+    }
     if (status == contracts.UNSUPPORTED) { ret error.UNRECOGNIZED_NAME; }
     if (status != contracts.OK || server.lease.identity == nil ||
         server.lease.generation == nil) { ret error.HANDSHAKE_FAILURE; }
@@ -1863,8 +1982,12 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
         if (!extract_server_name(?hello, ?requested)) {
             ret error.ILLEGAL_PARAMETER;
         }
+        var offered_alpn: contracts.Bytes;
+        if (!extract_offered_alpn(?hello, ?offered_alpn)) {
+            ret error.ILLEGAL_PARAMETER;
+        }
         retain_server_name(server, requested);
-        failure = acquire_credentials(server, server.server_name);
+        failure = acquire_credentials(server, server.server_name, offered_alpn);
         if (failure != error.OK) { ret failure; }
         if (!record_size_limit(server, ?hello)) { ret error.ILLEGAL_PARAMETER; }
         failure = retain_peer_parameters(server, ?hello);
@@ -4056,5 +4179,91 @@ test "validation: mutated client hellos leave the server in a bounded state" {
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 5; }
     if (keys.destroy_private(?key) != contracts.OK) { ret 6; }
+    ret 0;
+}
+
+test "server: an ALPN-aware selector sees only complete offered protocol names" {
+    var offered: [12]u8 = [12]u8{2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1',
+        '.', '1'};
+    val request: CredentialOffer = CredentialOffer{server_name: contracts.Bytes{
+        data: "site.example"::*u8, len: 12}, offered_alpn: contracts.Bytes{
+        data: ?offered[0], len: 12}};
+    if (!offered_alpn_contains(request, contracts.Bytes{data: "h2"::*u8,
+        len: 2}) || !offered_alpn_contains(request, contracts.Bytes{
+        data: "http/1.1"::*u8, len: 8})) { ret 1; }
+    if (offered_alpn_contains(request, contracts.Bytes{data: "acme-tls/1"::*u8,
+        len: 10})) { ret 2; }
+    offered[3] = 9;
+    if (offered_alpn_contains(request, contracts.Bytes{data: "http/1.1"::*u8,
+        len: 8})) { ret 3; }
+    ret 0;
+}
+
+test "server: an exact ALPN offer contains only its single protocol" {
+    var single: [11]u8 = [11]u8{
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    var offer: CredentialOffer = CredentialOffer{
+        server_name: contracts.Bytes{data: nil, len: 0},
+        offered_alpn: contracts.Bytes{data: ?single[0], len: 11}};
+    val challenge: contracts.Bytes = contracts.Bytes{
+        data: "acme-tls/1"::*u8, len: 10};
+    if (!offered_alpn_exactly(offer, challenge)) { ret 1; }
+    var mixed: [14]u8 = [14]u8{
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1', 2, 'h', '2'};
+    offer.offered_alpn = contracts.Bytes{data: ?mixed[0], len: 14};
+    if (!offered_alpn_contains(offer, challenge) ||
+        offered_alpn_exactly(offer, challenge)) { ret 2; }
+    var duplicate: [22]u8 = [22]u8{
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1',
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    offer.offered_alpn = contracts.Bytes{data: ?duplicate[0], len: 22};
+    if (offered_alpn_exactly(offer, challenge)) { ret 3; }
+    ret 0;
+}
+
+fun test_challenge_store_selector(store: *credentials.Store, offer: CredentialOffer,
+    output: *credentials.Lease) contracts.Error {
+    if (store == nil || !offered_alpn_exactly(offer,
+            contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
+        ret contracts.UNSUPPORTED;
+    }
+    ret credentials.acquire(store, offer.server_name, output);
+}
+
+test "server: transient selector leases its store before retirement" {
+    var owner: secret.Allocator = secret.system_allocator();
+    var chain_storage: [1]cert.Certificate;
+    var key: keys.PrivateKey;
+    var identity: credentials.Identity;
+    if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
+        ret 1;
+    }
+    var generation: credentials.Generation = credentials.empty_generation();
+    if (credentials.initialize(?generation, ?identity, 1, 0, nil,
+            false) != contracts.OK) { ret 2; }
+    var challenge_store: credentials.Store = credentials.empty_store();
+    if (credentials.initialize_store(?challenge_store, ?generation) != contracts.OK) {
+        ret 3;
+    }
+    var alpn: [11]u8 = [11]u8{10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    val offer: CredentialOffer = CredentialOffer{server_name: contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15}, offered_alpn: contracts.Bytes{
+        data: ?alpn[0], len: 11}};
+    var lease: credentials.Lease = credentials.empty_lease();
+    if (test_challenge_store_selector(?challenge_store, offer, ?lease) !=
+            contracts.OK || lease.generation != ?generation ||
+        lease.identity != ?identity) { ret 4; }
+    var retired: *credentials.Generation = nil;
+    if (credentials.retire_store(?challenge_store, ?retired) != contracts.OK ||
+        retired != ?generation || credentials.reclaimable(retired) ||
+        credentials.clear(retired) != contracts.INVALID_STATE) { ret 5; }
+    if (credentials.release(?lease) != contracts.OK ||
+        !credentials.reclaimable(retired) ||
+        credentials.clear(retired) != contracts.OK) { ret 6; }
+    var refused: credentials.Lease = credentials.empty_lease();
+    if (test_challenge_store_selector(?challenge_store, offer, ?refused) !=
+            contracts.INVALID_STATE || keys.destroy_private(?key) != contracts.OK) {
+        ret 7;
+    }
     ret 0;
 }
