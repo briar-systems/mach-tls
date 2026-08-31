@@ -19,8 +19,8 @@ at most `MAX_TICKET_KEYS` keys, exactly one of which is current for sealing.
 retired key stops sealing immediately and stops opening `overlap_seconds` later,
 whatever remained of its original window. That makes retirement bounded and
 predictable rather than "at least the overlap". Keys past their opening window
-are wiped and their slots reused; a ring that is full evicts the key that stops
-opening first.
+are wiped and their slots reused. A ring with `MAX_TICKET_KEYS` live keys
+refuses rotation until a key expires, preserving every configured overlap.
 
 A ticket therefore survives rotation for exactly the configured overlap. Its own
 lifetime is independent and is enforced from the issue time sealed inside it, so

@@ -15,6 +15,7 @@ pub val SECP256R1: NamedGroup = 0x0017;
 pub val X25519:    NamedGroup = 0x001D;
 
 pub val ECDSA_SECP256R1_SHA256: SignatureScheme = 0x0403;
+pub val ECDSA_SECP384R1_SHA384: SignatureScheme = 0x0503;
 pub val ED25519:                 SignatureScheme = 0x0807;
 pub val RSA_PSS_RSAE_SHA256:    SignatureScheme = 0x0804;
 pub val RSA_PSS_RSAE_SHA384:    SignatureScheme = 0x0805;
@@ -23,5 +24,6 @@ test "tls13: protocol and cipher suite ids match the registry" {
     if (VERSION != 0x0304) { ret 1; }
     if (AES_128_GCM_SHA256 != 0x1301) { ret 1; }
     if (CHACHA20_POLY1305_SHA256 != 0x1303) { ret 1; }
+    if (ECDSA_SECP384R1_SHA384 != 0x0503) { ret 1; }
     ret 0;
 }

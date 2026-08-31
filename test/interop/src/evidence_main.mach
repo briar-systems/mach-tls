@@ -150,11 +150,14 @@ fun main(argc: i64, argv: **u8) i64 {
     print.print("| scheme | value | roles |\n| --- | --- | --- |\n");
     if (!codec.valid_signature_scheme(tls13.ED25519) ||
         !codec.valid_signature_scheme(tls13.ECDSA_SECP256R1_SHA256) ||
+        !codec.valid_signature_scheme(tls13.ECDSA_SECP384R1_SHA384) ||
         !codec.valid_signature_scheme(tls13.RSA_PSS_RSAE_SHA256) ||
         !codec.valid_signature_scheme(tls13.RSA_PSS_RSAE_SHA384)) { ret 7; }
     row("ed25519", tls13.ED25519, "sign and verify, both versions");
     row("ecdsa_secp256r1_sha256", tls13.ECDSA_SECP256R1_SHA256,
         "sign and verify, both versions");
+    row("ecdsa_secp384r1_sha384", tls13.ECDSA_SECP384R1_SHA384,
+        "verify only, both versions");
     row("rsa_pss_rsae_sha256", tls13.RSA_PSS_RSAE_SHA256,
         "sign and verify, both versions");
     row("rsa_pss_rsae_sha384", tls13.RSA_PSS_RSAE_SHA384,

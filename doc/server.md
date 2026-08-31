@@ -36,7 +36,7 @@ it does not change the contract or the record layer.
 its bounded arrays. The credential store, ALPN names, version, suite, group, and
 signature arrays remain immutable caller-owned borrows for the lifetime of the
 engine. The configuration requires one TLS 1.3 version, one to three cipher
-suites, one or two groups, one to four signature schemes, an initialized
+suites, one or two groups, one to five signature schemes, an initialized
 credential store, an operating-system or application entropy source, and
 explicit finite limits.
 
@@ -67,10 +67,15 @@ HelloRetryRequest sentinel. `ingest` at `INITIAL` accepts the ClientHello.
 1. The ClientHello is decoded, its extensions validated for structure,
    placement, uniqueness, and ordering, and TLS 1.3 confirmed in
    `supported_versions`.
-2. The SNI host name is extracted and a credential lease is acquired for it.
-   Exact names outrank the longest matching wildcard, which outranks the
-   configured default. A name with no match and no default fails with
-   `unrecognized_name`.
+2. The SNI host name and complete offered-ALPN list are extracted before a
+   credential lease is acquired. `server.init_with_credential_selector` may
+   inspect both through one borrowed `CredentialOffer` and its typed
+   caller-owned transient `credentials.Store`. It leases through
+   `credentials.acquire`; returning `UNSUPPORTED` falls through to the
+   configured published store. The default `server.init` path selects that
+   store generation by SNI. Exact names outrank the longest matching wildcard,
+   which outranks the configured default. A name with no match and no default
+   fails with `unrecognized_name`.
 3. The lease fixes the certificate, the private key, the client-authentication
    requirement, and the client trust store for the whole connection.
 4. Negotiation selects a suite, a group, a signature scheme compatible with the
@@ -105,6 +110,23 @@ store, and client-authentication requirement it started with, and a rotation
 cannot alter any of them mid-connection. The caller may reclaim the retired
 arrays and keys only after `credentials.reclaimable` returns true.
 
+`credentials.initialize_tls_alpn_challenge` creates the one-identity,
+one-certificate transient generation RFC 8737 requires. It accepts the
+critical `acmeIdentifier` extension only through `x509.parse_tls_alpn_challenge`
+and only after proving the key matches and the SAN contains exactly one
+non-wildcard `dNSName` equal case-insensitively to the validation name. Ordinary
+`x509.parse`, normal generation initialization, and all client verification
+continue to reject unknown critical extensions. A selector must choose this
+generation only when `server.offered_alpn_exactly` confirms the current
+ClientHello offers `acme-tls/1` and no other ALPN protocol. The generic selector
+still receives the complete list and may use `offered_alpn_contains` for other
+selection policies. Its owner initializes one stable caller-owned Store
+with `credentials.initialize_vacant_store`, publishes each challenge with
+`publish_store`, leases it with `acquire`, then calls `withdraw_store` before
+reclaiming it after the final transient lease is released. Publication,
+selection, and withdrawal synchronize through that Store without replacing
+its lock while a selector may be entering it.
+
 ## Failure
 
 Invalid ClientHello variants fail closed with one protocol-correct alert and
@@ -138,7 +160,8 @@ without publishing state, and that a terminal engine refuses further input.
 
 The external harness performs real TCP handshakes against OpenSSL and GnuTLS
 clients covering SNI selection, wildcard selection, ALPN, all three cipher
-suites, X25519 and P-256 including HelloRetryRequest, Ed25519, ECDSA P-256, and
-RSA-PSS credentials, required client authentication, credential rotation during
-an established connection, and the negotiation failures above. See
+suites, X25519 and P-256 including HelloRetryRequest, Ed25519, ECDSA P-256,
+verification-only ECDSA P-384 peer authentication, and RSA-PSS credentials,
+required client authentication, credential rotation during an established
+connection, and the negotiation failures above. See
 [`../test/interop/README.md`](../test/interop/README.md).

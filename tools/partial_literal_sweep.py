@@ -22,6 +22,13 @@
 #     subtree only, and reports ambiguity rather than guessing.
 #   * Take the module root from each project's `[project] id` in mach.toml, not
 #     from its directory name: mach-crypto is `crypto`, mach-tls is `tls`.
+#   * Refuse to report a count when the input was incomplete. A dependency that
+#     is absent from `dep/` resolves nothing, so its records are missing, so
+#     every literal naming one is skipped and the total silently falls. That
+#     produced a clean bill for hedge while ~43 sites went unexamined, because
+#     the warning sat in a line a caller had truncated away. A missing
+#     dependency, an unresolved qualifier, and an ambiguous one are now all
+#     fatal: the headline itself is marked UNRELIABLE and the exit status is 1.
 #
 # `[N]Type{a, b}` is an array literal and is excluded; it is not a record
 # literal. An unresolvable qualifier is reported and skipped, never guessed at.
@@ -45,6 +52,19 @@ SELF_ID, SELF_SRC = manifest(ROOT)
 if SELF_ID is None:
     print("no mach.toml at", ROOT); sys.exit(2)
 
+# every dependency the project declares must actually be on disk and scanned;
+# an absent one silently removes its records and every literal that names them
+def declared_deps(root):
+    names = set()
+    for f in ('mach.lock', 'mach.toml'):
+        p = os.path.join(root, f)
+        if not os.path.exists(p): continue
+        names |= set(re.findall(r'^\s*\[dep\.([\w.-]+)\]', open(p).read(), re.M))
+        if names: break
+    return names
+
+DECLARED = declared_deps(ROOT)
+
 roots = {}   # absolute source dir -> module root id
 roots[os.path.join(ROOT, SELF_SRC)] = SELF_ID
 dep_report = []
@@ -55,6 +75,10 @@ for d in sorted(glob.glob(os.path.join(ROOT, 'dep', '*'))):
         dep_report.append((os.path.basename(d), None)); continue
     roots[os.path.join(d, dsrc)] = did
     dep_report.append((os.path.basename(d), did))
+
+present = {b for b, i in dep_report if i is not None}
+missing_deps = sorted(DECLARED - present)
+unreadable = sorted(b for b, i in dep_report if i is None)
 
 def module_of(path):
     for base, rid in roots.items():
@@ -169,8 +193,15 @@ print(f"files scanned  : {len(files)}  (this project: {sum(1 for f in texts if f
 print(f"record defs    : {len(defs)}")
 print(f"unresolved qual: {dict(sorted(unresolved.items())) if unresolved else 'none'}")
 print(f"ambiguous qual : {ambiguous if ambiguous else 'none'}")
+print(f"declared deps  : {len(DECLARED)}  missing: {', '.join(missing_deps) or 'none'}"
+      + (f"  unreadable: {', '.join(unreadable)}" if unreadable else ""))
+skipped = sum(unresolved.values()) + sum(len(v) for v in ambiguous.values())
+reliable = not missing_deps and not unreadable and not unresolved and not ambiguous
 src_n = sum(1 for x in findings if x[3] == 'src')
-print(f"PARTIAL LITERALS: {len(findings)}   (src {src_n} / test {len(findings)-src_n})")
+# the reliability verdict rides on the headline so truncating the output cannot
+# separate the number from the reason it is wrong
+mark = "" if reliable else f"   [UNRELIABLE: {skipped} literal sites skipped]"
+print(f"PARTIAL LITERALS: {len(findings)}   (src {src_n} / test {len(findings)-src_n}){mark}")
 if findings:
     from collections import Counter
     print()
@@ -179,3 +210,19 @@ if findings:
     print()
     for f, ln, key, kind, a, b, missing in sorted(findings, key=lambda x: (x[3] != 'src', x[0], x[1])):
         print(f"{kind:4s} {f}:{ln}  {key}  {a}/{b}  missing: {', '.join(n + ':' + t for n, t in missing)}")
+
+print()
+if reliable:
+    print("VERDICT: complete. Every declared dependency was scanned and every "
+          "qualifier resolved.")
+else:
+    why = []
+    if missing_deps: why.append(f"{len(missing_deps)} declared dependencies absent from dep/")
+    if unreadable:   why.append(f"{len(unreadable)} dependencies without a readable mach.toml")
+    if unresolved:   why.append(f"{len(unresolved)} qualifiers unresolved")
+    if ambiguous:    why.append(f"{len(ambiguous)} qualifiers ambiguous")
+    print("VERDICT: UNRELIABLE. " + "; ".join(why) + ".")
+    print(f"         {skipped} literal sites were skipped, so the count above is a "
+          "floor and not an answer.")
+    print("         Populate dep/ at the commits in mach.lock and run again.")
+    sys.exit(1)

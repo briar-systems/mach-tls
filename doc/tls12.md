@@ -68,6 +68,11 @@ carries, and it is verified against the leaf key that the certificate path
 validation just authenticated. The suite constrains the certificate: an ECDSA
 suite refuses an RSA leaf and an RSA suite refuses anything else.
 
+Peer signature verification accepts Ed25519, ECDSA P-256 with SHA-256, ECDSA
+P-384 with SHA-384, RSA-PSS with SHA-256 or SHA-384, and legacy RSA PKCS #1
+with SHA-256 or SHA-384. P-384 is not a named group and is never selected for
+local signing.
+
 Both roles reject a record whose legacy version is outside `{3,1}` to `{3,3}`
 when it is unprotected, and require exactly `{3,3}` once it is protected.
 RFC 5246 appendix E.1 permits the lower value in a first ClientHello, and every

@@ -9,6 +9,12 @@ use crypto.secret;
 use std.types.bool.bool;
 use std.types.size.usize;
 
+pub val MAX_SIGNATURE_SCHEMES: usize = 5;
+
+pub fun valid_signature_count(value: usize) bool {
+    ret value > 0 && value <= MAX_SIGNATURE_SCHEMES;
+}
+
 pub rec ProtocolName {
     data: *u8;
     len:  usize;
@@ -109,5 +115,12 @@ test "config: default limits are finite and protocol conforming" {
         limits.max_client_flight_bytes == 0 ||
         limits.max_server_flight_bytes == 0 ||
         limits.max_chain_bytes == 0) { ret 1; }
+    ret 0;
+}
+
+test "config: all verification schemes fit one bounded policy" {
+    if (!valid_signature_count(MAX_SIGNATURE_SCHEMES) ||
+        valid_signature_count(0) ||
+        valid_signature_count(MAX_SIGNATURE_SCHEMES + 1)) { ret 1; }
     ret 0;
 }

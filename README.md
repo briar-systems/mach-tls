@@ -50,7 +50,7 @@ TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GC
 
 The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction.
 
-The TLS 1.3 server is complete. It selects credentials by SNI with exact, wildcard, and default precedence, negotiates ALPN, suites, groups, and signatures against the leased private key, issues at most one HelloRetryRequest, requests and verifies optional client authentication, and answers invalid ClientHellos with protocol-correct alerts and bounded work. Certificate rotation retires a generation without disturbing any established connection.
+The TLS 1.3 server is complete. It selects credentials by SNI with exact, wildcard, and default precedence, or through an ALPN-aware server credential selector that sees SNI and the complete offered ALPN list before leasing one generation. RFC 8737 TLS-ALPN challenge credentials are accepted only through their explicit transient-store contract. It negotiates ALPN, suites, groups, and signatures against the leased private key, issues at most one HelloRetryRequest, requests and verifies optional client authentication, and answers invalid ClientHellos with protocol-correct alerts and bounded work. Certificate rotation retires a generation without disturbing any established connection.
 
 TLS 1.2 is implemented for both roles over the same engine contract, the same records, and the same transport. It negotiates the six declared ECDHE AEAD suites, always uses the RFC 7627 extended master secret, refuses renegotiation outright, and implements downgrade protection in both directions: a dual-version listener marks its random and refuses `TLS_FALLBACK_SCSV`, and a client that could have offered TLS 1.3 refuses a marked random. A listener configured for TLS 1.3 only cannot be reached over TLS 1.2. TLS 1.2 client authentication and TLS 1.2 resumption are deliberately absent; the contract and the reasons are in [`doc/tls12.md`](doc/tls12.md).
 
@@ -62,7 +62,15 @@ Session resumption is implemented for both roles. A server seals sessions under 
 
 Certificate parsing is strict DER and publishes only borrowed views after the entire certificate validates. Path construction backtracks across unordered intermediates and trust anchors within an explicit depth bound. It verifies signatures, validity, basic constraints, path length, key usage, extended key usage, authority key identifiers, DNS and IP name constraints, and the requested server or client purpose. Unknown critical extensions fail closed.
 
-Certificate paths authenticate Ed25519, ECDSA P-256 SHA-256, RSA-PSS SHA-256/SHA-384, and RSA PKCS #1 v1.5 SHA-256/SHA-384 signatures within explicit depth and public-key-operation bounds. Server identities use subject alternative names only. DNS matching is ASCII case-insensitive, permits one complete leftmost wildcard label, and never allows a wildcard to span labels. IP literals are parsed to network bytes and match only `iPAddress` entries. Common-name fallback is intentionally absent.
+Certificate paths authenticate Ed25519, ECDSA P-256 SHA-256, ECDSA P-384
+SHA-384, RSA-PSS SHA-256/SHA-384, and RSA PKCS #1 v1.5 SHA-256/SHA-384
+signatures within explicit depth and public-key-operation bounds. P-384 is
+verification-only. It is accepted for certificate paths and peer signatures but
+never selected for local signing or key exchange. Server identities use subject
+alternative names only. DNS matching is ASCII case-insensitive, permits one
+complete leftmost wildcard label, and never allows a wildcard to span labels.
+IP literals are parsed to network bytes and match only `iPAddress` entries.
+Common-name fallback is intentionally absent.
 
 PEM bundle loading validates every block before publishing a chain. Private keys are owned by `mach-crypto` secret allocators and support PKCS #8, SEC 1, and RSA PKCS #1 containers. Credential initialization proves that the private key matches the leaf certificate before publication.
 
