@@ -113,11 +113,14 @@ arrays and keys only after `credentials.reclaimable` returns true.
 `credentials.initialize_tls_alpn_challenge` creates the one-identity,
 one-certificate transient generation RFC 8737 requires. It accepts the
 critical `acmeIdentifier` extension only through `x509.parse_tls_alpn_challenge`
-and only after proving the key and exact DNS identity match. Ordinary
+and only after proving the key matches and the SAN contains exactly one
+non-wildcard `dNSName` equal case-insensitively to the validation name. Ordinary
 `x509.parse`, normal generation initialization, and all client verification
 continue to reject unknown critical extensions. A selector must choose this
-generation only when `server.offered_alpn_contains` confirms `acme-tls/1` in
-the current ClientHello. Its owner initializes one stable caller-owned Store
+generation only when `server.offered_alpn_exactly` confirms the current
+ClientHello offers `acme-tls/1` and no other ALPN protocol. The generic selector
+still receives the complete list and may use `offered_alpn_contains` for other
+selection policies. Its owner initializes one stable caller-owned Store
 with `credentials.initialize_vacant_store`, publishes each challenge with
 `publish_store`, leases it with `acquire`, then calls `withdraw_store` before
 reclaiming it after the final transient lease is released. Publication,

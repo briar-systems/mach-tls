@@ -140,6 +140,16 @@ pub fun offered_alpn_contains(offer: CredentialOffer, protocol: contracts.Bytes)
     ret false;
 }
 
+pub fun offered_alpn_exactly(offer: CredentialOffer,
+    protocol: contracts.Bytes) bool {
+    if (offer.offered_alpn.data == nil || protocol.data == nil ||
+        protocol.len == 0 || protocol.len > 255 ||
+        offer.offered_alpn.len != protocol.len + 1 ||
+        offer.offered_alpn.data[0] != protocol.len::u8) { ret false; }
+    ret bytes_equal(contracts.Bytes{data: ?offer.offered_alpn.data[1],
+        len: protocol.len}, protocol);
+}
+
 pub rec Server {
     config: *config.ServerConfig;
     configuration: config.ServerConfig;
@@ -4189,9 +4199,31 @@ test "server: an ALPN-aware selector sees only complete offered protocol names" 
     ret 0;
 }
 
+test "server: an exact ALPN offer contains only its single protocol" {
+    var single: [11]u8 = [11]u8{
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    var offer: CredentialOffer = CredentialOffer{
+        server_name: contracts.Bytes{data: nil, len: 0},
+        offered_alpn: contracts.Bytes{data: ?single[0], len: 11}};
+    val challenge: contracts.Bytes = contracts.Bytes{
+        data: "acme-tls/1"::*u8, len: 10};
+    if (!offered_alpn_exactly(offer, challenge)) { ret 1; }
+    var mixed: [14]u8 = [14]u8{
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1', 2, 'h', '2'};
+    offer.offered_alpn = contracts.Bytes{data: ?mixed[0], len: 14};
+    if (!offered_alpn_contains(offer, challenge) ||
+        offered_alpn_exactly(offer, challenge)) { ret 2; }
+    var duplicate: [22]u8 = [22]u8{
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1',
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    offer.offered_alpn = contracts.Bytes{data: ?duplicate[0], len: 22};
+    if (offered_alpn_exactly(offer, challenge)) { ret 3; }
+    ret 0;
+}
+
 fun test_challenge_store_selector(store: *credentials.Store, offer: CredentialOffer,
     output: *credentials.Lease) contracts.Error {
-    if (store == nil || !offered_alpn_contains(offer,
+    if (store == nil || !offered_alpn_exactly(offer,
             contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
         ret contracts.UNSUPPORTED;
     }
