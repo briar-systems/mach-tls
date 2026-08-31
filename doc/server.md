@@ -69,8 +69,10 @@ HelloRetryRequest sentinel. `ingest` at `INITIAL` accepts the ClientHello.
    `supported_versions`.
 2. The SNI host name and complete offered-ALPN list are extracted before a
    credential lease is acquired. `server.init_with_credential_selector` may
-   inspect both through one borrowed `CredentialOffer` and lease a caller-owned
-   transient generation. The default `server.init` path selects the published
+   inspect both through one borrowed `CredentialOffer` and its typed
+   caller-owned transient `credentials.Store`. It leases through
+   `credentials.acquire`; returning `UNSUPPORTED` falls through to the
+   configured published store. The default `server.init` path selects that
    store generation by SNI. Exact names outrank the longest matching wildcard,
    which outranks the configured default. A name with no match and no default
    fails with `unrecognized_name`.
@@ -115,8 +117,9 @@ and only after proving the key and exact DNS identity match. Ordinary
 `x509.parse`, normal generation initialization, and all client verification
 continue to reject unknown critical extensions. A selector must choose this
 generation only when `server.offered_alpn_contains` confirms `acme-tls/1` in
-the current ClientHello, and its owner must retain the generation and key until
-the transient lease is released.
+the current ClientHello. Its owner publishes it through a caller-owned
+`credentials.Store`, selects it with `credentials.acquire`, then calls
+`retire_store` before reclaiming it after the transient lease is released.
 
 ## Failure
 

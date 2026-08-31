@@ -99,19 +99,24 @@ pub rec CredentialOffer {
     offered_alpn: contracts.Bytes;
 }
 
-pub def CredentialSelect: fun(ptr, CredentialOffer, *credentials.Lease)
+pub def CredentialSelect: fun(*credentials.Store, CredentialOffer, *credentials.Lease)
     contracts.Error;
 
 pub rec CredentialSelector {
-    context: ptr;
+    store: *credentials.Store;
     select: CredentialSelect;
 }
 
 pub fun no_credential_selector() CredentialSelector {
     var value: CredentialSelector;
-    value.context = nil;
+    value.store = nil;
     value.select = nil;
     ret value;
+}
+
+fun selector_valid(value: CredentialSelector) bool {
+    ret (value.select == nil && value.store == nil) ||
+        (value.select != nil && value.store != nil);
 }
 
 pub fun offered_alpn_contains(offer: CredentialOffer, protocol: contracts.Bytes)
@@ -822,7 +827,8 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
     if (!server_owner_valid(server) ||
         (server.state != 0 && server.state != DESTROYED) ||
         !config_valid(configuration, ?storage, extra, peer_extension) ||
-        !config_sources_disjoint(server, configuration, ?storage, extra)) {
+        !config_sources_disjoint(server, configuration, ?storage, extra) ||
+        !selector_valid(selector)) {
         ret false;
     }
     server.configuration = configuration[0];
@@ -1469,8 +1475,12 @@ fun acquire_credentials(server: *Server, requested: contracts.Bytes,
         status = credentials.acquire(server.config.credentials, requested,
             ?server.lease);
     } or {
-        status = server.selector.select(server.selector.context, CredentialOffer{
+        status = server.selector.select(server.selector.store, CredentialOffer{
             server_name: requested, offered_alpn: offered_alpn}, ?server.lease);
+        if (status == contracts.UNSUPPORTED) {
+            status = credentials.acquire(server.config.credentials, requested,
+                ?server.lease);
+        }
     }
     if (status == contracts.UNSUPPORTED) { ret error.UNRECOGNIZED_NAME; }
     if (status != contracts.OK || server.lease.identity == nil ||
@@ -4157,5 +4167,52 @@ test "server: an ALPN-aware selector sees only complete offered protocol names" 
     offered[3] = 9;
     if (offered_alpn_contains(request, contracts.Bytes{data: "http/1.1"::*u8,
         len: 8})) { ret 3; }
+    ret 0;
+}
+
+fun test_challenge_store_selector(store: *credentials.Store, offer: CredentialOffer,
+    output: *credentials.Lease) contracts.Error {
+    if (store == nil || !offered_alpn_contains(offer,
+            contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
+        ret contracts.UNSUPPORTED;
+    }
+    ret credentials.acquire(store, offer.server_name, output);
+}
+
+test "server: transient selector leases its store before retirement" {
+    var owner: secret.Allocator = secret.system_allocator();
+    var chain_storage: [1]cert.Certificate;
+    var key: keys.PrivateKey;
+    var identity: credentials.Identity;
+    if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
+        ret 1;
+    }
+    var generation: credentials.Generation = credentials.empty_generation();
+    if (credentials.initialize(?generation, ?identity, 1, 0, nil,
+            false) != contracts.OK) { ret 2; }
+    var challenge_store: credentials.Store = credentials.empty_store();
+    if (credentials.initialize_store(?challenge_store, ?generation) != contracts.OK) {
+        ret 3;
+    }
+    var alpn: [11]u8 = [11]u8{10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    val offer: CredentialOffer = CredentialOffer{server_name: contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15}, offered_alpn: contracts.Bytes{
+        data: ?alpn[0], len: 11}};
+    var lease: credentials.Lease = credentials.empty_lease();
+    if (test_challenge_store_selector(?challenge_store, offer, ?lease) !=
+            contracts.OK || lease.generation != ?generation ||
+        lease.identity != ?identity) { ret 4; }
+    var retired: *credentials.Generation = nil;
+    if (credentials.retire_store(?challenge_store, ?retired) != contracts.OK ||
+        retired != ?generation || credentials.reclaimable(retired) ||
+        credentials.clear(retired) != contracts.INVALID_STATE) { ret 5; }
+    if (credentials.release(?lease) != contracts.OK ||
+        !credentials.reclaimable(retired) ||
+        credentials.clear(retired) != contracts.OK) { ret 6; }
+    var refused: credentials.Lease = credentials.empty_lease();
+    if (test_challenge_store_selector(?challenge_store, offer, ?refused) !=
+            contracts.INVALID_STATE || keys.destroy_private(?key) != contracts.OK) {
+        ret 7;
+    }
     ret 0;
 }
