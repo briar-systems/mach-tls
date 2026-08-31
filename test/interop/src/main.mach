@@ -204,7 +204,7 @@ var option_key_update: bool;
 var option_tls12: bool;
 var tls12_configuration: config.ClientConfig;
 var tls12_suites: [6]tls13.CipherSuite;
-var tls12_signatures: [6]tls13.SignatureScheme;
+var tls12_signatures: [7]tls13.SignatureScheme;
 var tls12_versions: [1]u16;
 var legacy_engine: tls12_connection.Connection;
 var legacy_hello: [16384]u8;
@@ -435,12 +435,15 @@ fun dial_one(index: usize) i64 {
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
+    val p384_root_hex: *u8 = "3082020a30820190a003020102020101300a06082a8648ce3d040303303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f74301e170d3236303833313138353133375a170d3336303832383138353133375a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f743076301006072a8648ce3d020106052b81040022036200047d75bfcce4046b92abec5888d18a67b3c2d605e70401c09dcb4f8cf43f106c2f13854a0afabc9529fa96604f00631141b31294348150ea12cc8e960e8b321a2af2f16f30729a923e40de4f856e10a20bf07dee074f4a272912db48d738abc586a3663064301f0603551d23041830168014ded0082f54cba5a1f86938525c08c2d259399cc830120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e04160414ded0082f54cba5a1f86938525c08c2d259399cc8300a06082a8648ce3d0403030368003065023100e492d957772464ce3b1b9d75c1d71304ad239eac892803114005a7c3ce56c09256e3378f96e84be8187046b66f35c90302301f676226a26fe6b4e93676fe231e30678b846074977d380208b50f84803227b4c4350731458e0e396561754f85dbf7ec"::*u8;
     val client_hex: *u8 = "3082016530820117a00302010202147da845f0ef3c4bedac9ebe18bdafc1e948a3424a300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133343832305a170d3237303832383133343832305a30183116301406035504030c0d4d616368544c53436c69656e74302a300506032b657003210033e63a8f44421a42ed9b8120e72beee01e147bde123fe0489ccb27e41993c527a3753073300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070302301d0603551d0e04160414928fd5e4ed358ed2992a33dbb12e18ffade4f16b301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300506032b65700341002a1880fbe668a98aef6514366d6ea77a10f26b8018955f559791658fae49d564d27b240dcd44fa613414aceb9b09d1cec53acc280568a38378c5dcfb032e8a0b"::*u8;
     val client_key_hex: *u8 = "302e020100300506032b6570042204206dd175e2faad594759fd8fb1cd1eeea1f40d01f11189bfd4a6dda111ebee0935"::*u8;
     var root_der: [341]u8;
+    var p384_root_der: [526]u8;
     var client_der: [361]u8;
     var client_key_der: [48]^u8;
     if (!decode_hex(root_hex, 682, ?root_der[0], 341) ||
+        !decode_hex(p384_root_hex, 1052, ?p384_root_der[0], 526) ||
         !decode_hex(client_hex, 722, ?client_der[0], 361) ||
         !decode_secret_hex(client_key_hex, 96, ?client_key_der[0], 48)) { ret 1; }
     var connections: usize = 1;
@@ -464,8 +467,11 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     if (connections == 0 || connections > 4) { connections = 1; }
 
-    var anchor: cert.Certificate = cert.Certificate{der: ?root_der[0], der_len: 341};
-    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var anchors: [2]cert.Certificate = [2]cert.Certificate{
+        cert.Certificate{der: ?root_der[0], der_len: 341},
+        cert.Certificate{der: ?p384_root_der[0], der_len: 526},
+    };
+    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchors[0], len: 2};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
         config.ProtocolName{data: "h2"::*u8, len: 2}};
     var versions: [1]u16 = [1]u16{tls13.VERSION};
@@ -474,9 +480,10 @@ fun main(argc: i64, argv: **u8) i64 {
         tls13.CHACHA20_POLY1305_SHA256};
     var groups: [2]tls13.NamedGroup = [2]tls13.NamedGroup{
         tls13.X25519, tls13.SECP256R1};
-    var signatures: [4]tls13.SignatureScheme = [4]tls13.SignatureScheme{
+    var signatures: [5]tls13.SignatureScheme = [5]tls13.SignatureScheme{
         tls13.ED25519, tls13.ECDSA_SECP256R1_SHA256,
-        tls13.RSA_PSS_RSAE_SHA256, tls13.RSA_PSS_RSAE_SHA384};
+        tls13.ECDSA_SECP384R1_SHA384, tls13.RSA_PSS_RSAE_SHA256,
+        tls13.RSA_PSS_RSAE_SHA384};
     var entropy: secret.Entropy = secret.system_entropy();
     var allocator: secret.Allocator = secret.system_allocator();
     var client_key: keys.PrivateKey = keys.empty_private();
@@ -500,7 +507,7 @@ fun main(argc: i64, argv: **u8) i64 {
     dial_configuration.versions = ?versions[0]; dial_configuration.version_len = 1;
     dial_configuration.suites = ?suites[0]; dial_configuration.suite_len = 3;
     dial_configuration.groups = ?groups[0]; dial_configuration.group_len = 2;
-    dial_configuration.signatures = ?signatures[0]; dial_configuration.signature_len = 4;
+    dial_configuration.signatures = ?signatures[0]; dial_configuration.signature_len = 5;
     dial_configuration.client_identity = ?client_identity;
     dial_configuration.entropy = ?entropy;
     dial_configuration.limits = config.production_limits();
@@ -521,10 +528,11 @@ fun main(argc: i64, argv: **u8) i64 {
     tls12_suites[5] = tls12.ECDHE_RSA_CHACHA20_POLY1305;
     tls12_signatures[0] = tls13.ED25519;
     tls12_signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
-    tls12_signatures[2] = tls13.RSA_PSS_RSAE_SHA256;
-    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA384;
-    tls12_signatures[4] = 0x0401;
-    tls12_signatures[5] = 0x0501;
+    tls12_signatures[2] = tls13.ECDSA_SECP384R1_SHA384;
+    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA256;
+    tls12_signatures[4] = tls13.RSA_PSS_RSAE_SHA384;
+    tls12_signatures[5] = 0x0401;
+    tls12_signatures[6] = 0x0501;
     tls12_configuration = config.ClientConfig{};
     tls12_configuration.client_identity = nil;
     tls12_configuration.sessions = nil;
@@ -540,7 +548,7 @@ fun main(argc: i64, argv: **u8) i64 {
     tls12_configuration.groups = ?groups[0];
     tls12_configuration.group_len = 2;
     tls12_configuration.signatures = ?tls12_signatures[0];
-    tls12_configuration.signature_len = 6;
+    tls12_configuration.signature_len = 7;
     tls12_configuration.entropy = ?entropy;
     tls12_configuration.limits = config.production_limits();
     tls12_configuration.limits.max_peer_handshake_bytes = 65536;

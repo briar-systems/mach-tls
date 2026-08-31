@@ -4,7 +4,14 @@
 
 ## Supported certificate keys and signatures
 
-Subject public keys support Ed25519, P-256, and RSA with 2048 through 4096-bit moduli. Certificate signatures support Ed25519, ECDSA P-256 with SHA-256, RSA-PSS with SHA-256 or SHA-384, and RSA PKCS #1 v1.5 with SHA-256 or SHA-384. RSA-PSS parameters must select the same supported hash for the message and MGF1 and must use a salt whose length equals the hash length.
+Subject public keys support Ed25519, P-256, P-384, and RSA with 2048 through
+4096-bit moduli. Certificate signatures support Ed25519, ECDSA P-256 with
+SHA-256, ECDSA P-384 with SHA-384, RSA-PSS with SHA-256 or SHA-384, and RSA
+PKCS #1 v1.5 with SHA-256 or SHA-384. P-384 is verification-only. The package
+does not load a P-384 private key, select P-384 for local signing, or expose a
+P-384 key-share group. RSA-PSS parameters must select the same supported hash
+for the message and MGF1 and must use a salt whose length equals the hash
+length.
 
 A trust anchor's self-signature is not part of certification path validation. `parse_trust_anchor` therefore accepts an otherwise valid anchor whose outer self-signature algorithm is not supported. Every non-anchor certificate still requires a supported signature algorithm.
 
