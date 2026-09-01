@@ -437,10 +437,10 @@ client half of the same criterion.
 ## Qualification for the TLS 1.2 revision
 
 Against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64: 13 TLS 1.2 server legs
-and 6 TLS 1.2 client legs returned exit status zero, and the TLS 1.2 client
+and 7 TLS 1.2 client legs returned exit status zero, and the TLS 1.2 client
 against a TLS 1.3 only server failed as required. The TLS 1.3 legs above were
-re-run unchanged: 19 server legs, 10 client legs, and 4 resumption legs, all
-zero.
+re-run unchanged: 19 server legs, 11 client legs, and 4 resumption legs, all
+zero. The client counts include the two P-384 verification legs.
 
 # Running the whole matrix
 
@@ -455,7 +455,7 @@ prints the peer versions and the release evidence, and exits non-zero naming any
 leg that failed. It is the qualification record for a revision, and it is the
 only place the legs are written down once rather than pasted twice.
 
-The qualification recorded for this revision is 53 legs passed, 0 failed,
+The qualification recorded for this revision is 55 legs passed, 0 failed,
 against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64.
 
 What the matrix does not cover is written down in
