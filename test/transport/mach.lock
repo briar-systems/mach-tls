@@ -2,10 +2,10 @@
 
 [dep.mach-std]
 url = "https://github.com/briar-systems/mach-std"
-ref = "tag/v0.33.0"
-commit = "d2f08352acaac3169e823335ab4ef1e8ce632abb"
+ref = "tag/v0.34.0"
+commit = "2f0a0f9cc73edc5f4e31d6c90ab445dfaf79ddb4"
 
 [dep.mach-crypto]
 url = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.7.0"
-commit = "0f74518b3381ac993900d7ce44a86a3c26a1522e"
+ref = "tag/v0.8.0"
+commit = "903c17adf0030cc4d4d4754e293cc6bb8d4e133a"

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `mach-std` advances to `v0.34.0` and `mach-crypto` advances to `v0.8.0`,
+  keeping downstream consumers on one compatible typed-allocation stack.
+
 ## [0.2.0] - 2026-08-31
 
 ### Added
