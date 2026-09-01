@@ -1,6 +1,6 @@
 [project]
 id = "tls"
-version = "0.2.1"
+version = "0.2.2"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -58,4 +58,4 @@ ref = "tag/v0.34.0"
 
 [dep.mach-crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.8.0"
+ref = "tag/v0.8.1"
