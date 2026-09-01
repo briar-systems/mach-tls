@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- `mach-crypto` advances to `v0.8.1`, adopting the wiped deallocation retry
+  contract so every secret owner release observes zeroed storage.
+
 ## [0.2.1] - 2026-09-01
 
 ### Changed
