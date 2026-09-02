@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- `server.destroy` and `client.destroy` clear every per-handshake field, so an
+  engine initialised again on the same record starts from the declared zero
+  state. Previously the traffic-secret generations survived, and a second
+  handshake on a reused record emitted its HANDSHAKE secret at generation 2,
+  which mach-quic's handshake adapter rejects.
+
 ## [0.2.2] - 2026-09-01
 
 ### Changed

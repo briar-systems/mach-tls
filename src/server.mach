@@ -2750,6 +2750,13 @@ fun destroy_inner(server: *Server) bool {
     server.client_trust = nil;
     queue_clear(server);
     server.output_used = 0;
+    # every per-handshake field goes with the handshake, so an engine
+    # initialised on this record again starts from the declared zero state;
+    # only the transition owner survives, since this thread still holds it
+    val owner: i64 = server.transition_owner;
+    var cleared: Server;
+    @server = cleared;
+    server.transition_owner = owner;
     server.state = DESTROYED;
     ret true;
 }
@@ -3211,6 +3218,30 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     }
 
     if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 37; }
+    # the same records and storage carry a second handshake whose secrets
+    # start again at generation one
+    if (!init(?listener_engine, ?listener, server_storage, extra, 0) ||
+        start(?listener_engine, 1800000001).status != engine.OK) { ret 40; }
+    if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra, 0) ||
+        client.start(?dialer_engine, 1800000001).status != engine.OK) { ret 41; }
+    if (!client.snapshot(?dialer_engine).output_pending) { ret 46; }
+    if (client.snapshot(?dialer_engine).status != engine.MORE) { ret 47; }
+    if (snapshot(?listener_engine).status != engine.MORE) { ret 48; }
+    val exchanged_again: i64 = exchange(?listener_engine, ?dialer_engine);
+    if (exchanged_again != 0) { ret 50 + exchanged_again::i32; }
+    if (snapshot(?listener_engine).status != engine.COMPLETE ||
+        client.snapshot(?dialer_engine).status != engine.COMPLETE) { ret 42; }
+    i = 0;
+    for (i < 4) {
+        if (listener_engine.secret_generation[i] > 1) { ret 43; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 6) {
+        if (dialer_engine.secret_generation[i] > 1) { ret 44; }
+        i = i + 1;
+    }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 45; }
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK ||
         !credentials.reclaimable(retired)) { ret 38; }
