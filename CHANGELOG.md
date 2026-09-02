@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Removed
+
+- `tools/partial_literal_sweep.py`. It enumerated record literals naming fewer
+  fields than their record declares, which is a workaround for
+  briar-systems/mach#3108; that defect is being fixed in the compiler. The rule
+  itself still holds, and the `no_*` constructors are what keep it.
+
 ## [0.2.3] - 2026-09-02
 
 ### Fixed
