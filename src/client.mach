@@ -2416,6 +2416,13 @@ fun destroy_inner(client: *Client) bool {
     client.selected_alpn.data = nil;
     client.output_pending = false;
     client.alert_pending = false;
+    # every per-handshake field goes with the handshake, so an engine
+    # initialised on this record again starts from the declared zero state;
+    # only the transition owner survives, since this thread still holds it
+    val owner: i64 = client.transition_owner;
+    var cleared: Client;
+    @client = cleared;
+    client.transition_owner = owner;
     client.state = DESTROYED;
     ret true;
 }
