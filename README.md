@@ -123,9 +123,10 @@ its arrays — and assigning each field. The `no_transport`, `no_client_config`,
 cleared by declaration, and teardown paths copy from them rather than assigning
 a literal.
 
-`tools/partial_literal_sweep.py` enumerates any literal that breaks the rule.
-It reports zero, and its header records the four ways a sweep like it can be
-wrong while still producing plausible output.
+Nothing enforces this automatically. Enumerating the violations was a
+workaround for briar-systems/mach#3108, and that defect is being fixed in the
+compiler, so the constructors above are what keep the rule in one place rather
+than at every teardown site.
 
 ## Local development
 
