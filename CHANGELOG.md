@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.4] - 2026-09-05
 
 ### Removed
 
@@ -8,6 +8,14 @@
   fields than their record declares, which is a workaround for
   briar-systems/mach#3108; that defect is being fixed in the compiler. The rule
   itself still holds, and the `no_*` constructors are what keep it.
+
+### Added
+
+- GitHub Actions CI: every pull request builds the library, runs the suite in both profiles and the transport project, runs the OpenSSL and GnuTLS interoperability matrix, and verifies IR across all six targets.
+
+### Changed
+
+- Dependencies: mach-crypto v0.8.2.
 
 ## [0.2.3] - 2026-09-02
 
