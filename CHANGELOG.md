@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- A client that sends no ALPN extension is served instead of refused with
+  `no_application_protocol`. RFC 7301 section 3.2 reserves that alert for a
+  client that advertised protocols and matched none; `require_alpn` answered
+  both cases, because the absence of the extension and an offer that matched
+  nothing both left the selection empty. A client that advertises nothing now
+  negotiates nothing and the handshake continues, on TLS 1.3 and TLS 1.2
+  alike. An offer that matched nothing still gets the alert.
+
+### Added
+
+- `engine.Snapshot.peer_offered_alpn`, which says whether the peer sent an
+  ALPN extension at all. An empty `selected_alpn` no longer has two meanings:
+  with this false the peer asked for nothing, with it true the peer's offer
+  was not covered. A server that cannot serve without ALPN uses this to refuse
+  on its own terms rather than having the library guess for it.
+- `--expect-absent-alpn` in the interoperability server harness, which holds a
+  listener that configures `require_alpn` to serving a client that offers
+  none, and asserts the snapshot reports it as having offered nothing. Two
+  legs drive it with `openssl s_client` and no `-alpn`, one per version.
+
 ## [0.2.4] - 2026-09-05
 
 ### Removed

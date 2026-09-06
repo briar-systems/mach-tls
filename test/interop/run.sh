@@ -166,6 +166,13 @@ server_leg "1.3 refuses tls 1.2 gnutls (protocol_version)" "--expect-failure 70"
   "gnutls-cli --port 9443 127.0.0.1 --x509cafile $CA --priority NORMAL:-VERS-ALL:+VERS-TLS1.2 --insecure"
 server_leg "1.3 refuses alpn mismatch (no_application_protocol)" "--expect-failure 120" \
   "openssl s_client -connect 127.0.0.1:9443 -CAfile $CA -alpn h3 -tls1_3 -quiet -servername api.example.com"
+# RFC 7301 section 3.2: the alert above answers an offer that matched nothing.
+# a client that sends no ALPN extension at all asked for nothing and is served,
+# even though this listener configures require_alpn.
+server_leg "1.3 serves a client that offers no alpn" "--expect-absent-alpn" \
+  "openssl s_client -connect 127.0.0.1:9443 -CAfile $CA -tls1_3 -quiet -verify_return_error -servername api.example.com"
+server_leg "1.2 serves a client that offers no alpn" "--tls12 --expect-absent-alpn" \
+  "openssl s_client -connect 127.0.0.1:9443 -CAfile $CA -tls1_2 -quiet -verify_return_error -servername api.example.com"
 server_leg "1.3 refuses unknown sni (unrecognized_name)" "--no-default --expect-failure 112" \
   "openssl s_client -connect 127.0.0.1:9443 -CAfile $CA -alpn h2 -tls1_3 -quiet -servername nowhere.invalid"
 server_leg "1.3 refuses missing client certificate (certificate_required)" \
