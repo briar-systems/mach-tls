@@ -198,6 +198,7 @@ pub rec Server {
     peer_key_second: [MAX_PUBLIC_KEY]u8;
     selected_alpn_storage: [255]u8;
     selected_alpn: contracts.Bytes;
+    peer_offered_alpn: bool;
     server_name_storage: [253]u8;
     server_name: contracts.Bytes;
     peer_parameters: contracts.Bytes;
@@ -901,6 +902,7 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
     server.peer_leaf = x509.no_certificate();
     server.selected_alpn.data = nil;
     server.selected_alpn.len = 0;
+    server.peer_offered_alpn = false;
     server.server_name.data = nil;
     server.server_name.len = 0;
     server.peer_parameters.data = nil;
@@ -2036,6 +2038,7 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
     }
     server.suite = selection.suite;
     server.signature_scheme = selection.signature;
+    server.peer_offered_alpn = selection.protocol_offered;
     if (selection.protocol.len != 0) {
         copy_bytes(?server.selected_alpn_storage[0], selection.protocol.data,
             selection.protocol.len);
@@ -2779,6 +2782,7 @@ fun snapshot_inner(server: *Server) engine.Snapshot {
     value.retry_count = server.retry_count;
     value.authenticated = server.authenticated;
     value.selected_alpn = server.selected_alpn;
+    value.peer_offered_alpn = server.peer_offered_alpn;
     value.peer_parameters = server.peer_parameters;
     value.peer_name = server.server_name;
     value.client_auth_requested = server.client_auth_required;

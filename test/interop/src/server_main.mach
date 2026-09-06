@@ -223,6 +223,11 @@ var application_output: [64]u8;
 var fixtures: file.Root;
 var option_require_client_auth: bool;
 var option_require_alpn: bool;
+# a client that sends no ALPN extension must still be served by a listener that
+# configures `require_alpn`, and must be reported as having offered nothing.
+# this is separate from `--optional-alpn`, which relaxes the configuration; here
+# the configuration stays strict and the expectation changes.
+var option_expect_absent_alpn: bool;
 var option_expect_failure: bool;
 var option_expect_alert: usize;
 var option_rotate: bool;
@@ -441,7 +446,16 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         report("handshake error=", handshake.terminal_error::usize);
         ret 20;
     }
-    if (option_require_alpn && (negotiated.selected_alpn.len != 2 ||
+    if (option_expect_absent_alpn) {
+        if (negotiated.selected_alpn.len != 0) {
+            print.print("a protocol was negotiated with no offer\n");
+            ret 21;
+        }
+        if (negotiated.peer_offered_alpn) {
+            print.print("an absent alpn extension was reported as offered\n");
+            ret 21;
+        }
+    } or (option_require_alpn && (negotiated.selected_alpn.len != 2 ||
         negotiated.selected_alpn.data[0] != 'h' ||
         negotiated.selected_alpn.data[1] != '2')) {
         print.print("alpn was not negotiated\n");
@@ -590,6 +604,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var port: u16 = 9443;
     option_require_client_auth = false;
     option_require_alpn = true;
+    option_expect_absent_alpn = false;
     option_expect_failure = false;
     option_expect_alert = 256;
     option_rotate = false;
@@ -615,6 +630,8 @@ fun main(argc: i64, argv: **u8) i64 {
             option_require_client_auth = true;
         } or (streq(current, "--optional-alpn"::*u8)) {
             option_require_alpn = false;
+        } or (streq(current, "--expect-absent-alpn"::*u8)) {
+            option_expect_absent_alpn = true;
         } or (streq(current, "--groups-p256"::*u8)) {
             prefer_p256 = true;
         } or (streq(current, "--key-update"::*u8)) {
