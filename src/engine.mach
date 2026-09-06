@@ -92,6 +92,11 @@ pub rec Snapshot {
     retry_count: u8;
     authenticated: bool;
     selected_alpn: contracts.Bytes;
+    # whether the peer sent an ALPN extension. an empty `selected_alpn` with
+    # this false is a peer that asked for nothing; with this true it is a peer
+    # whose offer the policy did not cover, and only the caller knows whether
+    # it can serve the first.
+    peer_offered_alpn: bool;
     peer_parameters: contracts.Bytes;
     peer_name: contracts.Bytes;
     client_auth_requested: bool;
@@ -140,6 +145,7 @@ pub fun empty_snapshot() Snapshot {
     value.authenticated = false;
     value.selected_alpn.data = nil;
     value.selected_alpn.len = 0;
+    value.peer_offered_alpn = false;
     value.peer_parameters.data = nil;
     value.peer_parameters.len = 0;
     value.peer_name.data = nil;

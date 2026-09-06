@@ -121,6 +121,7 @@ pub rec Connection {
     peer_leaf_present: bool;
     selected_alpn_storage: [255]u8;
     selected_alpn: contracts.Bytes;
+    peer_offered_alpn: bool;
     server_name_storage: [253]u8;
     server_name: contracts.Bytes;
     client_auth_requested: bool;
@@ -516,6 +517,7 @@ fun reset(value: *Connection, storage: Storage) {
     value.peer_leaf_present = false;
     value.selected_alpn.data = nil;
     value.selected_alpn.len = 0;
+    value.peer_offered_alpn = false;
     value.server_name.data = nil;
     value.server_name.len = 0;
     value.client_auth_requested = false;
@@ -1449,9 +1451,12 @@ fun select_server_alpn(value: *Connection,
     var item: extensions.Extension;
     if (!extensions.find(hello.extensions,
             extensions.APPLICATION_LAYER_PROTOCOL, ?item)) {
-        if (configuration.require_alpn) { ret error.NO_APPLICATION_PROTOCOL; }
+        # RFC 7301 section 3.2: the alert answers an offer that matched
+        # nothing. a client that made no offer is served without ALPN, and a
+        # server that cannot serve without it refuses on its own terms.
         ret error.OK;
     }
+    value.peer_offered_alpn = true;
     var i: usize = 0;
     for (i < configuration.alpn_len) {
         var offset: usize = 2;
@@ -2147,6 +2152,7 @@ pub fun snapshot(value: *Connection) engine.Snapshot {
         view.group = value.curve;
         view.authenticated = value.authenticated;
         view.selected_alpn = value.selected_alpn;
+        view.peer_offered_alpn = value.peer_offered_alpn;
         view.peer_name = value.server_name;
         view.client_auth_requested = value.client_auth_requested;
         view.output_pending = pending(value);
