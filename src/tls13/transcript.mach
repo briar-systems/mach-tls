@@ -2,15 +2,15 @@
 
 use crypto.contracts;
 use crypto.hash;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
 use tls.error;
 use tls.handshake;
 use tls.handshake.codec;
 use tls.tls13;
 use tls.tls13.key_schedule;
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
-use std.types.size.usize;
 
 pub def State: u8;
 
@@ -22,20 +22,20 @@ pub val DESTROYED: State = 3;
 pub val SHA256_MAX_BYTES: u64 = 0x1fffffffffffffff;
 
 pub rec Transcript {
-    sha256:     hash.Sha256;
-    sha384:     hash.Sha384;
-    algorithm:  key_schedule.HashAlgorithm;
-    state:      State;
-    total:      u64;
-    retry_used: bool;
+    sha256:      hash.Sha256;
+    sha384:      hash.Sha384;
+    algorithm:   key_schedule.HashAlgorithm;
+    state:       State;
+    total:       u64;
+    retry_used:  bool;
     frame_count: usize;
-    first_type: handshake.MessageType;
-    last_type:  handshake.MessageType;
-    unframed:   bool;
+    first_type:  handshake.MessageType;
+    last_type:   handshake.MessageType;
+    unframed:    bool;
 }
 
 fun mapped(failure: contracts.Error) error.Error {
-    if (failure == contracts.OK) { ret error.OK; }
+    if (failure == contracts.OK)               { ret error.OK; }
     if (failure == contracts.OUTPUT_TOO_SMALL) { ret error.RESOURCE_LIMIT; }
     if (failure == contracts.INVALID_INPUT || failure == contracts.INVALID_STATE) {
         ret error.ILLEGAL_PARAMETER;
@@ -49,16 +49,16 @@ fun mapped_operation(operation: contracts.Operation) error.Error {
 
 pub fun empty() Transcript {
     ret Transcript{
-        sha256: hash.empty_sha256(),
-        sha384: hash.empty_sha384(),
-        algorithm: 0,
-        state: EMPTY,
-        total: 0,
-        retry_used: false,
+        sha256:      hash.empty_sha256(),
+        sha384:      hash.empty_sha384(),
+        algorithm:   0,
+        state:       EMPTY,
+        total:       0,
+        retry_used:  false,
         frame_count: 0,
-        first_type: 0,
-        last_type: 0,
-        unframed: false,
+        first_type:  0,
+        last_type:   0,
+        unframed:    false,
     };
 }
 
@@ -72,10 +72,12 @@ fun reset_context(value: *Transcript) error.Error {
     if (value.algorithm == key_schedule.SHA256) {
         failure = hash.destroy_sha256(?value.sha256);
         if (failure == contracts.OK) { failure = hash.init_sha256(?value.sha256); }
-    } or (value.algorithm == key_schedule.SHA384) {
+    }
+    or (value.algorithm == key_schedule.SHA384) {
         failure = hash.destroy_sha384(?value.sha384);
         if (failure == contracts.OK) { failure = hash.init_sha384(?value.sha384); }
-    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    }
+    or                           { ret error.UNSUPPORTED_ALGORITHM; }
     if (failure != contracts.OK) { ret mapped(failure); }
     value.total = 0;
     ret error.OK;
@@ -89,17 +91,17 @@ pub fun init(value: *Transcript,
     if (key_schedule.hash_size(algorithm) == 0) { ret error.UNSUPPORTED_ALGORITHM; }
     hash.destroy_sha256(?value.sha256);
     hash.destroy_sha384(?value.sha384);
-    value.algorithm = algorithm;
-    value.total = 0;
-    value.retry_used = false;
+    value.algorithm   = algorithm;
+    value.total       = 0;
+    value.retry_used  = false;
     value.frame_count = 0;
-    value.first_type = 0;
-    value.last_type = 0;
-    value.unframed = false;
+    value.first_type  = 0;
+    value.last_type   = 0;
+    value.unframed    = false;
     val failure: error.Error = reset_context(value);
     if (failure != error.OK) {
         value.algorithm = 0;
-        value.state = DESTROYED;
+        value.state     = DESTROYED;
         ret failure;
     }
     value.state = ACTIVE;
@@ -116,17 +118,19 @@ fun append(value: *Transcript, input: contracts.Bytes) error.Error {
         || (input.len != 0 && input.data == nil)) { ret error.ILLEGAL_PARAMETER; }
     val amount: u64 = input.len::u64;
     if ((value.algorithm == key_schedule.SHA256
-            && amount > SHA256_MAX_BYTES - value.total)
+        && amount > SHA256_MAX_BYTES - value.total)
         || (value.algorithm == key_schedule.SHA384
-            && amount > 0xffffffffffffffff - value.total)) {
+        && amount > 0xffffffffffffffff - value.total)) {
         ret error.RESOURCE_LIMIT;
     }
     var failure: contracts.Error;
     if (value.algorithm == key_schedule.SHA256) {
         failure = hash.update_sha256(?value.sha256, input);
-    } or (value.algorithm == key_schedule.SHA384) {
+    }
+    or (value.algorithm == key_schedule.SHA384) {
         failure = hash.update_sha384(?value.sha384, input);
-    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    }
+    or                           { ret error.UNSUPPORTED_ALGORITHM; }
     if (failure != contracts.OK) { ret mapped(failure); }
     value.total = value.total + amount;
     ret error.OK;
@@ -143,24 +147,24 @@ pub fun update_frame(value: *Transcript, encoded: contracts.Bytes) error.Error {
         ret error.ILLEGAL_PARAMETER;
     }
     var message: handshake.Message;
-    val parsed: handshake.Progress = handshake.parse(encoded.data, encoded.len,
+    val parsed:  handshake.Progress = handshake.parse(encoded.data, encoded.len,
         handshake.MAX_BODY_SIZE, ?message);
     if (parsed.status != handshake.COMPLETE || parsed.consumed != encoded.len) {
         if (parsed.error != error.OK) { ret parsed.error; }
         ret error.DECODE_ERROR;
     }
     val failure: error.Error = append(value, encoded);
-    if (failure != error.OK) { ret failure; }
+    if (failure != error.OK)    { ret failure; }
     if (value.frame_count == 0) { value.first_type = message.header.message_type; }
     value.frame_count = value.frame_count + 1;
-    value.last_type = message.header.message_type;
+    value.last_type   = message.header.message_type;
     ret error.OK;
 }
 
 # use a dedicated transcript so the complete client hello can advance the main transcript
 pub fun update_binder_client_hello(value: *Transcript, encoded: contracts.Bytes,
     after_retry: bool) error.Error {
-    var prefix: contracts.Bytes;
+    var prefix:  contracts.Bytes;
     val failure: error.Error = codec.client_hello_binder_prefix(encoded,
         after_retry, ?prefix);
     if (failure != error.OK) { ret failure; }
@@ -172,9 +176,11 @@ pub fun snapshot(value: *Transcript, output: contracts.Buffer) error.Error {
     var operation: contracts.Operation;
     if (value.algorithm == key_schedule.SHA256) {
         operation = hash.snapshot_sha256(?value.sha256, output);
-    } or (value.algorithm == key_schedule.SHA384) {
+    }
+    or (value.algorithm == key_schedule.SHA384) {
         operation = hash.snapshot_sha384(?value.sha384, output);
-    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    }
+    or { ret error.UNSUPPORTED_ALGORITHM; }
     ret mapped_operation(operation);
 }
 
@@ -183,9 +189,11 @@ pub fun final(value: *Transcript, output: contracts.Buffer) error.Error {
     var operation: contracts.Operation;
     if (value.algorithm == key_schedule.SHA256) {
         operation = hash.final_sha256(?value.sha256, output);
-    } or (value.algorithm == key_schedule.SHA384) {
+    }
+    or (value.algorithm == key_schedule.SHA384) {
         operation = hash.final_sha384(?value.sha384, output);
-    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    }
+    or { ret error.UNSUPPORTED_ALGORITHM; }
     val failure: error.Error = mapped_operation(operation);
     if (failure == error.OK) { value.state = FINALIZED; }
     ret failure;
@@ -200,23 +208,23 @@ pub fun rewrite_for_retry(value: *Transcript,
         ret error.ILLEGAL_PARAMETER;
     }
     var message: handshake.Message;
-    val parsed: handshake.Progress = handshake.parse(hello_retry_request.data,
+    val parsed:  handshake.Progress = handshake.parse(hello_retry_request.data,
         hello_retry_request.len, handshake.MAX_BODY_SIZE, ?message);
     if (parsed.status != handshake.COMPLETE || parsed.consumed != hello_retry_request.len) {
         if (parsed.error != error.OK) { ret parsed.error; }
         ret error.DECODE_ERROR;
     }
-    var server: codec.ServerHello;
+    var server:  codec.ServerHello;
     val decoded: error.Error = codec.decode_server_hello(?message, ?server);
     if (decoded != error.OK) { ret decoded; }
-    if (!server.retry) { ret error.ILLEGAL_PARAMETER; }
+    if (!server.retry)       { ret error.ILLEGAL_PARAMETER; }
 
-    var prior: [48]u8;
-    val size: usize = digest_size(value);
+    var prior:   [48]u8;
+    val size:    usize       = digest_size(value);
     var failure: error.Error = snapshot(value,
         contracts.Buffer{data: ?prior[0], capacity: size});
     if (failure != error.OK) { ret failure; }
-    var synthetic: [52]u8;
+    var synthetic:    [52]u8;
     val encoded_hash: handshake.Progress = codec.encode_message_hash(
         contracts.Bytes{data: ?prior[0], len: size},
         contracts.Buffer{data: ?synthetic[0], capacity: 52});
@@ -228,26 +236,32 @@ pub fun rewrite_for_retry(value: *Transcript,
     }
     if (failure == error.OK) { failure = append(value, hello_retry_request); }
     var i: usize = 0;
-    for (i < 48) { prior[i] = 0; i = i + 1; }
-    for (i < 52) { synthetic[i] = 0; i = i + 1; }
+    for (i < 48) {
+        prior[i] = 0;
+        i        = i + 1;
+    }
+    for (i < 52) {
+        synthetic[i] = 0;
+        i            = i + 1;
+    }
     if (failure != error.OK) {
         hash.destroy_sha256(?value.sha256);
         hash.destroy_sha384(?value.sha384);
-        value.algorithm = 0;
-        value.state = DESTROYED;
-        value.total = 0;
-        value.retry_used = false;
+        value.algorithm   = 0;
+        value.state       = DESTROYED;
+        value.total       = 0;
+        value.retry_used  = false;
         value.frame_count = 0;
-        value.first_type = 0;
-        value.last_type = 0;
-        value.unframed = false;
+        value.first_type  = 0;
+        value.last_type   = 0;
+        value.unframed    = false;
         ret failure;
     }
-    value.retry_used = true;
+    value.retry_used  = true;
     value.frame_count = 2;
-    value.first_type = handshake.MESSAGE_HASH;
-    value.last_type = handshake.SERVER_HELLO;
-    value.unframed = false;
+    value.first_type  = handshake.MESSAGE_HASH;
+    value.last_type   = handshake.SERVER_HELLO;
+    value.unframed    = false;
     ret error.OK;
 }
 
@@ -255,14 +269,14 @@ pub fun destroy(value: *Transcript) {
     if (value == nil) { ret; }
     hash.destroy_sha256(?value.sha256);
     hash.destroy_sha384(?value.sha384);
-    value.algorithm = 0;
-    value.state = DESTROYED;
-    value.total = 0;
-    value.retry_used = false;
+    value.algorithm   = 0;
+    value.state       = DESTROYED;
+    value.total       = 0;
+    value.retry_used  = false;
     value.frame_count = 0;
-    value.first_type = 0;
-    value.last_type = 0;
-    value.unframed = false;
+    value.first_type  = 0;
+    value.last_type   = 0;
+    value.unframed    = false;
 }
 
 fun bytes_match(actual: *u8, expected: *u8, length: usize) bool {
@@ -280,7 +294,7 @@ test "transcript: fragmented snapshots and consuming finals are exact" {
     if (init_for_suite(?value, tls13.AES_128_GCM_SHA256) != error.OK) { ret 1; }
     if (update(?value, contracts.Bytes{data: "a"::*u8, len: 1}) != error.OK
         || update(?value, contracts.Bytes{data: "bc"::*u8, len: 2}) != error.OK) { ret 2; }
-    var output: [48]u8;
+    var output:      [48]u8;
     var expected256: [32]u8 = [32]u8{
         0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
         0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
@@ -308,7 +322,7 @@ test "transcript: fragmented snapshots and consuming finals are exact" {
         0x58, 0xba, 0xec, 0xa1, 0x34, 0xc8, 0x25, 0xa7,
     };
     if (snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 47})
-            != error.RESOURCE_LIMIT
+        != error.RESOURCE_LIMIT
         || snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 48}) != error.OK
         || !bytes_match(?output[0], ?expected384[0], 48)) { ret 6; }
     destroy(?value);
@@ -316,8 +330,8 @@ test "transcript: fragmented snapshots and consuming finals are exact" {
 }
 
 test "transcript: complete frames reject truncation and trailing bytes" {
-    var body: [3]u8 = [3]u8{1, 2, 3};
-    var wire: [8]u8;
+    var body:    [3]u8              = [3]u8{1, 2, 3};
+    var wire:    [8]u8;
     val encoded: handshake.Progress = handshake.serialize(handshake.CERTIFICATE_VERIFY,
         contracts.Bytes{data: ?body[0], len: 3},
         contracts.Buffer{data: ?wire[0], capacity: 8});
@@ -400,9 +414,9 @@ test "transcript: rfc 8448 hello retry rewrite is exact and single-use" {
     var value: Transcript = empty();
     if (init(?value, key_schedule.SHA256) != error.OK
         || update_frame(?value,
-            contracts.Bytes{data: ?client_hello[0], len: 180}) != error.OK
+        contracts.Bytes{data: ?client_hello[0], len: 180}) != error.OK
         || rewrite_for_retry(?value,
-            contracts.Bytes{data: ?retry[0], len: 176}) != error.OK) { ret 1; }
+        contracts.Bytes{data: ?retry[0], len: 176}) != error.OK) { ret 1; }
     var output: [32]u8;
     if (snapshot(?value, contracts.Buffer{data: ?output[0], capacity: 32}) != error.OK
         || !bytes_match(?output[0], ?expected[0], 32)
@@ -413,9 +427,9 @@ test "transcript: rfc 8448 hello retry rewrite is exact and single-use" {
     var untouched: Transcript = empty();
     if (init(?untouched, key_schedule.SHA256) != error.OK
         || update_frame(?untouched,
-            contracts.Bytes{data: ?client_hello[0], len: 180}) != error.OK) { ret 4; }
+        contracts.Bytes{data: ?client_hello[0], len: 180}) != error.OK) { ret 4; }
     if (rewrite_for_retry(?untouched,
-            contracts.Bytes{data: ?retry[0], len: 176}) == error.OK
+        contracts.Bytes{data: ?retry[0], len: 176}) == error.OK
         || untouched.total != 180 || untouched.retry_used) { ret 5; }
     destroy(?untouched);
     destroy(?value);

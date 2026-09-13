@@ -7,18 +7,18 @@ use tls.transport;
 
 fwd tls.error.Error;
 
-pub def Role: u8;
-pub def Phase: u8;
+pub def Role:   u8;
+pub def Phase:  u8;
 pub def Status: u8;
 
 pub val CLIENT: Role = 0;
 pub val SERVER: Role = 1;
 
-pub val INITIAL:           Phase = 0;
-pub val NEGOTIATING:       Phase = 1;
-pub val ESTABLISHED:       Phase = 2;
-pub val CLOSING:           Phase = 3;
-pub val CLOSED:            Phase = 4;
+pub val INITIAL:     Phase = 0;
+pub val NEGOTIATING: Phase = 1;
+pub val ESTABLISHED: Phase = 2;
+pub val CLOSING:     Phase = 3;
+pub val CLOSED:      Phase = 4;
 
 pub val PENDING:  Status = 0;
 pub val COMPLETE: Status = 1;
@@ -52,6 +52,6 @@ pub rec Progress {
 test "state: connection lifecycle is ordered" {
     if (INITIAL >= NEGOTIATING) { ret 1; }
     if (ESTABLISHED >= CLOSING) { ret 1; }
-    if (CLOSING >= CLOSED) { ret 1; }
+    if (CLOSING >= CLOSED)      { ret 1; }
     ret 0;
 }
