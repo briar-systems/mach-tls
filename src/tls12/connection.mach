@@ -724,7 +724,7 @@ fun fill_public(value: *Connection, output: *u8, length: usize) bool {
         ret false;
     }
     var i: usize = 0;
-    for (i < length) { output[i] = temporary[i]:^; i = i + 1; }
+    for (i < length) { output[i] = temporary[i]:>u8; i = i + 1; }
     ct.zeroize(?temporary[0], MAX_POINT);
     ret true;
 }
@@ -2535,7 +2535,7 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
     # both sides derived the same master secret and the same directional keys
     var i: usize = 0;
     for (i < tls12.MASTER_SECRET_SIZE) {
-        if (dialer.secrets.master[i]:^ != listener.secrets.master[i]:^) {
+        if (dialer.secrets.master[i]:>u8 != listener.secrets.master[i]:>u8) {
             ret 23;
         }
         i = i + 1;
@@ -2549,7 +2549,7 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
     }
     i = 0;
     for (i < client_key.len) {
-        if (client_key.data[i]:^ != server_view_key.data[i]:^) { ret 25; }
+        if (client_key.data[i]:>u8 != server_view_key.data[i]:>u8) { ret 25; }
         i = i + 1;
     }
     # renegotiation is refused by both roles once established

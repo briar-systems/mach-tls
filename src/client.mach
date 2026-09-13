@@ -788,7 +788,7 @@ fun fill_entropy(client: *Client, output: *u8, length: usize) bool {
         ret false;
     }
     var i: usize = 0;
-    for (i < length) { output[i] = temporary[i]:^; i = i + 1; }
+    for (i < length) { output[i] = temporary[i]:>u8; i = i + 1; }
     ct.zeroize(?temporary[0], MAX_KEY_SHARE);
     ret true;
 }
@@ -2823,7 +2823,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     }
     var hostile_key_index: usize = 0;
     for (hostile_key_index < 32) {
-        if (hostile_client.private_key[hostile_key_index]:^ != 0) { ret 77; }
+        if (hostile_client.private_key[hostile_key_index]:>u8 != 0) { ret 77; }
         hostile_key_index = hostile_key_index + 1;
     }
     if (!destroy(?hostile_client)) { ret 78; }
@@ -3132,7 +3132,7 @@ fun secrets_equal(first: contracts.SecretBytes,
     }
     var i: usize = 0;
     for (i < first.len) {
-        if (first.data[i]:^ != second.data[i]:^) { ret false; }
+        if (first.data[i]:>u8 != second.data[i]:>u8) { ret false; }
         i = i + 1;
     }
     ret true;

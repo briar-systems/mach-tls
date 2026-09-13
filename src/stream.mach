@@ -642,7 +642,7 @@ fun consume_plaintext(stream: *Stream) bool {
     var i: usize = 0;
     for (i < amount) {
         stream.operation.application_buffer[snapshot.application_bytes + i] =
-            stream.plaintext[stream.plaintext_read + i]:^;
+            stream.plaintext[stream.plaintext_read + i]:>u8;
         i = i + 1;
     }
     if (!transport.advance(?stream.operation, amount)) {
@@ -759,8 +759,8 @@ fun process_record(stream: *Stream) bool {
     if (content_type == record.ALERT) {
         var alert_bytes: [2]u8;
         if (protected && content_length == 2) {
-            alert_bytes[0] = stream.plaintext[0]:^;
-            alert_bytes[1] = stream.plaintext[1]:^;
+            alert_bytes[0] = stream.plaintext[0]:>u8;
+            alert_bytes[1] = stream.plaintext[1]:>u8;
             content = ?alert_bytes[0];
         }
         val handled: bool = handle_alert(stream, content, content_length);
@@ -772,7 +772,7 @@ fun process_record(stream: *Stream) bool {
         if (protected) {
             var i: usize = 0;
             for (i < content_length) {
-                revealed[i] = stream.plaintext[i]:^;
+                revealed[i] = stream.plaintext[i]:>u8;
                 i = i + 1;
             }
             content = ?revealed[0];

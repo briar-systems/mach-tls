@@ -4,11 +4,7 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
-use std.types.result.Result;
-use std.types.result.err;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
+use std.types.result.res;
 use std.system.os;
 use std.sync.cancel;
 use std.sync.mutex;
@@ -20,8 +16,12 @@ use net_async: std.net.async;
 use tls.error;
 use tls.memory_range;
 
-pub def SubmitBufferFun: fun(ptr, *cancel.Scope, *u8, usize, usize) Result[io_runtime.Token, io_error.Error];
-pub def SubmitCloseFun: fun(ptr, *cancel.Scope, usize) Result[io_runtime.Token, io_error.Error];
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
+pub def SubmitBufferFun: fun(ptr, *cancel.Scope, *u8, usize, usize) res[io_runtime.Token, io_error.Error];
+pub def SubmitCloseFun: fun(ptr, *cancel.Scope, usize) res[io_runtime.Token, io_error.Error];
 pub def AliasesStateFun: fun(ptr, *u8, usize) bool;
 
 # every submission resolves through the shared runtime exactly once
@@ -109,7 +109,7 @@ pub fun read(
     buffer: *u8,
     length: usize,
     context: usize,
-) Result[io_runtime.Token, io_error.Error] {
+) res[io_runtime.Token, io_error.Error] {
     var descriptor: Transport;
     if (!load(transport, ?descriptor) || scope == nil ||
         state_overlaps_loaded(transport, ?descriptor, scope::*u8,
@@ -117,7 +117,7 @@ pub fun read(
         state_overlaps_loaded(transport, ?descriptor, buffer, length) ||
         memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer,
             length)) {
-        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_READ));
+        ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_READ)};
     }
     ret descriptor.submit_read(descriptor.context, scope, buffer, length,
         context);
@@ -129,7 +129,7 @@ pub fun write(
     buffer: *u8,
     length: usize,
     context: usize,
-) Result[io_runtime.Token, io_error.Error] {
+) res[io_runtime.Token, io_error.Error] {
     var descriptor: Transport;
     if (!load(transport, ?descriptor) || scope == nil ||
         state_overlaps_loaded(transport, ?descriptor, scope::*u8,
@@ -137,7 +137,7 @@ pub fun write(
         state_overlaps_loaded(transport, ?descriptor, buffer, length) ||
         memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer,
             length)) {
-        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_WRITE));
+        ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_WRITE)};
     }
     ret descriptor.submit_write(descriptor.context, scope, buffer, length,
         context);
@@ -147,12 +147,12 @@ pub fun close(
     transport: *Transport,
     scope: *cancel.Scope,
     context: usize,
-) Result[io_runtime.Token, io_error.Error] {
+) res[io_runtime.Token, io_error.Error] {
     var descriptor: Transport;
     if (!load(transport, ?descriptor) || scope == nil ||
         state_overlaps_loaded(transport, ?descriptor, scope::*u8,
             $size_of(cancel.Scope))) {
-        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+        ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
     ret descriptor.submit_close(descriptor.context, scope, context);
 }
@@ -161,12 +161,12 @@ pub fun shutdown(
     transport: *Transport,
     scope: *cancel.Scope,
     context: usize,
-) Result[io_runtime.Token, io_error.Error] {
+) res[io_runtime.Token, io_error.Error] {
     var descriptor: Transport;
     if (!load(transport, ?descriptor) || scope == nil ||
         state_overlaps_loaded(transport, ?descriptor, scope::*u8,
             $size_of(cancel.Scope))) {
-        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SHUTDOWN));
+        ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_SHUTDOWN)};
     }
     ret descriptor.submit_shutdown(descriptor.context, scope, context);
 }
@@ -175,12 +175,12 @@ pub fun abort(
     transport: *Transport,
     scope: *cancel.Scope,
     context: usize,
-) Result[io_runtime.Token, io_error.Error] {
+) res[io_runtime.Token, io_error.Error] {
     var descriptor: Transport;
     if (!load(transport, ?descriptor) || scope == nil ||
         state_overlaps_loaded(transport, ?descriptor, scope::*u8,
             $size_of(cancel.Scope))) {
-        ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+        ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)};
     }
     ret descriptor.submit_abort(descriptor.context, scope, context);
 }
@@ -208,28 +208,28 @@ fun tcp_aliases_state(context: ptr, data: *u8, len: usize) bool {
             data, len) || net_async.aliases(adapter.driver, data, len);
 }
 
-fun tcp_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+fun tcp_read(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
     ret net_async.submit_read(adapter.driver, scope, adapter.stream, buffer, length, token_context);
 }
 
-fun tcp_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+fun tcp_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
     ret net_async.submit_write(adapter.driver, scope, adapter.stream, buffer, length, token_context);
 }
 
-fun tcp_close(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+fun tcp_close(context: ptr, scope: *cancel.Scope, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
     ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream, adapter.close_mode, token_context);
 }
 
-fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
     ret net_async.submit_shutdown_write(adapter.driver, scope, adapter.stream,
         token_context);
 }
 
-fun tcp_abort(context: ptr, scope: *cancel.Scope, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+fun tcp_abort(context: ptr, scope: *cancel.Scope, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
     ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream,
         lifecycle.ABORTIVE, token_context);
@@ -345,8 +345,8 @@ pub rec Operation {
 }
 
 fun reason_error(reason: cancel.Reason) error.Error {
-    if (reason == cancel.TIMED_OUT) { ret error.TIMEOUT; }
-    if (reason == cancel.CANCELLED) { ret error.CANCELLED; }
+    if (sel reason.timed_out) { ret error.TIMEOUT; }
+    if (sel reason.cancelled) { ret error.CANCELLED; }
     ret error.CLOSED;
 }
 
@@ -364,7 +364,7 @@ fun terminal_locked(operation: *Operation, terminal_error: error.Error, end_of_s
         operation.state == OPERATION_SUBMITTING ||
         operation.state == OPERATION_ACCEPTING) { ret false; }
     if (!cancellation_owner && operation.cancellation_active) {
-        if (!cancel.unregister(?operation.cancellation)) { ret false; }
+        if (!transition_ok(cancel.unregister(?operation.cancellation))) { ret false; }
         operation.cancellation_active = false;
     }
     operation.state = OPERATION_TERMINAL;
@@ -436,7 +436,7 @@ pub fun begin(
     operation.lock = mutex.make();
     cancel.init_registration(?operation.cancellation);
     val attached: cancel.Reason = cancel.attach(scope, ?operation.cancellation, cancel_operation, operation::ptr);
-    if (attached == cancel.ACTIVE) {
+    if (sel attached.active) {
         operation.cancellation_active = true;
     } or {
         operation.cancellation_requested = true;
@@ -447,7 +447,7 @@ pub fun begin(
     ret true;
 }
 
-fun action_submission(transport: *Transport, operation: *Operation, action: Action) Result[io_runtime.Token, io_error.Error] {
+fun action_submission(transport: *Transport, operation: *Operation, action: Action) res[io_runtime.Token, io_error.Error] {
     if (action.kind == TRANSPORT_READ) {
         ret read(transport, operation.scope, action.buffer, action.length, action.context);
     }
@@ -455,22 +455,22 @@ fun action_submission(transport: *Transport, operation: *Operation, action: Acti
         ret write(transport, operation.scope, action.buffer, action.length, action.context);
     }
     if (action.kind == TRANSPORT_CLOSE) {
-        if (action.buffer != nil || action.length != 0) { ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE)); }
+        if (action.buffer != nil || action.length != 0) { ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)}; }
         ret close(transport, operation.scope, action.context);
     }
     if (action.kind == TRANSPORT_SHUTDOWN) {
         if (action.buffer != nil || action.length != 0) {
-            ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SHUTDOWN));
+            ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_SHUTDOWN)};
         }
         ret shutdown(transport, operation.scope, action.context);
     }
     if (action.kind == TRANSPORT_ABORT) {
         if (action.buffer != nil || action.length != 0) {
-            ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_CLOSE));
+            ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_CLOSE)};
         }
         ret abort(transport, operation.scope, action.context);
     }
-    ret err[io_runtime.Token, io_error.Error](invalid(io_error.OP_SUBMIT));
+    ret res[io_runtime.Token, io_error.Error].err{invalid(io_error.OP_SUBMIT)};
 }
 
 # engines may sequence reads and writes under one stable application token
@@ -526,7 +526,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
     operation.provider_owner = transport;
     mutex.unlock(?operation.lock);
 
-    val submitted: Result[io_runtime.Token, io_error.Error] =
+    val submitted: res[io_runtime.Token, io_error.Error] =
         action_submission(?descriptor, operation, action);
     val descriptor_stable: bool = descriptor_equal(?descriptor, transport);
     mutex.lock(?operation.lock);
@@ -534,7 +534,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
         mutex.unlock(?operation.lock);
         ret false;
     }
-    if (is_err[io_runtime.Token, io_error.Error](submitted)) {
+    if (sel submitted.err) {
         operation.state = OPERATION_OPEN;
         operation.provider = no_transport();
         operation.provider_owner = nil;
@@ -544,14 +544,14 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
             terminal_locked(operation, operation.cancellation_error, false, true);
         } or {
             terminal_locked(operation,
-                map_error(unwrap_err[io_runtime.Token, io_error.Error](submitted)),
+                map_error(submitted.err),
                 false, false);
         }
         mutex.unlock(?operation.lock);
         ret false;
     }
     val lower_token: io_runtime.Token =
-        unwrap_ok[io_runtime.Token, io_error.Error](submitted);
+        submitted.ok;
     if (lower_token.generation == 0) {
         operation.state = OPERATION_OPEN;
         operation.provider = no_transport();
