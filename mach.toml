@@ -1,6 +1,6 @@
 [project]
 id = "tls"
-version = "0.2.5"
+version = "0.3.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
