@@ -2,46 +2,46 @@
 
 pub def Error: u16;
 
-pub val OK:                    Error = 0;
-pub val CLOSED:                Error = 1;
-pub val CANCELLED:             Error = 2;
-pub val TIMEOUT:               Error = 3;
-pub val DECODE_ERROR:          Error = 4;
-pub val UNEXPECTED_MESSAGE:    Error = 5;
-pub val ILLEGAL_PARAMETER:     Error = 6;
-pub val BAD_RECORD_MAC:        Error = 7;
-pub val HANDSHAKE_FAILURE:     Error = 8;
-pub val BAD_CERTIFICATE:       Error = 9;
-pub val CERTIFICATE_EXPIRED:   Error = 10;
-pub val UNKNOWN_CA:            Error = 11;
-pub val HOSTNAME_MISMATCH:     Error = 12;
-pub val UNSUPPORTED_ALGORITHM: Error = 13;
-pub val RESOURCE_LIMIT:        Error = 14;
-pub val INTERNAL_ERROR:        Error = 15;
-pub val RECORD_OVERFLOW:       Error = 16;
-pub val SEQUENCE_EXHAUSTED:    Error = 17;
-pub val ALERT_RECEIVED:        Error = 18;
-pub val PROTOCOL_VERSION:      Error = 19;
-pub val MISSING_EXTENSION:     Error = 20;
-pub val UNSUPPORTED_EXTENSION: Error = 21;
+pub val OK:                      Error = 0;
+pub val CLOSED:                  Error = 1;
+pub val CANCELLED:               Error = 2;
+pub val TIMEOUT:                 Error = 3;
+pub val DECODE_ERROR:            Error = 4;
+pub val UNEXPECTED_MESSAGE:      Error = 5;
+pub val ILLEGAL_PARAMETER:       Error = 6;
+pub val BAD_RECORD_MAC:          Error = 7;
+pub val HANDSHAKE_FAILURE:       Error = 8;
+pub val BAD_CERTIFICATE:         Error = 9;
+pub val CERTIFICATE_EXPIRED:     Error = 10;
+pub val UNKNOWN_CA:              Error = 11;
+pub val HOSTNAME_MISMATCH:       Error = 12;
+pub val UNSUPPORTED_ALGORITHM:   Error = 13;
+pub val RESOURCE_LIMIT:          Error = 14;
+pub val INTERNAL_ERROR:          Error = 15;
+pub val RECORD_OVERFLOW:         Error = 16;
+pub val SEQUENCE_EXHAUSTED:      Error = 17;
+pub val ALERT_RECEIVED:          Error = 18;
+pub val PROTOCOL_VERSION:        Error = 19;
+pub val MISSING_EXTENSION:       Error = 20;
+pub val UNSUPPORTED_EXTENSION:   Error = 21;
 pub val NO_APPLICATION_PROTOCOL: Error = 22;
-pub val DECRYPT_ERROR:         Error = 23;
-pub val UNRECOGNIZED_NAME:     Error = 24;
-pub val CERTIFICATE_REQUIRED:  Error = 25;
-pub val INAPPROPRIATE_FALLBACK: Error = 26;
-pub val NO_RENEGOTIATION:      Error = 27;
-pub val INSUFFICIENT_SECURITY: Error = 28;
+pub val DECRYPT_ERROR:           Error = 23;
+pub val UNRECOGNIZED_NAME:       Error = 24;
+pub val CERTIFICATE_REQUIRED:    Error = 25;
+pub val INAPPROPRIATE_FALLBACK:  Error = 26;
+pub val NO_RENEGOTIATION:        Error = 27;
+pub val INSUFFICIENT_SECURITY:   Error = 28;
 
 test "error: terminal results are distinct" {
-    if (CANCELLED == TIMEOUT) { ret 1; }
-    if (CLOSED == OK) { ret 1; }
-    if (BAD_CERTIFICATE == UNKNOWN_CA) { ret 1; }
-    if (RECORD_OVERFLOW == SEQUENCE_EXHAUSTED) { ret 1; }
-    if (PROTOCOL_VERSION == MISSING_EXTENSION) { ret 1; }
+    if (CANCELLED == TIMEOUT)                             { ret 1; }
+    if (CLOSED == OK)                                     { ret 1; }
+    if (BAD_CERTIFICATE == UNKNOWN_CA)                    { ret 1; }
+    if (RECORD_OVERFLOW == SEQUENCE_EXHAUSTED)            { ret 1; }
+    if (PROTOCOL_VERSION == MISSING_EXTENSION)            { ret 1; }
     if (UNSUPPORTED_EXTENSION == NO_APPLICATION_PROTOCOL) { ret 1; }
-    if (UNRECOGNIZED_NAME == CERTIFICATE_REQUIRED) { ret 1; }
-    if (UNRECOGNIZED_NAME == DECRYPT_ERROR) { ret 1; }
-    if (INAPPROPRIATE_FALLBACK == NO_RENEGOTIATION) { ret 1; }
-    if (INSUFFICIENT_SECURITY == INAPPROPRIATE_FALLBACK) { ret 1; }
+    if (UNRECOGNIZED_NAME == CERTIFICATE_REQUIRED)        { ret 1; }
+    if (UNRECOGNIZED_NAME == DECRYPT_ERROR)               { ret 1; }
+    if (INAPPROPRIATE_FALLBACK == NO_RENEGOTIATION)       { ret 1; }
+    if (INSUFFICIENT_SECURITY == INAPPROPRIATE_FALLBACK)  { ret 1; }
     ret 0;
 }

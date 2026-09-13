@@ -10,36 +10,36 @@ use tls.record;
 use tls.tls13;
 
 pub def Level: u8;
-pub val INITIAL: Level = 1;
-pub val HANDSHAKE: Level = 2;
+pub val INITIAL:     Level = 1;
+pub val HANDSHAKE:   Level = 2;
 pub val APPLICATION: Level = 3;
 
 pub def Direction: u8;
-pub val SEND: Direction = 1;
+pub val SEND:    Direction = 1;
 pub val RECEIVE: Direction = 2;
 
 pub def EventKind: u8;
-pub val CRYPTO: EventKind = 1;
-pub val TRAFFIC_SECRET: EventKind = 2;
-pub val PEER_PARAMETERS: EventKind = 3;
-pub val EARLY_DATA: EventKind = 4;
-pub val AUTHENTICATION: EventKind = 5;
+pub val CRYPTO:             EventKind = 1;
+pub val TRAFFIC_SECRET:     EventKind = 2;
+pub val PEER_PARAMETERS:    EventKind = 3;
+pub val EARLY_DATA:         EventKind = 4;
+pub val AUTHENTICATION:     EventKind = 5;
 pub val HANDSHAKE_COMPLETE: EventKind = 6;
-pub val ALERT: EventKind = 7;
+pub val ALERT:              EventKind = 7;
 # tls 1.2 announces each key change with its own record
 pub val CHANGE_CIPHER_SPEC: EventKind = 8;
 
 pub def Status: u8;
-pub val OK: Status = 1;
-pub val MORE: Status = 2;
-pub val BLOCKED: Status = 3;
+pub val OK:       Status = 1;
+pub val MORE:     Status = 2;
+pub val BLOCKED:  Status = 3;
 pub val COMPLETE: Status = 4;
-pub val FAILED: Status = 5;
-pub val CLOSED: Status = 6;
+pub val FAILED:   Status = 5;
+pub val CLOSED:   Status = 6;
 
 pub def Role: u8;
-pub val CLIENT: Role = 1;
-pub val SERVER: Role = 2;
+pub val CLIENT:       Role = 1;
+pub val SERVER:       Role = 2;
 pub val TLS12_CLIENT: Role = 3;
 pub val TLS12_SERVER: Role = 4;
 
@@ -51,60 +51,60 @@ pub fun is_tls12(role: Role) bool {
     ret role == TLS12_CLIENT || role == TLS12_SERVER;
 }
 
-pub val EARLY_NOT_OFFERED: u8 = 1;
-pub val EARLY_ACCEPTED: u8 = 2;
-pub val EARLY_REJECTED: u8 = 3;
-pub val AUTHENTICATED: u8 = 1;
+pub val EARLY_NOT_OFFERED:     u8 = 1;
+pub val EARLY_ACCEPTED:        u8 = 2;
+pub val EARLY_REJECTED:        u8 = 3;
+pub val AUTHENTICATED:         u8 = 1;
 pub val AUTHENTICATION_FAILED: u8 = 2;
 
 pub val MAX_TRAFFIC_KEY: usize = 32;
 pub val TRAFFIC_IV_SIZE: usize = 12;
 
 pub rec Result {
-    status: Status;
-    error: error.Error;
+    status:   Status;
+    error:    error.Error;
     consumed: usize;
     required: usize;
 }
 
 # event data and secrets remain borrowed until complete_event
 pub rec Event {
-    token: u64;
-    kind: EventKind;
-    level: Level;
-    direction: Direction;
-    suite: tls13.CipherSuite;
-    aead: record.Algorithm;
-    generation: u64;
-    data: contracts.Bytes;
-    secret: contracts.SecretBytes;
+    token:       u64;
+    kind:        EventKind;
+    level:       Level;
+    direction:   Direction;
+    suite:       tls13.CipherSuite;
+    aead:        record.Algorithm;
+    generation:  u64;
+    data:        contracts.Bytes;
+    secret:      contracts.SecretBytes;
     disposition: u8;
-    alert: record.AlertDescription;
+    alert:       record.AlertDescription;
 }
 
 pub rec Snapshot {
-    role: Role;
-    version: u16;
-    status: Status;
-    error: error.Error;
-    suite: tls13.CipherSuite;
-    group: tls13.NamedGroup;
-    retry_count: u8;
+    role:          Role;
+    version:       u16;
+    status:        Status;
+    error:         error.Error;
+    suite:         tls13.CipherSuite;
+    group:         tls13.NamedGroup;
+    retry_count:   u8;
     authenticated: bool;
     selected_alpn: contracts.Bytes;
     # whether the peer sent an ALPN extension. an empty `selected_alpn` with
     # this false is a peer that asked for nothing; with this true it is a peer
     # whose offer the policy did not cover, and only the caller knows whether
     # it can serve the first.
-    peer_offered_alpn: bool;
-    peer_parameters: contracts.Bytes;
-    peer_name: contracts.Bytes;
+    peer_offered_alpn:     bool;
+    peer_parameters:       contracts.Bytes;
+    peer_name:             contracts.Bytes;
     client_auth_requested: bool;
-    resumed: bool;
-    tickets_issued: u8;
-    output_pending: bool;
-    event_active: bool;
-    destroyed: bool;
+    resumed:               bool;
+    tickets_issued:        u8;
+    output_pending:        bool;
+    event_active:          bool;
+    destroyed:             bool;
 }
 
 pub fun result(status: Status, failure: error.Error, consumed: usize,
@@ -117,45 +117,45 @@ pub fun result(status: Status, failure: error.Error, consumed: usize,
 # clear secret-welded members
 pub fun empty_event() Event {
     var value: Event;
-    value.token = 0;
-    value.kind = 0;
-    value.level = 0;
-    value.direction = 0;
-    value.suite = 0;
-    value.aead = 0;
-    value.generation = 0;
-    value.data.data = nil;
-    value.data.len = 0;
+    value.token       = 0;
+    value.kind        = 0;
+    value.level       = 0;
+    value.direction   = 0;
+    value.suite       = 0;
+    value.aead        = 0;
+    value.generation  = 0;
+    value.data.data   = nil;
+    value.data.len    = 0;
     value.secret.data = nil;
-    value.secret.len = 0;
+    value.secret.len  = 0;
     value.disposition = 0;
-    value.alert = record.NO_ALERT;
+    value.alert       = record.NO_ALERT;
     ret value;
 }
 
 pub fun empty_snapshot() Snapshot {
     var value: Snapshot;
-    value.role = 0;
-    value.version = 0;
-    value.status = 0;
-    value.error = error.OK;
-    value.suite = 0;
-    value.group = 0;
-    value.retry_count = 0;
-    value.authenticated = false;
-    value.selected_alpn.data = nil;
-    value.selected_alpn.len = 0;
-    value.peer_offered_alpn = false;
-    value.peer_parameters.data = nil;
-    value.peer_parameters.len = 0;
-    value.peer_name.data = nil;
-    value.peer_name.len = 0;
+    value.role                  = 0;
+    value.version               = 0;
+    value.status                = 0;
+    value.error                 = error.OK;
+    value.suite                 = 0;
+    value.group                 = 0;
+    value.retry_count           = 0;
+    value.authenticated         = false;
+    value.selected_alpn.data    = nil;
+    value.selected_alpn.len     = 0;
+    value.peer_offered_alpn     = false;
+    value.peer_parameters.data  = nil;
+    value.peer_parameters.len   = 0;
+    value.peer_name.data        = nil;
+    value.peer_name.len         = 0;
     value.client_auth_requested = false;
-    value.resumed = false;
-    value.tickets_issued = 0;
-    value.output_pending = false;
-    value.event_active = false;
-    value.destroyed = false;
+    value.resumed               = false;
+    value.tickets_issued        = 0;
+    value.output_pending        = false;
+    value.event_active          = false;
+    value.destroyed             = false;
     ret value;
 }
 
@@ -172,14 +172,14 @@ pub fun next_generation(value: u64) u64 {
 # one protocol alert per failure, shared by every role and version
 pub fun alert_for(failure: error.Error) record.AlertDescription {
     if (failure == error.UNEXPECTED_MESSAGE) { ret record.UNEXPECTED_MESSAGE_ALERT; }
-    if (failure == error.DECODE_ERROR) { ret record.DECODE_ERROR_ALERT; }
-    if (failure == error.ILLEGAL_PARAMETER) { ret record.ILLEGAL_PARAMETER_ALERT; }
+    if (failure == error.DECODE_ERROR)       { ret record.DECODE_ERROR_ALERT; }
+    if (failure == error.ILLEGAL_PARAMETER)  { ret record.ILLEGAL_PARAMETER_ALERT; }
     if (failure == error.BAD_CERTIFICATE || failure == error.HOSTNAME_MISMATCH) {
         ret record.BAD_CERTIFICATE_ALERT;
     }
     if (failure == error.CERTIFICATE_EXPIRED) { ret record.CERTIFICATE_EXPIRED_ALERT; }
-    if (failure == error.UNKNOWN_CA) { ret record.UNKNOWN_CA_ALERT; }
-    if (failure == error.DECRYPT_ERROR) { ret record.DECRYPT_ERROR_ALERT; }
+    if (failure == error.UNKNOWN_CA)          { ret record.UNKNOWN_CA_ALERT; }
+    if (failure == error.DECRYPT_ERROR)       { ret record.DECRYPT_ERROR_ALERT; }
     if (failure == error.NO_APPLICATION_PROTOCOL) {
         ret record.NO_APPLICATION_PROTOCOL_ALERT;
     }
@@ -187,8 +187,8 @@ pub fun alert_for(failure: error.Error) record.AlertDescription {
     if (failure == error.UNSUPPORTED_EXTENSION) {
         ret record.UNSUPPORTED_EXTENSION_ALERT;
     }
-    if (failure == error.PROTOCOL_VERSION) { ret record.PROTOCOL_VERSION_ALERT; }
-    if (failure == error.UNRECOGNIZED_NAME) { ret record.UNRECOGNIZED_NAME_ALERT; }
+    if (failure == error.PROTOCOL_VERSION)     { ret record.PROTOCOL_VERSION_ALERT; }
+    if (failure == error.UNRECOGNIZED_NAME)    { ret record.UNRECOGNIZED_NAME_ALERT; }
     if (failure == error.CERTIFICATE_REQUIRED) { ret record.CERTIFICATE_REQUIRED_ALERT; }
     if (failure == error.INAPPROPRIATE_FALLBACK) {
         ret record.INAPPROPRIATE_FALLBACK_ALERT;
@@ -202,7 +202,7 @@ pub fun alert_for(failure: error.Error) record.AlertDescription {
         ret record.INSUFFICIENT_SECURITY_ALERT;
     }
     if (failure == error.RECORD_OVERFLOW) { ret record.RECORD_OVERFLOW_ALERT; }
-    if (failure == error.BAD_RECORD_MAC) { ret record.BAD_RECORD_MAC_ALERT; }
+    if (failure == error.BAD_RECORD_MAC)  { ret record.BAD_RECORD_MAC_ALERT; }
     if (failure == error.HANDSHAKE_FAILURE ||
         failure == error.UNSUPPORTED_ALGORITHM) {
         ret record.HANDSHAKE_FAILURE_ALERT;
@@ -214,7 +214,7 @@ test "engine: levels, roles, and generations are total" {
     if (valid_level(0) || valid_level(4) || !valid_level(INITIAL) ||
         !valid_level(APPLICATION)) { ret 1; }
     if (next_generation(0) != 1 || next_generation(~(0::u64)) != 1) { ret 2; }
-    if (CLIENT == SERVER || SEND == RECEIVE) { ret 3; }
+    if (CLIENT == SERVER || SEND == RECEIVE)                        { ret 3; }
     if (!is_client(CLIENT) || !is_client(TLS12_CLIENT) || is_client(SERVER) ||
         is_client(TLS12_SERVER)) { ret 5; }
     if (!is_tls12(TLS12_CLIENT) || !is_tls12(TLS12_SERVER) ||
@@ -228,15 +228,15 @@ test "engine: every protocol failure maps to one distinct alert" {
         alert_for(error.DECODE_ERROR) != record.DECODE_ERROR_ALERT ||
         alert_for(error.PROTOCOL_VERSION) != record.PROTOCOL_VERSION_ALERT ||
         alert_for(error.NO_APPLICATION_PROTOCOL) !=
-            record.NO_APPLICATION_PROTOCOL_ALERT ||
+        record.NO_APPLICATION_PROTOCOL_ALERT ||
         alert_for(error.UNKNOWN_CA) != record.UNKNOWN_CA_ALERT ||
         alert_for(error.UNRECOGNIZED_NAME) != record.UNRECOGNIZED_NAME_ALERT ||
         alert_for(error.CERTIFICATE_REQUIRED) != record.CERTIFICATE_REQUIRED_ALERT ||
         alert_for(error.INAPPROPRIATE_FALLBACK) !=
-            record.INAPPROPRIATE_FALLBACK_ALERT ||
+        record.INAPPROPRIATE_FALLBACK_ALERT ||
         alert_for(error.NO_RENEGOTIATION) != record.UNEXPECTED_MESSAGE_ALERT ||
         alert_for(error.INSUFFICIENT_SECURITY) !=
-            record.INSUFFICIENT_SECURITY_ALERT ||
+        record.INSUFFICIENT_SECURITY_ALERT ||
         alert_for(error.INTERNAL_ERROR) != record.INTERNAL_ERROR_ALERT) { ret 1; }
     if (alert_for(error.RESOURCE_LIMIT) != record.INTERNAL_ERROR_ALERT) { ret 2; }
     ret 0;

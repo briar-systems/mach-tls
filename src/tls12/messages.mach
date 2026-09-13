@@ -12,11 +12,11 @@ use tls.signature_scheme;
 use tls.tls12;
 use tls.tls13;
 
-pub val NAMED_CURVE: u8 = 3;
-pub val MAX_POINT: usize = 65;
+pub val NAMED_CURVE:   u8    = 3;
+pub val MAX_POINT:     usize = 65;
 pub val MAX_SIGNATURE: usize = 512;
 
-pub val CERTIFICATE_TYPE_RSA: u8 = 1;
+pub val CERTIFICATE_TYPE_RSA:   u8 = 1;
 pub val CERTIFICATE_TYPE_ECDSA: u8 = 64;
 
 pub rec ClientHello {
@@ -59,9 +59,9 @@ pub rec ServerKeyExchange {
 }
 
 pub rec CertificateRequest {
-    certificate_types:   contracts.Bytes;
+    certificate_types:    contracts.Bytes;
     signature_algorithms: contracts.Bytes;
-    authorities:         contracts.Bytes;
+    authorities:          contracts.Bytes;
 }
 
 pub rec ClientKeyExchange {
@@ -148,7 +148,7 @@ rec Writer {
 fun put_u8(output: *Writer, value: u8) {
     if (output.offset >= output.capacity) { ret; }
     output.data[output.offset] = value;
-    output.offset = output.offset + 1;
+    output.offset              = output.offset + 1;
 }
 
 fun put_u16(output: *Writer, value: u16) {
@@ -185,9 +185,9 @@ fun prepare(message_type: handshake.MessageType, body_length: usize,
     if (output.data == nil || output.capacity < required) {
         ret result(handshake.NEED_OUTPUT, 0, required, error.OK);
     }
-    writer.data = output.data;
+    writer.data     = output.data;
     writer.capacity = output.capacity;
-    writer.offset = 0;
+    writer.offset   = 0;
     put_u8(writer, message_type);
     put_u24(writer, body_length);
     ret result(handshake.PROGRESSED, 0, required, error.OK);
@@ -205,7 +205,7 @@ pub fun valid_named_curve(curve: u16) bool {
 }
 
 fun valid_point(curve: u16, value: contracts.Bytes) bool {
-    if (value.data == nil) { ret false; }
+    if (value.data == nil)     { ret false; }
     if (curve == tls13.X25519) { ret value.len == 32; }
     if (curve == tls13.SECP256R1) {
         ret value.len == 65 && value.data[0] == 4;
@@ -221,10 +221,10 @@ pub fun decode_client_hello(message: *handshake.Message,
         ret error.UNEXPECTED_MESSAGE;
     }
     var state: Reader = reader(message.body.data, message.body.len);
-    output.legacy_version = u16_value(?state);
-    output.random = take(?state, 32);
-    output.session_id = vector8(?state);
-    output.cipher_suites = vector16(?state);
+    output.legacy_version      = u16_value(?state);
+    output.random              = take(?state, 32);
+    output.session_id          = vector8(?state);
+    output.cipher_suites       = vector16(?state);
     output.compression_methods = vector8(?state);
     var extension_bytes: contracts.Bytes = contracts.Bytes{data: nil, len: 0};
     if (remaining(?state) != 0) { extension_bytes = vector16(?state); }
@@ -234,13 +234,13 @@ pub fun decode_client_hello(message: *handshake.Message,
     if (output.random.len != 32 || output.session_id.len > 32 ||
         output.cipher_suites.len < 2 || (output.cipher_suites.len & 1) != 0 ||
         output.compression_methods.len == 0) { ret error.ILLEGAL_PARAMETER; }
-    var null_compression: bool = false;
-    var i: usize = 0;
+    var null_compression: bool  = false;
+    var i:                usize = 0;
     for (i < output.compression_methods.len) {
         if (output.compression_methods.data[i] == 0) { null_compression = true; }
         i = i + 1;
     }
-    if (!null_compression) { ret error.ILLEGAL_PARAMETER; }
+    if (!null_compression)                     { ret error.ILLEGAL_PARAMETER; }
     if (output.legacy_version < tls12.VERSION) { ret error.PROTOCOL_VERSION; }
     ret extensions.validate(output.extensions);
 }
@@ -253,10 +253,10 @@ pub fun decode_server_hello(message: *handshake.Message,
         ret error.UNEXPECTED_MESSAGE;
     }
     var state: Reader = reader(message.body.data, message.body.len);
-    output.legacy_version = u16_value(?state);
-    output.random = take(?state, 32);
-    output.session_id = vector8(?state);
-    output.cipher_suite = u16_value(?state);
+    output.legacy_version     = u16_value(?state);
+    output.random             = take(?state, 32);
+    output.session_id         = vector8(?state);
+    output.cipher_suite       = u16_value(?state);
     output.compression_method = u8_value(?state);
     var extension_bytes: contracts.Bytes = contracts.Bytes{data: nil, len: 0};
     if (remaining(?state) != 0) { extension_bytes = vector16(?state); }
@@ -267,7 +267,7 @@ pub fun decode_server_hello(message: *handshake.Message,
         ret error.ILLEGAL_PARAMETER;
     }
     if (output.legacy_version != tls12.VERSION) { ret error.PROTOCOL_VERSION; }
-    if (output.compression_method != 0) { ret error.ILLEGAL_PARAMETER; }
+    if (output.compression_method != 0)         { ret error.ILLEGAL_PARAMETER; }
     ret extensions.validate(output.extensions);
 }
 
@@ -286,7 +286,7 @@ pub fun encode_server_hello(value: *ServerHello,
     val body: usize = 2 + 32 + 1 + value.session_id.len + 2 + 1 + 2 +
         value.extensions.len;
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.SERVER_HELLO, body,
+    val ready:  handshake.Progress = prepare(handshake.SERVER_HELLO, body,
         output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u16(?writer, tls12.VERSION);
@@ -304,9 +304,9 @@ pub fun encode_server_hello(value: *ServerHello,
 fun inspect_certificate_entries(bytes: contracts.Bytes,
     count: *usize) error.Error {
     @count = 0;
-    if (bytes.len == 0) { ret error.OK; }
+    if (bytes.len == 0)    { ret error.OK; }
     if (bytes.data == nil) { ret error.DECODE_ERROR; }
-    var offset: usize = 0;
+    var offset:  usize = 0;
     var entries: usize = 0;
     for (offset < bytes.len) {
         if (bytes.len - offset < 3) { ret error.DECODE_ERROR; }
@@ -315,7 +315,7 @@ fun inspect_certificate_entries(bytes: contracts.Bytes,
         if (length == 0 || length > bytes.len - offset - 3) {
             ret error.DECODE_ERROR;
         }
-        offset = offset + 3 + length;
+        offset  = offset + 3 + length;
         entries = entries + 1;
     }
     if (offset != bytes.len) { ret error.DECODE_ERROR; }
@@ -366,14 +366,14 @@ pub fun next_certificate(state: *CertificateIterator,
 
 pub fun encode_certificate(entries: contracts.Bytes,
     output: contracts.Buffer) handshake.Progress {
-    var count: usize = 0;
+    var count:      usize       = 0;
     val validation: error.Error = inspect_certificate_entries(entries, ?count);
     if (validation != error.OK) {
         ret result(handshake.REJECTED, 0, 0, validation);
     }
-    val body: usize = 3 + entries.len;
+    val body:   usize              = 3 + entries.len;
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.CERTIFICATE, body, output,
+    val ready:  handshake.Progress = prepare(handshake.CERTIFICATE, body, output,
         ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u24(?writer, entries.len);
@@ -388,12 +388,12 @@ pub fun decode_server_key_exchange(message: *handshake.Message,
         message.body.len::u32 != message.header.length) {
         ret error.UNEXPECTED_MESSAGE;
     }
-    var state: Reader = reader(message.body.data, message.body.len);
-    val curve_type: u8 = u8_value(?state);
-    output.curve = u16_value(?state);
+    var state:      Reader = reader(message.body.data, message.body.len);
+    val curve_type: u8     = u8_value(?state);
+    output.curve      = u16_value(?state);
     output.public_key = vector8(?state);
     val params_length: usize = state.offset;
-    output.scheme = u16_value(?state);
+    output.scheme    = u16_value(?state);
     output.signature = vector16(?state);
     if (!complete(?state)) { ret error.DECODE_ERROR; }
     if (curve_type != NAMED_CURVE || !valid_named_curve(output.curve) ||
@@ -418,7 +418,7 @@ pub fun encode_server_key_exchange(value: *ServerKeyExchange,
     val body: usize = 1 + 2 + 1 + value.public_key.len + 2 + 2 +
         value.signature.len;
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.SERVER_KEY_EXCHANGE, body,
+    val ready:  handshake.Progress = prepare(handshake.SERVER_KEY_EXCHANGE, body,
         output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u8(?writer, NAMED_CURVE);
@@ -439,11 +439,20 @@ pub fun signed_params(client_random: contracts.Bytes,
         server_random.len != 32 || params.data == nil ||
         capacity < 64 + params.len) { ret false; }
     var i: usize = 0;
-    for (i < 32) { output[i] = client_random.data[i]; i = i + 1; }
+    for (i < 32) {
+        output[i] = client_random.data[i];
+        i         = i + 1;
+    }
     i = 0;
-    for (i < 32) { output[32 + i] = server_random.data[i]; i = i + 1; }
+    for (i < 32) {
+        output[32 + i] = server_random.data[i];
+        i              = i + 1;
+    }
     i = 0;
-    for (i < params.len) { output[64 + i] = params.data[i]; i = i + 1; }
+    for (i < params.len) {
+        output[64 + i] = params.data[i];
+        i              = i + 1;
+    }
     @length = 64 + params.len;
     ret true;
 }
@@ -456,9 +465,9 @@ pub fun decode_certificate_request(message: *handshake.Message,
         ret error.UNEXPECTED_MESSAGE;
     }
     var state: Reader = reader(message.body.data, message.body.len);
-    output.certificate_types = vector8(?state);
+    output.certificate_types    = vector8(?state);
     output.signature_algorithms = vector16(?state);
-    output.authorities = vector16(?state);
+    output.authorities          = vector16(?state);
     if (!complete(?state)) { ret error.DECODE_ERROR; }
     if (output.certificate_types.len == 0 ||
         output.signature_algorithms.len < 2 ||
@@ -481,7 +490,7 @@ pub fun encode_certificate_request(value: *CertificateRequest,
     val body: usize = 1 + value.certificate_types.len + 2 +
         value.signature_algorithms.len + 2 + value.authorities.len;
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.CERTIFICATE_REQUEST, body,
+    val ready:  handshake.Progress = prepare(handshake.CERTIFICATE_REQUEST, body,
         output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u8(?writer, value.certificate_types.len::u8);
@@ -506,7 +515,7 @@ pub fun decode_server_hello_done(message: *handshake.Message) error.Error {
 
 pub fun encode_server_hello_done(output: contracts.Buffer) handshake.Progress {
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.SERVER_HELLO_DONE, 0,
+    val ready:  handshake.Progress = prepare(handshake.SERVER_HELLO_DONE, 0,
         output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     ret result(handshake.COMPLETE, writer.offset, writer.offset, error.OK);
@@ -521,7 +530,7 @@ pub fun decode_client_key_exchange(message: *handshake.Message, curve: u16,
     }
     var state: Reader = reader(message.body.data, message.body.len);
     output.public_key = vector8(?state);
-    if (!complete(?state)) { ret error.DECODE_ERROR; }
+    if (!complete(?state))                      { ret error.DECODE_ERROR; }
     if (!valid_point(curve, output.public_key)) { ret error.ILLEGAL_PARAMETER; }
     ret error.OK;
 }
@@ -532,7 +541,7 @@ pub fun encode_client_key_exchange(value: contracts.Bytes,
         ret result(handshake.REJECTED, 0, 0, error.ILLEGAL_PARAMETER);
     }
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.CLIENT_KEY_EXCHANGE,
+    val ready:  handshake.Progress = prepare(handshake.CLIENT_KEY_EXCHANGE,
         1 + value.len, output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u8(?writer, value.len::u8);
@@ -548,7 +557,7 @@ pub fun decode_certificate_verify(message: *handshake.Message,
         ret error.UNEXPECTED_MESSAGE;
     }
     var state: Reader = reader(message.body.data, message.body.len);
-    output.scheme = u16_value(?state);
+    output.scheme    = u16_value(?state);
     output.signature = vector16(?state);
     if (!complete(?state)) { ret error.DECODE_ERROR; }
     if (!valid_signature_scheme(output.scheme) || output.signature.len == 0 ||
@@ -564,7 +573,7 @@ pub fun encode_certificate_verify(value: *CertificateVerify,
         ret result(handshake.REJECTED, 0, 0, error.ILLEGAL_PARAMETER);
     }
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.CERTIFICATE_VERIFY,
+    val ready:  handshake.Progress = prepare(handshake.CERTIFICATE_VERIFY,
         4 + value.signature.len, output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u16(?writer, value.scheme);
@@ -612,7 +621,7 @@ pub fun encode_client_hello(value: *ClientHello,
         value.cipher_suites.len + 1 + value.compression_methods.len + 2 +
         value.extensions.len;
     var writer: Writer;
-    val ready: handshake.Progress = prepare(handshake.CLIENT_HELLO, body,
+    val ready:  handshake.Progress = prepare(handshake.CLIENT_HELLO, body,
         output, ?writer);
     if (ready.status != handshake.PROGRESSED) { ret ready; }
     put_u16(?writer, tls12.VERSION);
@@ -631,21 +640,24 @@ pub fun encode_client_hello(value: *ClientHello,
 
 test "tls12.codec: the server flight round trips through exact framing" {
     var random: [32]u8;
-    var i: usize = 0;
-    for (i < 32) { random[i] = (0x40 + i)::u8; i = i + 1; }
+    var i:      usize = 0;
+    for (i < 32) {
+        random[i] = (0x40 + i)::u8;
+        i         = i + 1;
+    }
     var extension_bytes: [8]u8 = [8]u8{0, 23, 0, 0, 0xff, 0x01, 0, 1};
-    var wire: [512]u8;
-    var hello: ServerHello;
-    hello.legacy_version = tls12.VERSION;
-    hello.random = contracts.Bytes{data: ?random[0], len: 32};
-    hello.session_id = contracts.Bytes{data: nil, len: 0};
-    hello.cipher_suite = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
+    var wire:            [512]u8;
+    var hello:           ServerHello;
+    hello.legacy_version     = tls12.VERSION;
+    hello.random             = contracts.Bytes{data: ?random[0], len: 32};
+    hello.session_id         = contracts.Bytes{data: nil, len: 0};
+    hello.cipher_suite       = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
     hello.compression_method = 0;
-    hello.extensions = extensions.list(?extension_bytes[0], 9,
+    hello.extensions         = extensions.list(?extension_bytes[0], 9,
         extensions.TLS12_SERVER_HELLO);
     # a truncated renegotiation_info body is refused
     if (encode_server_hello(?hello,
-            contracts.Buffer{data: ?wire[0], capacity: 512}).status !=
+        contracts.Buffer{data: ?wire[0], capacity: 512}).status !=
         handshake.REJECTED) { ret 1; }
     hello.extensions = extensions.list(?extension_bytes[0], 9,
         extensions.TLS12_SERVER_HELLO);
@@ -659,34 +671,40 @@ test "tls12.codec: the server flight round trips through exact framing" {
     if (encoded.status != handshake.COMPLETE) { ret 2; }
     var message: handshake.Message;
     if (handshake.parse_version(?wire[0], encoded.produced, 4096, true,
-            ?message).status != handshake.COMPLETE) { ret 3; }
+        ?message).status != handshake.COMPLETE) { ret 3; }
     var decoded: ServerHello;
     if (decode_server_hello(?message, ?decoded) != error.OK) { ret 4; }
     if (decoded.cipher_suite != tls12.ECDHE_RSA_AES_128_GCM_SHA256 ||
         decoded.random.len != 32 || decoded.extensions.len != 9) { ret 5; }
     var found: extensions.Extension;
     if (!extensions.find(decoded.extensions, extensions.EXTENDED_MASTER_SECRET,
-            ?found) || found.len != 0) { ret 6; }
+        ?found) || found.len != 0) { ret 6; }
     if (!extensions.find(decoded.extensions, extensions.RENEGOTIATION_INFO,
-            ?found) || found.len != 1) { ret 7; }
+        ?found) || found.len != 1) { ret 7; }
 
     var point: [65]u8;
     point[0] = 4;
-    i = 1;
-    for (i < 65) { point[i] = (0x10 + i)::u8; i = i + 1; }
+    i        = 1;
+    for (i < 65) {
+        point[i] = (0x10 + i)::u8;
+        i        = i + 1;
+    }
     var signature_bytes: [64]u8;
     i = 0;
-    for (i < 64) { signature_bytes[i] = (0x70 + i)::u8; i = i + 1; }
+    for (i < 64) {
+        signature_bytes[i] = (0x70 + i)::u8;
+        i                  = i + 1;
+    }
     var exchange: ServerKeyExchange;
-    exchange.curve = tls13.SECP256R1;
+    exchange.curve      = tls13.SECP256R1;
     exchange.public_key = contracts.Bytes{data: ?point[0], len: 65};
-    exchange.scheme = tls13.ECDSA_SECP256R1_SHA256;
-    exchange.signature = contracts.Bytes{data: ?signature_bytes[0], len: 64};
+    exchange.scheme     = tls13.ECDSA_SECP256R1_SHA256;
+    exchange.signature  = contracts.Bytes{data: ?signature_bytes[0], len: 64};
     val exchange_encoded: handshake.Progress = encode_server_key_exchange(
         ?exchange, contracts.Buffer{data: ?wire[0], capacity: 512});
     if (exchange_encoded.status != handshake.COMPLETE) { ret 8; }
     if (handshake.parse_version(?wire[0], exchange_encoded.produced, 4096, true,
-            ?message).status != handshake.COMPLETE) { ret 9; }
+        ?message).status != handshake.COMPLETE) { ret 9; }
     var exchange_decoded: ServerKeyExchange;
     if (decode_server_key_exchange(?message, ?exchange_decoded) != error.OK) {
         ret 10;
@@ -712,7 +730,10 @@ test "tls12.codec: the server flight round trips through exact framing" {
 
     var verify_bytes: [12]u8;
     i = 0;
-    for (i < 12) { verify_bytes[i] = (0xc0 + i)::u8; i = i + 1; }
+    for (i < 12) {
+        verify_bytes[i] = (0xc0 + i)::u8;
+        i               = i + 1;
+    }
     val finished: handshake.Progress = encode_finished(
         contracts.Bytes{data: ?verify_bytes[0], len: 12},
         contracts.Buffer{data: ?wire[0], capacity: 512});
@@ -731,14 +752,17 @@ test "tls12.codec: p-384 server key exchange preserves scheme 0x0503" {
     var point: [65]u8;
     point[0] = 4;
     var i: usize = 1;
-    for (i < 65) { point[i] = i::u8; i = i + 1; }
+    for (i < 65) {
+        point[i] = i::u8;
+        i        = i + 1;
+    }
     var signature_bytes: [8]u8 = [8]u8{0x30, 6, 2, 1, 1, 2, 1, 1};
-    var exchange: ServerKeyExchange;
-    exchange.curve = tls13.SECP256R1;
+    var exchange:        ServerKeyExchange;
+    exchange.curve      = tls13.SECP256R1;
     exchange.public_key = contracts.Bytes{data: ?point[0], len: 65};
-    exchange.scheme = tls13.ECDSA_SECP384R1_SHA384;
-    exchange.signature = contracts.Bytes{data: ?signature_bytes[0], len: 8};
-    var wire: [85]u8;
+    exchange.scheme     = tls13.ECDSA_SECP384R1_SHA384;
+    exchange.signature  = contracts.Bytes{data: ?signature_bytes[0], len: 8};
+    var wire:    [85]u8;
     val encoded: handshake.Progress = encode_server_key_exchange(?exchange,
         contracts.Buffer{data: ?wire[0], capacity: 85});
     if (encoded.status != handshake.COMPLETE || encoded.produced != 85 ||

@@ -16,10 +16,10 @@ use std.types.size.usize;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
-use tls.client;
 use tls.cert.name;
 use tls.cert.verify;
 use tls.cert.x509;
+use tls.client;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -36,31 +36,31 @@ use tls.tls13.key_schedule;
 use tls.tls13.transcript;
 use tls.validation;
 
-pub val MAX_KEY_SHARE: usize = 65;
-pub val MAX_PUBLIC_KEY: usize = 512;
-pub val MAX_SIGNATURE: usize = 512;
-pub val MAX_SIGNED_CONTEXT: usize = 64 + 34 + 1 + 48;
-pub val MAX_QUEUED_EVENTS: usize = 12;
-pub val MAX_TICKETS_PER_CONNECTION: u8 = 4;
-pub val TICKET_MESSAGE_BYTES: usize = 4 + 4 + 4 + 1 + session.NONCE_SIZE + 2 +
+pub val MAX_KEY_SHARE:              usize = 65;
+pub val MAX_PUBLIC_KEY:             usize = 512;
+pub val MAX_SIGNATURE:              usize = 512;
+pub val MAX_SIGNED_CONTEXT:         usize = 64 + 34 + 1 + 48;
+pub val MAX_QUEUED_EVENTS:          usize = 12;
+pub val MAX_TICKETS_PER_CONNECTION: u8    = 4;
+pub val TICKET_MESSAGE_BYTES:       usize = 4 + 4 + 4 + 1 + session.NONCE_SIZE + 2 +
     session.MAX_TICKET_BYTES + 2;
 pub val QUIC_TRANSPORT_PARAMETERS: u16 = 0x0039;
 
-val EXPECT_CLIENT_HELLO: u8 = 1;
-val EXPECT_RETRY_HELLO: u8 = 2;
-val EXPECT_CLIENT_CERTIFICATE: u8 = 3;
+val EXPECT_CLIENT_HELLO:              u8 = 1;
+val EXPECT_RETRY_HELLO:               u8 = 2;
+val EXPECT_CLIENT_CERTIFICATE:        u8 = 3;
 val EXPECT_CLIENT_CERTIFICATE_VERIFY: u8 = 4;
-val EXPECT_CLIENT_FINISHED: u8 = 5;
-val ESTABLISHED: u8 = 6;
-val CLOSING: u8 = 7;
-val TERMINAL: u8 = 8;
-val DESTROYED: u8 = 9;
+val EXPECT_CLIENT_FINISHED:           u8 = 5;
+val ESTABLISHED:                      u8 = 6;
+val CLOSING:                          u8 = 7;
+val TERMINAL:                         u8 = 8;
+val DESTROYED:                        u8 = 9;
 
-val SEND_HANDSHAKE: usize = 0;
-val RECEIVE_HANDSHAKE: usize = 1;
-val SEND_APPLICATION: usize = 2;
+val SEND_HANDSHAKE:      usize = 0;
+val RECEIVE_HANDSHAKE:   usize = 1;
+val SEND_APPLICATION:    usize = 2;
 val RECEIVE_APPLICATION: usize = 3;
-val NO_SECRET: usize = 4;
+val NO_SECRET:           usize = 4;
 
 pub rec ExtraExtension {
     kind: u16;
@@ -69,28 +69,28 @@ pub rec ExtraExtension {
 
 # all variable-size handshake storage is caller-owned and remains borrowed
 pub rec Storage {
-    input: *u8;
-    input_capacity: usize;
-    output: *u8;
-    output_capacity: usize;
-    hello: *u8;
-    hello_capacity: usize;
-    certificates: *cert.Certificate;
-    certificate_capacity: usize;
-    peer_parameters: *u8;
+    input:                    *u8;
+    input_capacity:           usize;
+    output:                   *u8;
+    output_capacity:          usize;
+    hello:                    *u8;
+    hello_capacity:           usize;
+    certificates:             *cert.Certificate;
+    certificate_capacity:     usize;
+    peer_parameters:          *u8;
     peer_parameters_capacity: usize;
 }
 
 # an ordered queue keeps interleaved flights and secret transitions explicit
 rec Pending {
-    kind: engine.EventKind;
-    level: engine.Level;
-    direction: engine.Direction;
+    kind:         engine.EventKind;
+    level:        engine.Level;
+    direction:    engine.Direction;
     secret_index: usize;
-    offset: usize;
-    length: usize;
-    disposition: u8;
-    alert: record.AlertDescription;
+    offset:       usize;
+    length:       usize;
+    disposition:  u8;
+    alert:        record.AlertDescription;
 }
 
 # selectors inspect one complete client hello and lease exactly one generation.
@@ -104,13 +104,13 @@ pub def CredentialSelect: fun(*credentials.Store, CredentialOffer, *credentials.
     contracts.Error;
 
 pub rec CredentialSelector {
-    store: *credentials.Store;
+    store:  *credentials.Store;
     select: CredentialSelect;
 }
 
 pub fun no_credential_selector() CredentialSelector {
     var value: CredentialSelector;
-    value.store = nil;
+    value.store  = nil;
     value.select = nil;
     ret value;
 }
@@ -133,7 +133,8 @@ pub fun offered_alpn_contains(offer: CredentialOffer, protocol: contracts.Bytes)
         val length: usize = offer.offered_alpn.data[at]::usize;
         if (length == 0 || length > offer.offered_alpn.len - at - 1) { ret false; }
         if (length == protocol.len && bytes_equal(contracts.Bytes{
-            data: ?offer.offered_alpn.data[at + 1], len: length}, protocol)) {
+            data: ?offer.offered_alpn.data[at + 1], len: length
+        }, protocol)) {
             ret true;
         }
         at = at + 1 + length;
@@ -152,67 +153,67 @@ pub fun offered_alpn_exactly(offer: CredentialOffer,
 }
 
 pub rec Server {
-    config: *config.ServerConfig;
-    configuration: config.ServerConfig;
-    entropy: secret.Entropy;
-    storage: Storage;
-    extra: ExtraExtension;
-    peer_extension: u16;
-    transcript: transcript.Transcript;
-    schedule: key_schedule.Schedule;
-    lease: credentials.Lease;
-    lease_held: bool;
-    selector: CredentialSelector;
-    state: u8;
-    failure: error.Error;
-    pending_alert: record.AlertDescription;
-    suite: tls13.CipherSuite;
-    group: tls13.NamedGroup;
-    signature_scheme: tls13.SignatureScheme;
-    verification_time: i64;
-    input_len: usize;
-    input_read: usize;
-    hello_len: usize;
-    output_used: usize;
-    random: [32]u8;
-    session_id: [32]u8;
-    session_id_len: usize;
-    private_key: [32]^u8;
-    public_key: [MAX_KEY_SHARE]u8;
-    public_key_len: usize;
-    retry_count: u8;
-    client_auth_required: bool;
-    client_trust: *cert.TrustStore;
-    client_certificate_seen: bool;
+    config:                   *config.ServerConfig;
+    configuration:            config.ServerConfig;
+    entropy:                  secret.Entropy;
+    storage:                  Storage;
+    extra:                    ExtraExtension;
+    peer_extension:           u16;
+    transcript:               transcript.Transcript;
+    schedule:                 key_schedule.Schedule;
+    lease:                    credentials.Lease;
+    lease_held:               bool;
+    selector:                 CredentialSelector;
+    state:                    u8;
+    failure:                  error.Error;
+    pending_alert:            record.AlertDescription;
+    suite:                    tls13.CipherSuite;
+    group:                    tls13.NamedGroup;
+    signature_scheme:         tls13.SignatureScheme;
+    verification_time:        i64;
+    input_len:                usize;
+    input_read:               usize;
+    hello_len:                usize;
+    output_used:              usize;
+    random:                   [32]u8;
+    session_id:               [32]u8;
+    session_id_len:           usize;
+    private_key:              [32]^u8;
+    public_key:               [MAX_KEY_SHARE]u8;
+    public_key_len:           usize;
+    retry_count:              u8;
+    client_auth_required:     bool;
+    client_trust:             *cert.TrustStore;
+    client_certificate_seen:  bool;
     client_certificate_empty: bool;
-    authenticated: bool;
-    early_data_offered: bool;
-    resumed: bool;
-    psk_index: u16;
-    ticket_state: session.State;
-    binder_transcript: transcript.Transcript;
-    tickets_issued: u8;
-    ticket_nonce: u64;
-    peer_leaf: x509.Certificate;
-    peer_key_first: [MAX_PUBLIC_KEY]u8;
-    peer_key_second: [MAX_PUBLIC_KEY]u8;
-    selected_alpn_storage: [255]u8;
-    selected_alpn: contracts.Bytes;
-    peer_offered_alpn: bool;
-    server_name_storage: [253]u8;
-    server_name: contracts.Bytes;
-    peer_parameters: contracts.Bytes;
-    queue: [MAX_QUEUED_EVENTS]Pending;
-    queue_head: usize;
-    queue_len: usize;
-    event_active: bool;
-    event_generation: u64;
-    active_event: engine.Event;
-    secret_generation: [4]u64;
-    transition_owner: i64;
+    authenticated:            bool;
+    early_data_offered:       bool;
+    resumed:                  bool;
+    psk_index:                u16;
+    ticket_state:             session.State;
+    binder_transcript:        transcript.Transcript;
+    tickets_issued:           u8;
+    ticket_nonce:             u64;
+    peer_leaf:                x509.Certificate;
+    peer_key_first:           [MAX_PUBLIC_KEY]u8;
+    peer_key_second:          [MAX_PUBLIC_KEY]u8;
+    selected_alpn_storage:    [255]u8;
+    selected_alpn:            contracts.Bytes;
+    peer_offered_alpn:        bool;
+    server_name_storage:      [253]u8;
+    server_name:              contracts.Bytes;
+    peer_parameters:          contracts.Bytes;
+    queue:                    [MAX_QUEUED_EVENTS]Pending;
+    queue_head:               usize;
+    queue_len:                usize;
+    event_active:             bool;
+    event_generation:         u64;
+    active_event:             engine.Event;
+    secret_generation:        [4]u64;
+    transition_owner:         i64;
     receive_record_plaintext: usize;
-    send_record_plaintext: usize;
-    record_limit_seen: bool;
+    send_record_plaintext:    usize;
+    record_limit_seen:        bool;
 }
 
 fun result(status: engine.Status, failure: error.Error, consumed: usize,
@@ -221,12 +222,12 @@ fun result(status: engine.Status, failure: error.Error, consumed: usize,
 }
 
 fun write_u16(data: *u8, offset: usize, value: u16) {
-    data[offset] = (value >> 8)::u8;
+    data[offset]     = (value >> 8)::u8;
     data[offset + 1] = value::u8;
 }
 
 fun write_u24(data: *u8, offset: usize, value: usize) {
-    data[offset] = (value >> 16)::u8;
+    data[offset]     = (value >> 16)::u8;
     data[offset + 1] = (value >> 8)::u8;
     data[offset + 2] = value::u8;
 }
@@ -239,7 +240,7 @@ fun copy_bytes(destination: *u8, source: *u8, length: usize) {
     var i: usize = 0;
     for (i < length) {
         destination[i] = source[i];
-        i = i + 1;
+        i              = i + 1;
     }
 }
 
@@ -263,7 +264,7 @@ fun add_size(total: *usize, amount: usize) bool {
 fun server_owner_valid(server: *Server) bool {
     if (server == nil) { ret false; }
     val address: usize = (?server.state)::usize;
-    val offset: usize = $offset_of(Server, state);
+    val offset:  usize = $offset_of(Server, state);
     ret address >= offset && memory_range.valid((address - offset)::*u8,
         $size_of(Server));
 }
@@ -288,7 +289,7 @@ fun enter(server: *Server) bool {
         var expected: i64 = atomic.load(?server.transition_owner);
         if (expected == owner) { ret false; }
         if (expected == 0 && atomic.cas(?server.transition_owner,
-                ?expected, owner)) { ret true; }
+            ?expected, owner)) { ret true; }
         if (expected != 0) {
             os.thread_wait(?server.transition_owner, expected);
         }
@@ -305,20 +306,20 @@ fun leave(server: *Server) {
 fun config_data(value: *config.ServerConfig) *u8 {
     if (value == nil) { ret nil; }
     val address: usize = (?value.alpn_len)::usize;
-    val offset: usize = $offset_of(config.ServerConfig, alpn_len);
+    val offset:  usize = $offset_of(config.ServerConfig, alpn_len);
     if (address < offset) { ret nil; }
     ret (address - offset)::*u8;
 }
 
 fun config_descriptor_valid(value: *config.ServerConfig) bool {
     if (value == nil || !memory_range.valid(config_data(value),
-            $size_of(config.ServerConfig))) { ret false; }
+        $size_of(config.ServerConfig))) { ret false; }
     val entropy: *secret.Entropy = value.entropy;
     if (entropy == nil || !memory_range.valid((?entropy.context)::*u8,
-            $size_of(secret.Entropy))) { ret false; }
+        $size_of(secret.Entropy))) { ret false; }
     if (value.credentials == nil ||
         !memory_range.valid((?value.credentials.lock)::*u8,
-            $size_of(credentials.Store))) { ret false; }
+        $size_of(credentials.Store))) { ret false; }
     ret true;
 }
 
@@ -328,37 +329,37 @@ fun descriptor_overlaps(value: *config.ServerConfig, data: *u8,
         ret true;
     }
     ret memory_range.overlap(data, len, config_data(value),
-            $size_of(config.ServerConfig)) ||
+        $size_of(config.ServerConfig)) ||
         memory_range.overlap(data, len, (?value.entropy.context)::*u8,
-            $size_of(secret.Entropy)) ||
+        $size_of(secret.Entropy)) ||
         memory_range.overlap(data, len, (?value.credentials.lock)::*u8,
-            $size_of(credentials.Store));
+        $size_of(credentials.Store));
 }
 
 fun config_borrows_valid(value: *config.ServerConfig,
     extra: ExtraExtension) bool {
     if (!config_descriptor_valid(value)) { ret false; }
-    var alpn_bytes: usize = 0;
-    var version_bytes: usize = 0;
-    var suite_bytes: usize = 0;
-    var group_bytes: usize = 0;
+    var alpn_bytes:      usize = 0;
+    var version_bytes:   usize = 0;
+    var suite_bytes:     usize = 0;
+    var group_bytes:     usize = 0;
     var signature_bytes: usize = 0;
     if (!memory_range.scaled(value.alpn_len, $size_of(config.ProtocolName),
-            ?alpn_bytes) ||
+        ?alpn_bytes) ||
         !memory_range.scaled(value.version_len, $size_of(u16), ?version_bytes) ||
         !memory_range.scaled(value.suite_len, $size_of(tls13.CipherSuite),
-            ?suite_bytes) ||
+        ?suite_bytes) ||
         !memory_range.scaled(value.group_len, $size_of(tls13.NamedGroup),
-            ?group_bytes) ||
+        ?group_bytes) ||
         !memory_range.scaled(value.signature_len,
-            $size_of(tls13.SignatureScheme), ?signature_bytes) ||
+        $size_of(tls13.SignatureScheme), ?signature_bytes) ||
         !memory_range.valid(value.alpn::*u8, alpn_bytes) ||
         !memory_range.valid(value.versions::*u8, version_bytes) ||
         !memory_range.valid(value.suites::*u8, suite_bytes) ||
         !memory_range.valid(value.groups::*u8, group_bytes) ||
         !memory_range.valid(value.signatures::*u8, signature_bytes) ||
         !memory_range.valid(value.entropy.context::*u8,
-            value.entropy_context_size) ||
+        value.entropy_context_size) ||
         !memory_range.valid(extra.data.data, extra.data.len)) { ret false; }
     var i: usize = 0;
     for (i < value.alpn_len) {
@@ -374,33 +375,33 @@ fun storage_ranges_valid(storage: *Storage) bool {
     if (storage == nil) { ret false; }
     var certificate_bytes: usize = 0;
     if (!memory_range.scaled(storage.certificate_capacity,
-            $size_of(cert.Certificate), ?certificate_bytes) ||
+        $size_of(cert.Certificate), ?certificate_bytes) ||
         !memory_range.valid(storage.input, storage.input_capacity) ||
         !memory_range.valid(storage.output, storage.output_capacity) ||
         !memory_range.valid(storage.hello, storage.hello_capacity) ||
         !memory_range.valid(storage.certificates::*u8, certificate_bytes) ||
         !memory_range.valid(storage.peer_parameters,
-            storage.peer_parameters_capacity)) { ret false; }
+        storage.peer_parameters_capacity)) { ret false; }
     if (memory_range.overlap(storage.input, storage.input_capacity,
-            storage.output, storage.output_capacity) ||
+        storage.output, storage.output_capacity) ||
         memory_range.overlap(storage.input, storage.input_capacity,
-            storage.hello, storage.hello_capacity) ||
+        storage.hello, storage.hello_capacity) ||
         memory_range.overlap(storage.input, storage.input_capacity,
-            storage.certificates::*u8, certificate_bytes) ||
+        storage.certificates::*u8, certificate_bytes) ||
         memory_range.overlap(storage.input, storage.input_capacity,
-            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        storage.peer_parameters, storage.peer_parameters_capacity) ||
         memory_range.overlap(storage.output, storage.output_capacity,
-            storage.hello, storage.hello_capacity) ||
+        storage.hello, storage.hello_capacity) ||
         memory_range.overlap(storage.output, storage.output_capacity,
-            storage.certificates::*u8, certificate_bytes) ||
+        storage.certificates::*u8, certificate_bytes) ||
         memory_range.overlap(storage.output, storage.output_capacity,
-            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        storage.peer_parameters, storage.peer_parameters_capacity) ||
         memory_range.overlap(storage.hello, storage.hello_capacity,
-            storage.certificates::*u8, certificate_bytes) ||
+        storage.certificates::*u8, certificate_bytes) ||
         memory_range.overlap(storage.hello, storage.hello_capacity,
-            storage.peer_parameters, storage.peer_parameters_capacity) ||
+        storage.peer_parameters, storage.peer_parameters_capacity) ||
         memory_range.overlap(storage.certificates::*u8, certificate_bytes,
-            storage.peer_parameters, storage.peer_parameters_capacity)) {
+        storage.peer_parameters, storage.peer_parameters_capacity)) {
         ret false;
     }
     ret true;
@@ -410,14 +411,14 @@ fun storage_overlaps(storage: *Storage, data: *u8, len: usize) bool {
     if (storage == nil || !memory_range.valid(data, len)) { ret true; }
     var certificate_bytes: usize = 0;
     if (!memory_range.scaled(storage.certificate_capacity,
-            $size_of(cert.Certificate), ?certificate_bytes)) { ret true; }
+        $size_of(cert.Certificate), ?certificate_bytes)) { ret true; }
     ret memory_range.overlap(data, len, storage.input, storage.input_capacity) ||
         memory_range.overlap(data, len, storage.output, storage.output_capacity) ||
         memory_range.overlap(data, len, storage.hello, storage.hello_capacity) ||
         memory_range.overlap(data, len, storage.certificates::*u8,
-            certificate_bytes) ||
+        certificate_bytes) ||
         memory_range.overlap(data, len, storage.peer_parameters,
-            storage.peer_parameters_capacity);
+        storage.peer_parameters_capacity);
 }
 
 fun borrowed_overlaps(value: *config.ServerConfig, extra: ExtraExtension,
@@ -431,34 +432,34 @@ fun borrowed_overlaps(value: *config.ServerConfig, extra: ExtraExtension,
     }
     if (include_callback_context &&
         memory_range.overlap(data, len, value.entropy.context::*u8,
-            value.entropy_context_size)) { ret true; }
-    var alpn_bytes: usize = 0;
-    var version_bytes: usize = 0;
-    var suite_bytes: usize = 0;
-    var group_bytes: usize = 0;
+        value.entropy_context_size)) { ret true; }
+    var alpn_bytes:      usize = 0;
+    var version_bytes:   usize = 0;
+    var suite_bytes:     usize = 0;
+    var group_bytes:     usize = 0;
     var signature_bytes: usize = 0;
     if (!memory_range.scaled(value.alpn_len, $size_of(config.ProtocolName),
-            ?alpn_bytes) ||
+        ?alpn_bytes) ||
         !memory_range.scaled(value.version_len, $size_of(u16), ?version_bytes) ||
         !memory_range.scaled(value.suite_len, $size_of(tls13.CipherSuite),
-            ?suite_bytes) ||
+        ?suite_bytes) ||
         !memory_range.scaled(value.group_len, $size_of(tls13.NamedGroup),
-            ?group_bytes) ||
+        ?group_bytes) ||
         !memory_range.scaled(value.signature_len,
-            $size_of(tls13.SignatureScheme), ?signature_bytes)) { ret true; }
+        $size_of(tls13.SignatureScheme), ?signature_bytes)) { ret true; }
     if (memory_range.overlap(data, len, value.alpn::*u8, alpn_bytes) ||
         memory_range.overlap(data, len, value.versions::*u8, version_bytes) ||
         memory_range.overlap(data, len, value.suites::*u8, suite_bytes) ||
         memory_range.overlap(data, len, value.groups::*u8, group_bytes) ||
         memory_range.overlap(data, len, value.signatures::*u8,
-            signature_bytes) ||
+        signature_bytes) ||
         memory_range.overlap(data, len, extra.data.data, extra.data.len)) {
         ret true;
     }
     var i: usize = 0;
     for (i < value.alpn_len) {
         if (memory_range.overlap(data, len, value.alpn[i].data,
-                value.alpn[i].len)) { ret true; }
+            value.alpn[i].len)) { ret true; }
         i = i + 1;
     }
     ret false;
@@ -475,7 +476,7 @@ pub fun aliases_borrowed(server: *Server, data: *u8, len: usize) bool {
         storage_overlaps(?server.storage, data, len) ||
         borrowed_overlaps(server.config, server.extra, data, len, true, true) ||
         (server.selector.select != nil && memory_range.overlap(data, len,
-            (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
+        (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
 }
 
 pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
@@ -487,37 +488,37 @@ pub fun aliases_configuration(server: *Server, data: *u8, len: usize) bool {
     }
     ret borrowed_overlaps(server.config, server.extra, data, len, false, true) ||
         (server.selector.select != nil && memory_range.overlap(data, len,
-            (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
+        (?server.selector.store.lock)::*u8, $size_of(credentials.Store)));
 }
 
 fun config_sources_disjoint(server: *Server, value: *config.ServerConfig,
     storage: *Storage, extra: ExtraExtension) bool {
     if (!server_owner_valid(server) ||
         borrowed_overlaps(value, extra, server_owner_data(server),
-            $size_of(Server), true, true) ||
+        $size_of(Server), true, true) ||
         storage_overlaps(storage, server_owner_data(server), $size_of(Server))) {
         ret false;
     }
     if (value.entropy_context_size != 0 &&
         (server_owner_overlaps(server, value.entropy.context::*u8,
-            value.entropy_context_size) ||
+        value.entropy_context_size) ||
         storage_overlaps(storage, value.entropy.context::*u8,
-            value.entropy_context_size) ||
+        value.entropy_context_size) ||
         borrowed_overlaps(value, extra, value.entropy.context::*u8,
-            value.entropy_context_size, true, false))) { ret false; }
+        value.entropy_context_size, true, false))) { ret false; }
     var certificate_bytes: usize = 0;
     if (!memory_range.scaled(storage.certificate_capacity,
-            $size_of(cert.Certificate), ?certificate_bytes) ||
+        $size_of(cert.Certificate), ?certificate_bytes) ||
         borrowed_overlaps(value, extra, storage.input, storage.input_capacity,
-            true, true) ||
+        true, true) ||
         borrowed_overlaps(value, extra, storage.output, storage.output_capacity,
-            true, true) ||
+        true, true) ||
         borrowed_overlaps(value, extra, storage.hello, storage.hello_capacity,
-            true, true) ||
+        true, true) ||
         borrowed_overlaps(value, extra, storage.certificates::*u8,
-            certificate_bytes, true, true) ||
+        certificate_bytes, true, true) ||
         borrowed_overlaps(value, extra, storage.peer_parameters,
-            storage.peer_parameters_capacity, true, true)) { ret false; }
+        storage.peer_parameters_capacity, true, true)) { ret false; }
     ret true;
 }
 
@@ -525,7 +526,7 @@ fun selector_sources_disjoint(server: *Server, value: *config.ServerConfig,
     storage: *Storage, extra: ExtraExtension,
     selector: CredentialSelector) bool {
     if (selector.select == nil) { ret true; }
-    val data: *u8 = (?selector.store.lock)::*u8;
+    val data:   *u8   = (?selector.store.lock)::*u8;
     val length: usize = $size_of(credentials.Store);
     ret !server_owner_overlaps(server, data, length) &&
         !storage_overlaps(storage, data, length) &&
@@ -556,8 +557,8 @@ fun server_flight_requirement(value: *config.ServerConfig,
     if (output == nil) { ret false; }
     var encrypted: usize = 6;
     if (!add_size(?encrypted, 4)) { ret false; }
-    var alpn: usize = 4 + 2 + 1;
-    var i: usize = 0;
+    var alpn:   usize = 4 + 2 + 1;
+    var i:      usize = 0;
     var widest: usize = 0;
     for (i < value.alpn_len) {
         if (value.alpn[i].len > widest) { widest = value.alpn[i].len; }
@@ -571,7 +572,7 @@ fun server_flight_requirement(value: *config.ServerConfig,
     var required: usize = encrypted;
     if (!add_size(?required, 4 + 1 + 2 + 4 + 2 + value.signature_len * 2) ||
         !add_size(?required, 8 + value.limits.max_chain_bytes +
-            5 * verify.MAX_CHAIN_DEPTH) ||
+        5 * verify.MAX_CHAIN_DEPTH) ||
         !add_size(?required, 8 + MAX_SIGNATURE) ||
         !add_size(?required, 4 + 48)) { ret false; }
     @output = required;
@@ -586,7 +587,7 @@ fun entropy_equal(first: secret.Entropy, second: secret.Entropy) bool {
 
 fun limits_equal(first: config.Limits, second: config.Limits) bool {
     ret first.max_receive_record_plaintext ==
-            second.max_receive_record_plaintext &&
+        second.max_receive_record_plaintext &&
         first.max_send_record_plaintext == second.max_send_record_plaintext &&
         first.max_peer_handshake_bytes == second.max_peer_handshake_bytes &&
         first.max_client_hello_bytes == second.max_client_hello_bytes &&
@@ -635,25 +636,25 @@ fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
         atomic.load(?server.transition_owner) != owner ||
         server.config != ?server.configuration || !server.entropy.initialized ||
         server.entropy.fill_fn == nil || output == nil) { ret false; }
-    val descriptor: secret.Entropy = server.entropy;
-    val expected_config: *config.ServerConfig = server.config;
-    val expected_configuration: config.ServerConfig = server.configuration;
-    val expected_storage: Storage = server.storage;
-    val expected_extra: ExtraExtension = server.extra;
-    val expected_peer_extension: u16 = server.peer_extension;
-    val expected_state: u8 = server.state;
-    val expected_failure: error.Error = server.failure;
-    val expected_pending_alert: record.AlertDescription = server.pending_alert;
-    val expected_input_len: usize = server.input_len;
-    val expected_input_read: usize = server.input_read;
-    val expected_hello_len: usize = server.hello_len;
-    val expected_output_used: usize = server.output_used;
-    val expected_queue_head: usize = server.queue_head;
-    val expected_queue_len: usize = server.queue_len;
-    val expected_event_active: bool = server.event_active;
-    val expected_receive_limit: usize = server.receive_record_plaintext;
-    val expected_send_limit: usize = server.send_record_plaintext;
-    val status: i64 = descriptor.fill_fn(descriptor.context,
+    val descriptor:              secret.Entropy          = server.entropy;
+    val expected_config:         *config.ServerConfig    = server.config;
+    val expected_configuration:  config.ServerConfig     = server.configuration;
+    val expected_storage:        Storage                 = server.storage;
+    val expected_extra:          ExtraExtension          = server.extra;
+    val expected_peer_extension: u16                     = server.peer_extension;
+    val expected_state:          u8                      = server.state;
+    val expected_failure:        error.Error             = server.failure;
+    val expected_pending_alert:  record.AlertDescription = server.pending_alert;
+    val expected_input_len:      usize                   = server.input_len;
+    val expected_input_read:     usize                   = server.input_read;
+    val expected_hello_len:      usize                   = server.hello_len;
+    val expected_output_used:    usize                   = server.output_used;
+    val expected_queue_head:     usize                   = server.queue_head;
+    val expected_queue_len:      usize                   = server.queue_len;
+    val expected_event_active:   bool                    = server.event_active;
+    val expected_receive_limit:  usize                   = server.receive_record_plaintext;
+    val expected_send_limit:     usize                   = server.send_record_plaintext;
+    val status:                  i64                     = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
     val valid: bool = atomic.load(?server.transition_owner) == owner &&
         server.config == expected_config && server.state == expected_state &&
@@ -677,25 +678,25 @@ fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
         server.send_record_plaintext == expected_send_limit;
     if (!valid || status != 0) {
         ct.zeroize(output, length);
-        server.entropy = descriptor;
-        server.configuration = expected_configuration;
-        server.configuration.entropy = ?server.entropy;
-        server.config = ?server.configuration;
-        server.storage = expected_storage;
-        server.extra = expected_extra;
-        server.peer_extension = expected_peer_extension;
-        server.state = expected_state;
-        server.failure = expected_failure;
-        server.pending_alert = expected_pending_alert;
-        server.input_len = expected_input_len;
-        server.input_read = expected_input_read;
-        server.hello_len = expected_hello_len;
-        server.output_used = expected_output_used;
-        server.queue_head = expected_queue_head;
-        server.queue_len = expected_queue_len;
-        server.event_active = expected_event_active;
+        server.entropy                  = descriptor;
+        server.configuration            = expected_configuration;
+        server.configuration.entropy    = ?server.entropy;
+        server.config                   = ?server.configuration;
+        server.storage                  = expected_storage;
+        server.extra                    = expected_extra;
+        server.peer_extension           = expected_peer_extension;
+        server.state                    = expected_state;
+        server.failure                  = expected_failure;
+        server.pending_alert            = expected_pending_alert;
+        server.input_len                = expected_input_len;
+        server.input_read               = expected_input_read;
+        server.hello_len                = expected_hello_len;
+        server.output_used              = expected_output_used;
+        server.queue_head               = expected_queue_head;
+        server.queue_len                = expected_queue_len;
+        server.event_active             = expected_event_active;
         server.receive_record_plaintext = expected_receive_limit;
-        server.send_record_plaintext = expected_send_limit;
+        server.send_record_plaintext    = expected_send_limit;
         ret false;
     }
     ret true;
@@ -711,7 +712,10 @@ fun fill_public(server: *Server, output: *u8, length: usize) bool {
         ret false;
     }
     var i: usize = 0;
-    for (i < length) { output[i] = temporary[i]:>u8; i = i + 1; }
+    for (i < length) {
+        output[i] = temporary[i]:>u8;
+        i         = i + 1;
+    }
     ct.zeroize(?temporary[0], MAX_KEY_SHARE);
     ret true;
 }
@@ -741,7 +745,7 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
         !memory_range.valid(value.entropy.context::*u8,
-            value.entropy_context_size) ||
+        value.entropy_context_size) ||
         value.credentials == nil || !value.credentials.initialized ||
         (value.alpn_len != 0 && value.alpn == nil) || value.alpn_len > 255 ||
         (value.require_alpn && value.alpn_len == 0) ||
@@ -757,16 +761,16 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         value.limits.max_send_record_plaintext > record.MAX_PLAINTEXT ||
         value.limits.max_peer_handshake_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_peer_handshake_bytes >
-            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
         value.limits.max_client_hello_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_client_hello_bytes >
-            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
         value.limits.max_client_flight_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_client_flight_bytes >
-            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
         value.limits.max_server_flight_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_server_flight_bytes >
-            handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
+        handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
         value.limits.max_chain_bytes == 0 ||
         value.limits.max_chain_bytes > handshake.MAX_BODY_SIZE ||
         value.limits.max_ticket_bytes == 0 ||
@@ -781,19 +785,19 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         (extra.kind != 0 && reserved_server_extension(extra.kind)) ||
         (peer_extension != 0 &&
         (storage.peer_parameters == nil ||
-            storage.peer_parameters_capacity == 0)) ||
+        storage.peer_parameters_capacity == 0)) ||
         value.tickets_per_connection > MAX_TICKETS_PER_CONNECTION ||
         (value.tickets_per_connection != 0 && value.tickets == nil) ||
         (value.tickets != nil && !value.tickets.initialized) ||
         (value.replay_policy != session.REPLAY_PERMISSIVE &&
-            value.replay_policy != session.REPLAY_SINGLE_USE) ||
+        value.replay_policy != session.REPLAY_SINGLE_USE) ||
         (value.replay_policy == session.REPLAY_SINGLE_USE &&
-            (value.replay == nil || !value.replay.initialized ||
-                value.tickets == nil)) ||
+        (value.replay == nil || !value.replay.initialized ||
+        value.tickets == nil)) ||
         (value.replay != nil && !value.replay.initialized)) { ret false; }
     var ticket_output: usize = 0;
     if (!memory_range.scaled(value.tickets_per_connection::usize,
-            TICKET_MESSAGE_BYTES, ?ticket_output) ||
+        TICKET_MESSAGE_BYTES, ?ticket_output) ||
         ticket_output > storage.output_capacity) { ret false; }
     if (value.versions[0] != tls13.VERSION) { ret false; }
     var i: usize = 0;
@@ -833,14 +837,14 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         var prior: usize = 0;
         for (prior < i) {
             if (bytes_equal(contracts.Bytes{data: value.alpn[prior].data,
-                    len: value.alpn[prior].len},
+                len: value.alpn[prior].len},
                 contracts.Bytes{data: value.alpn[i].data,
-                    len: value.alpn[i].len})) { ret false; }
+                len: value.alpn[i].len})) { ret false; }
             prior = prior + 1;
         }
         i = i + 1;
     }
-    var hello_required: usize = 0;
+    var hello_required:  usize = 0;
     var flight_required: usize = 0;
     if (!server_hello_requirement(?hello_required) ||
         !server_flight_requirement(value, extra, ?flight_required) ||
@@ -860,61 +864,61 @@ fun init_inner(server: *Server, configuration: *config.ServerConfig,
         !config_valid(configuration, ?storage, extra, peer_extension) ||
         !config_sources_disjoint(server, configuration, ?storage, extra) ||
         !selector_valid(selector) || !selector_sources_disjoint(server,
-            configuration, ?storage, extra, selector)) {
+        configuration, ?storage, extra, selector)) {
         ret false;
     }
-    server.configuration = configuration[0];
-    server.entropy = configuration.entropy[0];
-    server.configuration.entropy = ?server.entropy;
-    server.config = ?server.configuration;
-    server.storage = storage;
-    server.extra = extra;
-    server.peer_extension = peer_extension;
-    server.transcript = transcript.empty();
-    server.lease = credentials.empty_lease();
-    server.lease_held = false;
-    server.selector = selector;
-    server.state = EXPECT_CLIENT_HELLO;
-    server.failure = error.OK;
-    server.pending_alert = record.NO_ALERT;
-    server.suite = 0;
-    server.group = 0;
-    server.signature_scheme = 0;
-    server.input_len = 0;
-    server.input_read = 0;
-    server.hello_len = 0;
-    server.output_used = 0;
-    server.session_id_len = 0;
-    server.public_key_len = 0;
-    server.retry_count = 0;
-    server.client_auth_required = false;
-    server.client_trust = nil;
-    server.client_certificate_seen = false;
+    server.configuration            = configuration[0];
+    server.entropy                  = configuration.entropy[0];
+    server.configuration.entropy    = ?server.entropy;
+    server.config                   = ?server.configuration;
+    server.storage                  = storage;
+    server.extra                    = extra;
+    server.peer_extension           = peer_extension;
+    server.transcript               = transcript.empty();
+    server.lease                    = credentials.empty_lease();
+    server.lease_held               = false;
+    server.selector                 = selector;
+    server.state                    = EXPECT_CLIENT_HELLO;
+    server.failure                  = error.OK;
+    server.pending_alert            = record.NO_ALERT;
+    server.suite                    = 0;
+    server.group                    = 0;
+    server.signature_scheme         = 0;
+    server.input_len                = 0;
+    server.input_read               = 0;
+    server.hello_len                = 0;
+    server.output_used              = 0;
+    server.session_id_len           = 0;
+    server.public_key_len           = 0;
+    server.retry_count              = 0;
+    server.client_auth_required     = false;
+    server.client_trust             = nil;
+    server.client_certificate_seen  = false;
     server.client_certificate_empty = false;
-    server.authenticated = false;
-    server.early_data_offered = false;
-    server.resumed = false;
-    server.psk_index = 0;
-    server.ticket_state = session.empty_state();
-    server.binder_transcript = transcript.empty();
-    server.tickets_issued = 0;
-    server.ticket_nonce = 0;
-    server.peer_leaf = x509.no_certificate();
-    server.selected_alpn.data = nil;
-    server.selected_alpn.len = 0;
-    server.peer_offered_alpn = false;
-    server.server_name.data = nil;
-    server.server_name.len = 0;
-    server.peer_parameters.data = nil;
-    server.peer_parameters.len = 0;
-    server.queue_head = 0;
-    server.queue_len = 0;
-    server.event_active = false;
+    server.authenticated            = false;
+    server.early_data_offered       = false;
+    server.resumed                  = false;
+    server.psk_index                = 0;
+    server.ticket_state             = session.empty_state();
+    server.binder_transcript        = transcript.empty();
+    server.tickets_issued           = 0;
+    server.ticket_nonce             = 0;
+    server.peer_leaf                = x509.no_certificate();
+    server.selected_alpn.data       = nil;
+    server.selected_alpn.len        = 0;
+    server.peer_offered_alpn        = false;
+    server.server_name.data         = nil;
+    server.server_name.len          = 0;
+    server.peer_parameters.data     = nil;
+    server.peer_parameters.len      = 0;
+    server.queue_head               = 0;
+    server.queue_len                = 0;
+    server.event_active             = false;
     server.receive_record_plaintext =
         server.config.limits.max_receive_record_plaintext;
     server.send_record_plaintext = server.config.limits.max_send_record_plaintext;
-    server.record_limit_seen = false;
-    server.event_generation = engine.next_generation(server.event_generation);
+    server.record_limit_seen     = false;
+    server.event_generation      = engine.next_generation(server.event_generation);
     ct.zeroize(?server.private_key[0], 32);
     ret true;
 }
@@ -940,13 +944,13 @@ pub fun init_with_credential_selector(server: *Server,
 
 fun queue_clear(server: *Server) {
     server.queue_head = 0;
-    server.queue_len = 0;
+    server.queue_len  = 0;
 }
 
 fun queue_push(server: *Server, item: Pending) bool {
     if (server.queue_len >= MAX_QUEUED_EVENTS) { ret false; }
     server.queue[server.queue_len] = item;
-    server.queue_len = server.queue_len + 1;
+    server.queue_len               = server.queue_len + 1;
     ret true;
 }
 
@@ -954,13 +958,13 @@ fun queue_crypto(server: *Server, level: engine.Level, offset: usize,
     length: usize) bool {
     ret queue_push(server, Pending{kind: engine.CRYPTO, level: level,
         direction: engine.SEND, secret_index: NO_SECRET, offset: offset,
-        length: length, disposition: 0, alert: record.NO_ALERT});
+        length:    length, disposition: 0, alert: record.NO_ALERT});
 }
 
 fun queue_secret(server: *Server, level: engine.Level,
     direction: engine.Direction, secret_index: usize) bool {
     ret queue_push(server, Pending{kind: engine.TRAFFIC_SECRET, level: level,
-        direction: direction, secret_index: secret_index, offset: 0, length: 0,
+        direction:   direction, secret_index: secret_index, offset: 0, length: 0,
         disposition: 0, alert: record.NO_ALERT});
 }
 
@@ -968,7 +972,7 @@ fun queue_simple(server: *Server, kind: engine.EventKind, level: engine.Level,
     disposition: u8) bool {
     ret queue_push(server, Pending{kind: kind, level: level, direction: 0,
         secret_index: NO_SECRET, offset: 0, length: 0, disposition: disposition,
-        alert: record.NO_ALERT});
+        alert:        record.NO_ALERT});
 }
 
 fun pending(server: *Server) bool {
@@ -986,13 +990,13 @@ fun release_lease(server: *Server) {
 fun fail(server: *Server, failure: error.Error,
     alert: record.AlertDescription) engine.Result {
     if (server != nil && server.state != DESTROYED) {
-        server.failure = failure;
+        server.failure       = failure;
         server.pending_alert = alert;
         queue_clear(server);
         server.output_used = 0;
         if (alert != record.NO_ALERT) {
             queue_push(server, Pending{kind: engine.ALERT, level: 0,
-                direction: 0, secret_index: NO_SECRET, offset: 0, length: 0,
+                direction:   0, secret_index: NO_SECRET, offset: 0, length: 0,
                 disposition: 0, alert: alert});
         }
         server.state = TERMINAL;
@@ -1010,8 +1014,8 @@ fun start_inner(server: *Server, verification_time: i64) engine.Result {
     if (!fill_public(server, ?server.random[0], 32)) {
         ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
     }
-    var i: usize = 0;
-    var matches_retry: bool = true;
+    var i:             usize = 0;
+    var matches_retry: bool  = true;
     for (i < 32) {
         if (server.random[i] != codec.HELLO_RETRY_RANDOM[i]) {
             matches_retry = false;
@@ -1050,15 +1054,16 @@ fun derive_share(server: *Server, group: tls13.NamedGroup) bool {
             operation = x25519.derive_public(
                 contracts.SecretBytes{data: ?server.private_key[0], len: 32},
                 contracts.Buffer{data: ?server.public_key[0],
-                    capacity: MAX_KEY_SHARE});
-        } or {
+                capacity: MAX_KEY_SHARE});
+        }
+        or {
             operation = p256.derive_public(
                 contracts.SecretBytes{data: ?server.private_key[0], len: 32},
                 contracts.Buffer{data: ?server.public_key[0],
-                    capacity: MAX_KEY_SHARE});
+                capacity: MAX_KEY_SHARE});
         }
         if (operation.error == contracts.OK) {
-            server.group = group;
+            server.group          = group;
             server.public_key_len = operation.written;
             ret true;
         }
@@ -1074,7 +1079,8 @@ fun shared_secret(server: *Server, peer: contracts.Bytes, output: *^u8) bool {
         operation = x25519.agree(
             contracts.SecretBytes{data: ?server.private_key[0], len: 32}, peer,
             contracts.SecretBuffer{data: output, capacity: 32});
-    } or {
+    }
+    or {
         operation = p256.agree(
             contracts.SecretBytes{data: ?server.private_key[0], len: 32}, peer,
             contracts.SecretBuffer{data: output, capacity: 32});
@@ -1089,7 +1095,7 @@ fun client_share(hello: *codec.ClientHello, group: tls13.NamedGroup,
         shares.len < 2) { ret false; }
     var offset: usize = 2;
     for (offset + 3 < shares.len) {
-        val current: u16 = read_u16(shares.data, offset);
+        val current: u16   = read_u16(shares.data, offset);
         val key_len: usize = read_u16(shares.data, offset + 2)::usize;
         if (current == group) {
             output[0] = contracts.Bytes{data: ?shares.data[offset + 4],
@@ -1110,7 +1116,7 @@ fun extract_server_name(hello: *codec.ClientHello,
     output[0] = contracts.Bytes{data: nil, len: 0};
     var name_extension: extensions.Extension;
     if (!extensions.find(hello.extensions, extensions.SERVER_NAME,
-            ?name_extension) || name_extension.len < 5) { ret true; }
+        ?name_extension) || name_extension.len < 5) { ret true; }
     val length: usize = read_u16(name_extension.data, 3)::usize;
     if (name_extension.data[2] != 0 || length == 0 || length > 253 ||
         name_extension.len != 5 + length) { ret false; }
@@ -1157,7 +1163,7 @@ fun record_size_limit(server: *Server, hello: *codec.ClientHello) bool {
     var limit_extension: extensions.Extension;
     server.record_limit_seen = false;
     if (!extensions.find(hello.extensions, extensions.RECORD_SIZE_LIMIT,
-            ?limit_extension)) { ret true; }
+        ?limit_extension)) { ret true; }
     if (limit_extension.len != 2) { ret false; }
     val limit: usize = read_u16(limit_extension.data, 0)::usize - 1;
     if (limit == 0) { ret false; }
@@ -1171,13 +1177,13 @@ fun record_size_limit(server: *Server, hello: *codec.ClientHello) bool {
 fun psk_identity_count(psk: extensions.Extension) usize {
     if (psk.len < 2) { ret 0; }
     val identities_len: usize = read_u16(psk.data, 0)::usize;
-    var offset: usize = 2;
-    val end: usize = 2 + identities_len;
-    var count: usize = 0;
+    var offset:         usize = 2;
+    val end:            usize = 2 + identities_len;
+    var count:          usize = 0;
     for (offset + 5 < end) {
         val identity_len: usize = read_u16(psk.data, offset)::usize;
         offset = offset + 2 + identity_len + 4;
-        count = count + 1;
+        count  = count + 1;
     }
     ret count;
 }
@@ -1186,9 +1192,9 @@ fun psk_identity_at(psk: extensions.Extension, index: usize,
     identity: *contracts.Bytes, obfuscated_age: *u32) bool {
     if (psk.len < 2) { ret false; }
     val identities_len: usize = read_u16(psk.data, 0)::usize;
-    var offset: usize = 2;
-    val end: usize = 2 + identities_len;
-    var current: usize = 0;
+    var offset:         usize = 2;
+    val end:            usize = 2 + identities_len;
+    var current:        usize = 0;
     for (offset + 5 < end) {
         val identity_len: usize = read_u16(psk.data, offset)::usize;
         if (current == index) {
@@ -1201,7 +1207,7 @@ fun psk_identity_at(psk: extensions.Extension, index: usize,
                 psk.data[age_offset + 3]::u32;
             ret true;
         }
-        offset = offset + 2 + identity_len + 4;
+        offset  = offset + 2 + identity_len + 4;
         current = current + 1;
     }
     ret false;
@@ -1211,7 +1217,7 @@ fun psk_binder_at(psk: extensions.Extension, index: usize,
     binder: *contracts.Bytes) bool {
     if (psk.len < 2) { ret false; }
     val identities_len: usize = read_u16(psk.data, 0)::usize;
-    var offset: usize = 2 + identities_len;
+    var offset:         usize = 2 + identities_len;
     if (offset + 2 > psk.len) { ret false; }
     val binders_len: usize = read_u16(psk.data, offset)::usize;
     offset = offset + 2;
@@ -1226,7 +1232,7 @@ fun psk_binder_at(psk: extensions.Extension, index: usize,
                 len: binder_len};
             ret true;
         }
-        offset = offset + 1 + binder_len;
+        offset  = offset + 1 + binder_len;
         current = current + 1;
     }
     ret false;
@@ -1235,7 +1241,7 @@ fun psk_binder_at(psk: extensions.Extension, index: usize,
 fun offered_psk_dhe(hello: *codec.ClientHello) bool {
     var modes: extensions.Extension;
     if (!extensions.find(hello.extensions, extensions.PSK_KEY_EXCHANGE_MODES,
-            ?modes)) { ret false; }
+        ?modes)) { ret false; }
     var i: usize = 1;
     for (i < modes.len) {
         if (modes.data[i] == 1) { ret true; }
@@ -1265,11 +1271,11 @@ fun ticket_name_matches(server: *Server, state: *session.State) bool {
 
 fun binder_matches(first: contracts.Bytes, second: *u8, length: usize) bool {
     if (first.len != length || first.data == nil) { ret false; }
-    var difference: u8 = 0;
-    var i: usize = 0;
+    var difference: u8    = 0;
+    var i:          usize = 0;
     for (i < length) {
         difference = difference | (first.data[i] ^ second[i]);
-        i = i + 1;
+        i          = i + 1;
     }
     ret difference == 0;
 }
@@ -1289,13 +1295,13 @@ fun try_resume(server: *Server, hello: *codec.ClientHello,
     if (count == 0) { ret error.OK; }
     var index: usize = 0;
     for (index < count) {
-        var identity: contracts.Bytes;
+        var identity:       contracts.Bytes;
         var obfuscated_age: u32 = 0;
-        var state: session.State;
+        var state:          session.State;
         if (psk_identity_at(psk, index, ?identity, ?obfuscated_age) &&
             identity.len != 0 &&
             session.open(server.config.tickets, identity,
-                server.verification_time, ?state)) {
+            server.verification_time, ?state)) {
             val usable: bool = configured_suite(server, state.suite) &&
                 offered_suite_value(hello, state.suite) &&
                 ticket_name_matches(server, ?state);
@@ -1358,17 +1364,26 @@ fun accept_ticket(server: *Server, hello: *codec.ClientHello,
             contracts.Buffer{data: ?expected[0], capacity: 48});
     }
     var i: usize = 0;
-    for (i < 48) { hash[i] = 0; i = i + 1; }
+    for (i < 48) {
+        hash[i] = 0;
+        i       = i + 1;
+    }
     transcript.destroy(?server.binder_transcript);
     if (failure != error.OK) {
         key_schedule.destroy(?server.schedule);
         i = 0;
-        for (i < 48) { expected[i] = 0; i = i + 1; }
+        for (i < 48) {
+            expected[i] = 0;
+            i           = i + 1;
+        }
         ret failure;
     }
     val matched: bool = binder_matches(offered, ?expected[0], size);
     i = 0;
-    for (i < 48) { expected[i] = 0; i = i + 1; }
+    for (i < 48) {
+        expected[i] = 0;
+        i           = i + 1;
+    }
     if (!matched) {
         key_schedule.destroy(?server.schedule);
         ret error.DECRYPT_ERROR;
@@ -1377,15 +1392,15 @@ fun accept_ticket(server: *Server, hello: *codec.ClientHello,
     # ticket identity, which is what a single-use policy actually bounds
     if (server.config.replay_policy == session.REPLAY_SINGLE_USE &&
         !session.replay_admit(server.config.replay, identity,
-            state.issued_at + state.lifetime_seconds::i64,
-            server.verification_time)) {
+        state.issued_at + state.lifetime_seconds::i64,
+        server.verification_time)) {
         key_schedule.destroy(?server.schedule);
         ret error.OK;
     }
-    server.resumed = true;
-    server.psk_index = index::u16;
+    server.resumed       = true;
+    server.psk_index     = index::u16;
     server.authenticated = state.client_authenticated;
-    server.ticket_state = @state;
+    server.ticket_state  = @state;
     ret error.OK;
 }
 
@@ -1402,7 +1417,8 @@ fun retain_peer_parameters(server: *Server, hello: *codec.ClientHello) error.Err
         copy_bytes(server.storage.peer_parameters, item.data, item.len);
     }
     server.peer_parameters = contracts.Bytes{
-        data: server.storage.peer_parameters, len: item.len};
+        data: server.storage.peer_parameters, len: item.len
+    };
     ret error.OK;
 }
 
@@ -1427,22 +1443,22 @@ fun hello_consistent(first: *codec.ClientHello,
         ret false;
     }
     var iterator: extensions.Iterator = extensions.iterator(second.extensions);
-    var item: extensions.Extension;
+    var item:     extensions.Extension;
     for (true) {
         val status: extensions.NextStatus = extensions.next(?iterator, ?item);
-        if (status == extensions.NEXT_DONE) { brk; }
-        if (status != extensions.NEXT_ITEM) { ret false; }
+        if (status == extensions.NEXT_DONE)     { brk; }
+        if (status != extensions.NEXT_ITEM)     { ret false; }
         if (retry_extension_mutable(item.kind)) { cnt; }
         var original: extensions.Extension;
         if (!find_in(first.extensions, item.kind, ?original) ||
             !bytes_equal(contracts.Bytes{data: original.data, len: original.len},
-                contracts.Bytes{data: item.data, len: item.len})) { ret false; }
+            contracts.Bytes{data: item.data, len: item.len})) { ret false; }
     }
     var reverse: extensions.Iterator = extensions.iterator(first.extensions);
     for (true) {
         val status: extensions.NextStatus = extensions.next(?reverse, ?item);
-        if (status == extensions.NEXT_DONE) { brk; }
-        if (status != extensions.NEXT_ITEM) { ret false; }
+        if (status == extensions.NEXT_DONE)     { brk; }
+        if (status != extensions.NEXT_ITEM)     { ret false; }
         if (retry_extension_mutable(item.kind)) { cnt; }
         var repeated: extensions.Extension;
         if (!find_in(second.extensions, item.kind, ?repeated)) { ret false; }
@@ -1452,7 +1468,7 @@ fun hello_consistent(first: *codec.ClientHello,
 
 fun decode_retained_hello(server: *Server, output: *codec.ClientHello) error.Error {
     var message: handshake.Message;
-    val parsed: handshake.Progress = handshake.parse(server.storage.hello,
+    val parsed:  handshake.Progress = handshake.parse(server.storage.hello,
         server.hello_len,
         server.config.limits.max_client_hello_bytes - handshake.HEADER_SIZE,
         ?message);
@@ -1466,12 +1482,12 @@ fun build_policy(server: *Server, schemes: *tls13.SignatureScheme,
     val identity: *credentials.Identity = server.lease.identity;
     if (identity == nil || identity.private_key == nil) { ret false; }
     val algorithm: keys.Algorithm = identity.private_key.algorithm;
-    var count: usize = 0;
-    var i: usize = 0;
+    var count:     usize          = 0;
+    var i:         usize          = 0;
     for (i < server.config.signature_len) {
         if (scheme_matches_key(server.config.signatures[i], algorithm)) {
             schemes[count] = server.config.signatures[i];
-            count = count + 1;
+            count          = count + 1;
         }
         i = i + 1;
     }
@@ -1482,14 +1498,14 @@ fun build_policy(server: *Server, schemes: *tls13.SignatureScheme,
             len: server.config.alpn[i].len};
         i = i + 1;
     }
-    policy.suites = server.config.suites;
-    policy.suite_len = server.config.suite_len;
-    policy.groups = server.config.groups;
-    policy.group_len = server.config.group_len;
-    policy.signatures = schemes;
-    policy.signature_len = count;
-    policy.protocols = protocols;
-    policy.protocol_len = server.config.alpn_len;
+    policy.suites           = server.config.suites;
+    policy.suite_len        = server.config.suite_len;
+    policy.groups           = server.config.groups;
+    policy.group_len        = server.config.group_len;
+    policy.signatures       = schemes;
+    policy.signature_len    = count;
+    policy.protocols        = protocols;
+    policy.protocol_len     = server.config.alpn_len;
     policy.require_protocol = server.config.require_alpn;
     ret true;
 }
@@ -1501,9 +1517,11 @@ fun acquire_credentials(server: *Server, requested: contracts.Bytes,
     if (server.selector.select == nil) {
         status = credentials.acquire(server.config.credentials, requested,
             ?server.lease);
-    } or {
+    }
+    or {
         status = server.selector.select(server.selector.store, CredentialOffer{
-            server_name: requested, offered_alpn: offered_alpn}, ?server.lease);
+            server_name: requested, offered_alpn: offered_alpn
+        }, ?server.lease);
         if (status == contracts.UNSUPPORTED) {
             status = credentials.acquire(server.config.credentials, requested,
                 ?server.lease);
@@ -1512,9 +1530,9 @@ fun acquire_credentials(server: *Server, requested: contracts.Bytes,
     if (status == contracts.UNSUPPORTED) { ret error.UNRECOGNIZED_NAME; }
     if (status != contracts.OK || server.lease.identity == nil ||
         server.lease.generation == nil) { ret error.HANDSHAKE_FAILURE; }
-    server.lease_held = true;
+    server.lease_held           = true;
     server.client_auth_required = server.lease.generation.require_client_auth;
-    server.client_trust = server.lease.generation.client_trust;
+    server.client_trust         = server.lease.generation.client_trust;
     if (server.client_auth_required && server.client_trust == nil) {
         ret error.INTERNAL_ERROR;
     }
@@ -1523,8 +1541,8 @@ fun acquire_credentials(server: *Server, requested: contracts.Bytes,
 
 fun build_hello_retry(server: *Server, selection: *negotiation.Selection) error.Error {
     var extension_bytes: [16]u8;
-    var offset: usize = 0;
-    var version: [2]u8;
+    var offset:          usize = 0;
+    var version:         [2]u8;
     write_u16(?version[0], 0, tls13.VERSION);
     offset = put_extension(?extension_bytes[0], offset,
         extensions.SUPPORTED_VERSIONS,
@@ -1534,18 +1552,18 @@ fun build_hello_retry(server: *Server, selection: *negotiation.Selection) error.
     offset = put_extension(?extension_bytes[0], offset, extensions.KEY_SHARE,
         contracts.Bytes{data: ?group_bytes[0], len: 2});
     var retry: codec.ServerHello;
-    retry.legacy_version = tls13.LEGACY_VERSION;
-    retry.random = contracts.Bytes{data: ?codec.HELLO_RETRY_RANDOM[0], len: 32};
+    retry.legacy_version    = tls13.LEGACY_VERSION;
+    retry.random            = contracts.Bytes{data: ?codec.HELLO_RETRY_RANDOM[0], len: 32};
     retry.legacy_session_id = contracts.Bytes{data: ?server.session_id[0],
         len: server.session_id_len};
-    retry.cipher_suite = selection.suite;
+    retry.cipher_suite       = selection.suite;
     retry.compression_method = 0;
-    retry.extensions = extensions.list(?extension_bytes[0], offset,
+    retry.extensions         = extensions.list(?extension_bytes[0], offset,
         extensions.HELLO_RETRY_REQUEST);
     retry.retry = true;
     val encoded: handshake.Progress = codec.encode_server_hello(?retry,
         contracts.Buffer{data: ?server.storage.output[server.output_used],
-            capacity: server.storage.output_capacity - server.output_used});
+        capacity: server.storage.output_capacity - server.output_used});
     if (encoded.status != handshake.COMPLETE) {
         if (encoded.error != error.OK) { ret encoded.error; }
         ret error.RESOURCE_LIMIT;
@@ -1559,23 +1577,23 @@ fun build_hello_retry(server: *Server, selection: *negotiation.Selection) error.
     if (failure == error.OK) {
         failure = transcript.rewrite_for_retry(?server.transcript,
             contracts.Bytes{data: ?server.storage.output[server.output_used],
-                len: encoded.produced});
+            len: encoded.produced});
     }
     if (failure != error.OK) { ret failure; }
     if (!queue_crypto(server, engine.INITIAL, server.output_used,
-            encoded.produced)) { ret error.INTERNAL_ERROR; }
+        encoded.produced)) { ret error.INTERNAL_ERROR; }
     server.output_used = server.output_used + encoded.produced;
-    server.suite = selection.suite;
-    server.group = selection.group;
+    server.suite       = selection.suite;
+    server.group       = selection.group;
     server.retry_count = 1;
-    server.state = EXPECT_RETRY_HELLO;
+    server.state       = EXPECT_RETRY_HELLO;
     ret error.OK;
 }
 
 fun build_server_hello(server: *Server, peer: contracts.Bytes) error.Error {
     var extension_bytes: [96]u8;
-    var offset: usize = 0;
-    var version: [2]u8;
+    var offset:          usize = 0;
+    var version:         [2]u8;
     write_u16(?version[0], 0, tls13.VERSION);
     offset = put_extension(?extension_bytes[0], offset,
         extensions.SUPPORTED_VERSIONS,
@@ -1595,25 +1613,25 @@ fun build_server_hello(server: *Server, peer: contracts.Bytes) error.Error {
             contracts.Bytes{data: ?selected[0], len: 2});
     }
     var hello: codec.ServerHello;
-    hello.legacy_version = tls13.LEGACY_VERSION;
-    hello.random = contracts.Bytes{data: ?server.random[0], len: 32};
+    hello.legacy_version    = tls13.LEGACY_VERSION;
+    hello.random            = contracts.Bytes{data: ?server.random[0], len: 32};
     hello.legacy_session_id = contracts.Bytes{data: ?server.session_id[0],
         len: server.session_id_len};
-    hello.cipher_suite = server.suite;
+    hello.cipher_suite       = server.suite;
     hello.compression_method = 0;
-    hello.extensions = extensions.list(?extension_bytes[0], offset,
+    hello.extensions         = extensions.list(?extension_bytes[0], offset,
         extensions.SERVER_HELLO);
     hello.retry = false;
     val encoded: handshake.Progress = codec.encode_server_hello(?hello,
         contracts.Buffer{data: ?server.storage.output[server.output_used],
-            capacity: server.storage.output_capacity - server.output_used});
+        capacity: server.storage.output_capacity - server.output_used});
     if (encoded.status != handshake.COMPLETE) {
         if (encoded.error != error.OK) { ret encoded.error; }
         ret error.RESOURCE_LIMIT;
     }
     var failure: error.Error = transcript.update_frame(?server.transcript,
         contracts.Bytes{data: ?server.storage.output[server.output_used],
-            len: encoded.produced});
+        len: encoded.produced});
     if (failure != error.OK) { ret failure; }
     var hash: [48]u8;
     failure = transcript.snapshot(?server.transcript,
@@ -1632,25 +1650,28 @@ fun build_server_hello(server: *Server, peer: contracts.Bytes) error.Error {
         failure = key_schedule.advance_handshake(?server.schedule,
             contracts.SecretBytes{data: ?shared[0], len: 32},
             contracts.Bytes{data: ?hash[0],
-                len: key_schedule.hash_size(server.schedule.algorithm)});
+            len: key_schedule.hash_size(server.schedule.algorithm)});
     }
     ct.zeroize(?shared[0], 32);
     var i: usize = 0;
-    for (i < 48) { hash[i] = 0; i = i + 1; }
+    for (i < 48) {
+        hash[i] = 0;
+        i       = i + 1;
+    }
     ct.zeroize(?server.private_key[0], 32);
     if (failure != error.OK) { ret failure; }
     if (!queue_crypto(server, engine.INITIAL, server.output_used,
-            encoded.produced)) { ret error.INTERNAL_ERROR; }
+        encoded.produced)) { ret error.INTERNAL_ERROR; }
     server.output_used = server.output_used + encoded.produced;
     if (!queue_secret(server, engine.HANDSHAKE, engine.SEND, SEND_HANDSHAKE) ||
         !queue_secret(server, engine.HANDSHAKE, engine.RECEIVE,
-            RECEIVE_HANDSHAKE)) { ret error.INTERNAL_ERROR; }
+        RECEIVE_HANDSHAKE)) { ret error.INTERNAL_ERROR; }
     ret error.OK;
 }
 
 fun append_encrypted_extensions(server: *Server, offset: usize) usize {
     var extension_bytes: [512]u8;
-    var cursor: usize = 0;
+    var cursor:          usize = 0;
     if (server.selected_alpn.len != 0) {
         var alpn_body: [258]u8;
         write_u16(?alpn_body[0], 0, (1 + server.selected_alpn.len)::u16);
@@ -1660,7 +1681,7 @@ fun append_encrypted_extensions(server: *Server, offset: usize) usize {
         cursor = put_extension(?extension_bytes[0], cursor,
             extensions.APPLICATION_LAYER_PROTOCOL,
             contracts.Bytes{data: ?alpn_body[0],
-                len: 3 + server.selected_alpn.len});
+            len: 3 + server.selected_alpn.len});
     }
     if (server.server_name.len != 0) {
         cursor = put_extension(?extension_bytes[0], cursor,
@@ -1681,9 +1702,9 @@ fun append_encrypted_extensions(server: *Server, offset: usize) usize {
     val encoded: handshake.Progress = codec.encode_extension_message(
         handshake.ENCRYPTED_EXTENSIONS,
         extensions.list(?extension_bytes[0], cursor,
-            extensions.ENCRYPTED_EXTENSIONS),
+        extensions.ENCRYPTED_EXTENSIONS),
         contracts.Buffer{data: ?server.storage.output[offset],
-            capacity: server.storage.output_capacity - offset});
+        capacity: server.storage.output_capacity - offset});
     if (encoded.status != handshake.COMPLETE) { ret 0; }
     ret offset + encoded.produced;
 }
@@ -1709,20 +1730,20 @@ fun encode_signature_algorithms(server: *Server, output: *u8,
 fun append_certificate_request(server: *Server, offset: usize) usize {
     if (!server.client_auth_required) { ret offset; }
     var extension_bytes: [32]u8;
-    var algorithms: [MAX_SIGNATURE_ALGORITHM_BYTES]u8;
-    val algorithm_len: usize = encode_signature_algorithms(server,
+    var algorithms:      [MAX_SIGNATURE_ALGORITHM_BYTES]u8;
+    val algorithm_len:   usize = encode_signature_algorithms(server,
         ?algorithms[0], MAX_SIGNATURE_ALGORITHM_BYTES);
     if (algorithm_len == 0) { ret 0; }
     val cursor: usize = put_extension(?extension_bytes[0], 0,
         extensions.SIGNATURE_ALGORITHMS,
         contracts.Bytes{data: ?algorithms[0], len: algorithm_len});
     var request: codec.CertificateRequest;
-    request.context = contracts.Bytes{data: nil, len: 0};
+    request.context    = contracts.Bytes{data: nil, len: 0};
     request.extensions = extensions.list(?extension_bytes[0], cursor,
         extensions.CERTIFICATE_REQUEST);
     val encoded: handshake.Progress = codec.encode_certificate_request(?request,
         contracts.Buffer{data: ?server.storage.output[offset],
-            capacity: server.storage.output_capacity - offset});
+        capacity: server.storage.output_capacity - offset});
     if (encoded.status != handshake.COMPLETE) { ret 0; }
     ret offset + encoded.produced;
 }
@@ -1731,15 +1752,15 @@ fun append_certificate(server: *Server, offset: usize) usize {
     val identity: *credentials.Identity = server.lease.identity;
     if (identity == nil) { ret 0; }
     var entries_length: usize = 0;
-    var i: usize = 0;
+    var i:              usize = 0;
     for (i < identity.chain.len) {
         val encoded_length: usize = identity.chain.certificates[i].der_len;
         if (encoded_length > server.storage.output_capacity ||
             entries_length > server.storage.output_capacity - encoded_length ||
             entries_length + encoded_length >
-                server.storage.output_capacity - 5) { ret 0; }
+            server.storage.output_capacity - 5) { ret 0; }
         entries_length = entries_length + 5 + encoded_length;
-        i = i + 1;
+        i              = i + 1;
     }
     if (entries_length == 0 || offset > server.storage.output_capacity ||
         entries_length > server.storage.output_capacity - 8) { ret 0; }
@@ -1758,27 +1779,33 @@ fun append_certificate(server: *Server, offset: usize) usize {
             encoded.der_len);
         write_u16(server.storage.output, cursor + 3 + encoded.der_len, 0);
         cursor = cursor + 5 + encoded.der_len;
-        i = i + 1;
+        i      = i + 1;
     }
     ret cursor;
 }
 
 fun certificate_verify_input(server: *Server, from_server: bool,
     output: *u8) error.Error {
-    var hash: [48]u8;
-    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
+    var hash:    [48]u8;
+    val size:    usize       = key_schedule.hash_size(server.schedule.algorithm);
     val failure: error.Error = transcript.snapshot(?server.transcript,
         contracts.Buffer{data: ?hash[0], capacity: 48});
     if (failure != error.OK) { ret failure; }
     var i: usize = 0;
-    for (i < 64) { output[i] = 0x20; i = i + 1; }
+    for (i < 64) {
+        output[i] = 0x20;
+        i         = i + 1;
+    }
     var context: *u8 = "TLS 1.3, client CertificateVerify"::*u8;
     if (from_server) { context = "TLS 1.3, server CertificateVerify"::*u8; }
     copy_bytes(?output[64], context, 33);
     output[97] = 0;
     copy_bytes(?output[98], ?hash[0], size);
     i = 0;
-    for (i < 48) { hash[i] = 0; i = i + 1; }
+    for (i < 48) {
+        hash[i] = 0;
+        i       = i + 1;
+    }
     ret error.OK;
 }
 
@@ -1796,10 +1823,10 @@ fun sign_server(server: *Server, message: contracts.Bytes,
         }
         ret signature.sign_ecdsa_p256_sha256(key, message, output);
     }
-    var modulus: [512]u8;
-    var exponent: [512]u8;
+    var modulus:          [512]u8;
+    var exponent:         [512]u8;
     var private_exponent: [512]^u8;
-    val copied: contracts.Error = keys.copy_rsa(private_key,
+    val copied:           contracts.Error = keys.copy_rsa(private_key,
         contracts.Buffer{data: ?modulus[0], capacity: 512},
         contracts.Buffer{data: ?exponent[0], capacity: 512},
         contracts.SecretBuffer{data: ?private_exponent[0], capacity: 512});
@@ -1807,7 +1834,7 @@ fun sign_server(server: *Server, message: contracts.Bytes,
         ct.zeroize(?private_exponent[0], 512);
         ret contracts.Operation{error: copied, written: 0};
     }
-    var salt: [48]^u8;
+    var salt:        [48]^u8;
     var salt_length: usize = 48;
     if (server.signature_scheme == tls13.RSA_PSS_RSAE_SHA256) {
         salt_length = 32;
@@ -1818,7 +1845,7 @@ fun sign_server(server: *Server, message: contracts.Bytes,
         ret contracts.Operation{error: contracts.ENTROPY_UNAVAILABLE, written: 0};
     }
     val rsa_key: signature.RsaPrivateKey = signature.RsaPrivateKey{
-        modulus: contracts.Bytes{data: ?modulus[0], len: private_key.modulus_len},
+        modulus:         contracts.Bytes{data: ?modulus[0], len: private_key.modulus_len},
         public_exponent: contracts.Bytes{data: ?exponent[0],
             len: private_key.exponent_len},
         private_exponent: contracts.SecretBytes{data: ?private_exponent[0],
@@ -1828,7 +1855,8 @@ fun sign_server(server: *Server, message: contracts.Bytes,
     if (server.signature_scheme == tls13.RSA_PSS_RSAE_SHA256) {
         operation = signature.sign_rsa_pss_sha256(rsa_key, message,
             contracts.SecretBytes{data: ?salt[0], len: 32}, output);
-    } or {
+    }
+    or {
         operation = signature.sign_rsa_pss_sha384(rsa_key, message,
             contracts.SecretBytes{data: ?salt[0], len: 48}, output);
     }
@@ -1841,25 +1869,31 @@ fun append_certificate_verify(server: *Server, offset: usize) usize {
     var signed: [MAX_SIGNED_CONTEXT]u8;
     if (certificate_verify_input(server, true, ?signed[0]) != error.OK) { ret 0; }
     var signature_bytes: [MAX_SIGNATURE]u8;
-    val operation: contracts.Operation = sign_server(server,
+    val operation:       contracts.Operation = sign_server(server,
         contracts.Bytes{data: ?signed[0],
-            len: 98 + key_schedule.hash_size(server.schedule.algorithm)},
+        len: 98 + key_schedule.hash_size(server.schedule.algorithm)},
         contracts.Buffer{data: ?signature_bytes[0], capacity: MAX_SIGNATURE});
     var i: usize = 0;
-    for (i < MAX_SIGNED_CONTEXT) { signed[i] = 0; i = i + 1; }
+    for (i < MAX_SIGNED_CONTEXT) {
+        signed[i] = 0;
+        i         = i + 1;
+    }
     if (operation.error != contracts.OK || operation.written == 0 ||
         8 + operation.written > server.storage.output_capacity - offset) {
         ret 0;
     }
     var value: codec.CertificateVerify;
-    value.scheme = server.signature_scheme;
+    value.scheme    = server.signature_scheme;
     value.signature = contracts.Bytes{data: ?signature_bytes[0],
         len: operation.written};
     val encoded: handshake.Progress = codec.encode_certificate_verify(?value,
         contracts.Buffer{data: ?server.storage.output[offset],
-            capacity: server.storage.output_capacity - offset});
+        capacity: server.storage.output_capacity - offset});
     i = 0;
-    for (i < MAX_SIGNATURE) { signature_bytes[i] = 0; i = i + 1; }
+    for (i < MAX_SIGNATURE) {
+        signature_bytes[i] = 0;
+        i                  = i + 1;
+    }
     if (encoded.status != handshake.COMPLETE) { ret 0; }
     ret offset + encoded.produced;
 }
@@ -1880,9 +1914,13 @@ fun append_finished(server: *Server, base: *key_schedule.Secret,
     value.verify_data = contracts.Bytes{data: ?verify_data[0], len: size};
     val encoded: handshake.Progress = codec.encode_finished(?value,
         contracts.Buffer{data: ?server.storage.output[offset],
-            capacity: server.storage.output_capacity - offset});
+        capacity: server.storage.output_capacity - offset});
     var i: usize = 0;
-    for (i < 48) { hash[i] = 0; verify_data[i] = 0; i = i + 1; }
+    for (i < 48) {
+        hash[i]        = 0;
+        verify_data[i] = 0;
+        i              = i + 1;
+    }
     if (encoded.status != handshake.COMPLETE) { ret 0; }
     ret offset + encoded.produced;
 }
@@ -1895,8 +1933,8 @@ fun absorb(server: *Server, start: usize, end: usize) error.Error {
 
 fun build_server_flight(server: *Server) error.Error {
     val flight_start: usize = server.output_used;
-    var offset: usize = flight_start;
-    var next: usize = append_encrypted_extensions(server, offset);
+    var offset:       usize = flight_start;
+    var next:         usize = append_encrypted_extensions(server, offset);
     if (next == 0) { ret error.RESOURCE_LIMIT; }
     var failure: error.Error = absorb(server, offset, next);
     if (failure != error.OK) { ret failure; }
@@ -1914,7 +1952,7 @@ fun build_server_flight(server: *Server) error.Error {
         failure = absorb(server, offset, next);
         if (failure != error.OK) { ret failure; }
         offset = next;
-        next = append_certificate_verify(server, offset);
+        next   = append_certificate_verify(server, offset);
         if (next == 0) { ret error.INTERNAL_ERROR; }
         failure = absorb(server, offset, next);
         if (failure != error.OK) { ret failure; }
@@ -1938,12 +1976,15 @@ fun build_server_flight(server: *Server) error.Error {
             contracts.Bytes{data: ?hash[0], len: size});
     }
     var i: usize = 0;
-    for (i < 48) { hash[i] = 0; i = i + 1; }
+    for (i < 48) {
+        hash[i] = 0;
+        i       = i + 1;
+    }
     if (failure != error.OK) { ret failure; }
     if (!queue_crypto(server, engine.HANDSHAKE, flight_start,
-            offset - flight_start) ||
+        offset - flight_start) ||
         !queue_secret(server, engine.APPLICATION, engine.SEND,
-            SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
+        SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
     server.output_used = offset;
     # the peer's transport parameters reach the caller through the event stream,
     # on the same borrowed-until-complete_event contract the client half uses,
@@ -1952,14 +1993,15 @@ fun build_server_flight(server: *Server) error.Error {
     # the extension, so the bytes are present whenever peer_extension is set.
     if (server.peer_extension != 0 &&
         !queue_simple(server, engine.PEER_PARAMETERS, engine.HANDSHAKE,
-            0)) { ret error.INTERNAL_ERROR; }
+        0)) { ret error.INTERNAL_ERROR; }
     var disposition: u8 = engine.EARLY_NOT_OFFERED;
     if (server.early_data_offered) { disposition = engine.EARLY_REJECTED; }
     if (!queue_simple(server, engine.EARLY_DATA, engine.HANDSHAKE,
-            disposition)) { ret error.INTERNAL_ERROR; }
+        disposition)) { ret error.INTERNAL_ERROR; }
     if (server.client_auth_required && !server.resumed) {
         server.state = EXPECT_CLIENT_CERTIFICATE;
-    } or {
+    }
+    or {
         server.state = EXPECT_CLIENT_FINISHED;
     }
     ret error.OK;
@@ -1967,11 +2009,11 @@ fun build_server_flight(server: *Server) error.Error {
 
 fun handle_client_hello(server: *Server, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
-    val after_retry: bool = server.retry_count != 0;
-    var hello: codec.ClientHello;
-    var failure: error.Error = codec.decode_client_hello(message, after_retry,
+    val after_retry: bool        = server.retry_count != 0;
+    var hello:       codec.ClientHello;
+    var failure:     error.Error = codec.decode_client_hello(message, after_retry,
         ?hello);
-    if (failure != error.OK) { ret failure; }
+    if (failure != error.OK)      { ret failure; }
     if (!offered_version(?hello)) { ret error.PROTOCOL_VERSION; }
     if (frame.len > server.config.limits.max_client_hello_bytes) {
         ret error.RESOURCE_LIMIT;
@@ -2000,11 +2042,12 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
         }
         retain_server_name(server, requested);
         failure = acquire_credentials(server, server.server_name, offered_alpn);
-        if (failure != error.OK) { ret failure; }
+        if (failure != error.OK)                { ret failure; }
         if (!record_size_limit(server, ?hello)) { ret error.ILLEGAL_PARAMETER; }
         failure = retain_peer_parameters(server, ?hello);
         if (failure != error.OK) { ret failure; }
-    } or {
+    }
+    or {
         var original: codec.ClientHello;
         failure = decode_retained_hello(server, ?original);
         if (failure != error.OK) { ret failure; }
@@ -2012,9 +2055,9 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
             ret error.ILLEGAL_PARAMETER;
         }
     }
-    var schemes: [config.MAX_SIGNATURE_SCHEMES]tls13.SignatureScheme;
+    var schemes:   [config.MAX_SIGNATURE_SCHEMES]tls13.SignatureScheme;
     var protocols: [255]negotiation.Protocol;
-    var policy: negotiation.Policy;
+    var policy:    negotiation.Policy;
     if (!build_policy(server, ?schemes[0], ?protocols[0], ?policy)) {
         ret error.HANDSHAKE_FAILURE;
     }
@@ -2030,30 +2073,32 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
         var resumed_suite: tls13.CipherSuite = selection.suite;
         failure = try_resume(server, ?hello, frame, ?resumed_suite);
         if (failure != error.OK) { ret failure; }
-        if (server.resumed) { selection.suite = resumed_suite; }
+        if (server.resumed)      { selection.suite = resumed_suite; }
     }
     var peer: contracts.Bytes;
     if (!client_share(?hello, selection.group, ?peer)) {
         ret error.ILLEGAL_PARAMETER;
     }
-    server.suite = selection.suite;
-    server.signature_scheme = selection.signature;
+    server.suite             = selection.suite;
+    server.signature_scheme  = selection.signature;
     server.peer_offered_alpn = selection.protocol_offered;
     if (selection.protocol.len != 0) {
         copy_bytes(?server.selected_alpn_storage[0], selection.protocol.data,
             selection.protocol.len);
         server.selected_alpn = contracts.Bytes{
-            data: ?server.selected_alpn_storage[0], len: selection.protocol.len};
+            data: ?server.selected_alpn_storage[0], len: selection.protocol.len
+        };
     }
     if (!after_retry) {
         failure = transcript.init_for_suite(?server.transcript, selection.suite);
         if (failure == error.OK) {
             failure = transcript.update_frame(?server.transcript, frame);
         }
-    } or {
+    }
+    or {
         failure = transcript.update_frame(?server.transcript, frame);
     }
-    if (failure != error.OK) { ret failure; }
+    if (failure != error.OK)                    { ret failure; }
     if (!derive_share(server, selection.group)) { ret error.INTERNAL_ERROR; }
     failure = build_server_hello(server, peer);
     if (failure != error.OK) { ret failure; }
@@ -2061,7 +2106,7 @@ fun handle_client_hello(server: *Server, frame: contracts.Bytes,
 }
 
 fun retain_peer_key(server: *Server) bool {
-    val first: contracts.Bytes = server.peer_leaf.public_key.first;
+    val first:  contracts.Bytes = server.peer_leaf.public_key.first;
     val second: contracts.Bytes = server.peer_leaf.public_key.second;
     if (first.data == nil || first.len == 0 || first.len > MAX_PUBLIC_KEY ||
         second.len > MAX_PUBLIC_KEY || (second.len != 0 && second.data == nil)) {
@@ -2072,25 +2117,27 @@ fun retain_peer_key(server: *Server) bool {
         copy_bytes(?server.peer_key_second[0], second.data, second.len);
     }
     server.peer_leaf.public_key.encoded.data = nil;
-    server.peer_leaf.public_key.encoded.len = 0;
-    server.peer_leaf.public_key.first = contracts.Bytes{
-        data: ?server.peer_key_first[0], len: first.len};
+    server.peer_leaf.public_key.encoded.len  = 0;
+    server.peer_leaf.public_key.first        = contracts.Bytes{
+        data: ?server.peer_key_first[0], len: first.len
+    };
     server.peer_leaf.public_key.second = contracts.Bytes{
-        data: ?server.peer_key_second[0], len: second.len};
+        data: ?server.peer_key_second[0], len: second.len
+    };
     ret true;
 }
 
 fun handle_client_certificate(server: *Server, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var certificate_message: codec.CertificateMessage;
-    var failure: error.Error = codec.decode_certificate(message, true,
+    var failure:             error.Error = codec.decode_certificate(message, true,
         ?certificate_message);
-    if (failure != error.OK) { ret failure; }
+    if (failure != error.OK)                  { ret failure; }
     if (certificate_message.context.len != 0) { ret error.ILLEGAL_PARAMETER; }
     server.client_certificate_seen = true;
     if (certificate_message.count == 0) {
         server.client_certificate_empty = true;
-        failure = transcript.update_frame(?server.transcript, frame);
+        failure                         = transcript.update_frame(?server.transcript, frame);
         if (failure != error.OK) { ret failure; }
         server.state = EXPECT_CLIENT_FINISHED;
         ret error.CERTIFICATE_REQUIRED;
@@ -2098,7 +2145,7 @@ fun handle_client_certificate(server: *Server, frame: contracts.Bytes,
     if (certificate_message.count > server.storage.certificate_capacity ||
         certificate_message.count > verify.MAX_CHAIN_DEPTH ||
         certificate_message.entries.len >
-            server.config.limits.max_chain_bytes) { ret error.BAD_CERTIFICATE; }
+        server.config.limits.max_chain_bytes) { ret error.BAD_CERTIFICATE; }
     var iterator: codec.CertificateIterator = codec.certificate_iterator(
         ?certificate_message);
     var entry: codec.CertificateEntry;
@@ -2111,26 +2158,27 @@ fun handle_client_certificate(server: *Server, frame: contracts.Bytes,
         if (status != extensions.NEXT_ITEM ||
             count >= server.storage.certificate_capacity ||
             entry.certificate.len >
-                server.config.limits.max_chain_bytes - total) {
+            server.config.limits.max_chain_bytes - total) {
             ret error.BAD_CERTIFICATE;
         }
-        server.storage.certificates[count].der = entry.certificate.data;
+        server.storage.certificates[count].der     = entry.certificate.data;
         server.storage.certificates[count].der_len = entry.certificate.len;
-        total = total + entry.certificate.len;
-        count = count + 1;
+        total                                      = total + entry.certificate.len;
+        count                                      = count + 1;
     }
     if (count != certificate_message.count || count == 0) {
         ret error.BAD_CERTIFICATE;
     }
     val chain: cert.Chain = cert.Chain{
-        certificates: server.storage.certificates, len: count};
+        certificates: server.storage.certificates, len: count
+    };
     var options: verify.Options;
-    options.identity = contracts.Bytes{data: nil, len: 0};
-    options.purpose = verify.CLIENT_AUTH;
-    options.now = server.verification_time;
-    options.max_depth = verify.MAX_CHAIN_DEPTH;
+    options.identity             = contracts.Bytes{data: nil, len: 0};
+    options.purpose              = verify.CLIENT_AUTH;
+    options.now                  = server.verification_time;
+    options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
-    failure = verify.chain(server.client_trust, ?chain, ?options);
+    failure                      = verify.chain(server.client_trust, ?chain, ?options);
     if (failure != error.OK) { ret failure; }
     if (x509.parse(contracts.Bytes{data: server.storage.certificates[0].der,
         len: server.storage.certificates[0].der_len},
@@ -2158,7 +2206,7 @@ fun verify_peer_signature(server: *Server,
     if (!configured_signature(server, value.scheme)) {
         ret error.ILLEGAL_PARAMETER;
     }
-    var signed: [MAX_SIGNED_CONTEXT]u8;
+    var signed:  [MAX_SIGNED_CONTEXT]u8;
     var failure: error.Error = certificate_verify_input(server, false,
         ?signed[0]);
     if (failure != error.OK) { ret failure; }
@@ -2167,15 +2215,18 @@ fun verify_peer_signature(server: *Server,
     val status: contracts.Error = signature_scheme.verify(value.scheme,
         ?server.peer_leaf.public_key, message, value.signature);
     var i: usize = 0;
-    for (i < MAX_SIGNED_CONTEXT) { signed[i] = 0; i = i + 1; }
+    for (i < MAX_SIGNED_CONTEXT) {
+        signed[i] = 0;
+        i         = i + 1;
+    }
     if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
-    if (status != contracts.OK) { ret error.DECRYPT_ERROR; }
+    if (status != contracts.OK)          { ret error.DECRYPT_ERROR; }
     ret error.OK;
 }
 
 fun handle_client_certificate_verify(server: *Server, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
-    var value: codec.CertificateVerify;
+    var value:   codec.CertificateVerify;
     var failure: error.Error = codec.decode_certificate_verify(message, ?value);
     if (failure == error.OK) { failure = verify_peer_signature(server, ?value); }
     if (failure == error.OK) {
@@ -2183,17 +2234,17 @@ fun handle_client_certificate_verify(server: *Server, frame: contracts.Bytes,
     }
     if (failure == error.OK) {
         server.authenticated = true;
-        server.state = EXPECT_CLIENT_FINISHED;
+        server.state         = EXPECT_CLIENT_FINISHED;
     }
     ret failure;
 }
 
 fun handle_client_finished(server: *Server, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
-    val size: usize = key_schedule.hash_size(server.schedule.algorithm);
-    var value: codec.Finished;
+    val size:    usize       = key_schedule.hash_size(server.schedule.algorithm);
+    var value:   codec.Finished;
     var failure: error.Error = codec.decode_finished(message, size, ?value);
-    var hash: [48]u8;
+    var hash:    [48]u8;
     if (failure == error.OK) {
         failure = transcript.snapshot(?server.transcript,
             contracts.Buffer{data: ?hash[0], capacity: 48});
@@ -2215,20 +2266,23 @@ fun handle_client_finished(server: *Server, frame: contracts.Bytes,
             contracts.Bytes{data: ?hash[0], len: size});
     }
     var i: usize = 0;
-    for (i < 48) { hash[i] = 0; i = i + 1; }
+    for (i < 48) {
+        hash[i] = 0;
+        i       = i + 1;
+    }
     if (failure != error.OK) { ret failure; }
     if (!queue_secret(server, engine.APPLICATION, engine.RECEIVE,
-            RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
+        RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
     if (server.client_auth_required) {
         var disposition: u8 = engine.AUTHENTICATION_FAILED;
         if (server.authenticated) { disposition = engine.AUTHENTICATED; }
         if (!queue_simple(server, engine.AUTHENTICATION, engine.APPLICATION,
-                disposition)) { ret error.INTERNAL_ERROR; }
+            disposition)) { ret error.INTERNAL_ERROR; }
     }
     val issued: error.Error = issue_tickets(server);
     if (issued != error.OK) { ret issued; }
     if (!queue_simple(server, engine.HANDSHAKE_COMPLETE, engine.APPLICATION,
-            0)) { ret error.INTERNAL_ERROR; }
+        0)) { ret error.INTERNAL_ERROR; }
     server.state = ESTABLISHED;
     ret error.OK;
 }
@@ -2239,17 +2293,17 @@ fun ticket_state_for(server: *Server, nonce: contracts.Bytes,
     @output = session.empty_state();
     if (key_schedule.resumption_psk(?server.schedule, nonce,
         contracts.SecretBuffer{data: ?output.secret[0],
-            capacity: session.MAX_SECRET}) != error.OK) {
+        capacity: session.MAX_SECRET}) != error.OK) {
         session.state_destroy(output);
         ret false;
     }
-    output.version = tls13.VERSION;
-    output.suite = server.suite;
-    output.secret_len = size;
-    output.issued_at = server.verification_time;
-    output.lifetime_seconds = server.config.tickets.ticket_lifetime_seconds;
-    output.max_early_data = 0;
-    output.client_authenticated = server.authenticated;
+    output.version               = tls13.VERSION;
+    output.suite                 = server.suite;
+    output.secret_len            = size;
+    output.issued_at             = server.verification_time;
+    output.lifetime_seconds      = server.config.tickets.ticket_lifetime_seconds;
+    output.max_early_data        = 0;
+    output.client_authenticated  = server.authenticated;
     output.credential_generation =
         session.keyring_generation(server.config.tickets);
     if (server.selected_alpn.len != 0 &&
@@ -2283,8 +2337,8 @@ fun issue_tickets(server: *Server) error.Error {
         }
         var state: session.State;
         if (!ticket_state_for(server,
-                contracts.Bytes{data: ?nonce[0], len: session.NONCE_SIZE},
-                ?state)) { ret error.INTERNAL_ERROR; }
+            contracts.Bytes{data: ?nonce[0], len: session.NONCE_SIZE},
+            ?state)) { ret error.INTERNAL_ERROR; }
         var age_add: [4]u8;
         if (!fill_public(server, ?age_add[0], 4)) {
             session.state_destroy(?state);
@@ -2296,30 +2350,30 @@ fun issue_tickets(server: *Server) error.Error {
         val length: usize = session.seal(server.config.tickets, ?state,
             server.verification_time, ?server.entropy,
             contracts.Buffer{data: ?sealed[0],
-                capacity: session.MAX_TICKET_BYTES});
+            capacity: session.MAX_TICKET_BYTES});
         if (length == 0) {
             session.state_destroy(?state);
             ret error.INTERNAL_ERROR;
         }
         var message: codec.NewSessionTicket;
         message.lifetime = state.lifetime_seconds;
-        message.age_add = state.age_add;
-        message.nonce = contracts.Bytes{data: ?nonce[0],
+        message.age_add  = state.age_add;
+        message.nonce    = contracts.Bytes{data: ?nonce[0],
             len: session.NONCE_SIZE};
-        message.ticket = contracts.Bytes{data: ?sealed[0], len: length};
+        message.ticket     = contracts.Bytes{data: ?sealed[0], len: length};
         message.extensions = extensions.list(nil, 0,
             extensions.NEW_SESSION_TICKET);
         val encoded: handshake.Progress = codec.encode_new_session_ticket(
             ?message,
             contracts.Buffer{data: ?server.storage.output[server.output_used],
-                capacity: server.storage.output_capacity - server.output_used});
+            capacity: server.storage.output_capacity - server.output_used});
         session.state_destroy(?state);
         if (encoded.status != handshake.COMPLETE) { ret error.RESOURCE_LIMIT; }
         if (!queue_crypto(server, engine.APPLICATION, server.output_used,
-                encoded.produced)) { ret error.INTERNAL_ERROR; }
-        server.output_used = server.output_used + encoded.produced;
+            encoded.produced)) { ret error.INTERNAL_ERROR; }
+        server.output_used    = server.output_used + encoded.produced;
         server.tickets_issued = server.tickets_issued + 1;
-        issued = issued + 1;
+        issued                = issued + 1;
     }
     ret error.OK;
 }
@@ -2333,7 +2387,7 @@ fun request_key_update_inner(server: *Server, request: u8) engine.Result {
     val encoded: handshake.Progress = codec.encode_key_update(
         codec.KeyUpdate{request: request},
         contracts.Buffer{data: ?server.storage.output[server.output_used],
-            capacity: server.storage.output_capacity - server.output_used});
+        capacity: server.storage.output_capacity - server.output_used});
     if (encoded.status != handshake.COMPLETE) {
         ret result(engine.FAILED, error.RESOURCE_LIMIT, 0, 0);
     }
@@ -2343,9 +2397,9 @@ fun request_key_update_inner(server: *Server, request: u8) engine.Result {
         ret fail(server, failure, engine.alert_for(failure));
     }
     if (!queue_crypto(server, engine.APPLICATION, server.output_used,
-            encoded.produced) ||
+        encoded.produced) ||
         !queue_secret(server, engine.APPLICATION, engine.SEND,
-            SEND_APPLICATION)) {
+        SEND_APPLICATION)) {
         ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
     }
     server.output_used = server.output_used + encoded.produced;
@@ -2368,14 +2422,14 @@ fun handle_post_handshake(server: *Server,
         if (server.peer_extension == QUIC_TRANSPORT_PARAMETERS) {
             ret error.UNEXPECTED_MESSAGE;
         }
-        var update: codec.KeyUpdate;
+        var update:  codec.KeyUpdate;
         var failure: error.Error = codec.decode_key_update(message, ?update);
         if (failure != error.OK) { ret failure; }
         failure = key_schedule.update_traffic(?server.schedule,
             ?server.schedule.client_application_traffic);
         if (failure != error.OK) { ret failure; }
         if (!queue_secret(server, engine.APPLICATION, engine.RECEIVE,
-                RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
+            RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
         if (update.request == codec.UPDATE_REQUESTED) {
             if (server.output_used != 0 && server.queue_len == server.queue_head) {
                 server.output_used = 0;
@@ -2383,7 +2437,7 @@ fun handle_post_handshake(server: *Server,
             val encoded: handshake.Progress = codec.encode_key_update(
                 codec.KeyUpdate{request: codec.UPDATE_NOT_REQUESTED},
                 contracts.Buffer{data: ?server.storage.output[server.output_used],
-                    capacity: server.storage.output_capacity - server.output_used});
+                capacity: server.storage.output_capacity - server.output_used});
             if (encoded.status != handshake.COMPLETE) {
                 ret error.RESOURCE_LIMIT;
             }
@@ -2391,9 +2445,9 @@ fun handle_post_handshake(server: *Server,
                 ?server.schedule.server_application_traffic);
             if (failure != error.OK) { ret failure; }
             if (!queue_crypto(server, engine.APPLICATION, server.output_used,
-                    encoded.produced) ||
+                encoded.produced) ||
                 !queue_secret(server, engine.APPLICATION, engine.SEND,
-                    SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
+                SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
             server.output_used = server.output_used + encoded.produced;
         }
         ret error.OK;
@@ -2441,11 +2495,11 @@ fun drive(server: *Server) engine.Result {
         }
         if (server.input_read == server.input_len) {
             server.input_read = 0;
-            server.input_len = 0;
+            server.input_len  = 0;
             ret result(engine.MORE, error.OK, 0, handshake.HEADER_SIZE);
         }
         var message: handshake.Message;
-        val parsed: handshake.Progress = handshake.parse(
+        val parsed:  handshake.Progress = handshake.parse(
             ?server.storage.input[server.input_read],
             server.input_len - server.input_read,
             server.config.limits.max_peer_handshake_bytes - handshake.HEADER_SIZE,
@@ -2457,7 +2511,8 @@ fun drive(server: *Server) engine.Result {
             ret fail(server, parsed.error, engine.alert_for(parsed.error));
         }
         val frame: contracts.Bytes = contracts.Bytes{
-            data: ?server.storage.input[server.input_read], len: parsed.consumed};
+            data: ?server.storage.input[server.input_read], len: parsed.consumed
+        };
         val failure: error.Error = process_frame(server, frame, ?message);
         if (failure != error.OK) {
             ret fail(server, failure, engine.alert_for(failure));
@@ -2472,17 +2527,17 @@ fun compact_input(server: *Server) {
     if (server.input_read == 0) { ret; }
     if (server.input_read == server.input_len) {
         server.input_read = 0;
-        server.input_len = 0;
+        server.input_len  = 0;
         ret;
     }
     val remaining: usize = server.input_len - server.input_read;
-    var i: usize = 0;
+    var i:         usize = 0;
     for (i < remaining) {
         server.storage.input[i] = server.storage.input[server.input_read + i];
-        i = i + 1;
+        i                       = i + 1;
     }
     server.input_read = 0;
-    server.input_len = remaining;
+    server.input_len  = remaining;
 }
 
 fun expected_level(server: *Server) engine.Level {
@@ -2500,7 +2555,7 @@ fun ingest_inner(server: *Server, level: engine.Level, data: *u8,
         server_owner_overlaps(server, data, length) ||
         storage_overlaps(?server.storage, data, length) ||
         borrowed_overlaps(server.config, server.extra, data, length,
-            true, true)) {
+        true, true)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     if (pending(server) || server.event_active) {
@@ -2579,22 +2634,22 @@ fun next_event_inner(server: *Server, output: *engine.Event) bool {
     if (!server_owner_valid(server) || output == nil ||
         !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
         server_owner_overlaps(server, (?output.token)::*u8,
-            $size_of(engine.Event)) ||
+        $size_of(engine.Event)) ||
         storage_overlaps(?server.storage, (?output.token)::*u8,
-            $size_of(engine.Event)) ||
+        $size_of(engine.Event)) ||
         borrowed_overlaps(server.config, server.extra, (?output.token)::*u8,
-            $size_of(engine.Event), true, true) || server.event_active ||
+        $size_of(engine.Event), true, true) || server.event_active ||
         server.state == DESTROYED || !pending(server)) { ret false; }
-    val item: Pending = server.queue[server.queue_head];
+    val item:  Pending      = server.queue[server.queue_head];
     var event: engine.Event = engine.empty_event();
-    event.token = engine.next_generation(server.event_generation);
-    event.kind = item.kind;
-    event.level = item.level;
-    event.direction = item.direction;
-    event.suite = server.suite;
-    event.aead = aead_for(server.suite);
+    event.token       = engine.next_generation(server.event_generation);
+    event.kind        = item.kind;
+    event.level       = item.level;
+    event.direction   = item.direction;
+    event.suite       = server.suite;
+    event.aead        = aead_for(server.suite);
     event.disposition = item.disposition;
-    event.alert = item.alert;
+    event.alert       = item.alert;
     if (item.kind == engine.CRYPTO) {
         if (item.offset > server.storage.output_capacity ||
             item.length > server.storage.output_capacity - item.offset) {
@@ -2602,20 +2657,22 @@ fun next_event_inner(server: *Server, output: *engine.Event) bool {
         }
         event.data = contracts.Bytes{data: ?server.storage.output[item.offset],
             len: item.length};
-    } or (item.kind == engine.TRAFFIC_SECRET) {
+    }
+    or (item.kind == engine.TRAFFIC_SECRET) {
         val traffic: *key_schedule.Secret = secret_for(server, item.secret_index);
         if (traffic == nil) { ret false; }
-        event.secret = key_schedule.bytes(traffic);
+        event.secret     = key_schedule.bytes(traffic);
         event.generation = engine.next_generation(
             server.secret_generation[item.secret_index]);
         server.secret_generation[item.secret_index] = event.generation;
-    } or (item.kind == engine.PEER_PARAMETERS) {
+    }
+    or (item.kind == engine.PEER_PARAMETERS) {
         event.data = server.peer_parameters;
     }
-    output[0] = event;
+    output[0]               = event;
     server.event_generation = event.token;
-    server.active_event = event;
-    server.event_active = true;
+    server.active_event     = event;
+    server.event_active     = true;
     ret true;
 }
 
@@ -2709,8 +2766,8 @@ fun close_inner(server: *Server,
         i = i + 1;
     }
     if (!queue_push(server, Pending{kind: engine.ALERT, level: 0, direction: 0,
-            secret_index: NO_SECRET, offset: 0, length: 0, disposition: 0,
-            alert: description})) {
+        secret_index: NO_SECRET, offset: 0, length: 0, disposition: 0,
+        alert:        description})) {
         ret result(engine.FAILED, error.RESOURCE_LIMIT, 0, 0);
     }
     server.pending_alert = description;
@@ -2739,28 +2796,28 @@ fun destroy_inner(server: *Server) bool {
     server.config = nil;
     # cleared by declaration, which covers every field rather than the subset
     # a manual list happens to name (briar-systems/mach#3108)
-    server.configuration = config.no_server_config();
-    server.entropy = config.no_entropy();
-    server.storage.input = nil;
-    server.storage.output = nil;
-    server.storage.hello = nil;
-    server.storage.certificates = nil;
+    server.configuration           = config.no_server_config();
+    server.entropy                 = config.no_entropy();
+    server.storage.input           = nil;
+    server.storage.output          = nil;
+    server.storage.hello           = nil;
+    server.storage.certificates    = nil;
     server.storage.peer_parameters = nil;
-    server.extra.data.data = nil;
-    server.peer_parameters.data = nil;
-    server.selected_alpn.data = nil;
-    server.server_name.data = nil;
-    server.client_trust = nil;
+    server.extra.data.data         = nil;
+    server.peer_parameters.data    = nil;
+    server.selected_alpn.data      = nil;
+    server.server_name.data        = nil;
+    server.client_trust            = nil;
     queue_clear(server);
     server.output_used = 0;
     # every per-handshake field goes with the handshake, so an engine
     # initialised on this record again starts from the declared zero state;
     # only the transition owner survives, since this thread still holds it
-    val owner: i64 = server.transition_owner;
+    val owner:   i64 = server.transition_owner;
     var cleared: Server;
-    @server = cleared;
+    @server                 = cleared;
     server.transition_owner = owner;
-    server.state = DESTROYED;
+    server.state            = DESTROYED;
     ret true;
 }
 
@@ -2774,27 +2831,27 @@ pub fun destroy(server: *Server) bool {
 fun snapshot_inner(server: *Server) engine.Snapshot {
     var value: engine.Snapshot = engine.empty_snapshot();
     if (!server_owner_valid(server)) { ret value; }
-    value.role = engine.SERVER;
-    value.version = tls13.VERSION;
-    value.error = server.failure;
-    value.suite = server.suite;
-    value.group = server.group;
-    value.retry_count = server.retry_count;
-    value.authenticated = server.authenticated;
-    value.selected_alpn = server.selected_alpn;
-    value.peer_offered_alpn = server.peer_offered_alpn;
-    value.peer_parameters = server.peer_parameters;
-    value.peer_name = server.server_name;
+    value.role                  = engine.SERVER;
+    value.version               = tls13.VERSION;
+    value.error                 = server.failure;
+    value.suite                 = server.suite;
+    value.group                 = server.group;
+    value.retry_count           = server.retry_count;
+    value.authenticated         = server.authenticated;
+    value.selected_alpn         = server.selected_alpn;
+    value.peer_offered_alpn     = server.peer_offered_alpn;
+    value.peer_parameters       = server.peer_parameters;
+    value.peer_name             = server.server_name;
     value.client_auth_requested = server.client_auth_required;
-    value.resumed = server.resumed;
-    value.tickets_issued = server.tickets_issued;
-    value.output_pending = pending(server);
-    value.event_active = server.event_active;
-    value.destroyed = server.state == DESTROYED;
+    value.resumed               = server.resumed;
+    value.tickets_issued        = server.tickets_issued;
+    value.output_pending        = pending(server);
+    value.event_active          = server.event_active;
+    value.destroyed             = server.state == DESTROYED;
     if (server.state == ESTABLISHED) { value.status = engine.COMPLETE; }
-    or (server.state == TERMINAL) { value.status = engine.FAILED; }
-    or (server.state == DESTROYED) { value.status = engine.CLOSED; }
-    or { value.status = engine.MORE; }
+    or (server.state == TERMINAL)    { value.status = engine.FAILED; }
+    or (server.state == DESTROYED)   { value.status = engine.CLOSED; }
+    or                               { value.status = engine.MORE; }
     ret value;
 }
 
@@ -2832,9 +2889,9 @@ fun no_extra_extension() ExtraExtension {
 }
 
 test "server: configuration rejects unbounded and missing ownership" {
-    var server: Server;
+    var server:        Server;
     var configuration: config.ServerConfig;
-    var storage: Storage;
+    var storage:       Storage;
     if (init(?server, ?configuration, storage, no_extra_extension(), 0)) { ret 1; }
     if (snapshot(?server).status != engine.MORE ||
         snapshot(?server).role != engine.SERVER) { ret 2; }
@@ -2846,30 +2903,30 @@ test "server: configuration rejects unbounded and missing ownership" {
 test "server: certificate request carries the maximum signature policy" {
     var signatures: [config.MAX_SIGNATURE_SCHEMES]tls13.SignatureScheme =
         [config.MAX_SIGNATURE_SCHEMES]tls13.SignatureScheme{
-            tls13.ED25519,
-            tls13.ECDSA_SECP256R1_SHA256,
-            tls13.ECDSA_SECP384R1_SHA384,
-            tls13.RSA_PSS_RSAE_SHA256,
-            tls13.RSA_PSS_RSAE_SHA384,
-        };
+        tls13.ED25519,
+        tls13.ECDSA_SECP256R1_SHA256,
+        tls13.ECDSA_SECP384R1_SHA384,
+        tls13.RSA_PSS_RSAE_SHA256,
+        tls13.RSA_PSS_RSAE_SHA384,
+    };
     var configuration: config.ServerConfig;
-    configuration.signatures = ?signatures[0];
+    configuration.signatures    = ?signatures[0];
     configuration.signature_len = config.MAX_SIGNATURE_SCHEMES;
-    var wire: [64]u8;
+    var wire:   [64]u8;
     var server: Server;
-    server.config = ?configuration;
-    server.client_auth_required = true;
-    server.storage.output = ?wire[0];
+    server.config                  = ?configuration;
+    server.client_auth_required    = true;
+    server.storage.output          = ?wire[0];
     server.storage.output_capacity = 64;
     var bounded: [MAX_SIGNATURE_ALGORITHM_BYTES + 2]u8;
-    bounded[0] = 0xa5;
+    bounded[0]                                 = 0xa5;
     bounded[MAX_SIGNATURE_ALGORITHM_BYTES + 1] = 0x5a;
     if (encode_signature_algorithms(?server, ?bounded[1],
-            MAX_SIGNATURE_ALGORITHM_BYTES - 1) != 0 ||
+        MAX_SIGNATURE_ALGORITHM_BYTES - 1) != 0 ||
         bounded[0] != 0xa5 ||
         bounded[MAX_SIGNATURE_ALGORITHM_BYTES + 1] != 0x5a ||
         encode_signature_algorithms(?server, ?bounded[1],
-            MAX_SIGNATURE_ALGORITHM_BYTES) != MAX_SIGNATURE_ALGORITHM_BYTES ||
+        MAX_SIGNATURE_ALGORITHM_BYTES) != MAX_SIGNATURE_ALGORITHM_BYTES ||
         bounded[0] != 0xa5 ||
         bounded[MAX_SIGNATURE_ALGORITHM_BYTES + 1] != 0x5a) { ret 1; }
     val written: usize = append_certificate_request(?server, 0);
@@ -2883,7 +2940,7 @@ test "server: certificate request carries the maximum signature policy" {
     }
     var offered: extensions.Extension;
     if (!extensions.find(request.extensions, extensions.SIGNATURE_ALGORITHMS,
-            ?offered) || offered.len != 12 ||
+        ?offered) || offered.len != 12 ||
         read_u16(offered.data, 0) != 10) { ret 5; }
     var i: usize = 0;
     for (i < config.MAX_SIGNATURE_SCHEMES) {
@@ -2893,20 +2950,26 @@ test "server: certificate request carries the maximum signature policy" {
     ret 0;
 }
 
-var loopback_server_input: [8192]u8;
-var loopback_server_output: [8192]u8;
-var loopback_server_hello: [8192]u8;
+var loopback_server_input:        [8192]u8;
+var loopback_server_output:       [8192]u8;
+var loopback_server_hello:        [8192]u8;
 var loopback_server_certificates: [4]cert.Certificate;
-var loopback_client_input: [8192]u8;
-var loopback_client_output: [8192]u8;
-var loopback_client_hello: [8192]u8;
+var loopback_client_input:        [8192]u8;
+var loopback_client_output:       [8192]u8;
+var loopback_client_hello:        [8192]u8;
 var loopback_client_certificates: [4]cert.Certificate;
-var loopback_root: [341]u8;
-var loopback_leaf: [393]u8;
+var loopback_root:                [341]u8;
+var loopback_leaf:                [393]u8;
 
 fun hex_nibble(value: u8, output: *u8) bool {
-    if (value >= '0' && value <= '9') { output[0] = value - '0'; ret true; }
-    if (value >= 'a' && value <= 'f') { output[0] = value - 'a' + 10; ret true; }
+    if (value >= '0' && value <= '9') {
+        output[0] = value - '0';
+        ret true;
+    }
+    if (value >= 'a' && value <= 'f') {
+        output[0] = value - 'a' + 10;
+        ret true;
+    }
     ret false;
 }
 
@@ -2916,11 +2979,11 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
     var i: usize = 0;
     for (i < length / 2) {
         var high: u8;
-        var low: u8;
+        var low:  u8;
         if (!hex_nibble(input[i * 2], ?high) ||
             !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
         output[i] = (high << 4) | low;
-        i = i + 1;
+        i         = i + 1;
     }
     ret true;
 }
@@ -2928,11 +2991,11 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
 #[oblivious]
 fun test_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
-    val counter: *u8 = context::*u8;
-    var i: usize = 0;
+    val counter: *u8   = context::*u8;
+    var i:       usize = 0;
     for (i < length) {
         destination[i] = counter[0] + i::u8 + 1;
-        i = i + 1;
+        i              = i + 1;
     }
     counter[0] = counter[0] + 23;
     ret 0;
@@ -2959,9 +3022,9 @@ fun load_test_credentials(identity: *credentials.Identity,
         owner, key);
     ct.zeroize(?key_der[0], 48);
     if (loaded != contracts.OK) { ret false; }
-    chain_storage[0] = cert.Certificate{der: ?loopback_leaf[0], der_len: 393};
+    chain_storage[0]     = cert.Certificate{der: ?loopback_leaf[0], der_len: 393};
     identity.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
-    identity.chain = cert.Chain{certificates: chain_storage, len: 1};
+    identity.chain       = cert.Chain{certificates: chain_storage, len: 1};
     identity.private_key = key;
     ret true;
 }
@@ -2971,7 +3034,7 @@ fun exchange(local: *Server, peer: *client.Client) i64 {
     var rounds: usize = 0;
     for (rounds < 64) {
         var progressed: bool = false;
-        var event: engine.Event;
+        var event:      engine.Event;
         for (next_event(local, ?event)) {
             progressed = true;
             if (event.kind == engine.CRYPTO) {
@@ -3007,31 +3070,31 @@ fun exchange(local: *Server, peer: *client.Client) i64 {
 
 var quic_server_parameters: [64]u8;
 var quic_client_parameters: [64]u8;
-var quic_event_kinds: [64]u8;
-var quic_event_count: usize = 0;
-var quic_seen_parameters: [8]u8;
-var quic_seen_len: usize = 0;
+var quic_event_kinds:       [64]u8;
+var quic_event_count:       usize = 0;
+var quic_seen_parameters:   [8]u8;
+var quic_seen_len:          usize = 0;
 
 # the same loopback as `exchange`, recording the listener's event sequence and
 # the bytes carried by PEER_PARAMETERS while they are still borrowed
 fun exchange_recording(local: *Server, peer: *client.Client) i64 {
     var rounds: usize = 0;
     quic_event_count = 0;
-    quic_seen_len = 0;
+    quic_seen_len    = 0;
     for (rounds < 64) {
         var progressed: bool = false;
-        var event: engine.Event;
+        var event:      engine.Event;
         for (next_event(local, ?event)) {
             progressed = true;
             if (quic_event_count < 64) {
                 quic_event_kinds[quic_event_count] = event.kind;
-                quic_event_count = quic_event_count + 1;
+                quic_event_count                   = quic_event_count + 1;
             }
             if (event.kind == engine.PEER_PARAMETERS) {
                 var i: usize = 0;
                 for (i < event.data.len && i < 8) {
                     quic_seen_parameters[i] = event.data.data[i];
-                    i = i + 1;
+                    i                       = i + 1;
                 }
                 quic_seen_len = event.data.len;
             }
@@ -3060,7 +3123,7 @@ fun exchange_recording(local: *Server, peer: *client.Client) i64 {
             for (next_event(local, ?tail)) {
                 if (quic_event_count < 64) {
                     quic_event_kinds[quic_event_count] = tail.kind;
-                    quic_event_count = quic_event_count + 1;
+                    quic_event_count                   = quic_event_count + 1;
                 }
                 if (!complete_event(local, tail.token, true)) { ret 106; }
             }
@@ -3079,68 +3142,73 @@ fun exchange_recording(local: *Server, peer: *client.Client) i64 {
 }
 
 test "server: a complete tls 1.3 handshake authenticates the mach client" {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = secret.system_allocator();
     var chain_storage: [1]cert.Certificate;
-    var key: keys.PrivateKey;
-    var identity: credentials.Identity;
+    var key:           keys.PrivateKey;
+    var identity:      credentials.Identity;
     if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
         ret 1;
     }
     var generation: credentials.Generation = credentials.empty_generation();
     if (credentials.initialize(?generation, ?identity, 1, 0, nil,
-            false) != contracts.OK) { ret 2; }
+        false) != contracts.OK) { ret 2; }
     var store: credentials.Store = credentials.empty_store();
     if (credentials.initialize_store(?store, ?generation) != contracts.OK) {
         ret 3;
     }
 
-    var server_counter: u8 = 3;
+    var server_counter: u8             = 3;
     var server_entropy: secret.Entropy = secret.Entropy{
-        context: ?server_counter, secret_context: nil, fill_fn: test_entropy,
-        initialized: true};
+        context:     ?server_counter, secret_context: nil, fill_fn: test_entropy,
+        initialized: true
+    };
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
-        config.ProtocolName{data: "h2"::*u8, len: 2}};
-    var versions: [1]u16 = [1]u16{tls13.VERSION};
-    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
-        tls13.AES_128_GCM_SHA256};
-    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+        config.ProtocolName{data: "h2"::*u8, len: 2}
+    };
+    var versions: [1]u16               = [1]u16{tls13.VERSION};
+    var suites:   [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256
+    };
+    var groups:     [1]tls13.NamedGroup      = [1]tls13.NamedGroup{tls13.X25519};
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
-        tls13.ED25519};
+        tls13.ED25519
+    };
     var listener: config.ServerConfig;
-    listener.credentials = ?store;
-    listener.alpn = ?protocols[0];
-    listener.alpn_len = 1;
-    listener.require_alpn = true;
-    listener.versions = ?versions[0];
-    listener.version_len = 1;
-    listener.suites = ?suites[0];
-    listener.suite_len = 1;
-    listener.groups = ?groups[0];
-    listener.group_len = 1;
-    listener.signatures = ?signatures[0];
-    listener.signature_len = 1;
-    listener.entropy = ?server_entropy;
-    listener.entropy_context_size = 1;
-    listener.limits = config.production_limits();
+    listener.credentials                     = ?store;
+    listener.alpn                            = ?protocols[0];
+    listener.alpn_len                        = 1;
+    listener.require_alpn                    = true;
+    listener.versions                        = ?versions[0];
+    listener.version_len                     = 1;
+    listener.suites                          = ?suites[0];
+    listener.suite_len                       = 1;
+    listener.groups                          = ?groups[0];
+    listener.group_len                       = 1;
+    listener.signatures                      = ?signatures[0];
+    listener.signature_len                   = 1;
+    listener.entropy                         = ?server_entropy;
+    listener.entropy_context_size            = 1;
+    listener.limits                          = config.production_limits();
     listener.limits.max_peer_handshake_bytes = 8192;
-    listener.limits.max_client_hello_bytes = 8192;
-    listener.limits.max_chain_bytes = 4096;
-    listener.limits.max_server_flight_bytes = 8192;
+    listener.limits.max_client_hello_bytes   = 8192;
+    listener.limits.max_chain_bytes          = 4096;
+    listener.limits.max_server_flight_bytes  = 8192;
 
     var server_storage: Storage = Storage{
-        input: ?loopback_server_input[0], input_capacity: 8192,
-        output: ?loopback_server_output[0], output_capacity: 8192,
-        hello: ?loopback_server_hello[0], hello_capacity: 8192,
-        certificates: ?loopback_server_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?loopback_server_input[0], input_capacity: 8192,
+        output:          ?loopback_server_output[0], output_capacity: 8192,
+        hello:           ?loopback_server_hello[0], hello_capacity: 8192,
+        certificates:    ?loopback_server_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var extra: ExtraExtension;
-    extra.kind = 0;
+    extra.kind      = 0;
     extra.data.data = nil;
-    extra.data.len = 0;
-    var hello_required: usize = 0;
+    extra.data.len  = 0;
+    var hello_required:  usize = 0;
     var flight_required: usize = 0;
     if (!storage_requirements(?listener, extra, ?hello_required,
-            ?flight_required) || hello_required == 0 || flight_required == 0) {
+        ?flight_required) || hello_required == 0 || flight_required == 0) {
         ret 4;
     }
     var listener_engine: Server;
@@ -3149,39 +3217,41 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
 
     var anchor: cert.Certificate = cert.Certificate{der: ?loopback_root[0],
         der_len: 341};
-    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
-    var client_counter: u8 = 91;
-    var client_entropy: secret.Entropy = secret.Entropy{
-        context: ?client_counter, secret_context: nil, fill_fn: test_entropy,
-        initialized: true};
+    var trust:          cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var client_counter: u8              = 91;
+    var client_entropy: secret.Entropy  = secret.Entropy{
+        context:     ?client_counter, secret_context: nil, fill_fn: test_entropy,
+        initialized: true
+    };
     var dialer: config.ClientConfig;
-    dialer.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
-    dialer.alpn = ?protocols[0];
-    dialer.alpn_len = 1;
-    dialer.trust = ?trust;
-    dialer.versions = ?versions[0];
-    dialer.version_len = 1;
-    dialer.suites = ?suites[0];
-    dialer.suite_len = 1;
-    dialer.groups = ?groups[0];
-    dialer.group_len = 1;
-    dialer.signatures = ?signatures[0];
-    dialer.signature_len = 1;
-    dialer.client_identity = nil;
-    dialer.entropy = ?client_entropy;
-    dialer.entropy_context_size = 1;
-    dialer.limits = config.production_limits();
+    dialer.server_name                     = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+    dialer.alpn                            = ?protocols[0];
+    dialer.alpn_len                        = 1;
+    dialer.trust                           = ?trust;
+    dialer.versions                        = ?versions[0];
+    dialer.version_len                     = 1;
+    dialer.suites                          = ?suites[0];
+    dialer.suite_len                       = 1;
+    dialer.groups                          = ?groups[0];
+    dialer.group_len                       = 1;
+    dialer.signatures                      = ?signatures[0];
+    dialer.signature_len                   = 1;
+    dialer.client_identity                 = nil;
+    dialer.entropy                         = ?client_entropy;
+    dialer.entropy_context_size            = 1;
+    dialer.limits                          = config.production_limits();
     dialer.limits.max_peer_handshake_bytes = 8192;
     var client_storage: client.Storage = client.Storage{
-        input: ?loopback_client_input[0], input_capacity: 8192,
-        output: ?loopback_client_output[0], output_capacity: 8192,
-        hello: ?loopback_client_hello[0], hello_capacity: 8192,
-        certificates: ?loopback_client_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?loopback_client_input[0], input_capacity: 8192,
+        output:          ?loopback_client_output[0], output_capacity: 8192,
+        hello:           ?loopback_client_hello[0], hello_capacity: 8192,
+        certificates:    ?loopback_client_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var client_extra: client.ExtraExtension;
-    client_extra.kind = 0;
+    client_extra.kind      = 0;
     client_extra.data.data = nil;
-    client_extra.data.len = 0;
+    client_extra.data.len  = 0;
     var dialer_engine: client.Client;
     if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra, 0) ||
         client.start(?dialer_engine, 1800000000).status != engine.OK) { ret 6; }
@@ -3197,8 +3267,8 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     if (server_view.suite != tls13.AES_128_GCM_SHA256 ||
         client_view.suite != tls13.AES_128_GCM_SHA256) { ret 9; }
     if (server_view.group != tls13.X25519) { ret 30; }
-    if (server_view.retry_count != 0) { ret 31; }
-    if (server_view.peer_name.len != 15) { ret 32; }
+    if (server_view.retry_count != 0)      { ret 31; }
+    if (server_view.peer_name.len != 15)   { ret 32; }
     if (server_view.selected_alpn.len != 2 ||
         server_view.selected_alpn.data[0] != 'h' ||
         server_view.selected_alpn.data[1] != '2') { ret 33; }
@@ -3207,8 +3277,8 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     # both sides derived the same application traffic secrets
     var server_secret: [48]u8;
     var client_secret: [48]u8;
-    val size: usize = key_schedule.hash_size(listener_engine.schedule.algorithm);
-    val server_bytes: contracts.SecretBytes = key_schedule.bytes(
+    val size:          usize                 = key_schedule.hash_size(listener_engine.schedule.algorithm);
+    val server_bytes:  contracts.SecretBytes = key_schedule.bytes(
         ?listener_engine.schedule.server_application_traffic);
     val client_bytes: contracts.SecretBytes = key_schedule.bytes(
         ?dialer_engine.schedule.server_application_traffic);
@@ -3228,9 +3298,9 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
         start(?listener_engine, 1800000001).status != engine.OK) { ret 40; }
     if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra, 0) ||
         client.start(?dialer_engine, 1800000001).status != engine.OK) { ret 41; }
-    if (!client.snapshot(?dialer_engine).output_pending) { ret 46; }
+    if (!client.snapshot(?dialer_engine).output_pending)       { ret 46; }
     if (client.snapshot(?dialer_engine).status != engine.MORE) { ret 47; }
-    if (snapshot(?listener_engine).status != engine.MORE) { ret 48; }
+    if (snapshot(?listener_engine).status != engine.MORE)      { ret 48; }
     val exchanged_again: i64 = exchange(?listener_engine, ?dialer_engine);
     if (exchanged_again != 0) { ret 50 + exchanged_again::i32; }
     if (snapshot(?listener_engine).status != engine.COMPLETE ||
@@ -3254,113 +3324,120 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
 }
 
 test "server: quic transport parameters reach the caller as an event" {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = secret.system_allocator();
     var chain_storage: [1]cert.Certificate;
-    var key: keys.PrivateKey;
-    var identity: credentials.Identity;
+    var key:           keys.PrivateKey;
+    var identity:      credentials.Identity;
     if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
         ret 1;
     }
     var generation: credentials.Generation = credentials.empty_generation();
     if (credentials.initialize(?generation, ?identity, 1, 0, nil,
-            false) != contracts.OK) { ret 2; }
+        false) != contracts.OK) { ret 2; }
     var store: credentials.Store = credentials.empty_store();
     if (credentials.initialize_store(?store, ?generation) != contracts.OK) {
         ret 3;
     }
 
-    var server_counter: u8 = 3;
+    var server_counter: u8             = 3;
     var server_entropy: secret.Entropy = secret.Entropy{
-        context: ?server_counter, secret_context: nil, fill_fn: test_entropy,
-        initialized: true};
+        context:     ?server_counter, secret_context: nil, fill_fn: test_entropy,
+        initialized: true
+    };
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
-        config.ProtocolName{data: "h3"::*u8, len: 2}};
-    var versions: [1]u16 = [1]u16{tls13.VERSION};
-    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
-        tls13.AES_128_GCM_SHA256};
-    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+        config.ProtocolName{data: "h3"::*u8, len: 2}
+    };
+    var versions: [1]u16               = [1]u16{tls13.VERSION};
+    var suites:   [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256
+    };
+    var groups:     [1]tls13.NamedGroup      = [1]tls13.NamedGroup{tls13.X25519};
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
-        tls13.ED25519};
+        tls13.ED25519
+    };
     var listener: config.ServerConfig;
-    listener.credentials = ?store;
-    listener.alpn = ?protocols[0];
-    listener.alpn_len = 1;
-    listener.require_alpn = true;
-    listener.versions = ?versions[0];
-    listener.version_len = 1;
-    listener.suites = ?suites[0];
-    listener.suite_len = 1;
-    listener.groups = ?groups[0];
-    listener.group_len = 1;
-    listener.signatures = ?signatures[0];
-    listener.signature_len = 1;
-    listener.entropy = ?server_entropy;
-    listener.entropy_context_size = 1;
-    listener.limits = config.production_limits();
+    listener.credentials                     = ?store;
+    listener.alpn                            = ?protocols[0];
+    listener.alpn_len                        = 1;
+    listener.require_alpn                    = true;
+    listener.versions                        = ?versions[0];
+    listener.version_len                     = 1;
+    listener.suites                          = ?suites[0];
+    listener.suite_len                       = 1;
+    listener.groups                          = ?groups[0];
+    listener.group_len                       = 1;
+    listener.signatures                      = ?signatures[0];
+    listener.signature_len                   = 1;
+    listener.entropy                         = ?server_entropy;
+    listener.entropy_context_size            = 1;
+    listener.limits                          = config.production_limits();
     listener.limits.max_peer_handshake_bytes = 8192;
-    listener.limits.max_client_hello_bytes = 8192;
-    listener.limits.max_chain_bytes = 4096;
-    listener.limits.max_server_flight_bytes = 8192;
+    listener.limits.max_client_hello_bytes   = 8192;
+    listener.limits.max_chain_bytes          = 4096;
+    listener.limits.max_server_flight_bytes  = 8192;
 
     var server_storage: Storage = Storage{
-        input: ?loopback_server_input[0], input_capacity: 8192,
-        output: ?loopback_server_output[0], output_capacity: 8192,
-        hello: ?loopback_server_hello[0], hello_capacity: 8192,
-        certificates: ?loopback_server_certificates[0], certificate_capacity: 4,
-        peer_parameters: ?quic_server_parameters[0],
-        peer_parameters_capacity: 64};
+        input:                    ?loopback_server_input[0], input_capacity: 8192,
+        output:                   ?loopback_server_output[0], output_capacity: 8192,
+        hello:                    ?loopback_server_hello[0], hello_capacity: 8192,
+        certificates:             ?loopback_server_certificates[0], certificate_capacity: 4,
+        peer_parameters:          ?quic_server_parameters[0],
+        peer_parameters_capacity: 64
+    };
     # what the listener sends; the client reads this as its own peer parameters
     var server_transport: [4]u8 = [4]u8{0x51, 0x52, 0x53, 0x54};
-    var extra: ExtraExtension;
-    extra.kind = QUIC_TRANSPORT_PARAMETERS;
+    var extra:            ExtraExtension;
+    extra.kind      = QUIC_TRANSPORT_PARAMETERS;
     extra.data.data = ?server_transport[0];
-    extra.data.len = 4;
+    extra.data.len  = 4;
     var listener_engine: Server;
     if (!init(?listener_engine, ?listener, server_storage, extra,
-            QUIC_TRANSPORT_PARAMETERS) ||
+        QUIC_TRANSPORT_PARAMETERS) ||
         start(?listener_engine, 1800000000).status != engine.OK) { ret 4; }
 
     var anchor: cert.Certificate = cert.Certificate{der: ?loopback_root[0],
         der_len: 341};
-    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
-    var client_counter: u8 = 91;
-    var client_entropy: secret.Entropy = secret.Entropy{
-        context: ?client_counter, secret_context: nil, fill_fn: test_entropy,
-        initialized: true};
+    var trust:          cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
+    var client_counter: u8              = 91;
+    var client_entropy: secret.Entropy  = secret.Entropy{
+        context:     ?client_counter, secret_context: nil, fill_fn: test_entropy,
+        initialized: true
+    };
     var dialer: config.ClientConfig;
-    dialer.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
-    dialer.alpn = ?protocols[0];
-    dialer.alpn_len = 1;
-    dialer.trust = ?trust;
-    dialer.versions = ?versions[0];
-    dialer.version_len = 1;
-    dialer.suites = ?suites[0];
-    dialer.suite_len = 1;
-    dialer.groups = ?groups[0];
-    dialer.group_len = 1;
-    dialer.signatures = ?signatures[0];
-    dialer.signature_len = 1;
-    dialer.client_identity = nil;
-    dialer.entropy = ?client_entropy;
-    dialer.entropy_context_size = 1;
-    dialer.limits = config.production_limits();
+    dialer.server_name                     = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+    dialer.alpn                            = ?protocols[0];
+    dialer.alpn_len                        = 1;
+    dialer.trust                           = ?trust;
+    dialer.versions                        = ?versions[0];
+    dialer.version_len                     = 1;
+    dialer.suites                          = ?suites[0];
+    dialer.suite_len                       = 1;
+    dialer.groups                          = ?groups[0];
+    dialer.group_len                       = 1;
+    dialer.signatures                      = ?signatures[0];
+    dialer.signature_len                   = 1;
+    dialer.client_identity                 = nil;
+    dialer.entropy                         = ?client_entropy;
+    dialer.entropy_context_size            = 1;
+    dialer.limits                          = config.production_limits();
     dialer.limits.max_peer_handshake_bytes = 8192;
     var client_storage: client.Storage = client.Storage{
-        input: ?loopback_client_input[0], input_capacity: 8192,
-        output: ?loopback_client_output[0], output_capacity: 8192,
-        hello: ?loopback_client_hello[0], hello_capacity: 8192,
-        certificates: ?loopback_client_certificates[0], certificate_capacity: 4,
-        peer_parameters: ?quic_client_parameters[0],
-        peer_parameters_capacity: 64};
+        input:                    ?loopback_client_input[0], input_capacity: 8192,
+        output:                   ?loopback_client_output[0], output_capacity: 8192,
+        hello:                    ?loopback_client_hello[0], hello_capacity: 8192,
+        certificates:             ?loopback_client_certificates[0], certificate_capacity: 4,
+        peer_parameters:          ?quic_client_parameters[0],
+        peer_parameters_capacity: 64
+    };
     # what the client sends; the listener must surface exactly these bytes
     var client_transport: [4]u8 = [4]u8{0x11, 0x22, 0x33, 0x44};
-    var client_extra: client.ExtraExtension;
-    client_extra.kind = client.QUIC_TRANSPORT_PARAMETERS;
+    var client_extra:     client.ExtraExtension;
+    client_extra.kind      = client.QUIC_TRANSPORT_PARAMETERS;
     client_extra.data.data = ?client_transport[0];
-    client_extra.data.len = 4;
+    client_extra.data.len  = 4;
     var dialer_engine: client.Client;
     if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra,
-            client.QUIC_TRANSPORT_PARAMETERS) ||
+        client.QUIC_TRANSPORT_PARAMETERS) ||
         client.start(?dialer_engine, 1800000000).status != engine.OK) { ret 5; }
 
     val exchanged: i64 = exchange_recording(?listener_engine, ?dialer_engine);
@@ -3374,8 +3451,8 @@ test "server: quic transport parameters reach the caller as an event" {
 
     # and it arrived before completion, so a consumer may gate on it
     var parameters_at: usize = 64;
-    var complete_at: usize = 64;
-    var i: usize = 0;
+    var complete_at:   usize = 64;
+    var i:             usize = 0;
     for (i < quic_event_count) {
         if (quic_event_kinds[i] == engine.PEER_PARAMETERS &&
             parameters_at == 64) { parameters_at = i; }
@@ -3384,22 +3461,22 @@ test "server: quic transport parameters reach the caller as an event" {
         i = i + 1;
     }
     if (parameters_at == 64 || complete_at == 64) { ret 8; }
-    if (parameters_at >= complete_at) { ret 9; }
+    if (parameters_at >= complete_at)             { ret 9; }
 
     if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) {
         ret 40;
     }
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 41; }
-    if (keys.destroy_private(?key) != contracts.OK) { ret 42; }
+    if (keys.destroy_private(?key) != contracts.OK)                 { ret 42; }
     ret 0;
 }
 
-var corpus_extensions: [1024]u8;
-var corpus_hello: [2048]u8;
-var corpus_input: [8192]u8;
-var corpus_output: [8192]u8;
-var corpus_retained: [8192]u8;
+var corpus_extensions:   [1024]u8;
+var corpus_hello:        [2048]u8;
+var corpus_input:        [8192]u8;
+var corpus_output:       [8192]u8;
+var corpus_retained:     [8192]u8;
 var corpus_certificates: [4]cert.Certificate;
 
 fun put_u16_at(output: *u8, offset: usize, value: u16) usize {
@@ -3414,18 +3491,24 @@ fun put_bytes_at(output: *u8, offset: usize, source: *u8,
 }
 
 fun extension_supported_versions(offset: usize, include_tls13: bool) usize {
-    var body: [5]u8;
+    var body:   [5]u8;
     var length: usize = 3;
     body[0] = 2;
-    if (include_tls13) { body[1] = 3; body[2] = 4; }
-    or { body[1] = 3; body[2] = 3; }
+    if (include_tls13) {
+        body[1] = 3;
+        body[2] = 4;
+    }
+    or {
+        body[1] = 3;
+        body[2] = 3;
+    }
     ret put_extension(?corpus_extensions[0], offset,
         extensions.SUPPORTED_VERSIONS,
         contracts.Bytes{data: ?body[0], len: length});
 }
 
 fun extension_groups(offset: usize, group: u16, duplicate: bool) usize {
-    var body: [6]u8;
+    var body:   [6]u8;
     var length: usize = 4;
     write_u16(?body[0], 0, 2);
     write_u16(?body[0], 2, group);
@@ -3464,7 +3547,10 @@ fun extension_key_share(offset: usize, group: u16, key_len: usize) usize {
     write_u16(?body[0], 2, group);
     write_u16(?body[0], 4, key_len::u16);
     var i: usize = 0;
-    for (i < key_len) { body[6 + i] = (0x40 + i)::u8; i = i + 1; }
+    for (i < key_len) {
+        body[6 + i] = (0x40 + i)::u8;
+        i           = i + 1;
+    }
     if (group == tls13.SECP256R1) { body[6] = 4; }
     ret put_extension(?corpus_extensions[0], offset, extensions.KEY_SHARE,
         contracts.Bytes{data: ?body[0], len: 6 + key_len});
@@ -3485,21 +3571,24 @@ fun assemble_hello(legacy_version: u16, suite: u16, suite_count: usize,
     var offset: usize = 4;
     offset = put_u16_at(?corpus_hello[0], offset, legacy_version);
     var i: usize = 0;
-    for (i < 32) { corpus_hello[offset + i] = (0x10 + i)::u8; i = i + 1; }
-    offset = offset + 32;
+    for (i < 32) {
+        corpus_hello[offset + i] = (0x10 + i)::u8;
+        i                        = i + 1;
+    }
+    offset               = offset + 32;
     corpus_hello[offset] = 0;
-    offset = offset + 1;
-    offset = put_u16_at(?corpus_hello[0], offset, (suite_count * 2)::u16);
-    i = 0;
+    offset               = offset + 1;
+    offset               = put_u16_at(?corpus_hello[0], offset, (suite_count * 2)::u16);
+    i                    = 0;
     for (i < suite_count) {
         offset = put_u16_at(?corpus_hello[0], offset, suite);
-        i = i + 1;
+        i      = i + 1;
     }
-    corpus_hello[offset] = 1;
+    corpus_hello[offset]     = 1;
     corpus_hello[offset + 1] = compression;
-    offset = offset + 2;
-    offset = put_u16_at(?corpus_hello[0], offset, extension_len::u16);
-    offset = put_bytes_at(?corpus_hello[0], offset, ?corpus_extensions[0],
+    offset                   = offset + 2;
+    offset                   = put_u16_at(?corpus_hello[0], offset, extension_len::u16);
+    offset                   = put_bytes_at(?corpus_hello[0], offset, ?corpus_extensions[0],
         extension_len);
     corpus_hello[0] = handshake.CLIENT_HELLO;
     write_u24(?corpus_hello[0], 1, offset - 4);
@@ -3510,40 +3599,41 @@ fun corpus_listener(listener: *config.ServerConfig, store: *credentials.Store,
     protocols: *config.ProtocolName, versions: *u16,
     suites: *tls13.CipherSuite, groups: *tls13.NamedGroup,
     signatures: *tls13.SignatureScheme, entropy: *secret.Entropy) {
-    listener.credentials = store;
-    listener.alpn = protocols;
-    listener.alpn_len = 1;
-    listener.require_alpn = true;
-    listener.versions = versions;
-    listener.version_len = 1;
-    listener.suites = suites;
-    listener.suite_len = 1;
-    listener.groups = groups;
-    listener.group_len = 1;
-    listener.signatures = signatures;
-    listener.signature_len = 1;
-    listener.entropy = entropy;
-    listener.entropy_context_size = 1;
-    listener.limits = config.production_limits();
+    listener.credentials                     = store;
+    listener.alpn                            = protocols;
+    listener.alpn_len                        = 1;
+    listener.require_alpn                    = true;
+    listener.versions                        = versions;
+    listener.version_len                     = 1;
+    listener.suites                          = suites;
+    listener.suite_len                       = 1;
+    listener.groups                          = groups;
+    listener.group_len                       = 1;
+    listener.signatures                      = signatures;
+    listener.signature_len                   = 1;
+    listener.entropy                         = entropy;
+    listener.entropy_context_size            = 1;
+    listener.limits                          = config.production_limits();
     listener.limits.max_peer_handshake_bytes = 8192;
-    listener.limits.max_client_hello_bytes = 8192;
-    listener.limits.max_chain_bytes = 4096;
-    listener.limits.max_server_flight_bytes = 8192;
+    listener.limits.max_client_hello_bytes   = 8192;
+    listener.limits.max_chain_bytes          = 4096;
+    listener.limits.max_server_flight_bytes  = 8192;
 }
 
 # feed one hello to a fresh listener and report the alert it emits
 fun reject_code(listener: *config.ServerConfig, hello_len: usize,
     failure: *error.Error) record.AlertDescription {
     var storage: Storage = Storage{
-        input: ?corpus_input[0], input_capacity: 8192,
-        output: ?corpus_output[0], output_capacity: 8192,
-        hello: ?corpus_retained[0], hello_capacity: 8192,
-        certificates: ?corpus_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?corpus_input[0], input_capacity: 8192,
+        output:          ?corpus_output[0], output_capacity: 8192,
+        hello:           ?corpus_retained[0], hello_capacity: 8192,
+        certificates:    ?corpus_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var extra: ExtraExtension;
-    extra.kind = 0;
+    extra.kind      = 0;
     extra.data.data = nil;
-    extra.data.len = 0;
+    extra.data.len  = 0;
     var value: Server;
     @failure = error.INTERNAL_ERROR;
     if (!init(?value, listener, storage, extra, 0) ||
@@ -3564,7 +3654,7 @@ fun reject_code(listener: *config.ServerConfig, hello_len: usize,
     complete_event(?value, event.token, true);
     # a terminal engine accepts no further peer input
     if (ingest(?value, engine.INITIAL, ?corpus_hello[0],
-            hello_len).status != engine.FAILED) {
+        hello_len).status != engine.FAILED) {
         destroy(?value);
         ret record.NO_ALERT;
     }
@@ -3573,31 +3663,34 @@ fun reject_code(listener: *config.ServerConfig, hello_len: usize,
 }
 
 test "server: malformed client hellos fail with protocol-correct alerts" {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = secret.system_allocator();
     var chain_storage: [1]cert.Certificate;
-    var key: keys.PrivateKey;
-    var identity: credentials.Identity;
+    var key:           keys.PrivateKey;
+    var identity:      credentials.Identity;
     if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
         ret 1;
     }
     var generation: credentials.Generation = credentials.empty_generation();
     if (credentials.initialize(?generation, ?identity, 1, 0, nil,
-            false) != contracts.OK) { ret 2; }
+        false) != contracts.OK) { ret 2; }
     var store: credentials.Store = credentials.empty_store();
     if (credentials.initialize_store(?store, ?generation) != contracts.OK) {
         ret 3;
     }
-    var counter: u8 = 5;
+    var counter: u8             = 5;
     var entropy: secret.Entropy = secret.Entropy{context: ?counter,
         secret_context: nil, fill_fn: test_entropy, initialized: true};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
-        config.ProtocolName{data: "h2"::*u8, len: 2}};
-    var versions: [1]u16 = [1]u16{tls13.VERSION};
-    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
-        tls13.AES_128_GCM_SHA256};
-    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+        config.ProtocolName{data: "h2"::*u8, len: 2}
+    };
+    var versions: [1]u16               = [1]u16{tls13.VERSION};
+    var suites:   [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256
+    };
+    var groups:     [1]tls13.NamedGroup      = [1]tls13.NamedGroup{tls13.X25519};
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
-        tls13.ED25519};
+        tls13.ED25519
+    };
     var listener: config.ServerConfig;
     corpus_listener(?listener, ?store, ?protocols[0], ?versions[0], ?suites[0],
         ?groups[0], ?signatures[0], ?entropy);
@@ -3618,15 +3711,16 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
 
     # a truncated offer consumes input without publishing state
     var accepted_storage: Storage = Storage{
-        input: ?corpus_input[0], input_capacity: 8192,
-        output: ?corpus_output[0], output_capacity: 8192,
-        hello: ?corpus_retained[0], hello_capacity: 8192,
-        certificates: ?corpus_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?corpus_input[0], input_capacity: 8192,
+        output:          ?corpus_output[0], output_capacity: 8192,
+        hello:           ?corpus_retained[0], hello_capacity: 8192,
+        certificates:    ?corpus_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var partial_extra: ExtraExtension;
-    partial_extra.kind = 0;
+    partial_extra.kind      = 0;
     partial_extra.data.data = nil;
-    partial_extra.data.len = 0;
+    partial_extra.data.len  = 0;
     var partial: Server;
     if (!init(?partial, ?listener, accepted_storage, partial_extra, 0) ||
         start(?partial, 1800000000).status != engine.OK) { ret 5; }
@@ -3639,7 +3733,7 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
         byte = byte + 1;
     }
     if (ingest(?partial, engine.INITIAL, ?corpus_hello[hello_len - 1],
-            1).status != engine.OK || !pending(?partial)) { ret 7; }
+        1).status != engine.OK || !pending(?partial)) { ret 7; }
     if (!destroy(?partial)) { ret 8; }
 
     # supported_versions absent
@@ -3648,10 +3742,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 0, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.PROTOCOL_VERSION_ALERT ||
+        record.PROTOCOL_VERSION_ALERT ||
         failure != error.PROTOCOL_VERSION) { ret 10; }
 
     # supported_versions without tls 1.3
@@ -3661,10 +3755,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 0, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.PROTOCOL_VERSION_ALERT ||
+        record.PROTOCOL_VERSION_ALERT ||
         failure != error.PROTOCOL_VERSION) { ret 11; }
 
     # no key share and no pre-shared key
@@ -3673,10 +3767,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_groups(extension_len, tls13.X25519, false);
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 0, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.MISSING_EXTENSION_ALERT ||
+        record.MISSING_EXTENSION_ALERT ||
         failure != error.MISSING_EXTENSION) { ret 12; }
 
     # a key share for a group that was never offered
@@ -3686,10 +3780,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.SECP256R1, 65);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 0, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.ILLEGAL_PARAMETER_ALERT ||
+        record.ILLEGAL_PARAMETER_ALERT ||
         failure != error.ILLEGAL_PARAMETER) { ret 13; }
 
     # a duplicated value inside supported_groups
@@ -3699,10 +3793,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 0, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.ILLEGAL_PARAMETER_ALERT ||
+        record.ILLEGAL_PARAMETER_ALERT ||
         failure != error.ILLEGAL_PARAMETER) { ret 14; }
 
     # no cipher suite in common
@@ -3712,10 +3806,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, 0x1305, 1, 0,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, 0x1305, 1, 0,
         extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.HANDSHAKE_FAILURE_ALERT ||
+        record.HANDSHAKE_FAILURE_ALERT ||
         failure != error.HANDSHAKE_FAILURE) { ret 15; }
 
     # no application protocol in common
@@ -3725,10 +3819,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h3"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 0, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.NO_APPLICATION_PROTOCOL_ALERT ||
+        record.NO_APPLICATION_PROTOCOL_ALERT ||
         failure != error.NO_APPLICATION_PROTOCOL) { ret 16; }
 
     # a legacy record version the protocol forbids
@@ -3738,10 +3832,10 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(0x0301, tls13.AES_128_GCM_SHA256, 1, 0,
+    hello_len     = assemble_hello(0x0301, tls13.AES_128_GCM_SHA256, 1, 0,
         extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.ILLEGAL_PARAMETER_ALERT ||
+        record.ILLEGAL_PARAMETER_ALERT ||
         failure != error.ILLEGAL_PARAMETER) { ret 17; }
 
     # a compression method other than null
@@ -3751,23 +3845,23 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     extension_len = extension_signatures(extension_len);
     extension_len = extension_alpn(extension_len, "h2"::*u8, 2);
     extension_len = extension_key_share(extension_len, tls13.X25519, 32);
-    hello_len = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
+    hello_len     = assemble_hello(tls13.LEGACY_VERSION, tls13.AES_128_GCM_SHA256,
         1, 1, extension_len);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.ILLEGAL_PARAMETER_ALERT ||
+        record.ILLEGAL_PARAMETER_ALERT ||
         failure != error.ILLEGAL_PARAMETER) { ret 18; }
 
     # an unknown handshake message in place of the client hello
     corpus_hello[0] = 0x63;
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.UNEXPECTED_MESSAGE_ALERT ||
+        record.UNEXPECTED_MESSAGE_ALERT ||
         failure != error.UNEXPECTED_MESSAGE) { ret 19; }
 
     # a declared body above the configured client hello bound
     corpus_hello[0] = handshake.CLIENT_HELLO;
     write_u24(?corpus_hello[0], 1, 0xFFFFF0);
     if (reject_code(?listener, hello_len, ?failure) !=
-            record.INTERNAL_ERROR_ALERT ||
+        record.INTERNAL_ERROR_ALERT ||
         failure != error.RESOURCE_LIMIT) { ret 20; }
 
     var retired: *credentials.Generation = nil;
@@ -3777,46 +3871,46 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     ret 0;
 }
 
-var resume_server_input: [16384]u8;
-var resume_server_output: [16384]u8;
-var resume_server_hello: [16384]u8;
+var resume_server_input:        [16384]u8;
+var resume_server_output:       [16384]u8;
+var resume_server_hello:        [16384]u8;
 var resume_server_certificates: [4]cert.Certificate;
-var resume_client_input: [16384]u8;
-var resume_client_output: [16384]u8;
-var resume_client_hello: [16384]u8;
+var resume_client_input:        [16384]u8;
+var resume_client_output:       [16384]u8;
+var resume_client_hello:        [16384]u8;
 var resume_client_certificates: [4]cert.Certificate;
-var resume_ring: session.KeyRing;
-var resume_window: session.ReplayWindow;
-var resume_store: session.ClientStore;
-var resume_listener: config.ServerConfig;
-var resume_dialer: config.ClientConfig;
-var resume_protocols: [1]config.ProtocolName;
-var resume_versions: [1]u16;
-var resume_suites: [1]tls13.CipherSuite;
-var resume_groups: [1]tls13.NamedGroup;
-var resume_signatures: [1]tls13.SignatureScheme;
-var resume_server_entropy: secret.Entropy;
-var resume_client_entropy: secret.Entropy;
-var resume_server_counter: u8;
-var resume_client_counter: u8;
-var resume_anchor: cert.Certificate;
-var resume_trust: cert.TrustStore;
-var resume_chain: [1]cert.Certificate;
-var resume_key: keys.PrivateKey;
-var resume_identity: credentials.Identity;
-var resume_generation: credentials.Generation;
-var resume_store_credentials: credentials.Store;
+var resume_ring:                session.KeyRing;
+var resume_window:              session.ReplayWindow;
+var resume_store:               session.ClientStore;
+var resume_listener:            config.ServerConfig;
+var resume_dialer:              config.ClientConfig;
+var resume_protocols:           [1]config.ProtocolName;
+var resume_versions:            [1]u16;
+var resume_suites:              [1]tls13.CipherSuite;
+var resume_groups:              [1]tls13.NamedGroup;
+var resume_signatures:          [1]tls13.SignatureScheme;
+var resume_server_entropy:      secret.Entropy;
+var resume_client_entropy:      secret.Entropy;
+var resume_server_counter:      u8;
+var resume_client_counter:      u8;
+var resume_anchor:              cert.Certificate;
+var resume_trust:               cert.TrustStore;
+var resume_chain:               [1]cert.Certificate;
+var resume_key:                 keys.PrivateKey;
+var resume_identity:            credentials.Identity;
+var resume_generation:          credentials.Generation;
+var resume_store_credentials:   credentials.Store;
 
 fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     owner: *secret.Allocator, now: i64) bool {
     if (!load_test_credentials(?resume_identity, ?resume_chain[0], ?resume_key,
-            owner)) { ret false; }
+        owner)) { ret false; }
     resume_generation = credentials.empty_generation();
     if (credentials.initialize(?resume_generation, ?resume_identity, 1, 0, nil,
-            false) != contracts.OK) { ret false; }
+        false) != contracts.OK) { ret false; }
     resume_store_credentials = credentials.empty_store();
     if (credentials.initialize_store(?resume_store_credentials,
-            ?resume_generation) != contracts.OK) { ret false; }
+        ?resume_generation) != contracts.OK) { ret false; }
     resume_server_counter = 11;
     resume_client_counter = 71;
     resume_server_entropy = secret.Entropy{context: ?resume_server_counter,
@@ -3824,89 +3918,91 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     resume_client_entropy = secret.Entropy{context: ?resume_client_counter,
         secret_context: nil, fill_fn: test_entropy, initialized: true};
     if (!session.keyring_init(?resume_ring, ?resume_server_entropy, now, 3600,
-            1800, 7200) || !session.replay_init(?resume_window) ||
+        1800, 7200) || !session.replay_init(?resume_window) ||
         !session.client_store_init(?resume_store)) { ret false; }
-    resume_protocols[0] = config.ProtocolName{data: "h2"::*u8, len: 2};
-    resume_versions[0] = tls13.VERSION;
-    resume_suites[0] = tls13.AES_128_GCM_SHA256;
-    resume_groups[0] = tls13.X25519;
-    resume_signatures[0] = tls13.ED25519;
-    resume_listener = config.no_server_config();
-    resume_listener.credentials = ?resume_store_credentials;
-    resume_listener.alpn = ?resume_protocols[0];
-    resume_listener.alpn_len = 1;
-    resume_listener.require_alpn = true;
-    resume_listener.versions = ?resume_versions[0];
-    resume_listener.version_len = 1;
-    resume_listener.suites = ?resume_suites[0];
-    resume_listener.suite_len = 1;
-    resume_listener.groups = ?resume_groups[0];
-    resume_listener.group_len = 1;
-    resume_listener.signatures = ?resume_signatures[0];
-    resume_listener.signature_len = 1;
-    resume_listener.entropy = ?resume_server_entropy;
-    resume_listener.entropy_context_size = 1;
-    resume_listener.tickets = ?resume_ring;
-    resume_listener.replay = ?resume_window;
-    resume_listener.replay_policy = policy;
-    resume_listener.tickets_per_connection = tickets;
-    resume_listener.limits = config.production_limits();
+    resume_protocols[0]                             = config.ProtocolName{data: "h2"::*u8, len: 2};
+    resume_versions[0]                              = tls13.VERSION;
+    resume_suites[0]                                = tls13.AES_128_GCM_SHA256;
+    resume_groups[0]                                = tls13.X25519;
+    resume_signatures[0]                            = tls13.ED25519;
+    resume_listener                                 = config.no_server_config();
+    resume_listener.credentials                     = ?resume_store_credentials;
+    resume_listener.alpn                            = ?resume_protocols[0];
+    resume_listener.alpn_len                        = 1;
+    resume_listener.require_alpn                    = true;
+    resume_listener.versions                        = ?resume_versions[0];
+    resume_listener.version_len                     = 1;
+    resume_listener.suites                          = ?resume_suites[0];
+    resume_listener.suite_len                       = 1;
+    resume_listener.groups                          = ?resume_groups[0];
+    resume_listener.group_len                       = 1;
+    resume_listener.signatures                      = ?resume_signatures[0];
+    resume_listener.signature_len                   = 1;
+    resume_listener.entropy                         = ?resume_server_entropy;
+    resume_listener.entropy_context_size            = 1;
+    resume_listener.tickets                         = ?resume_ring;
+    resume_listener.replay                          = ?resume_window;
+    resume_listener.replay_policy                   = policy;
+    resume_listener.tickets_per_connection          = tickets;
+    resume_listener.limits                          = config.production_limits();
     resume_listener.limits.max_peer_handshake_bytes = 16384;
-    resume_listener.limits.max_client_hello_bytes = 16384;
-    resume_listener.limits.max_chain_bytes = 4096;
-    resume_listener.limits.max_server_flight_bytes = 8192;
+    resume_listener.limits.max_client_hello_bytes   = 16384;
+    resume_listener.limits.max_chain_bytes          = 4096;
+    resume_listener.limits.max_server_flight_bytes  = 8192;
 
-    resume_anchor = cert.Certificate{der: ?loopback_root[0], der_len: 341};
-    resume_trust = cert.TrustStore{anchors: ?resume_anchor, len: 1};
-    resume_dialer = config.no_client_config();
+    resume_anchor             = cert.Certificate{der: ?loopback_root[0], der_len: 341};
+    resume_trust              = cert.TrustStore{anchors: ?resume_anchor, len: 1};
+    resume_dialer             = config.no_client_config();
     resume_dialer.server_name = contracts.Bytes{data: "api.example.com"::*u8,
         len: 15};
-    resume_dialer.alpn = ?resume_protocols[0];
-    resume_dialer.alpn_len = 1;
-    resume_dialer.trust = ?resume_trust;
-    resume_dialer.versions = ?resume_versions[0];
-    resume_dialer.version_len = 1;
-    resume_dialer.suites = ?resume_suites[0];
-    resume_dialer.suite_len = 1;
-    resume_dialer.groups = ?resume_groups[0];
-    resume_dialer.group_len = 1;
-    resume_dialer.signatures = ?resume_signatures[0];
-    resume_dialer.signature_len = 1;
-    resume_dialer.entropy = ?resume_client_entropy;
-    resume_dialer.entropy_context_size = 1;
-    resume_dialer.sessions = ?resume_store;
-    resume_dialer.limits = config.production_limits();
+    resume_dialer.alpn                            = ?resume_protocols[0];
+    resume_dialer.alpn_len                        = 1;
+    resume_dialer.trust                           = ?resume_trust;
+    resume_dialer.versions                        = ?resume_versions[0];
+    resume_dialer.version_len                     = 1;
+    resume_dialer.suites                          = ?resume_suites[0];
+    resume_dialer.suite_len                       = 1;
+    resume_dialer.groups                          = ?resume_groups[0];
+    resume_dialer.group_len                       = 1;
+    resume_dialer.signatures                      = ?resume_signatures[0];
+    resume_dialer.signature_len                   = 1;
+    resume_dialer.entropy                         = ?resume_client_entropy;
+    resume_dialer.entropy_context_size            = 1;
+    resume_dialer.sessions                        = ?resume_store;
+    resume_dialer.limits                          = config.production_limits();
     resume_dialer.limits.max_peer_handshake_bytes = 16384;
-    resume_dialer.limits.max_client_hello_bytes = 16384;
+    resume_dialer.limits.max_client_hello_bytes   = 16384;
     ret true;
 }
 
 fun resume_connect(listener_engine: *Server, dialer_engine: *client.Client,
     now: i64) i64 {
     var server_storage: Storage = Storage{
-        input: ?resume_server_input[0], input_capacity: 16384,
-        output: ?resume_server_output[0], output_capacity: 16384,
-        hello: ?resume_server_hello[0], hello_capacity: 16384,
-        certificates: ?resume_server_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?resume_server_input[0], input_capacity: 16384,
+        output:          ?resume_server_output[0], output_capacity: 16384,
+        hello:           ?resume_server_hello[0], hello_capacity: 16384,
+        certificates:    ?resume_server_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var extra: ExtraExtension;
-    extra.kind = 0;
+    extra.kind      = 0;
     extra.data.data = nil;
-    extra.data.len = 0;
+    extra.data.len  = 0;
     if (!init(listener_engine, ?resume_listener, server_storage, extra, 0) ||
         start(listener_engine, now).status != engine.OK) { ret 1; }
     var client_storage: client.Storage = client.Storage{
-        input: ?resume_client_input[0], input_capacity: 16384,
-        output: ?resume_client_output[0], output_capacity: 16384,
-        hello: ?resume_client_hello[0], hello_capacity: 16384,
-        certificates: ?resume_client_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?resume_client_input[0], input_capacity: 16384,
+        output:          ?resume_client_output[0], output_capacity: 16384,
+        hello:           ?resume_client_hello[0], hello_capacity: 16384,
+        certificates:    ?resume_client_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var client_extra: client.ExtraExtension;
-    client_extra.kind = 0;
+    client_extra.kind      = 0;
     client_extra.data.data = nil;
-    client_extra.data.len = 0;
+    client_extra.data.len  = 0;
     if (!client.init(dialer_engine, ?resume_dialer, client_storage,
-            client_extra, 0) ||
+        client_extra, 0) ||
         client.start(dialer_engine, now).status != engine.OK) { ret 2; }
     val exchanged: i64 = exchange(listener_engine, dialer_engine);
     if (exchanged != 0) { ret 3; }
@@ -3918,12 +4014,12 @@ fun pump_post(local: *Server, peer: *client.Client) i64 {
     var rounds: usize = 0;
     for (rounds < 32) {
         var progressed: bool = false;
-        var event: engine.Event;
+        var event:      engine.Event;
         for (next_event(local, ?event)) {
             progressed = true;
             if (event.kind == engine.CRYPTO) {
                 if (client.ingest(peer, event.level, event.data.data,
-                        event.data.len).status == engine.FAILED) { ret 1; }
+                    event.data.len).status == engine.FAILED) { ret 1; }
             }
             if (!complete_event(local, event.token, true)) { ret 2; }
         }
@@ -3932,7 +4028,7 @@ fun pump_post(local: *Server, peer: *client.Client) i64 {
             progressed = true;
             if (peer_event.kind == engine.CRYPTO) {
                 if (ingest(local, peer_event.level, peer_event.data.data,
-                        peer_event.data.len).status == engine.FAILED) { ret 3; }
+                    peer_event.data.len).status == engine.FAILED) { ret 3; }
             }
             if (!client.complete_event(peer, peer_event.token, true)) { ret 4; }
         }
@@ -3947,13 +4043,14 @@ fun secrets_match(local: *Server, peer: *client.Client, server_send: bool) bool 
     if (size == 0 || size != key_schedule.hash_size(peer.schedule.algorithm)) {
         ret false;
     }
-    var mine: contracts.SecretBytes;
+    var mine:   contracts.SecretBytes;
     var theirs: contracts.SecretBytes;
     if (server_send) {
-        mine = key_schedule.bytes(?local.schedule.server_application_traffic);
+        mine   = key_schedule.bytes(?local.schedule.server_application_traffic);
         theirs = key_schedule.bytes(?peer.schedule.server_application_traffic);
-    } or {
-        mine = key_schedule.bytes(?local.schedule.client_application_traffic);
+    }
+    or {
+        mine   = key_schedule.bytes(?local.schedule.client_application_traffic);
         theirs = key_schedule.bytes(?peer.schedule.client_application_traffic);
     }
     if (mine.len != size || theirs.len != size) { ret false; }
@@ -3971,28 +4068,28 @@ test "session: a ticket resumes one connection and a key update rekeys it" {
         ret 1;
     }
     var listener_engine: Server;
-    var dialer_engine: client.Client;
-    val first: i64 = resume_connect(?listener_engine, ?dialer_engine,
+    var dialer_engine:   client.Client;
+    val first:           i64 = resume_connect(?listener_engine, ?dialer_engine,
         1800000000);
     if (first != 0) { ret 10 + first::i32; }
     if (snapshot(?listener_engine).resumed ||
         client.snapshot(?dialer_engine).resumed) { ret 2; }
     if (snapshot(?listener_engine).tickets_issued != 2) { ret 3; }
     val drained: i64 = pump_post(?listener_engine, ?dialer_engine);
-    if (drained != 0) { ret 20 + drained::i32; }
+    if (drained != 0)                                   { ret 20 + drained::i32; }
     if (session.client_store_count(?resume_store) != 2) { ret 4; }
 
     # a key update rekeys the sending direction on both sides
     if (!secrets_match(?listener_engine, ?dialer_engine, true)) { ret 5; }
     if (request_key_update(?listener_engine,
-            codec.UPDATE_NOT_REQUESTED).status != engine.OK) { ret 6; }
+        codec.UPDATE_NOT_REQUESTED).status != engine.OK) { ret 6; }
     val updated: i64 = pump_post(?listener_engine, ?dialer_engine);
-    if (updated != 0) { ret 30 + updated::i32; }
-    if (!secrets_match(?listener_engine, ?dialer_engine, true)) { ret 7; }
+    if (updated != 0)                                            { ret 30 + updated::i32; }
+    if (!secrets_match(?listener_engine, ?dialer_engine, true))  { ret 7; }
     if (!secrets_match(?listener_engine, ?dialer_engine, false)) { ret 8; }
     # the client initiates one too, and the peer answers it
     if (client.request_key_update(?dialer_engine,
-            codec.UPDATE_REQUESTED).status != engine.OK) { ret 9; }
+        codec.UPDATE_REQUESTED).status != engine.OK) { ret 9; }
     val answered: i64 = pump_post(?listener_engine, ?dialer_engine);
     if (answered != 0) { ret 40 + answered::i32; }
     if (!secrets_match(?listener_engine, ?dialer_engine, false) ||
@@ -4003,16 +4100,16 @@ test "session: a ticket resumes one connection and a key update rekeys it" {
 
     # the retained ticket resumes a fresh pair of engines
     var second_listener: Server;
-    var second_dialer: client.Client;
-    val second: i64 = resume_connect(?second_listener, ?second_dialer,
+    var second_dialer:   client.Client;
+    val second:          i64 = resume_connect(?second_listener, ?second_dialer,
         1800000100);
     if (second != 0) { ret 60 + second::i32; }
     val server_view: engine.Snapshot = snapshot(?second_listener);
     val client_view: engine.Snapshot = client.snapshot(?second_dialer);
-    if (!server_view.resumed || !client_view.resumed) { ret 52; }
-    if (!client_view.authenticated) { ret 53; }
+    if (!server_view.resumed || !client_view.resumed)  { ret 52; }
+    if (!client_view.authenticated)                    { ret 53; }
     if (server_view.suite != tls13.AES_128_GCM_SHA256) { ret 54; }
-    if (server_view.selected_alpn.len != 2) { ret 55; }
+    if (server_view.selected_alpn.len != 2)            { ret 55; }
     if (!secrets_match(?second_listener, ?second_dialer, true) ||
         !secrets_match(?second_listener, ?second_dialer, false)) { ret 56; }
     if (session.client_store_count(?resume_store) != 1) { ret 57; }
@@ -4035,22 +4132,22 @@ test "session: replay control, rotation overlap, and long sessions hold" {
         ret 1;
     }
     var listener_engine: Server;
-    var dialer_engine: client.Client;
+    var dialer_engine:   client.Client;
     if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) != 0) {
         ret 2;
     }
     if (pump_post(?listener_engine, ?dialer_engine) != 0) { ret 3; }
-    if (session.client_store_count(?resume_store) != 1) { ret 4; }
+    if (session.client_store_count(?resume_store) != 1)   { ret 4; }
 
     # one long session survives repeated rekeying in both directions
     var rounds: usize = 0;
     for (rounds < 32) {
         if (request_key_update(?listener_engine,
-                codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
+            codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
             pump_post(?listener_engine, ?dialer_engine) != 0 ||
             !secrets_match(?listener_engine, ?dialer_engine, true)) { ret 5; }
         if (client.request_key_update(?dialer_engine,
-                codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
+            codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
             pump_post(?listener_engine, ?dialer_engine) != 0 ||
             !secrets_match(?listener_engine, ?dialer_engine, false)) { ret 6; }
         rounds = rounds + 1;
@@ -4060,14 +4157,14 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     # keep a copy of the ticket so the same one can be presented twice
     var kept: session.Ticket;
     if (!session.client_store_take(?resume_store,
-            contracts.Bytes{data: "api.example.com"::*u8, len: 15}, 1800000000,
-            ?kept)) { ret 8; }
+        contracts.Bytes{data: "api.example.com"::*u8, len: 15}, 1800000000,
+        ?kept)) { ret 8; }
     var offered: session.Ticket = kept;
     offered.valid = true;
     if (!session.client_store_save(?resume_store, ?offered)) { ret 9; }
 
     var second_listener: Server;
-    var second_dialer: client.Client;
+    var second_dialer:   client.Client;
     if (resume_connect(?second_listener, ?second_dialer, 1800000100) != 0) {
         ret 10;
     }
@@ -4077,11 +4174,11 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     }
 
     # presenting the very same ticket again is refused and falls back
-    offered = kept;
+    offered       = kept;
     offered.valid = true;
     if (!session.client_store_save(?resume_store, ?offered)) { ret 13; }
     var third_listener: Server;
-    var third_dialer: client.Client;
+    var third_dialer:   client.Client;
     if (resume_connect(?third_listener, ?third_dialer, 1800000200) != 0) {
         ret 14;
     }
@@ -4089,19 +4186,19 @@ test "session: replay control, rotation overlap, and long sessions hold" {
         client.snapshot(?third_dialer).resumed) { ret 15; }
     if (snapshot(?third_listener).status != engine.COMPLETE ||
         client.snapshot(?third_dialer).status != engine.COMPLETE) { ret 16; }
-    if (!client.snapshot(?third_dialer).authenticated) { ret 17; }
+    if (!client.snapshot(?third_dialer).authenticated)               { ret 17; }
     if (!destroy(?third_listener) || !client.destroy(?third_dialer)) { ret 18; }
 
     # a ticket sealed before rotation still resumes inside the overlap
     resume_listener.replay_policy = session.REPLAY_PERMISSIVE;
     if (!session.keyring_rotate(?resume_ring, ?resume_server_entropy,
-            1800000300)) { ret 19; }
+        1800000300)) { ret 19; }
     if (session.keyring_openable(?resume_ring, 1800000300) != 2) { ret 20; }
-    offered = kept;
+    offered       = kept;
     offered.valid = true;
     if (!session.client_store_save(?resume_store, ?offered)) { ret 21; }
     var fourth_listener: Server;
-    var fourth_dialer: client.Client;
+    var fourth_dialer:   client.Client;
     if (resume_connect(?fourth_listener, ?fourth_dialer, 1800000400) != 0) {
         ret 22;
     }
@@ -4111,16 +4208,16 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     }
 
     # past the overlap the retired key is gone and the ticket cannot resume
-    offered = kept;
+    offered       = kept;
     offered.valid = true;
     if (!session.client_store_save(?resume_store, ?offered)) { ret 25; }
     var fifth_listener: Server;
-    var fifth_dialer: client.Client;
+    var fifth_dialer:   client.Client;
     if (resume_connect(?fifth_listener, ?fifth_dialer, 1800002200) != 0) {
         ret 26;
     }
-    if (snapshot(?fifth_listener).resumed) { ret 27; }
-    if (snapshot(?fifth_listener).status != engine.COMPLETE) { ret 28; }
+    if (snapshot(?fifth_listener).resumed)                           { ret 27; }
+    if (snapshot(?fifth_listener).status != engine.COMPLETE)         { ret 28; }
     if (!destroy(?fifth_listener) || !client.destroy(?fifth_dialer)) { ret 29; }
 
     var retired: *credentials.Generation = nil;
@@ -4134,24 +4231,25 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     ret 0;
 }
 
-var mutation_input: [8192]u8;
-var mutation_output: [8192]u8;
-var mutation_retained: [8192]u8;
+var mutation_input:        [8192]u8;
+var mutation_output:       [8192]u8;
+var mutation_retained:     [8192]u8;
 var mutation_certificates: [4]cert.Certificate;
-var mutation_case: [validation.MAX_CORPUS]u8;
+var mutation_case:         [validation.MAX_CORPUS]u8;
 
 # every outcome of one mutated hello must be a complete, bounded state
 fun feed_mutation(listener: *config.ServerConfig, length: usize) i64 {
     var storage: Storage = Storage{
-        input: ?mutation_input[0], input_capacity: 8192,
-        output: ?mutation_output[0], output_capacity: 8192,
-        hello: ?mutation_retained[0], hello_capacity: 8192,
-        certificates: ?mutation_certificates[0], certificate_capacity: 4,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?mutation_input[0], input_capacity: 8192,
+        output:          ?mutation_output[0], output_capacity: 8192,
+        hello:           ?mutation_retained[0], hello_capacity: 8192,
+        certificates:    ?mutation_certificates[0], certificate_capacity: 4,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var extra: ExtraExtension;
-    extra.kind = 0;
+    extra.kind      = 0;
     extra.data.data = nil;
-    extra.data.len = 0;
+    extra.data.len  = 0;
     var value: Server;
     if (!init(?value, listener, storage, extra, 0) ||
         start(?value, 1800000000).status != engine.OK) { ret 1; }
@@ -4163,16 +4261,17 @@ fun feed_mutation(listener: *config.ServerConfig, length: usize) i64 {
             value.queue[0].kind != engine.ALERT ||
             value.queue[0].alert == record.NO_ALERT) { outcome = 2; }
         if (outcome == 0 && ingest(?value, engine.INITIAL, ?mutation_case[0],
-                length).status != engine.FAILED) { outcome = 3; }
+            length).status != engine.FAILED) { outcome = 3; }
         if (outcome == 0 && snapshot(?value).error == error.OK) { outcome = 4; }
-    } or (fed.status == engine.OK) {
+    }
+    or (fed.status == engine.OK) {
         if (!pending(?value)) { outcome = 5; }
         var index: usize = 0;
         for (index < value.queue_len) {
             val item: Pending = value.queue[index];
             if (item.kind == engine.CRYPTO &&
                 (item.offset > 8192 || item.length > 8192 - item.offset ||
-                 item.length == 0)) { outcome = 6; }
+                item.length == 0)) { outcome = 6; }
             index = index + 1;
         }
         if (outcome == 0 && !codec.valid_cipher_suite(value.suite)) {
@@ -4181,44 +4280,49 @@ fun feed_mutation(listener: *config.ServerConfig, length: usize) i64 {
         if (outcome == 0 && snapshot(?value).status == engine.COMPLETE) {
             outcome = 8;
         }
-    } or (fed.status == engine.MORE) {
+    }
+    or (fed.status == engine.MORE) {
         if (pending(?value)) { outcome = 9; }
-    } or { outcome = 10; }
+    }
+    or { outcome = 10; }
     destroy(?value);
     ret outcome;
 }
 
 test "validation: mutated client hellos leave the server in a bounded state" {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = secret.system_allocator();
     var chain_storage: [1]cert.Certificate;
-    var key: keys.PrivateKey;
-    var identity: credentials.Identity;
+    var key:           keys.PrivateKey;
+    var identity:      credentials.Identity;
     if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
         ret 1;
     }
     var generation: credentials.Generation = credentials.empty_generation();
     if (credentials.initialize(?generation, ?identity, 1, 0, nil,
-            false) != contracts.OK) { ret 2; }
+        false) != contracts.OK) { ret 2; }
     var store: credentials.Store = credentials.empty_store();
     if (credentials.initialize_store(?store, ?generation) != contracts.OK) {
         ret 3;
     }
-    var counter: u8 = 17;
+    var counter: u8             = 17;
     var entropy: secret.Entropy = secret.Entropy{context: ?counter,
         secret_context: nil, fill_fn: test_entropy, initialized: true};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
-        config.ProtocolName{data: "h2"::*u8, len: 2}};
-    var versions: [1]u16 = [1]u16{tls13.VERSION};
-    var suites: [1]tls13.CipherSuite = [1]tls13.CipherSuite{
-        tls13.AES_128_GCM_SHA256};
-    var groups: [1]tls13.NamedGroup = [1]tls13.NamedGroup{tls13.X25519};
+        config.ProtocolName{data: "h2"::*u8, len: 2}
+    };
+    var versions: [1]u16               = [1]u16{tls13.VERSION};
+    var suites:   [1]tls13.CipherSuite = [1]tls13.CipherSuite{
+        tls13.AES_128_GCM_SHA256
+    };
+    var groups:     [1]tls13.NamedGroup      = [1]tls13.NamedGroup{tls13.X25519};
     var signatures: [1]tls13.SignatureScheme = [1]tls13.SignatureScheme{
-        tls13.ED25519};
+        tls13.ED25519
+    };
     var listener: config.ServerConfig;
     corpus_listener(?listener, ?store, ?protocols[0], ?versions[0], ?suites[0],
         ?groups[0], ?signatures[0], ?entropy);
     listener.limits.max_peer_handshake_bytes = 8192;
-    listener.limits.max_client_hello_bytes = 8192;
+    listener.limits.max_client_hello_bytes   = 8192;
 
     var extension_len: usize = extension_server_name(0);
     extension_len = extension_supported_versions(extension_len, true);
@@ -4230,15 +4334,18 @@ test "validation: mutated client hellos leave the server in a bounded state" {
         tls13.AES_128_GCM_SHA256, 1, 0, extension_len);
     if (length == 0 || length > validation.MAX_CORPUS) { ret 4; }
 
-    var state: u64 = 0xfeedfacecafe;
-    var accepted: usize = 0;
-    var refused: usize = 0;
+    var state:     u64   = 0xfeedfacecafe;
+    var accepted:  usize = 0;
+    var refused:   usize = 0;
     var iteration: usize = 0;
     for (iteration < 384) {
         var i: usize = 0;
-        for (i < length) { mutation_case[i] = corpus_hello[i]; i = i + 1; }
+        for (i < length) {
+            mutation_case[i] = corpus_hello[i];
+            i                = i + 1;
+        }
         var mutated: usize = length;
-        var rounds: usize = 1;
+        var rounds:  usize = 1;
         var applied: usize = 0;
         for (applied < rounds) {
             mutated = validation.mutate(?state, ?mutation_case[0], mutated,
@@ -4251,7 +4358,7 @@ test "validation: mutated client hellos leave the server in a bounded state" {
     }
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 5; }
-    if (keys.destroy_private(?key) != contracts.OK) { ret 6; }
+    if (keys.destroy_private(?key) != contracts.OK)                 { ret 6; }
     ret 0;
 }
 
@@ -4259,11 +4366,14 @@ test "server: an ALPN-aware selector sees only complete offered protocol names" 
     var offered: [12]u8 = [12]u8{2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1',
         '.', '1'};
     val request: CredentialOffer = CredentialOffer{server_name: contracts.Bytes{
-        data: "site.example"::*u8, len: 12}, offered_alpn: contracts.Bytes{
-        data: ?offered[0], len: 12}};
+        data: "site.example"::*u8, len: 12
+    }, offered_alpn: contracts.Bytes{
+        data: ?offered[0], len: 12
+    }};
     if (!offered_alpn_contains(request, contracts.Bytes{data: "h2"::*u8,
-        len: 2}) || !offered_alpn_contains(request, contracts.Bytes{
-        data: "http/1.1"::*u8, len: 8})) { ret 1; }
+        len:  2}) || !offered_alpn_contains(request, contracts.Bytes{
+        data: "http/1.1"::*u8, len: 8
+    })) { ret 1; }
     if (offered_alpn_contains(request, contracts.Bytes{data: "acme-tls/1"::*u8,
         len: 10})) { ret 2; }
     offered[3] = 9;
@@ -4274,21 +4384,26 @@ test "server: an ALPN-aware selector sees only complete offered protocol names" 
 
 test "server: an exact ALPN offer contains only its single protocol" {
     var single: [11]u8 = [11]u8{
-        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'
+    };
     var offer: CredentialOffer = CredentialOffer{
-        server_name: contracts.Bytes{data: nil, len: 0},
-        offered_alpn: contracts.Bytes{data: ?single[0], len: 11}};
+        server_name:  contracts.Bytes{data: nil, len: 0},
+        offered_alpn: contracts.Bytes{data: ?single[0], len: 11}
+    };
     val challenge: contracts.Bytes = contracts.Bytes{
-        data: "acme-tls/1"::*u8, len: 10};
+        data: "acme-tls/1"::*u8, len: 10
+    };
     if (!offered_alpn_exactly(offer, challenge)) { ret 1; }
     var mixed: [14]u8 = [14]u8{
-        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1', 2, 'h', '2'};
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1', 2, 'h', '2'
+    };
     offer.offered_alpn = contracts.Bytes{data: ?mixed[0], len: 14};
     if (!offered_alpn_contains(offer, challenge) ||
         offered_alpn_exactly(offer, challenge)) { ret 2; }
     var duplicate: [22]u8 = [22]u8{
         10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1',
-        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+        10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'
+    };
     offer.offered_alpn = contracts.Bytes{data: ?duplicate[0], len: 22};
     if (offered_alpn_exactly(offer, challenge)) { ret 3; }
     ret 0;
@@ -4297,34 +4412,36 @@ test "server: an exact ALPN offer contains only its single protocol" {
 fun test_challenge_store_selector(store: *credentials.Store, offer: CredentialOffer,
     output: *credentials.Lease) contracts.Error {
     if (store == nil || !offered_alpn_exactly(offer,
-            contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
+        contracts.Bytes{data: "acme-tls/1"::*u8, len: 10})) {
         ret contracts.UNSUPPORTED;
     }
     ret credentials.acquire(store, offer.server_name, output);
 }
 
 test "server: transient selector leases its store before retirement" {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = secret.system_allocator();
     var chain_storage: [1]cert.Certificate;
-    var key: keys.PrivateKey;
-    var identity: credentials.Identity;
+    var key:           keys.PrivateKey;
+    var identity:      credentials.Identity;
     if (!load_test_credentials(?identity, ?chain_storage[0], ?key, ?owner)) {
         ret 1;
     }
     var generation: credentials.Generation = credentials.empty_generation();
     if (credentials.initialize(?generation, ?identity, 1, 0, nil,
-            false) != contracts.OK) { ret 2; }
+        false) != contracts.OK) { ret 2; }
     var challenge_store: credentials.Store = credentials.empty_store();
     if (credentials.initialize_store(?challenge_store, ?generation) != contracts.OK) {
         ret 3;
     }
-    var alpn: [11]u8 = [11]u8{10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
+    var alpn:  [11]u8          = [11]u8{10, 'a', 'c', 'm', 'e', '-', 't', 'l', 's', '/', '1'};
     val offer: CredentialOffer = CredentialOffer{server_name: contracts.Bytes{
-        data: "api.example.com"::*u8, len: 15}, offered_alpn: contracts.Bytes{
-        data: ?alpn[0], len: 11}};
+        data: "api.example.com"::*u8, len: 15
+    }, offered_alpn: contracts.Bytes{
+        data: ?alpn[0], len: 11
+    }};
     var lease: credentials.Lease = credentials.empty_lease();
     if (test_challenge_store_selector(?challenge_store, offer, ?lease) !=
-            contracts.OK || lease.generation != ?generation ||
+        contracts.OK || lease.generation != ?generation ||
         lease.identity != ?identity) { ret 4; }
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?challenge_store, ?retired) != contracts.OK ||
@@ -4335,7 +4452,7 @@ test "server: transient selector leases its store before retirement" {
         credentials.clear(retired) != contracts.OK) { ret 6; }
     var refused: credentials.Lease = credentials.empty_lease();
     if (test_challenge_store_selector(?challenge_store, offer, ?refused) !=
-            contracts.INVALID_STATE || keys.destroy_private(?key) != contracts.OK) {
+        contracts.INVALID_STATE || keys.destroy_private(?key) != contracts.OK) {
         ret 7;
     }
     ret 0;

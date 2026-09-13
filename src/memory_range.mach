@@ -6,7 +6,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 
 pub fun valid_address(address: usize, len: usize) bool {
-    if (len == 0) { ret true; }
+    if (len == 0)     { ret true; }
     if (address == 0) { ret false; }
     ret len - 1 <= ~(0::usize) - address;
 }
