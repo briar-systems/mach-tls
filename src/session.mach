@@ -201,7 +201,7 @@ fun fill_public(entropy: *secret.Entropy, output: *u8, length: usize) bool {
         ret false;
     }
     var i: usize = 0;
-    for (i < length) { output[i] = temporary[i]:^; i = i + 1; }
+    for (i < length) { output[i] = temporary[i]:>u8; i = i + 1; }
     ct.zeroize(?temporary[0], MAX_TICKET_BYTES);
     ret true;
 }
@@ -480,9 +480,9 @@ fun encode_state(value: *State, output: *^u8) usize {
 fun decode_state(input: *^u8, length: usize, output: *State) bool {
     if (length < STATE_FIXED_SIZE + 2) { ret false; }
     @output = empty_state();
-    output.version = (input[0]:^::u16 << 8) | input[1]:^::u16;
-    output.suite = (input[2]:^::u16 << 8) | input[3]:^::u16;
-    output.secret_len = input[4]:^::usize;
+    output.version = (input[0]:>u8::u16 << 8) | input[1]:>u8::u16;
+    output.suite = (input[2]:>u8::u16 << 8) | input[3]:>u8::u16;
+    output.secret_len = input[4]:>u8::usize;
     var offset: usize = 5;
     var i: usize = 0;
     for (i < MAX_SECRET) {
@@ -492,7 +492,7 @@ fun decode_state(input: *^u8, length: usize, output: *State) bool {
     offset = offset + MAX_SECRET;
     var issued: u64 = 0;
     i = 0;
-    for (i < 8) { issued = (issued << 8) | input[offset + i]:^::u64; i = i + 1; }
+    for (i < 8) { issued = (issued << 8) | input[offset + i]:>u8::u64; i = i + 1; }
     output.issued_at = issued::i64;
     offset = offset + 8;
     var lifetime: u32 = 0;
@@ -500,9 +500,9 @@ fun decode_state(input: *^u8, length: usize, output: *State) bool {
     var early: u32 = 0;
     i = 0;
     for (i < 4) {
-        lifetime = (lifetime << 8) | input[offset + i]:^::u32;
-        age_add = (age_add << 8) | input[offset + 4 + i]:^::u32;
-        early = (early << 8) | input[offset + 8 + i]:^::u32;
+        lifetime = (lifetime << 8) | input[offset + i]:>u8::u32;
+        age_add = (age_add << 8) | input[offset + 4 + i]:>u8::u32;
+        early = (early << 8) | input[offset + 8 + i]:>u8::u32;
         i = i + 1;
     }
     output.lifetime_seconds = lifetime;
@@ -512,26 +512,26 @@ fun decode_state(input: *^u8, length: usize, output: *State) bool {
     var generation: u64 = 0;
     i = 0;
     for (i < 8) {
-        generation = (generation << 8) | input[offset + i]:^::u64;
+        generation = (generation << 8) | input[offset + i]:>u8::u64;
         i = i + 1;
     }
     output.credential_generation = generation;
     offset = offset + 8;
     output.client_authenticated =
-        (input[offset]:^ & STATE_CLIENT_AUTHENTICATED) != 0;
+        (input[offset]:>u8 & STATE_CLIENT_AUTHENTICATED) != 0;
     offset = offset + 1;
-    val alpn_len: usize = input[offset]:^::usize;
+    val alpn_len: usize = input[offset]:>u8::usize;
     offset = offset + 1;
     if (alpn_len > MAX_ALPN || offset + alpn_len + 1 > length) { ret false; }
     i = 0;
-    for (i < alpn_len) { output.alpn[i] = input[offset + i]:^; i = i + 1; }
+    for (i < alpn_len) { output.alpn[i] = input[offset + i]:>u8; i = i + 1; }
     output.alpn_len = alpn_len;
     offset = offset + alpn_len;
-    val name_len: usize = input[offset]:^::usize;
+    val name_len: usize = input[offset]:>u8::usize;
     offset = offset + 1;
     if (name_len > MAX_SERVER_NAME || offset + name_len != length) { ret false; }
     i = 0;
-    for (i < name_len) { output.server_name[i] = input[offset + i]:^; i = i + 1; }
+    for (i < name_len) { output.server_name[i] = input[offset + i]:>u8; i = i + 1; }
     output.server_name_len = name_len;
     ret state_valid(output);
 }
@@ -1055,7 +1055,7 @@ test "session: tickets survive key rotation for exactly the configured overlap" 
         recovered.server_name_len != 15) { ret 5; }
     i = 0;
     for (i < 32) {
-        if (recovered.secret[i]:^ != (0x30 + i)::u8) { ret 6; }
+        if (recovered.secret[i]:>u8 != (0x30 + i)::u8) { ret 6; }
         i = i + 1;
     }
 

@@ -14,10 +14,8 @@ use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_err;
-use std.types.result.unwrap_ok;
+use std.types.result.res;
+use std.types.error.err;
 use std.types.size.usize;
 use io_error: std.io.error;
 use io_runtime: std.io.runtime;
@@ -37,6 +35,22 @@ use tls.tls13;
 use tls.transport;
 use tls.memory_range;
 
+
+fun operation_ok(outcome: cancel.Operation) bool {
+    ret sel outcome.ok;
+}
+
+fun transition_ok(outcome: cancel.Transition) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
+
+fun runtime_ok(outcome: err[io_error.Error]) bool {
+    ret sel outcome.ok;
+}
+
+fun runtime_closed(outcome: res[bool, io_error.Error]) bool {
+    ret (sel outcome.ok) && outcome.ok;
+}
 rec BlockingTransport {
     runtime: *io_runtime.Runtime;
     stream: *tcp.Stream;
@@ -64,7 +78,7 @@ fun blocking_aliases_state(context: ptr, data: *u8, len: usize) bool {
 
 fun submit(state: *BlockingTransport, scope: *cancel.Scope,
     kind: io_runtime.Kind, buffer: *u8, length: usize,
-    context: usize) Result[io_runtime.Token, io_error.Error] {
+    context: usize) res[io_runtime.Token, io_error.Error] {
     val operation: io_runtime.Operation = io_runtime.Operation{kind: kind,
         resource: state.stream.handle.value, buffer: buffer, length: length,
         offset: 0, context: context};
@@ -72,19 +86,20 @@ fun submit(state: *BlockingTransport, scope: *cancel.Scope,
 }
 
 fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
-    length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *BlockingTransport = context::*BlockingTransport;
-    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.READ, buffer, length, token_context);
-    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
-    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
-    val received: Result[usize, io_error.Error] = tcp.stream_read(state.stream,
+    if (sel submitted.err) { ret submitted; }
+    val token: io_runtime.Token = submitted.ok;
+    val received: res[usize, io_error.Error] = tcp.stream_read(state.stream,
         buffer, length);
-    if (is_err[usize, io_error.Error](received)) {
+    if (sel received.err) {
         io_runtime.fail(state.runtime, token,
-            unwrap_err[usize, io_error.Error](received));
-    } or {
-        val bytes: usize = unwrap_ok[usize, io_error.Error](received);
+            received.err);
+    }
+    if (sel received.ok) {
+        val bytes: usize = received.ok;
         io_runtime.complete(state.runtime, token, bytes,
             state.stream.handle.value, bytes == 0);
     }
@@ -92,36 +107,37 @@ fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
 }
 
 fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
-    length: usize, token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *BlockingTransport = context::*BlockingTransport;
-    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.WRITE, buffer, length, token_context);
-    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
-    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
-    val written: Result[usize, io_error.Error] = tcp.stream_write(state.stream,
+    if (sel submitted.err) { ret submitted; }
+    val token: io_runtime.Token = submitted.ok;
+    val written: res[usize, io_error.Error] = tcp.stream_write(state.stream,
         buffer, length);
-    if (is_err[usize, io_error.Error](written)) {
+    if (sel written.err) {
         io_runtime.fail(state.runtime, token,
-            unwrap_err[usize, io_error.Error](written));
-    } or {
+            written.err);
+    }
+    if (sel written.ok) {
         io_runtime.complete(state.runtime, token,
-            unwrap_ok[usize, io_error.Error](written), state.stream.handle.value, false);
+            written.ok, state.stream.handle.value, false);
     }
     ret submitted;
 }
 
 fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
-    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *BlockingTransport = context::*BlockingTransport;
-    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.SHUTDOWN, nil, 0, token_context);
-    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
-    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
-    val stopped: Result[bool, io_error.Error] = tcp.stream_shutdown(state.stream,
+    if (sel submitted.err) { ret submitted; }
+    val token: io_runtime.Token = submitted.ok;
+    val stopped: err[io_error.Error] = tcp.stream_shutdown(state.stream,
         os.SHUT_WR);
-    if (is_err[bool, io_error.Error](stopped)) {
+    if (sel stopped.err) {
         io_runtime.fail(state.runtime, token,
-            unwrap_err[bool, io_error.Error](stopped));
+            stopped.err);
     } or {
         io_runtime.complete(state.runtime, token, 0, state.stream.handle.value, false);
     }
@@ -129,17 +145,17 @@ fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
 }
 
 fun blocking_close(context: ptr, scope: *cancel.Scope,
-    token_context: usize) Result[io_runtime.Token, io_error.Error] {
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
     val state: *BlockingTransport = context::*BlockingTransport;
     val resource: usize = state.stream.handle.value;
-    val submitted: Result[io_runtime.Token, io_error.Error] = submit(state, scope,
+    val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.CLOSE, nil, 0, token_context);
-    if (is_err[io_runtime.Token, io_error.Error](submitted)) { ret submitted; }
-    val token: io_runtime.Token = unwrap_ok[io_runtime.Token, io_error.Error](submitted);
-    val closed: Result[bool, io_error.Error] = tcp.stream_close(state.stream);
-    if (is_err[bool, io_error.Error](closed)) {
+    if (sel submitted.err) { ret submitted; }
+    val token: io_runtime.Token = submitted.ok;
+    val closed: err[io_error.Error] = tcp.stream_close(state.stream);
+    if (sel closed.err) {
         io_runtime.fail(state.runtime, token,
-            unwrap_err[bool, io_error.Error](closed));
+            closed.err);
     } or {
         io_runtime.complete(state.runtime, token, 0, resource, false);
     }
@@ -189,11 +205,10 @@ fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
     for (transport.snapshot(?secure.operation).state !=
         transport.OPERATION_TERMINAL) {
         var completion: io_runtime.Completion;
-        val polled: Result[usize, io_error.Error] = io_runtime.poll(owner,
+        val polled: res[usize, io_error.Error] = io_runtime.poll(owner,
             ?completion, 1);
-        if (is_err[usize, io_error.Error](polled) ||
-            unwrap_ok[usize, io_error.Error](polled) != 1 ||
-            !stream.accept(secure, ?completion)) { ret false; }
+        if (sel polled.err) { ret false; }
+        if (polled.ok != 1 || !stream.accept(secure, ?completion)) { ret false; }
     }
     ret true;
 }
@@ -264,11 +279,11 @@ fun report(label: str, value: usize) {
 
 # one complete connection: handshake, bounded settlement checks, exchange, close
 fun dial_one(index: usize) i64 {
-    val connected: Result[tcp.Stream, io_error.Error] = tcp.connect(
+    val connected: res[tcp.Stream, io_error.Error] = tcp.connect(
         ip.endpoint(127, 0, 0, 1, 9443));
-    if (is_err[tcp.Stream, io_error.Error](connected)) { ret 2; }
-    dial_socket = unwrap_ok[tcp.Stream, io_error.Error](connected);
-    if (is_err[bool, io_error.Error](io_runtime.make(?dial_runtime, 16))) {
+    if (sel connected.err) { ret 2; }
+    dial_socket = connected.ok;
+    if (!runtime_ok(io_runtime.make(?dial_runtime, 16))) {
         ret 3;
     }
     dial_blocking = BlockingTransport{runtime: ?dial_runtime,
@@ -294,7 +309,7 @@ fun dial_one(index: usize) i64 {
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 
     var scope: cancel.Scope;
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) { ret 4; }
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var secure: stream.Stream;
     var core: client.Client;
     var empty_extra: client.ExtraExtension;
@@ -335,34 +350,34 @@ fun dial_one(index: usize) i64 {
     report("suite=", negotiated.suite::usize);
     if (negotiated.resumed) { print.print("resumed=1\n"); }
     or { print.print("resumed=0\n"); }
-    if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) { ret 43; }
+    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
 
     var application_input: [64]u8;
     if (index == 0) {
-        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-            !cancel.cancel(?scope) ||
+        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+            !transition_ok(cancel.cancel(?scope)) ||
             !stream.read(?secure, ?scope,
                 transport.Token{index: 2, generation: 1},
                 ?application_input[0], 64, 2)) { ret 44; }
         val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
         if (cancelled.terminal_error != error.CANCELLED ||
-            !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+            !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 45;
         }
-        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
-            !cancel.timeout(?scope) ||
+        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+            !transition_ok(cancel.timeout(?scope)) ||
             !stream.read(?secure, ?scope,
                 transport.Token{index: 2, generation: 2},
                 ?application_input[0], 64, 3)) { ret 46; }
         val timed_out: transport.Snapshot = transport.snapshot(?secure.operation);
         if (timed_out.terminal_error != error.TIMEOUT ||
-            !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+            !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 47;
         }
     }
 
     if (option_key_update) {
-        if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
             !stream.key_update(?secure, ?scope,
                 transport.Token{index: 7, generation: 1}, 0, 7) ||
             !settle(?secure, ?dial_runtime)) { ret 60; }
@@ -371,7 +386,7 @@ fun dial_one(index: usize) i64 {
             report("key update error=", updated.terminal_error::usize);
             ret 61;
         }
-        if (!stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 62;
         }
         print.print("key-updated\n");
@@ -380,48 +395,48 @@ fun dial_one(index: usize) i64 {
     var application_output: [16]u8 = [16]u8{
         'm', 'a', 'c', 'h', '-', 't', 'l', 's', ' ', 'i', 'n', 't', 'e', 'r',
         '\n', 0};
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.write(?secure, ?scope,
             transport.Token{index: 3, generation: 1},
             ?application_output[0], 15, 4) ||
         !settle(?secure, ?dial_runtime)) { ret 48; }
     val written: transport.Snapshot = transport.snapshot(?secure.operation);
     if (written.terminal_error != error.OK || written.application_bytes != 15 ||
-        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 49;
     }
 
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.read(?secure, ?scope,
             transport.Token{index: 4, generation: 1},
             ?application_input[0], 64, 5) ||
         !settle(?secure, ?dial_runtime)) { ret 50; }
     val read: transport.Snapshot = transport.snapshot(?secure.operation);
     if (read.terminal_error != error.OK || read.application_bytes == 0 ||
-        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 51;
     }
 
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.half_close(?secure, ?scope,
             transport.Token{index: 5, generation: 1}, 6) ||
         !settle(?secure, ?dial_runtime)) { ret 52; }
     val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (half_closed.terminal_error != error.OK || !secure.send_closed ||
-        !stream.destroy_operation(?secure) || !cancel.destroy(?scope)) {
+        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 53;
     }
 
-    if (!cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}) ||
+    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.close(?secure, ?scope,
             transport.Token{index: 6, generation: 1}, 7) ||
         !settle(?secure, ?dial_runtime)) { ret 7; }
     val closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
         !stream.destroy(?secure) ||
-        !cancel.destroy(?scope) ||
-        is_err[bool, io_error.Error](io_runtime.close(?dial_runtime)) ||
-        is_err[bool, io_error.Error](io_runtime.destroy(?dial_runtime))) {
+        !operation_ok(cancel.destroy(?scope)) ||
+        !runtime_closed(io_runtime.close(?dial_runtime)) ||
+        !runtime_ok(io_runtime.destroy(?dial_runtime))) {
         ret 8;
     }
     if (option_tls12) {

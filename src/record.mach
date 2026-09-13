@@ -388,8 +388,8 @@ pub fun decode_alert(protocol: Protocol, data: *u8, length: usize, output: *Aler
 
 fun valid_secret_alert(protocol: Protocol, data: *^u8) bool {
     var bytes: [2]u8;
-    bytes[0] = data[0]:^;
-    bytes[1] = data[1]:^;
+    bytes[0] = data[0]:>u8;
+    bytes[1] = data[1]:>u8;
     var message: AlertMessage;
     ret decode_alert(protocol, ?bytes[0], 2, ?message) == tls_error.OK;
 }
@@ -574,7 +574,7 @@ pub fun seal(
         }
         var i: usize = 0;
         for (i < content.len) { scratch.data[i] = content.data[i]; i = i + 1; }
-        scratch.data[content.len] = content_type:^;
+        scratch.data[content.len] = content_type:>u8;
         i = content.len + 1;
         for (i < inner_length) { scratch.data[i] = 0; i = i + 1; }
         var aad: [5]u8;
@@ -648,9 +648,9 @@ fun inspect_inner(data: *^u8, length: usize, has_content: *bool,
         content_end = ct.select_usize(nonzero, i + 1, content_end);
         i = i + 1;
     }
-    has_content[0] = present:^ != 0;
-    decoded_type[0] = content_type:^;
-    decoded_end[0] = content_end:^;
+    has_content[0] = present:>u8 != 0;
+    decoded_type[0] = content_type:>u8;
+    decoded_end[0] = content_end:>usize;
 }
 
 pub fun open(cipher: *Cipher, input: *u8, length: usize, output: contracts.SecretBuffer) Opened {
@@ -790,7 +790,7 @@ fun fake_seal(key: contracts.SecretBytes, nonce: contracts.Bytes, aad: contracts
     val required: usize = plaintext.len + TAG_SIZE;
     if (output.data == nil || output.capacity < required) { ret contracts.Operation{error: contracts.OUTPUT_TOO_SMALL, written: 0}; }
     var i: usize = 0;
-    for (i < plaintext.len) { output.data[i] = (plaintext.data[i] ^ key.data[0]):^; i = i + 1; }
+    for (i < plaintext.len) { output.data[i] = (plaintext.data[i] ^ key.data[0]):>u8; i = i + 1; }
     val tag: u32 = fake_tag(aad, nonce, output.data, plaintext.len);
     i = 0;
     for (i < TAG_SIZE) { output.data[plaintext.len + i] = (tag ^ i::u32)::u8; i = i + 1; }
@@ -911,8 +911,8 @@ test "record: tls 1.3 real aead records match independent vectors" {
     if (aes128_opened.error != tls_error.OK || aes128_opened.content_type != HANDSHAKE
         || aes128_opened.written != 5) { ret 3; }
     var i: usize = 0;
-    for (i < 5) { if (plaintext[i]:^ != hello[i]:^) { ret 4; } i = i + 1; }
-    for (i < 8) { if (plaintext[i]:^ != 0) { ret 5; } i = i + 1; }
+    for (i < 5) { if (plaintext[i]:>u8 != hello[i]:>u8) { ret 4; } i = i + 1; }
+    for (i < 8) { if (plaintext[i]:>u8 != 0) { ret 5; } i = i + 1; }
     install(?receiver, TLS13, aes_128_gcm(),
         contracts.SecretBytes{data: ?aes128_key[0], len: 16},
         contracts.Bytes{data: ?aes128_iv[0], len: 12});
@@ -924,7 +924,7 @@ test "record: tls 1.3 real aead records match independent vectors" {
     if (rejected.error != tls_error.BAD_RECORD_MAC || rejected.alert != BAD_RECORD_MAC_ALERT
         || !receiver.failed) { ret 6; }
     i = 0;
-    for (i < 8) { if (plaintext[i]:^ != 0) { ret 6; } i = i + 1; }
+    for (i < 8) { if (plaintext[i]:>u8 != 0) { ret 6; } i = i + 1; }
 
     var aes256_key: [32]^u8;
     var aes256_iv: [12]u8;
@@ -954,8 +954,8 @@ test "record: tls 1.3 real aead records match independent vectors" {
     val aes256_opened: Opened = open(?receiver, ?wire[0], 27,
         contracts.SecretBuffer{data: ?plaintext[0], capacity: 32});
     if (aes256_opened.error != tls_error.OK || aes256_opened.content_type != ALERT
-        || aes256_opened.written != 2 || plaintext[0]:^ != FATAL
-        || plaintext[1]:^ != CLOSE_NOTIFY) { ret 8; }
+        || aes256_opened.written != 2 || plaintext[0]:>u8 != FATAL
+        || plaintext[1]:>u8 != CLOSE_NOTIFY) { ret 8; }
 
     var chacha_key: [32]^u8;
     var chacha_iv: [12]u8;
@@ -987,7 +987,7 @@ test "record: tls 1.3 real aead records match independent vectors" {
     if (chacha_opened.error != tls_error.OK || chacha_opened.content_type != APPLICATION_DATA
         || chacha_opened.written != 4) { ret 10; }
     i = 0;
-    for (i < 4) { if (plaintext[i]:^ != mach[i]:^) { ret 11; } i = i + 1; }
+    for (i < 4) { if (plaintext[i]:>u8 != mach[i]:>u8) { ret 11; } i = i + 1; }
     ret 0;
 }
 
@@ -1025,7 +1025,7 @@ test "record: tls 1.2 real aead records match independent vectors" {
     if (aes_opened.error != tls_error.OK || aes_opened.content_type != APPLICATION_DATA
         || aes_opened.written != 5) { ret 2; }
     var i: usize = 0;
-    for (i < 5) { if (plaintext[i]:^ != hello[i]:^) { ret 3; } i = i + 1; }
+    for (i < 5) { if (plaintext[i]:>u8 != hello[i]:>u8) { ret 3; } i = i + 1; }
 
     var chacha_key: [32]^u8;
     var chacha_iv: [12]u8;
@@ -1057,7 +1057,7 @@ test "record: tls 1.2 real aead records match independent vectors" {
     if (chacha_opened.error != tls_error.OK || chacha_opened.content_type != HANDSHAKE
         || chacha_opened.written != 4) { ret 5; }
     i = 0;
-    for (i < 4) { if (plaintext[i]:^ != mach[i]:^) { ret 6; } i = i + 1; }
+    for (i < 4) { if (plaintext[i]:>u8 != mach[i]:>u8) { ret 6; } i = i + 1; }
     ret 0;
 }
 
@@ -1104,9 +1104,9 @@ test "record: tls 1.3 encrypts type and padding and authenticates before release
     val opened: Opened = open(?receiver, ?wire[0], sealed.written, contracts.SecretBuffer{data: ?plaintext[0], capacity: 64});
     if (opened.error != tls_error.OK || opened.content_type != HANDSHAKE || opened.written != 5 || receiver.sequence != 1) { ret 3; }
     i = 0;
-    for (i < 5) { if (plaintext[i]:^ != message[i]:^) { ret 4; } i = i + 1; }
+    for (i < 5) { if (plaintext[i]:>u8 != message[i]:>u8) { ret 4; } i = i + 1; }
     i = 5;
-    for (i < 13) { if (plaintext[i]:^ != 0) { ret 5; } i = i + 1; }
+    for (i < 13) { if (plaintext[i]:>u8 != 0) { ret 5; } i = i + 1; }
 
     var rejected_receiver: Cipher;
     install(?rejected_receiver, TLS13, algorithm, contracts.SecretBytes{data: ?key[0], len: 16}, contracts.Bytes{data: ?iv[0], len: 12});
@@ -1116,7 +1116,7 @@ test "record: tls 1.3 encrypts type and padding and authenticates before release
     val rejected: Opened = open(?rejected_receiver, ?wire[0], sealed.written, contracts.SecretBuffer{data: ?plaintext[0], capacity: 64});
     if (rejected.error != tls_error.BAD_RECORD_MAC || rejected.alert != BAD_RECORD_MAC_ALERT || !rejected_receiver.failed) { ret 6; }
     i = 0;
-    for (i < 13) { if (plaintext[i]:^ != 0) { ret 7; } i = i + 1; }
+    for (i < 13) { if (plaintext[i]:>u8 != 0) { ret 7; } i = i + 1; }
     ret 0;
 }
 
@@ -1210,7 +1210,7 @@ test "record: installation rejects self-aliased public iv ownership" {
     var expected_key: [16]u8;
     var expected_iv: [12]u8;
     i = 0;
-    for (i < 16) { expected_key[i] = cipher.key[i]:^; i = i + 1; }
+    for (i < 16) { expected_key[i] = cipher.key[i]:>u8; i = i + 1; }
     i = 0;
     for (i < 12) { expected_iv[i] = cipher.iv[i]; i = i + 1; }
     if (install(?cipher, TLS13, algorithm,
@@ -1218,7 +1218,7 @@ test "record: installation rejects self-aliased public iv ownership" {
             contracts.Bytes{data: ?cipher.iv[0], len: 12})) { ret 2; }
     i = 0;
     for (i < 16) {
-        if (cipher.key[i]:^ != expected_key[i]) { ret 3; }
+        if (cipher.key[i]:>u8 != expected_key[i]) { ret 3; }
         i = i + 1;
     }
     i = 0;
@@ -1294,7 +1294,7 @@ test "record: empty application records remain protocol-correct" {
     val opened13: Opened = open(?receiver, ?wire[0], sealed13.written,
         contracts.SecretBuffer{data: ?plaintext[0], capacity: 1});
     if (opened13.error != tls_error.OK || opened13.content_type != APPLICATION_DATA || opened13.written != 0
-        || plaintext[0]:^ != 0) { ret 4; }
+        || plaintext[0]:>u8 != 0) { ret 4; }
     ret 0;
 }
 
@@ -1327,8 +1327,8 @@ test "record: tls 1.3 permits the complete padding envelope" {
         contracts.SecretBuffer{data: ?max_padding_plaintext[0], capacity: MAX_INNER_PLAINTEXT});
     if (opened.error != tls_error.OK || opened.content_type != APPLICATION_DATA
         || opened.written != 0 || receiver.sequence != 1
-        || max_padding_plaintext[0]:^ != 0
-        || max_padding_plaintext[MAX_INNER_PLAINTEXT - 1]:^ != 0) { ret 3; }
+        || max_padding_plaintext[0]:>u8 != 0
+        || max_padding_plaintext[MAX_INNER_PLAINTEXT - 1]:>u8 != 0) { ret 3; }
     ret 0;
 }
 
@@ -1449,7 +1449,7 @@ test "record: authenticated malformed inners and leaky providers release nothing
     var i: usize = 0;
     for (i < 8) { plaintext[i] = 0xaa; i = i + 1; }
     val empty: Opened = open(?receiver, ?wire[0], 22, contracts.SecretBuffer{data: ?plaintext[0], capacity: 8});
-    if (empty.error != tls_error.UNEXPECTED_MESSAGE || !receiver.failed || plaintext[0]:^ != 0) { ret 1; }
+    if (empty.error != tls_error.UNEXPECTED_MESSAGE || !receiver.failed || plaintext[0]:>u8 != 0) { ret 1; }
 
     inner[0] = 19;
     fake_seal(contracts.SecretBytes{data: ?key[0], len: 16}, contracts.Bytes{data: ?iv[0], len: 12},
@@ -1458,14 +1458,14 @@ test "record: authenticated malformed inners and leaky providers release nothing
     install(?receiver, TLS13, algorithm, contracts.SecretBytes{data: ?key[0], len: 16}, contracts.Bytes{data: ?iv[0], len: 12});
     plaintext[0] = 0xaa;
     val invalid: Opened = open(?receiver, ?wire[0], 22, contracts.SecretBuffer{data: ?plaintext[0], capacity: 8});
-    if (invalid.error != tls_error.UNEXPECTED_MESSAGE || !receiver.failed || plaintext[0]:^ != 0) { ret 2; }
+    if (invalid.error != tls_error.UNEXPECTED_MESSAGE || !receiver.failed || plaintext[0]:>u8 != 0) { ret 2; }
 
     val rejecting: Aead = aead(AES_128_GCM, fake_seal, leaky_reject_open);
     install(?receiver, TLS13, rejecting, contracts.SecretBytes{data: ?key[0], len: 16}, contracts.Bytes{data: ?iv[0], len: 12});
     plaintext[0] = 0xaa;
     val rejected: Opened = open(?receiver, ?wire[0], 22, contracts.SecretBuffer{data: ?plaintext[0], capacity: 8});
     if (rejected.error != tls_error.BAD_RECORD_MAC || rejected.alert != BAD_RECORD_MAC_ALERT
-        || plaintext[0]:^ != 0 || !receiver.failed) { ret 3; }
+        || plaintext[0]:>u8 != 0 || !receiver.failed) { ret 3; }
     ret 0;
 }
 
@@ -1481,9 +1481,9 @@ test "record: key installation and provider failures are transactional" {
     var forged: Aead = algorithm;
     forged.key_size = 32;
     if (install(?cipher, TLS13, forged, contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12}) || cipher.sequence != 7 || cipher.key[0]:^ != 1) { ret 2; }
+        contracts.Bytes{data: ?iv[0], len: 12}) || cipher.sequence != 7 || cipher.key[0]:>u8 != 1) { ret 2; }
     if (install(?cipher, TLS13, algorithm, contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 4}) || cipher.sequence != 7 || cipher.key[0]:^ != 1) { ret 3; }
+        contracts.Bytes{data: ?iv[0], len: 4}) || cipher.sequence != 7 || cipher.key[0]:>u8 != 1) { ret 3; }
 
     val failing: Aead = aead(AES_128_GCM, short_seal, fake_open);
     if (!install(?cipher, TLS13, failing, contracts.SecretBytes{data: ?key[0], len: 16},
@@ -1501,11 +1501,11 @@ test "record: key installation and provider failures are transactional" {
     i = 0;
     for (i < failed.required) { if (output[i] != 0) { ret 6; } i = i + 1; }
     i = 0;
-    for (i < 3) { if (scratch[i]:^ != 0) { ret 7; } i = i + 1; }
+    for (i < 3) { if (scratch[i]:>u8 != 0) { ret 7; } i = i + 1; }
 
     destroy(?cipher);
     if (cipher.installed || cipher.protocol != 0 || cipher.aead.seal != nil || cipher.aead.open != nil
-        || cipher.key[0]:^ != 0 || cipher.iv[0] != 0) { ret 8; }
+        || cipher.key[0]:>u8 != 0 || cipher.iv[0] != 0) { ret 8; }
     ret 0;
 }
 
@@ -1551,8 +1551,8 @@ test "record: providers receive exact writable regions" {
     val opened: Opened = open(?cipher, ?output[0], good.written,
         contracts.SecretBuffer{data: ?plaintext[0], capacity: 8});
     if (opened.error != tls_error.BAD_RECORD_MAC ||
-        observed_open_capacity != 2 || plaintext[0]:^ != 0 ||
-        plaintext[1]:^ != 0 || plaintext[2]:^ != 0xcc) { ret 6; }
+        observed_open_capacity != 2 || plaintext[0]:>u8 != 0 ||
+        plaintext[1]:>u8 != 0 || plaintext[2]:>u8 != 0xcc) { ret 6; }
     ret 0;
 }
 
