@@ -7,9 +7,9 @@ fwd tls.cert.x509;
 
 pub def KeyFormat: u8;
 
-pub val PKCS8_DER:       KeyFormat = 0;
-pub val SEC1_DER:        KeyFormat = 1;
-pub val RSA_PKCS1_DER:   KeyFormat = 2;
+pub val PKCS8_DER:     KeyFormat = 0;
+pub val SEC1_DER:      KeyFormat = 1;
+pub val RSA_PKCS1_DER: KeyFormat = 2;
 
 pub rec Certificate {
     der:     *u8;
@@ -27,7 +27,7 @@ pub rec TrustStore {
 }
 
 test "cert: encoded private key formats are explicit" {
-    if (PKCS8_DER == SEC1_DER) { ret 1; }
+    if (PKCS8_DER == SEC1_DER)     { ret 1; }
     if (SEC1_DER == RSA_PKCS1_DER) { ret 1; }
     ret 0;
 }

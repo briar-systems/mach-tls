@@ -71,20 +71,21 @@ fun certificate_block(input: contracts.Bytes, offset: usize,
     if (end < input.len && input.data[end] == '\r') {
         if (end + 1 >= input.len || input.data[end + 1] != '\n') { ret false; }
         end = end + 2;
-    } or (end < input.len && input.data[end] == '\n') { end = end + 1; }
+    }
+    or (end < input.len && input.data[end] == '\n') { end = end + 1; }
     @block = contracts.Bytes{data: ?input.data[offset], len: end - offset};
-    @next = end;
+    @next  = end;
     ret true;
 }
 
 fun overlaps(first: *u8, first_len: usize, second: *u8,
     second_len: usize) bool {
     if (first_len == 0 || second_len == 0) { ret false; }
-    if (first == nil || second == nil) { ret true; }
-    val first_start: usize = first::usize;
+    if (first == nil || second == nil)     { ret true; }
+    val first_start:  usize = first::usize;
     val second_start: usize = second::usize;
-    val first_end: usize = first_start + first_len;
-    val second_end: usize = second_start + second_len;
+    val first_end:    usize = first_start + first_len;
+    val second_end:   usize = second_start + second_len;
     if (first_end < first_start || second_end < second_start) { ret true; }
     ret first_start < second_end && second_start < first_end;
 }
@@ -95,7 +96,7 @@ pub fun certificate_der(input: contracts.Bytes,
     var parsed: x509.Certificate;
     val status: contracts.Error = x509.parse(input, ?parsed);
     if (status != contracts.OK) { ret status; }
-    output.der = input.data;
+    output.der     = input.data;
     output.der_len = input.len;
     ret contracts.OK;
 }
@@ -105,7 +106,7 @@ pub fun certificate_pem(input: contracts.Bytes, der_output: contracts.Buffer,
     if (output == nil) {
         ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
     }
-    var block: pem.Block;
+    var block:   pem.Block;
     val decoded: contracts.Error = pem.decode(input, der_output, ?block);
     if (decoded != contracts.OK) {
         ret contracts.Operation{error: decoded, written: 0};
@@ -128,16 +129,16 @@ pub fun chain_pem(input: contracts.Bytes, der_output: contracts.Buffer,
         ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
     }
     output.certificates = nil;
-    output.len = 0;
+    output.len          = 0;
     if (overlaps(input.data, input.len, der_output.data, der_output.capacity)) {
         ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
     }
     var position: usize = skip_whitespace(input, 0);
     var required: usize = 0;
-    var count: usize = 0;
+    var count:    usize = 0;
     for (position < input.len) {
         var block: contracts.Bytes;
-        var next: usize = 0;
+        var next:  usize = 0;
         if (!certificate_block(input, position, ?block, ?next)) {
             ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
         }
@@ -146,7 +147,7 @@ pub fun chain_pem(input: contracts.Bytes, der_output: contracts.Buffer,
             ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
         }
         required = required + decoded.written;
-        count = count + 1;
+        count    = count + 1;
         if (count > certificate_capacity) {
             ret contracts.Operation{error: contracts.OUTPUT_TOO_SMALL, written: 0};
         }
@@ -163,17 +164,17 @@ pub fun chain_pem(input: contracts.Bytes, der_output: contracts.Buffer,
     }
     position = skip_whitespace(input, 0);
     var written: usize = 0;
-    var index: usize = 0;
+    var index:   usize = 0;
     for (index < count) {
         var block_input: contracts.Bytes;
-        var next: usize = 0;
+        var next:        usize = 0;
         if (!certificate_block(input, position, ?block_input, ?next)) {
             ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
         }
-        var block: pem.Block;
+        var block:   pem.Block;
         val decoded: contracts.Error = pem.decode(block_input,
             contracts.Buffer{data: ?der_output.data[written],
-                capacity: der_output.capacity - written}, ?block);
+            capacity: der_output.capacity - written}, ?block);
         if (decoded != contracts.OK ||
             !bytes_equal(block.label, "CERTIFICATE"::*u8, 11)) {
             ret contracts.Operation{error: contracts.INVALID_INPUT, written: 0};
@@ -182,19 +183,19 @@ pub fun chain_pem(input: contracts.Bytes, der_output: contracts.Buffer,
         if (status != contracts.OK) {
             ret contracts.Operation{error: status, written: 0};
         }
-        written = written + block.der.len;
+        written  = written + block.der.len;
         position = skip_whitespace(input, next);
-        index = index + 1;
+        index    = index + 1;
     }
     output.certificates = certificates;
-    output.len = count;
+    output.len          = count;
     ret contracts.Operation{error: contracts.OK, written: written};
 }
 
 pub fun private_der(input: contracts.SecretBytes, format: cert.KeyFormat,
     owner: *secret.Allocator, output: *keys.PrivateKey) contracts.Error {
     if (format == cert.PKCS8_DER) { ret keys.decode_pkcs8(input, owner, output); }
-    if (format == cert.SEC1_DER) { ret keys.decode_sec1(input, owner, output); }
+    if (format == cert.SEC1_DER)  { ret keys.decode_sec1(input, owner, output); }
     if (format == cert.RSA_PKCS1_DER) {
         ret keys.decode_rsa_private(input, owner, output);
     }
@@ -208,8 +209,14 @@ pub fun private_pem(input: contracts.SecretBytes, owner: *secret.Allocator,
 
 fun hex_nibble(value: u8, output: *u8) bool {
     if (output == nil) { ret false; }
-    if (value >= '0' && value <= '9') { @output = value - '0'; ret true; }
-    if (value >= 'a' && value <= 'f') { @output = value - 'a' + 10; ret true; }
+    if (value >= '0' && value <= '9') {
+        @output = value - '0';
+        ret true;
+    }
+    if (value >= 'a' && value <= 'f') {
+        @output = value - 'a' + 10;
+        ret true;
+    }
     ret false;
 }
 
@@ -220,34 +227,40 @@ fun decode_secret_hex(input: *u8, input_len: usize, output: *^u8,
     var i: usize = 0;
     for (i < output_len) {
         var high: u8 = 0;
-        var low: u8 = 0;
+        var low:  u8 = 0;
         if (!hex_nibble(input[i * 2], ?high) ||
             !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
         output[i] = (high << 4) | low;
-        i = i + 1;
+        i         = i + 1;
     }
     ret true;
 }
 
 test "cert.load: decode certificate PEM and bounded bundles" {
-    val certificate_pem_data: *u8 = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAVKgAwIBAgIUcUBdqlz8lEoxcPtVyGLrQN0qDrwwBQYDK2VwMDwxCzAJ\nBgNVBAYTAlVTMRMwEQYDVQQKDApCcmlhciBUZXN0MRgwFgYDVQQDDA9CcmlhciBU\nZXN0IFJvb3QwHhcNMjYwODI4MTEzMjQ1WhcNMzYwODI1MTEzMjQ1WjA8MQswCQYD\nVQQGEwJVUzETMBEGA1UECgwKQnJpYXIgVGVzdDEYMBYGA1UEAwwPQnJpYXIgVGVz\ndCBSb290MCowBQYDK2VwAyEA1zQsVUhtzx5sroC8d3ohC0MJZbzDcOsY4SoyGpTY\ncU2jZjBkMB8GA1UdIwQYMBaAFELfNo+RqDCA56syuG7lnW5tmzn+MBIGA1UdEwEB\n/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRC3zaPkagwgOer\nMrhu5Z1ubZs5/jAFBgMrZXADQQB+WLFqB51+X7MOjRk2ZhOLGMvH4WNx8S8TO5rD\nVHQtXkYNVwGK3eDz3CZdB9uJH2HCTrIISG55wgGR3yg6cHoJ\n-----END CERTIFICATE-----\n"::*u8;
-    var der_bytes: [420]u8;
-    var certificate: cert.Certificate;
-    val loaded: contracts.Operation = certificate_pem(
+    val certificate_pem_data: *u8                 = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAVKgAwIBAgIUcUBdqlz8lEoxcPtVyGLrQN0qDrwwBQYDK2VwMDwxCzAJ\nBgNVBAYTAlVTMRMwEQYDVQQKDApCcmlhciBUZXN0MRgwFgYDVQQDDA9CcmlhciBU\nZXN0IFJvb3QwHhcNMjYwODI4MTEzMjQ1WhcNMzYwODI1MTEzMjQ1WjA8MQswCQYD\nVQQGEwJVUzETMBEGA1UECgwKQnJpYXIgVGVzdDEYMBYGA1UEAwwPQnJpYXIgVGVz\ndCBSb290MCowBQYDK2VwAyEA1zQsVUhtzx5sroC8d3ohC0MJZbzDcOsY4SoyGpTY\ncU2jZjBkMB8GA1UdIwQYMBaAFELfNo+RqDCA56syuG7lnW5tmzn+MBIGA1UdEwEB\n/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRC3zaPkagwgOer\nMrhu5Z1ubZs5/jAFBgMrZXADQQB+WLFqB51+X7MOjRk2ZhOLGMvH4WNx8S8TO5rD\nVHQtXkYNVwGK3eDz3CZdB9uJH2HCTrIISG55wgGR3yg6cHoJ\n-----END CERTIFICATE-----\n"::*u8;
+    var der_bytes:            [420]u8;
+    var certificate:          cert.Certificate;
+    val loaded:               contracts.Operation = certificate_pem(
         contracts.Bytes{data: certificate_pem_data, len: 623},
         contracts.Buffer{data: ?der_bytes[0], capacity: 420}, ?certificate);
     if (loaded.error != contracts.OK || loaded.written != 420 ||
         certificate.der != ?der_bytes[0] || certificate.der_len != 420) { ret 1; }
 
     var bundle: [1247]u8;
-    var i: usize = 0;
-    for (i < 623) { bundle[i] = certificate_pem_data[i]; i = i + 1; }
+    var i:      usize = 0;
+    for (i < 623) {
+        bundle[i] = certificate_pem_data[i];
+        i         = i + 1;
+    }
     bundle[623] = '\n';
-    i = 0;
-    for (i < 623) { bundle[624 + i] = certificate_pem_data[i]; i = i + 1; }
-    var chain_der: [840]u8;
+    i           = 0;
+    for (i < 623) {
+        bundle[624 + i] = certificate_pem_data[i];
+        i               = i + 1;
+    }
+    var chain_der:    [840]u8;
     var certificates: [2]cert.Certificate;
-    var chain: cert.Chain;
+    var chain:        cert.Chain;
     val chain_loaded: contracts.Operation = chain_pem(
         contracts.Bytes{data: ?bundle[0], len: 1247},
         contracts.Buffer{data: ?chain_der[0], capacity: 840},
@@ -256,7 +269,7 @@ test "cert.load: decode certificate PEM and bounded bundles" {
         chain.len != 2 || chain.certificates != ?certificates[0] ||
         certificates[1].der != ?chain_der[420]) { ret 2; }
     var too_small_chain: cert.Chain;
-    val too_small: contracts.Operation = chain_pem(
+    val too_small:       contracts.Operation = chain_pem(
         contracts.Bytes{data: ?bundle[0], len: 1247},
         contracts.Buffer{data: ?chain_der[0], capacity: 839},
         ?certificates[0], 2, ?too_small_chain);
@@ -274,9 +287,9 @@ test "cert.load: load DER and PEM private key containers" {
     var key_der: [48]^u8;
     if (!decode_secret_hex(key_hex, 96, ?key_der[0], 48)) { ret 1; }
     var owner: secret.Allocator = secret.system_allocator();
-    var key: keys.PrivateKey = keys.empty_private();
+    var key:   keys.PrivateKey  = keys.empty_private();
     if (private_der(contracts.SecretBytes{data: ?key_der[0], len: 48},
-            cert.PKCS8_DER, ?owner, ?key) != contracts.OK ||
+        cert.PKCS8_DER, ?owner, ?key) != contracts.OK ||
         key.algorithm != keys.ED25519 || key.container != keys.PKCS8) { ret 2; }
     var encoded: [256]^u8;
     val pem_key: contracts.Operation = keys.encode_private_pem(?key,
@@ -285,7 +298,7 @@ test "cert.load: load DER and PEM private key containers" {
         keys.destroy_private(?key) != contracts.OK) { ret 3; }
     var decoded: keys.PrivateKey = keys.empty_private();
     if (private_pem(contracts.SecretBytes{data: ?encoded[0], len: pem_key.written},
-            ?owner, ?decoded) != contracts.OK || decoded.algorithm != keys.ED25519 ||
+        ?owner, ?decoded) != contracts.OK || decoded.algorithm != keys.ED25519 ||
         keys.destroy_private(?decoded) != contracts.OK) { ret 4; }
     ret 0;
 }

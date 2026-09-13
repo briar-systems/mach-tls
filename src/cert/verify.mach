@@ -13,7 +13,7 @@ use tls.cert.name;
 use tls.cert.x509;
 use tls.error;
 
-pub val MAX_CHAIN_DEPTH: usize = 16;
+pub val MAX_CHAIN_DEPTH:      usize = 16;
 pub val MAX_SIGNATURE_CHECKS: usize = 256;
 
 pub def Purpose: u8;
@@ -22,15 +22,15 @@ pub val SERVER_AUTH: Purpose = 1;
 pub val CLIENT_AUTH: Purpose = 2;
 
 pub rec Options {
-    identity: contracts.Bytes;
-    purpose: Purpose;
-    now: i64;
-    max_depth: usize;
+    identity:             contracts.Bytes;
+    purpose:              Purpose;
+    now:                  i64;
+    max_depth:            usize;
     max_signature_checks: usize;
 }
 
 fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
-    if (first.len != second.len) { ret false; }
+    if (first.len != second.len)                                    { ret false; }
     if (first.len > 0 && (first.data == nil || second.data == nil)) { ret false; }
     var i: usize = 0;
     for (i < first.len) {
@@ -52,7 +52,7 @@ fun authority_matches(child: *x509.Certificate,
     if (child.extensions.authority_key_id_present &&
         issuer.extensions.subject_key_id_present &&
         !bytes_equal(child.extensions.authority_key_id,
-            issuer.extensions.subject_key_id)) { ret false; }
+        issuer.extensions.subject_key_id)) { ret false; }
     ret true;
 }
 
@@ -66,45 +66,52 @@ fun verify_signature(child: *x509.Certificate,
         }
         status = signature.verify_ed25519(issuer.public_key.first,
             child.tbs, child.signature);
-    } or (child.signature_algorithm == x509.ECDSA_P256_SHA256) {
+    }
+    or (child.signature_algorithm == x509.ECDSA_P256_SHA256) {
         if (issuer.public_key.algorithm != keys.P256) { ret error.BAD_CERTIFICATE; }
         status = signature.verify_ecdsa_p256_sha256(issuer.public_key.first,
             child.tbs, child.signature);
-    } or (child.signature_algorithm == x509.ECDSA_P384_SHA384) {
+    }
+    or (child.signature_algorithm == x509.ECDSA_P384_SHA384) {
         if (issuer.public_key.algorithm != keys.P384) { ret error.BAD_CERTIFICATE; }
         status = signature.verify_ecdsa_p384_sha384(issuer.public_key.first,
             child.tbs, child.signature);
-    } or (child.signature_algorithm == x509.RSA_PSS_SHA256 ||
+    }
+    or (child.signature_algorithm == x509.RSA_PSS_SHA256 ||
         child.signature_algorithm == x509.RSA_PSS_SHA384) {
         if (issuer.public_key.algorithm != keys.RSA) { ret error.BAD_CERTIFICATE; }
         val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
-            modulus: issuer.public_key.first,
+            modulus:  issuer.public_key.first,
             exponent: issuer.public_key.second,
         };
         if (child.signature_algorithm == x509.RSA_PSS_SHA256) {
             status = signature.verify_rsa_pss_sha256(public_key,
                 child.tbs, child.signature);
-        } or {
+        }
+        or {
             status = signature.verify_rsa_pss_sha384(public_key,
                 child.tbs, child.signature);
         }
-    } or (child.signature_algorithm == x509.RSA_PKCS1_SHA256 ||
+    }
+    or (child.signature_algorithm == x509.RSA_PKCS1_SHA256 ||
         child.signature_algorithm == x509.RSA_PKCS1_SHA384) {
         if (issuer.public_key.algorithm != keys.RSA) { ret error.BAD_CERTIFICATE; }
         val public_key: signature.RsaPublicKey = signature.RsaPublicKey{
-            modulus: issuer.public_key.first,
+            modulus:  issuer.public_key.first,
             exponent: issuer.public_key.second,
         };
         if (child.signature_algorithm == x509.RSA_PKCS1_SHA256) {
             status = signature.verify_rsa_pkcs1_sha256(public_key,
                 child.tbs, child.signature);
-        } or {
+        }
+        or {
             status = signature.verify_rsa_pkcs1_sha384(public_key,
                 child.tbs, child.signature);
         }
-    } or { ret error.UNSUPPORTED_ALGORITHM; }
+    }
+    or                                   { ret error.UNSUPPORTED_ALGORITHM; }
     if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
-    if (status != contracts.OK) { ret error.BAD_CERTIFICATE; }
+    if (status != contracts.OK)          { ret error.BAD_CERTIFICATE; }
     ret error.OK;
 }
 
@@ -138,12 +145,12 @@ fun valid_time(value: *x509.Certificate, now: i64) bool {
 
 fun ip_like(identity: contracts.Bytes) bool {
     if (identity.len == 0 || identity.data == nil) { ret false; }
-    var dot: bool = false;
-    var i: usize = 0;
+    var dot: bool  = false;
+    var i:   usize = 0;
     for (i < identity.len) {
         val character: u8 = identity.data[i];
-        if (character == ':') { ret true; }
-        if (character == '.') { dot = true; }
+        if (character == ':')                   { ret true; }
+        if (character == '.')                   { dot = true; }
         or (character < '0' || character > '9') { ret false; }
         i = i + 1;
     }
@@ -155,16 +162,16 @@ fun identity_matches(value: *x509.Certificate,
     if (value == nil || identity.len == 0 || identity.data == nil ||
         !value.extensions.subject_alt_name_present) { ret false; }
     var parsed_ip: [16]u8;
-    val ip: contracts.Operation = name.parse_ip(identity,
+    val ip:        contracts.Operation = name.parse_ip(identity,
         contracts.Buffer{data: ?parsed_ip[0], capacity: 16});
     val wants_ip: bool = ip.error == contracts.OK;
-    if (!wants_ip && ip_like(identity)) { ret false; }
+    if (!wants_ip && ip_like(identity))                   { ret false; }
     if (!wants_ip && !name.valid_reference_dns(identity)) { ret false; }
     var root: der.Element;
     if (der.exact(value.extensions.subject_alt_name, ?root) != contracts.OK ||
         root.tag != der.SEQUENCE) { ret false; }
     var parent: der.Cursor = der.cursor(value.extensions.subject_alt_name);
-    var body: der.Cursor;
+    var body:   der.Cursor;
     der.enter(?parent, ?root, ?body);
     for (!der.complete(?body)) {
         var general_name: der.Element;
@@ -172,7 +179,7 @@ fun identity_matches(value: *x509.Certificate,
         if (wants_ip && general_name.tag == 0x87 &&
             general_name.content.len == ip.written &&
             bytes_equal(general_name.content,
-                contracts.Bytes{data: ?parsed_ip[0], len: ip.written})) { ret true; }
+            contracts.Bytes{data: ?parsed_ip[0], len: ip.written})) { ret true; }
         if (!wants_ip && general_name.tag == 0x82 &&
             name.match_dns(identity, general_name.content)) { ret true; }
     }
@@ -187,10 +194,10 @@ pub fun server_identity(value: *x509.Certificate,
 fun dns_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
     if (value.len == 0 || constraint.len == 0 || value.data == nil ||
         constraint.data == nil) { ret false; }
-    var value_start: usize = 0;
-    var value_len: usize = value.len;
+    var value_start:      usize = 0;
+    var value_len:        usize = value.len;
     var constraint_start: usize = 0;
-    var constraint_len: usize = constraint.len;
+    var constraint_len:   usize = constraint.len;
     if (value_len > 0 && value.data[value_len - 1] == '.') { value_len = value_len - 1; }
     if (constraint_len > 0 && constraint.data[constraint_len - 1] == '.') {
         constraint_len = constraint_len - 1;
@@ -198,22 +205,22 @@ fun dns_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
     val subdomains_only: bool = constraint_len > 0 && constraint.data[0] == '.';
     if (subdomains_only) {
         constraint_start = 1;
-        constraint_len = constraint_len - 1;
+        constraint_len   = constraint_len - 1;
     }
     if (constraint_len == 0) { ret false; }
     if (value_len > 2 && value.data[0] == '*' && value.data[1] == '.') {
         value_start = 2;
-        value_len = value_len - 2;
+        value_len   = value_len - 2;
     }
     if (value_len < constraint_len) { ret false; }
     val offset: usize = value_start + value_len - constraint_len;
-    var i: usize = 0;
+    var i:      usize = 0;
     for (i < constraint_len) {
-        var first: u8 = value.data[offset + i];
+        var first:  u8 = value.data[offset + i];
         var second: u8 = constraint.data[constraint_start + i];
-        if (first >= 'A' && first <= 'Z') { first = first + ('a' - 'A'); }
+        if (first >= 'A' && first <= 'Z')   { first = first + ('a' - 'A'); }
         if (second >= 'A' && second <= 'Z') { second = second + ('a' - 'A'); }
-        if (first != second) { ret false; }
+        if (first != second)                { ret false; }
         i = i + 1;
     }
     if (value_len == constraint_len) { ret !subdomains_only; }
@@ -236,9 +243,9 @@ fun ip_within(value: contracts.Bytes, constraint: contracts.Bytes) bool {
 fun name_matches_constraint(tag: u8, value: contracts.Bytes,
     base: *der.Element) bool {
     if (base == nil || base.tag != tag) { ret false; }
-    if (tag == 0x82) { ret dns_within(value, base.content); }
-    if (tag == 0x87) { ret ip_within(value, base.content); }
-    if (tag == 0xa4) { ret x509.name_within(value, base.content); }
+    if (tag == 0x82)                    { ret dns_within(value, base.content); }
+    if (tag == 0x87)                    { ret ip_within(value, base.content); }
+    if (tag == 0xa4)                    { ret x509.name_within(value, base.content); }
     ret false;
 }
 
@@ -251,19 +258,19 @@ fun constraint_state(constraints: contracts.Bytes, tag: u8,
     if (der.exact(constraints, ?root) != contracts.OK ||
         root.tag != der.SEQUENCE) { ret false; }
     var parent: der.Cursor = der.cursor(constraints);
-    var body: der.Cursor;
+    var body:   der.Cursor;
     der.enter(?parent, ?root, ?body);
     for (!der.complete(?body)) {
         var group: der.Element;
         if (der.next(?body, ?group) != contracts.OK) { ret false; }
-        val permitted: bool = group.tag == 0xa0;
-        var subtrees: der.Cursor = der.cursor(group.content);
+        val permitted: bool       = group.tag == 0xa0;
+        var subtrees:  der.Cursor = der.cursor(group.content);
         for (!der.complete(?subtrees)) {
             var subtree: der.Element;
             if (der.next(?subtrees, ?subtree) != contracts.OK ||
                 subtree.tag != der.SEQUENCE) { ret false; }
             var subtree_parent: der.Cursor = der.cursor(subtree.encoded);
-            var subtree_body: der.Cursor;
+            var subtree_body:   der.Cursor;
             der.enter(?subtree_parent, ?subtree, ?subtree_body);
             var base: der.Element;
             if (der.next(?subtree_body, ?base) != contracts.OK ||
@@ -275,7 +282,8 @@ fun constraint_state(constraints: contracts.Bytes, tag: u8,
                     if (name_matches_constraint(tag, value, ?base)) {
                         @permitted_match = true;
                     }
-                } or (name_matches_constraint(tag, value, ?base)) {
+                }
+                or (name_matches_constraint(tag, value, ?base)) {
                     @excluded_match = true;
                 }
             }
@@ -287,8 +295,8 @@ fun constraint_state(constraints: contracts.Bytes, tag: u8,
 fun constrained_name(constraints: contracts.Bytes, tag: u8,
     value: contracts.Bytes) bool {
     var permitted_present: bool = false;
-    var permitted_match: bool = false;
-    var excluded_match: bool = false;
+    var permitted_match:   bool = false;
+    var excluded_match:    bool = false;
     if (!constraint_state(constraints, tag, value, ?permitted_present,
         ?permitted_match, ?excluded_match) || excluded_match) { ret false; }
     ret !permitted_present || permitted_match;
@@ -304,7 +312,7 @@ fun certificate_names_constrained(value: *x509.Certificate,
     if (der.exact(value.extensions.subject_alt_name, ?root) != contracts.OK ||
         root.tag != der.SEQUENCE) { ret false; }
     var parent: der.Cursor = der.cursor(value.extensions.subject_alt_name);
-    var body: der.Cursor;
+    var body:   der.Cursor;
     der.enter(?parent, ?root, ?body);
     for (!der.complete(?body)) {
         var general_name: der.Element;
@@ -322,8 +330,8 @@ fun validate_path(parsed: *x509.Certificate, path: *usize, path_len: usize,
     if (parsed == nil || path == nil || options == nil || path_len == 0) {
         ret error.INTERNAL_ERROR;
     }
-    val leaf: *x509.Certificate = ?parsed[path[0]];
-    var ca_limit: usize = path_len;
+    val leaf:     *x509.Certificate = ?parsed[path[0]];
+    var ca_limit: usize             = path_len;
     if (trusted_index_present) { ca_limit = ca_limit - 1; }
     var position: usize = 1;
     for (position < ca_limit) {
@@ -332,11 +340,11 @@ fun validate_path(parsed: *x509.Certificate, path: *usize, path_len: usize,
         if (!ca.extensions.basic_constraints_present ||
             !ca.extensions.basic_constraints_critical || !ca.extensions.ca ||
             (ca.extensions.key_usage_present &&
-                (ca.extensions.key_usage & x509.KEY_USAGE_KEY_CERT_SIGN) == 0) ||
+            (ca.extensions.key_usage & x509.KEY_USAGE_KEY_CERT_SIGN) == 0) ||
             !eku_allowed(ca, options.purpose)) { ret error.BAD_CERTIFICATE; }
         if (ca.extensions.path_length_present) {
             var subordinate_ca_count: usize = 0;
-            var subordinate: usize = 1;
+            var subordinate:          usize = 1;
             for (subordinate < position) {
                 val candidate: *x509.Certificate = ?parsed[path[subordinate]];
                 if (!self_issued(candidate)) {
@@ -354,7 +362,7 @@ fun validate_path(parsed: *x509.Certificate, path: *usize, path_len: usize,
                 val candidate: *x509.Certificate = ?parsed[path[subordinate]];
                 if ((subordinate == 0 || !self_issued(candidate)) &&
                     !certificate_names_constrained(candidate,
-                        ca.extensions.name_constraints)) {
+                    ca.extensions.name_constraints)) {
                     ret error.BAD_CERTIFICATE;
                 }
                 subordinate = subordinate + 1;
@@ -378,7 +386,7 @@ fun parse_anchor(value: *cert.Certificate,
     output: *x509.Certificate) bool {
     ret value != nil && output != nil && value.der != nil && value.der_len > 0 &&
         x509.parse_trust_anchor(contracts.Bytes{data: value.der, len: value.der_len},
-            output) == contracts.OK;
+        output) == contracts.OK;
 }
 
 pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
@@ -391,18 +399,18 @@ pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
         options.max_signature_checks > MAX_SIGNATURE_CHECKS ||
         (options.purpose != SERVER_AUTH && options.purpose != CLIENT_AUTH) ||
         (options.purpose == SERVER_AUTH &&
-            (options.identity.len == 0 || options.identity.data == nil))) {
+        (options.identity.len == 0 || options.identity.data == nil))) {
         ret error.BAD_CERTIFICATE;
     }
     var parsed: [MAX_CHAIN_DEPTH]x509.Certificate;
-    var i: usize = 0;
+    var i:      usize = 0;
     for (i < presented.len) {
         val encoded: cert.Certificate = presented.certificates[i];
         if (encoded.der == nil || encoded.der_len == 0) { ret error.BAD_CERTIFICATE; }
         val status: contracts.Error = x509.parse(
             contracts.Bytes{data: encoded.der, len: encoded.der_len}, ?parsed[i]);
         if (status == contracts.UNSUPPORTED) { ret error.UNSUPPORTED_ALGORITHM; }
-        if (status != contracts.OK) { ret error.BAD_CERTIFICATE; }
+        if (status != contracts.OK)          { ret error.BAD_CERTIFICATE; }
         var prior: usize = 0;
         for (prior < i) {
             if (bytes_equal(parsed[prior].encoded, parsed[i].encoded)) {
@@ -415,22 +423,22 @@ pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
     val leaf: *x509.Certificate = ?parsed[0];
     if (!valid_time(leaf, options.now)) { ret error.CERTIFICATE_EXPIRED; }
     if ((leaf.extensions.key_usage_present &&
-            (leaf.extensions.key_usage & x509.KEY_USAGE_DIGITAL_SIGNATURE) == 0) ||
+        (leaf.extensions.key_usage & x509.KEY_USAGE_DIGITAL_SIGNATURE) == 0) ||
         !eku_allowed(leaf, options.purpose)) { ret error.BAD_CERTIFICATE; }
     if (options.purpose == SERVER_AUTH &&
         !identity_matches(leaf, options.identity)) { ret error.HOSTNAME_MISMATCH; }
-    var path: [MAX_CHAIN_DEPTH]usize;
+    var path:           [MAX_CHAIN_DEPTH]usize;
     var next_candidate: [MAX_CHAIN_DEPTH]usize;
-    path[0] = 0;
+    path[0]           = 0;
     next_candidate[0] = 1;
-    var path_len: usize = 1;
-    var unsupported_seen: bool = false;
-    var invalid_path_seen: bool = false;
-    var expired_path_seen: bool = false;
-    var signature_checks: usize = 0;
+    var path_len:          usize = 1;
+    var unsupported_seen:  bool  = false;
+    var invalid_path_seen: bool  = false;
+    var expired_path_seen: bool  = false;
+    var signature_checks:  usize = 0;
     for (path_len > 0) {
-        val current: *x509.Certificate = ?parsed[path[path_len - 1]];
-        var anchor_index: usize = 0;
+        val current:      *x509.Certificate = ?parsed[path[path_len - 1]];
+        var anchor_index: usize             = 0;
         for (anchor_index < trust.len) {
             var anchor: x509.Certificate;
             if (!parse_anchor(?trust.anchors[anchor_index], ?anchor)) {
@@ -442,8 +450,10 @@ pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
                 if (validation == error.OK) { ret error.OK; }
                 if (validation == error.CERTIFICATE_EXPIRED) {
                     expired_path_seen = true;
-                } or { invalid_path_seen = true; }
-            } or (authority_matches(current, ?anchor)) {
+                }
+                or { invalid_path_seen = true; }
+            }
+            or (authority_matches(current, ?anchor)) {
                 if (signature_checks >= options.max_signature_checks) {
                     ret error.BAD_CERTIFICATE;
                 }
@@ -455,18 +465,21 @@ pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
                     if (validation == error.OK) { ret error.OK; }
                     if (validation == error.CERTIFICATE_EXPIRED) {
                         expired_path_seen = true;
-                    } or { invalid_path_seen = true; }
-                } or (signature_status == error.UNSUPPORTED_ALGORITHM) {
+                    }
+                    or { invalid_path_seen = true; }
+                }
+                or (signature_status == error.UNSUPPORTED_ALGORITHM) {
                     unsupported_seen = true;
-                } or {
+                }
+                or {
                     invalid_path_seen = true;
                 }
             }
             anchor_index = anchor_index + 1;
         }
-        val depth: usize = path_len - 1;
+        val depth:     usize = path_len - 1;
         var candidate: usize = next_candidate[depth];
-        var pushed: bool = false;
+        var pushed:    bool  = false;
         for (candidate < presented.len && !pushed) {
             next_candidate[depth] = candidate + 1;
             if (!visited(?path[0], path_len, candidate) &&
@@ -478,13 +491,15 @@ pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
                 val signature_status: error.Error = verify_signature(current,
                     ?parsed[candidate]);
                 if (signature_status == error.OK && path_len < options.max_depth) {
-                    path[path_len] = candidate;
+                    path[path_len]           = candidate;
                     next_candidate[path_len] = 1;
-                    path_len = path_len + 1;
-                    pushed = true;
-                } or (signature_status == error.UNSUPPORTED_ALGORITHM) {
+                    path_len                 = path_len + 1;
+                    pushed                   = true;
+                }
+                or (signature_status == error.UNSUPPORTED_ALGORITHM) {
                     unsupported_seen = true;
-                } or {
+                }
+                or {
                     invalid_path_seen = true;
                 }
             }
@@ -494,15 +509,24 @@ pub fun chain(trust: *cert.TrustStore, presented: *cert.Chain,
     }
     if (expired_path_seen) { ret error.CERTIFICATE_EXPIRED; }
     if (invalid_path_seen) { ret error.BAD_CERTIFICATE; }
-    if (unsupported_seen) { ret error.UNSUPPORTED_ALGORITHM; }
+    if (unsupported_seen)  { ret error.UNSUPPORTED_ALGORITHM; }
     ret error.UNKNOWN_CA;
 }
 
 fun hex_nibble(value: u8, output: *u8) bool {
     if (output == nil) { ret false; }
-    if (value >= '0' && value <= '9') { @output = value - '0'; ret true; }
-    if (value >= 'a' && value <= 'f') { @output = value - 'a' + 10; ret true; }
-    if (value >= 'A' && value <= 'F') { @output = value - 'A' + 10; ret true; }
+    if (value >= '0' && value <= '9') {
+        @output = value - '0';
+        ret true;
+    }
+    if (value >= 'a' && value <= 'f') {
+        @output = value - 'a' + 10;
+        ret true;
+    }
+    if (value >= 'A' && value <= 'F') {
+        @output = value - 'A' + 10;
+        ret true;
+    }
     ret false;
 }
 
@@ -512,89 +536,92 @@ fun decode_hex(input: *u8, input_len: usize, output: *u8,
     var i: usize = 0;
     for (i < output_len) {
         var high: u8 = 0;
-        var low: u8 = 0;
+        var low:  u8 = 0;
         if (!hex_nibble(input[i * 2], ?high) ||
             !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
         output[i] = (high << 4) | low;
-        i = i + 1;
+        i         = i + 1;
     }
     ret true;
 }
 
 test "cert.verify: dns subtrees are label-bound" {
     if (!dns_within(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
-            contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
+        contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
         !dns_within(contracts.Bytes{data: "*.example.com"::*u8, len: 13},
-            contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
+        contracts.Bytes{data: "example.com"::*u8, len: 11}) ||
         !dns_within(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
-            contracts.Bytes{data: ".example.com"::*u8, len: 12}) ||
+        contracts.Bytes{data: ".example.com"::*u8, len: 12}) ||
         dns_within(contracts.Bytes{data: "example.com"::*u8, len: 11},
-            contracts.Bytes{data: ".example.com"::*u8, len: 12}) ||
+        contracts.Bytes{data: ".example.com"::*u8, len: 12}) ||
         dns_within(contracts.Bytes{data: "badexample.com"::*u8, len: 14},
-            contracts.Bytes{data: "example.com"::*u8, len: 11})) { ret 1; }
+        contracts.Bytes{data: "example.com"::*u8, len: 11})) { ret 1; }
     ret 0;
 }
 
 test "cert.verify: ip constraints apply address masks" {
     var address: [4]u8 = [4]u8{192, 0, 2, 42};
-    var subnet: [8]u8 = [8]u8{192, 0, 2, 0, 255, 255, 255, 0};
+    var subnet:  [8]u8 = [8]u8{192, 0, 2, 0, 255, 255, 255, 0};
     if (!ip_within(contracts.Bytes{data: ?address[0], len: 4},
-            contracts.Bytes{data: ?subnet[0], len: 8})) { ret 1; }
+        contracts.Bytes{data: ?subnet[0], len: 8})) { ret 1; }
     address[2] = 3;
     if (ip_within(contracts.Bytes{data: ?address[0], len: 4},
-            contracts.Bytes{data: ?subnet[0], len: 8})) { ret 2; }
+        contracts.Bytes{data: ?subnet[0], len: 8})) { ret 2; }
     ret 0;
 }
 
 test "cert.verify: construct and validate an ed25519 server path" {
-    val root_hex: *u8 = "308201a030820152a003020102021471405daa5cfc944a3170fb55c862eb40dd2a0ebc300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74301e170d3236303832383131333234355a170d3336303832353131333234355a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74302a300506032b6570032100d7342c55486dcf1e6cae80bc777a210b430965bcc370eb18e12a321a94d8714da3663064301f0603551d2304183016801442df368f91a83080e7ab32b86ee59d6e6d9b39fe30120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e0416041442df368f91a83080e7ab32b86ee59d6e6d9b39fe300506032b65700341007e58b16a079d7e5fb30e8d193666138b18cbc7e16371f12f133b9ac354742d5e460d57018adde0f3dc265d07db891f61c24eb208486e79c20191df283a707a09"::*u8;
-    val leaf_hex: *u8 = "308201e230820194a003020102021414524b2bfdd6bfd62cdeed7c1032f372fdd8dbee300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74301e170d3236303832383131333234355a170d3237303832383131333234355a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b65700321002309514831142850f5aa231196d1265ae3210334742f922de1095fc5bdc0fa36a381a73081a4300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301302f0603551d1104283026820f6170692e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d8704c0000201301d0603551d0e041604144dae46833dd56f3990a328fd5addabfd78ec3cd4301f0603551d2304183016801442df368f91a83080e7ab32b86ee59d6e6d9b39fe300506032b6570034100c33f6a8338ece42e26e6708d61a40f9d698c20895803886d09c482d4162bfb6b9c9edbed9f72b3d042d980ef983a297e8b1821b85617bbdd242eed0328ef840b"::*u8;
+    val root_hex:     *u8 = "308201a030820152a003020102021471405daa5cfc944a3170fb55c862eb40dd2a0ebc300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74301e170d3236303832383131333234355a170d3336303832353131333234355a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74302a300506032b6570032100d7342c55486dcf1e6cae80bc777a210b430965bcc370eb18e12a321a94d8714da3663064301f0603551d2304183016801442df368f91a83080e7ab32b86ee59d6e6d9b39fe30120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e0416041442df368f91a83080e7ab32b86ee59d6e6d9b39fe300506032b65700341007e58b16a079d7e5fb30e8d193666138b18cbc7e16371f12f133b9ac354742d5e460d57018adde0f3dc265d07db891f61c24eb208486e79c20191df283a707a09"::*u8;
+    val leaf_hex:     *u8 = "308201e230820194a003020102021414524b2bfdd6bfd62cdeed7c1032f372fdd8dbee300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205465737420526f6f74301e170d3236303832383131333234355a170d3237303832383131333234355a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b65700321002309514831142850f5aa231196d1265ae3210334742f922de1095fc5bdc0fa36a381a73081a4300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301302f0603551d1104283026820f6170692e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d8704c0000201301d0603551d0e041604144dae46833dd56f3990a328fd5addabfd78ec3cd4301f0603551d2304183016801442df368f91a83080e7ab32b86ee59d6e6d9b39fe300506032b6570034100c33f6a8338ece42e26e6708d61a40f9d698c20895803886d09c482d4162bfb6b9c9edbed9f72b3d042d980ef983a297e8b1821b85617bbdd242eed0328ef840b"::*u8;
     var root_storage: [420]u8;
     var leaf_storage: [486]u8;
     if (!decode_hex(root_hex, 840, ?root_storage[0], 420) ||
         !decode_hex(leaf_hex, 972, ?leaf_storage[0], 486)) { ret 17; }
-    val root_der: *u8 = ?root_storage[0];
-    val leaf_der: *u8 = ?leaf_storage[0];
+    val root_der:     *u8                 = ?root_storage[0];
+    val leaf_der:     *u8                 = ?leaf_storage[0];
     var certificates: [1]cert.Certificate = [1]cert.Certificate{
         cert.Certificate{der: leaf_der, der_len: 486},
     };
     var anchors: [1]cert.Certificate = [1]cert.Certificate{
         cert.Certificate{der: root_der, der_len: 420},
     };
-    var presented: cert.Chain = cert.Chain{certificates: ?certificates[0], len: 1};
-    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchors[0], len: 1};
-    var options: Options = Options{
-        identity: contracts.Bytes{data: "api.example.com"::*u8, len: 15},
-        purpose: SERVER_AUTH,
-        now: 1800000000,
-        max_depth: MAX_CHAIN_DEPTH,
+    var presented: cert.Chain      = cert.Chain{certificates: ?certificates[0], len: 1};
+    var trust:     cert.TrustStore = cert.TrustStore{anchors: ?anchors[0], len: 1};
+    var options:   Options         = Options{
+        identity:             contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        purpose:              SERVER_AUTH,
+        now:                  1800000000,
+        max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
     var parsed_leaf: x509.Certificate;
     var parsed_root: x509.Certificate;
-    var leaf_root: der.Element;
+    var leaf_root:   der.Element;
     if (der.exact(contracts.Bytes{data: leaf_der, len: 486}, ?leaf_root) !=
         contracts.OK) { ret 18; }
     if (leaf_root.tag != der.SEQUENCE) { ret 19; }
     if (x509.parse(contracts.Bytes{data: leaf_der, len: 486},
-            ?parsed_leaf) != contracts.OK) { ret 20; }
+        ?parsed_leaf) != contracts.OK) { ret 20; }
     if (x509.parse_trust_anchor(contracts.Bytes{data: root_der, len: 420},
-            ?parsed_root) != contracts.OK) { ret 21; }
-    if (!authority_matches(?parsed_leaf, ?parsed_root)) { ret 22; }
+        ?parsed_root) != contracts.OK) { ret 21; }
+    if (!authority_matches(?parsed_leaf, ?parsed_root))           { ret 22; }
     if (verify_signature(?parsed_leaf, ?parsed_root) != error.OK) { ret 23; }
     val verified: error.Error = chain(?trust, ?presented, ?options);
     if (verified != error.OK) { ret verified::i32; }
     options.identity = contracts.Bytes{data: "bad.example.net"::*u8, len: 15};
     if (chain(?trust, ?presented, ?options) != error.HOSTNAME_MISMATCH) { ret 2; }
     options.identity = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
-    options.purpose = CLIENT_AUTH;
+    options.purpose  = CLIENT_AUTH;
     if (chain(?trust, ?presented, ?options) != error.BAD_CERTIFICATE) { ret 3; }
     var corrupted: [486]u8;
-    var i: usize = 0;
-    for (i < 486) { corrupted[i] = leaf_der[i]; i = i + 1; }
-    corrupted[485] = corrupted[485] ^ 1;
+    var i:         usize = 0;
+    for (i < 486) {
+        corrupted[i] = leaf_der[i];
+        i            = i + 1;
+    }
+    corrupted[485]      = corrupted[485] ^ 1;
     certificates[0].der = ?corrupted[0];
-    options.purpose = SERVER_AUTH;
+    options.purpose     = SERVER_AUTH;
     if (chain(?trust, ?presented, ?options) != error.BAD_CERTIFICATE) { ret 4; }
     ret 0;
 }
@@ -614,25 +641,25 @@ test "cert.verify: validate an openssl p-384 sha-384 server path" {
     };
     var presented: cert.Chain = cert.Chain{
         certificates: ?certificates[0],
-        len: 1,
+        len:          1,
     };
     var trust: cert.TrustStore = cert.TrustStore{
         anchors: ?anchors[0],
-        len: 1,
+        len:     1,
     };
     var options: Options = Options{
-        identity: contracts.Bytes{data: "p384.example.com"::*u8, len: 16},
-        purpose: SERVER_AUTH,
-        now: 1800000000,
-        max_depth: MAX_CHAIN_DEPTH,
+        identity:             contracts.Bytes{data: "p384.example.com"::*u8, len: 16},
+        purpose:              SERVER_AUTH,
+        now:                  1800000000,
+        max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
     var parsed_leaf: x509.Certificate;
     var parsed_root: x509.Certificate;
     if (x509.parse(contracts.Bytes{data: ?leaf_der[0], len: 574},
-            ?parsed_leaf) != contracts.OK ||
+        ?parsed_leaf) != contracts.OK ||
         x509.parse_trust_anchor(contracts.Bytes{data: ?root_der[0], len: 526},
-            ?parsed_root) != contracts.OK ||
+        ?parsed_root) != contracts.OK ||
         parsed_leaf.signature_algorithm != x509.ECDSA_P384_SHA384 ||
         parsed_root.signature_algorithm != x509.ECDSA_P384_SHA384 ||
         parsed_leaf.public_key.algorithm != keys.P384 ||
@@ -649,9 +676,9 @@ test "cert.verify: validate an openssl p-384 sha-384 server path" {
 }
 
 test "cert.verify: validate rsa pkcs1 and pss server paths" {
-    val root_hex: *u8 = "3082036a30820252a00302010202147ddd942a90ae4c97d37e326da92d74b300617b47300d06092a864886f70d01010b0500303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f74301e170d3236303832383131353530335a170d3336303832353131353530335a303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f7430820122300d06092a864886f70d01010105000382010f003082010a0282010100b71f705c9fda6ed1d4629e15b1ba43aea3205a2baaf93fcddd4f54c5b89329255938ae2366976ff28ff61ce6629717d94398be14532d563c80fc922a03a1445e2976cd255f7672bb971b0bd0f789a1906cffbad73d8d589ee53d0a77ced540bd1b16fa1fcf2fa130487e46f86f3403dc9bebadc39962834b69ffaa0d07e847a8a081ea148de9a4f92b52ea6f048c0d64d5736d1424981825f8a1c18c85d2bc34b57e94748c306cffc935497567a511aa7944331bb3ed61c419c268bc8d58334fabca9c000ca05783c9810b8aba989cc83cfe8f516a63451acb4ec3080226b3a2b7e4613fb8537e19fe187506cafcd132d0ff31328ba4efe854846ad27b01be590203010001a3663064301f0603551d23041830168014386361951b6c36d1bca2a92af746cc1e1a4d0b5230120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e04160414386361951b6c36d1bca2a92af746cc1e1a4d0b52300d06092a864886f70d01010b050003820101007d8847f2e767bf09bd30117b0f4e1b64a2f949929ae15a49811182f2059e8af3b37e2b3b400d22429f7c4eab7e1be601c69dff1822982dc06a25077a56893c319763949a11bab084592a4eab5d3697700c955c5c6f412756ec513d404daa4d72c753ce64200d7f6b37bab360b7e106213d580158347199d6bbdda23dc8c9118416fa1da079a276f50109d655f0696f845a2eb819cdf78c6f0b00e628db24be22572176ad163edc9406b77852df0ff11f36d5df3cca8c4d69a1c0cd49570bb27d346733f2962bfd51eec00551626dd759f36d6aba3482810dff0645680e3bfda6b2ee0f641b52f5e7a6457bf960644019bec51f5b921efab7ed3fa7fb6163b693"::*u8;
-    val pkcs1_hex: *u8 = "3082029e30820186a00302010202144403afed821b44e6ee1d3d0516ad553638aad354300d06092a864886f70d01010b0500303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f74301e170d3236303832383131353530335a170d3237303832383131353530335a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f7273612e6578616d706c652e636f6d302a300506032b65700321003f5c54edb876a83fadf3bb464c98b0efc0f0e0aa4b1e54507c0e72f07cbd9f30a3819230818f300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301a0603551d1104133011820f7273612e6578616d706c652e636f6d301d0603551d0e0416041485a4c8e0bc168721262c86a02cede713d140e446301f0603551d23041830168014386361951b6c36d1bca2a92af746cc1e1a4d0b52300d06092a864886f70d01010b05000382010100a0eec796b3f29b3f61cf2ad30a07c7609c1a316629bfcacf0a30483f086ab14dc3393b97255c24461d96e8ca5bcf5081cb6dd3513513bd37fe292ec7802e62be461671e2c2284c962500f48a29f096b5d41cc503c036ffb0a28db9e3c827030af0056d6a04fc4ea3a09220c4220db32b64e327d03ffa2371f542c00e1a323037851a45ee1622a9b8c98987be7fc58464a3d4fd09f58b0b4dd4dfed04fc145a2b67264230eb3370d79802f7ff32c2a91691c37be35f3a35a0b751fafa18d29319bb3fb50c5eb66e28d98a90da8bde4591fc988124c2b97829067c858d338a854ec3e1f4b97fc48f49b292e117a62dadb60cfbfa4c4cdd08fa275d10d3af9b9e96"::*u8;
-    val pss_hex: *u8 = "30820306308201baa00302010202144403afed821b44e6ee1d3d0516ad553638aad355304106092a864886f70d01010a3034a00f300d06096086480165030402020500a11c301a06092a864886f70d010108300d06096086480165030402020500a203020130303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f74301e170d3236303832383131353530335a170d3237303832383131353530335a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f7273612e6578616d706c652e636f6d302a300506032b65700321003f5c54edb876a83fadf3bb464c98b0efc0f0e0aa4b1e54507c0e72f07cbd9f30a3819230818f300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301a0603551d1104133011820f7273612e6578616d706c652e636f6d301d0603551d0e0416041485a4c8e0bc168721262c86a02cede713d140e446301f0603551d23041830168014386361951b6c36d1bca2a92af746cc1e1a4d0b52304106092a864886f70d01010a3034a00f300d06096086480165030402020500a11c301a06092a864886f70d010108300d06096086480165030402020500a20302013003820101007bdb4b8d51a2b167f81a77a55e3987bb47bb91bbc90046bd74a1d7270f63995e4c821cc6a20d4bafd80c17c7e0d0ef22c59b71492ebd57a523a9378f20e77db002a24e79e8579a6f966c11861d14c6063dbe0d63876beb544d65c3874668214a41e5c0a2ffd237439a52f8198e9b59a1529729da55891c1f0b4107428ea30457f27b2e684be8863cd445aae004b2aab1f164e29a5b592f73dc1048c5bd309ab2cde2675a69bbce4f89dc91d33a32936355bad4147382e5f01f4311472f4a94b8324cfdc865b9a855265de39d64df2427a7ef08d8fff8d877ae9251d6dd5d9226884763309fb4ab10f8edd6d645bf335c1d232821fe9f17025c87440d2a1b46be"::*u8;
+    val root_hex:     *u8 = "3082036a30820252a00302010202147ddd942a90ae4c97d37e326da92d74b300617b47300d06092a864886f70d01010b0500303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f74301e170d3236303832383131353530335a170d3336303832353131353530335a303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f7430820122300d06092a864886f70d01010105000382010f003082010a0282010100b71f705c9fda6ed1d4629e15b1ba43aea3205a2baaf93fcddd4f54c5b89329255938ae2366976ff28ff61ce6629717d94398be14532d563c80fc922a03a1445e2976cd255f7672bb971b0bd0f789a1906cffbad73d8d589ee53d0a77ced540bd1b16fa1fcf2fa130487e46f86f3403dc9bebadc39962834b69ffaa0d07e847a8a081ea148de9a4f92b52ea6f048c0d64d5736d1424981825f8a1c18c85d2bc34b57e94748c306cffc935497567a511aa7944331bb3ed61c419c268bc8d58334fabca9c000ca05783c9810b8aba989cc83cfe8f516a63451acb4ec3080226b3a2b7e4613fb8537e19fe187506cafcd132d0ff31328ba4efe854846ad27b01be590203010001a3663064301f0603551d23041830168014386361951b6c36d1bca2a92af746cc1e1a4d0b5230120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e04160414386361951b6c36d1bca2a92af746cc1e1a4d0b52300d06092a864886f70d01010b050003820101007d8847f2e767bf09bd30117b0f4e1b64a2f949929ae15a49811182f2059e8af3b37e2b3b400d22429f7c4eab7e1be601c69dff1822982dc06a25077a56893c319763949a11bab084592a4eab5d3697700c955c5c6f412756ec513d404daa4d72c753ce64200d7f6b37bab360b7e106213d580158347199d6bbdda23dc8c9118416fa1da079a276f50109d655f0696f845a2eb819cdf78c6f0b00e628db24be22572176ad163edc9406b77852df0ff11f36d5df3cca8c4d69a1c0cd49570bb27d346733f2962bfd51eec00551626dd759f36d6aba3482810dff0645680e3bfda6b2ee0f641b52f5e7a6457bf960644019bec51f5b921efab7ed3fa7fb6163b693"::*u8;
+    val pkcs1_hex:    *u8 = "3082029e30820186a00302010202144403afed821b44e6ee1d3d0516ad553638aad354300d06092a864886f70d01010b0500303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f74301e170d3236303832383131353530335a170d3237303832383131353530335a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f7273612e6578616d706c652e636f6d302a300506032b65700321003f5c54edb876a83fadf3bb464c98b0efc0f0e0aa4b1e54507c0e72f07cbd9f30a3819230818f300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301a0603551d1104133011820f7273612e6578616d706c652e636f6d301d0603551d0e0416041485a4c8e0bc168721262c86a02cede713d140e446301f0603551d23041830168014386361951b6c36d1bca2a92af746cc1e1a4d0b52300d06092a864886f70d01010b05000382010100a0eec796b3f29b3f61cf2ad30a07c7609c1a316629bfcacf0a30483f086ab14dc3393b97255c24461d96e8ca5bcf5081cb6dd3513513bd37fe292ec7802e62be461671e2c2284c962500f48a29f096b5d41cc503c036ffb0a28db9e3c827030af0056d6a04fc4ea3a09220c4220db32b64e327d03ffa2371f542c00e1a323037851a45ee1622a9b8c98987be7fc58464a3d4fd09f58b0b4dd4dfed04fc145a2b67264230eb3370d79802f7ff32c2a91691c37be35f3a35a0b751fafa18d29319bb3fb50c5eb66e28d98a90da8bde4591fc988124c2b97829067c858d338a854ec3e1f4b97fc48f49b292e117a62dadb60cfbfa4c4cdd08fa275d10d3af9b9e96"::*u8;
+    val pss_hex:      *u8 = "30820306308201baa00302010202144403afed821b44e6ee1d3d0516ad553638aad355304106092a864886f70d01010a3034a00f300d06096086480165030402020500a11c301a06092a864886f70d010108300d06096086480165030402020500a203020130303b310b300906035504061302555331133011060355040a0c0a427269617220546573743117301506035504030c0e42726961722052534120526f6f74301e170d3236303832383131353530335a170d3237303832383131353530335a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f7273612e6578616d706c652e636f6d302a300506032b65700321003f5c54edb876a83fadf3bb464c98b0efc0f0e0aa4b1e54507c0e72f07cbd9f30a3819230818f300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301a0603551d1104133011820f7273612e6578616d706c652e636f6d301d0603551d0e0416041485a4c8e0bc168721262c86a02cede713d140e446301f0603551d23041830168014386361951b6c36d1bca2a92af746cc1e1a4d0b52304106092a864886f70d01010a3034a00f300d06096086480165030402020500a11c301a06092a864886f70d010108300d06096086480165030402020500a20302013003820101007bdb4b8d51a2b167f81a77a55e3987bb47bb91bbc90046bd74a1d7270f63995e4c821cc6a20d4bafd80c17c7e0d0ef22c59b71492ebd57a523a9378f20e77db002a24e79e8579a6f966c11861d14c6063dbe0d63876beb544d65c3874668214a41e5c0a2ffd237439a52f8198e9b59a1529729da55891c1f0b4107428ea30457f27b2e684be8863cd445aae004b2aab1f164e29a5b592f73dc1048c5bd309ab2cde2675a69bbce4f89dc91d33a32936355bad4147382e5f01f4311472f4a94b8324cfdc865b9a855265de39d64df2427a7ef08d8fff8d877ae9251d6dd5d9226884763309fb4ab10f8edd6d645bf335c1d232821fe9f17025c87440d2a1b46be"::*u8;
     var root_storage: [878]u8;
     var leaf_storage: [778]u8;
     if (!decode_hex(root_hex, 1756, ?root_storage[0], 878) ||
@@ -664,20 +691,20 @@ test "cert.verify: validate rsa pkcs1 and pss server paths" {
     };
     var presented: cert.Chain = cert.Chain{
         certificates: ?certificates[0],
-        len: 1,
+        len:          1,
     };
     var trust: cert.TrustStore = cert.TrustStore{
         anchors: ?anchors[0],
-        len: 1,
+        len:     1,
     };
     var options: Options = Options{
-        identity: contracts.Bytes{data: "rsa.example.com"::*u8, len: 15},
-        purpose: SERVER_AUTH,
-        now: 1800000000,
-        max_depth: MAX_CHAIN_DEPTH,
+        identity:             contracts.Bytes{data: "rsa.example.com"::*u8, len: 15},
+        purpose:              SERVER_AUTH,
+        now:                  1800000000,
+        max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
-    if (chain(?trust, ?presented, ?options) != error.OK) { ret 2; }
+    if (chain(?trust, ?presented, ?options) != error.OK)   { ret 2; }
     if (!decode_hex(pss_hex, 1556, ?leaf_storage[0], 778)) { ret 3; }
     certificates[0].der_len = 778;
     if (chain(?trust, ?presented, ?options) != error.OK) { ret 4; }
@@ -689,12 +716,12 @@ test "cert.verify: validate rsa pkcs1 and pss server paths" {
 }
 
 test "cert.verify: enforce constrained intermediate paths" {
-    val root_hex: *u8 = "308201a030820152a00302010202142267bc66531b91dadf304fdec59c264c18c347b5300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74301e170d3236303832383131353235365a170d3336303832353131353235365a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74302a300506032b65700321000de325063608f1f0c6bfb71d0e4262d91bfa490b5077fe75a1619618bb8952f8a3663064301f0603551d230418301680149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d430120603551d130101ff040830060101ff020101300e0603551d0f0101ff040403020106301d0603551d0e041604149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d4300506032b6570034100078ca15fa1f4b60c55b65820eebe354ca8feb43aa41527f122ede1702b2066c2686f8b7109da7dd1496be05421d85addf2ed212f44237b27f1bee6ef4a1b3500"::*u8;
+    val root_hex:         *u8 = "308201a030820152a00302010202142267bc66531b91dadf304fdec59c264c18c347b5300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74301e170d3236303832383131353235365a170d3336303832353131353235365a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74302a300506032b65700321000de325063608f1f0c6bfb71d0e4262d91bfa490b5077fe75a1619618bb8952f8a3663064301f0603551d230418301680149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d430120603551d130101ff040830060101ff020101300e0603551d0f0101ff040403020106301d0603551d0e041604149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d4300506032b6570034100078ca15fa1f4b60c55b65820eebe354ca8feb43aa41527f122ede1702b2066c2686f8b7109da7dd1496be05421d85addf2ed212f44237b27f1bee6ef4a1b3500"::*u8;
     val intermediate_hex: *u8 = "308201ea3082019ca0030201020214565d3b85013a07dab2982f008653286b3c20bf43300506032b6570303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205061746820526f6f74301e170d3236303832383131353235365a170d3238303832373131353235365a3044310b300906035504061302555331133011060355040a0c0a427269617220546573743120301e06035504030c174272696172205465737420496e7465726d656469617465302a300506032b657003210013755291123c4ef7a7a1b670ae6252665b82744352dcb74b8b1a4de63764317fa381a73081a430120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106303e0603551d1e0101ff04343032a01b300d820b6578616d706c652e636f6d300a8708c0000200ffffff00a1133011820f6261642e6578616d706c652e636f6d301d0603551d0e04160414af524845cc1da171c5a89055c9bbbedfab85a42d301f0603551d230418301680149443f3e72ce0e9c30d124d1c72e9fe7ce1c418d4300506032b657003410014af65892f4987e341b4413bf1c7c461c18d25fce4676d670a53c34ec4916168eab9ce7f909fe60359daf628f10c298beb7aa8f2b62a0b5ad06dc50c36035909"::*u8;
-    val leaf_hex: *u8 = "308201ea3082019ca00302010202144a1277e9551691d2e5a62522059fa9542120e0d4300506032b65703044310b300906035504061302555331133011060355040a0c0a427269617220546573743120301e06035504030c174272696172205465737420496e7465726d656469617465301e170d3236303832383131353235365a170d3237303832383131353235365a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b65700321009e92569741727d5f3bb93c07a97a2f5dab4c4602d7db8ed66aa19ee3ebbc13c8a381a73081a4300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301302f0603551d1104283026820f6170692e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d8704c0000201301d0603551d0e0416041469cc98b16d68cc1e111e2bfb47e2485ebbfd8219301f0603551d23041830168014af524845cc1da171c5a89055c9bbbedfab85a42d300506032b657003410039975180668835ac0c31530afbf0da389be222903cf6486dbc2fc1b4f058187478d32f7da01111c291228afa3b39b874b654ff1183f96e588ef81a07500a1306"::*u8;
-    var root_der: [420]u8;
+    val leaf_hex:         *u8 = "308201ea3082019ca00302010202144a1277e9551691d2e5a62522059fa9542120e0d4300506032b65703044310b300906035504061302555331133011060355040a0c0a427269617220546573743120301e06035504030c174272696172205465737420496e7465726d656469617465301e170d3236303832383131353235365a170d3237303832383131353235365a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b65700321009e92569741727d5f3bb93c07a97a2f5dab4c4602d7db8ed66aa19ee3ebbc13c8a381a73081a4300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301302f0603551d1104283026820f6170692e6578616d706c652e636f6d820d2a2e6578616d706c652e636f6d8704c0000201301d0603551d0e0416041469cc98b16d68cc1e111e2bfb47e2485ebbfd8219301f0603551d23041830168014af524845cc1da171c5a89055c9bbbedfab85a42d300506032b657003410039975180668835ac0c31530afbf0da389be222903cf6486dbc2fc1b4f058187478d32f7da01111c291228afa3b39b874b654ff1183f96e588ef81a07500a1306"::*u8;
+    var root_der:         [420]u8;
     var intermediate_der: [494]u8;
-    var leaf_der: [494]u8;
+    var leaf_der:         [494]u8;
     if (!decode_hex(root_hex, 840, ?root_der[0], 420) ||
         !decode_hex(intermediate_hex, 988, ?intermediate_der[0], 494) ||
         !decode_hex(leaf_hex, 988, ?leaf_der[0], 494)) { ret 1; }
@@ -702,48 +729,48 @@ test "cert.verify: enforce constrained intermediate paths" {
         cert.Certificate{der: ?leaf_der[0], der_len: 494},
         cert.Certificate{der: ?intermediate_der[0], der_len: 494},
     };
-    var anchor: cert.Certificate = cert.Certificate{der: ?root_der[0], der_len: 420};
-    var presented: cert.Chain = cert.Chain{certificates: ?certificates[0], len: 2};
-    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
-    var options: Options = Options{
-        identity: contracts.Bytes{data: "api.example.com"::*u8, len: 15},
-        purpose: SERVER_AUTH,
-        now: 1800000000,
-        max_depth: MAX_CHAIN_DEPTH,
+    var anchor:    cert.Certificate = cert.Certificate{der: ?root_der[0], der_len: 420};
+    var presented: cert.Chain       = cert.Chain{certificates: ?certificates[0], len: 2};
+    var trust:     cert.TrustStore  = cert.TrustStore{anchors: ?anchor, len: 1};
+    var options:   Options          = Options{
+        identity:             contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        purpose:              SERVER_AUTH,
+        now:                  1800000000,
+        max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
     if (chain(?trust, ?presented, ?options) != error.OK) { ret 2; }
     options.max_signature_checks = 1;
     if (chain(?trust, ?presented, ?options) != error.BAD_CERTIFICATE) { ret 5; }
     options.max_signature_checks = MAX_SIGNATURE_CHECKS;
-    var parsed_leaf: x509.Certificate;
+    var parsed_leaf:         x509.Certificate;
     var parsed_intermediate: x509.Certificate;
     if (x509.parse(contracts.Bytes{data: ?leaf_der[0], len: 494},
-            ?parsed_leaf) != contracts.OK ||
+        ?parsed_leaf) != contracts.OK ||
         x509.parse(contracts.Bytes{data: ?intermediate_der[0], len: 494},
-            ?parsed_intermediate) != contracts.OK ||
+        ?parsed_intermediate) != contracts.OK ||
         !parsed_intermediate.extensions.name_constraints_present ||
         !certificate_names_constrained(?parsed_leaf,
-            parsed_intermediate.extensions.name_constraints)) { ret 3; }
-    var offset: usize = 0;
-    var replaced: bool = false;
+        parsed_intermediate.extensions.name_constraints)) { ret 3; }
+    var offset:     usize = 0;
+    var replaced:   bool  = false;
     var occurrence: usize = 0;
     for (offset + 15 <= 494 && !replaced) {
         if (leaf_der[offset] == 'a' && leaf_der[offset + 1] == 'p' &&
             leaf_der[offset + 2] == 'i' && leaf_der[offset + 3] == '.') {
             occurrence = occurrence + 1;
             if (occurrence == 2) {
-                leaf_der[offset] = 'b';
+                leaf_der[offset]     = 'b';
                 leaf_der[offset + 1] = 'a';
                 leaf_der[offset + 2] = 'd';
-                replaced = true;
+                replaced             = true;
             }
         }
         offset = offset + 1;
     }
     if (!replaced || x509.parse(contracts.Bytes{data: ?leaf_der[0], len: 494},
-            ?parsed_leaf) != contracts.OK ||
+        ?parsed_leaf) != contracts.OK ||
         certificate_names_constrained(?parsed_leaf,
-            parsed_intermediate.extensions.name_constraints)) { ret 4; }
+        parsed_intermediate.extensions.name_constraints)) { ret 4; }
     ret 0;
 }

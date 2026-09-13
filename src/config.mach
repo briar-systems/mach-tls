@@ -1,13 +1,13 @@
 # bounded client and server configuration
 
-use tls.cert;
-use tls.cert.credentials;
-use tls.session;
-use tls.tls13;
 use crypto.contracts;
 use crypto.secret;
 use std.types.bool.bool;
 use std.types.size.usize;
+use tls.cert;
+use tls.cert.credentials;
+use tls.session;
+use tls.tls13;
 
 pub val MAX_SIGNATURE_SCHEMES: usize = 5;
 
@@ -32,47 +32,47 @@ pub rec Limits {
 }
 
 pub rec ClientConfig {
-    server_name:     contracts.Bytes;
-    alpn:            *ProtocolName;
-    alpn_len:        usize;
-    trust:           *cert.TrustStore;
-    versions:        *u16;
-    version_len:     usize;
-    suites:          *tls13.CipherSuite;
-    suite_len:       usize;
-    groups:          *tls13.NamedGroup;
-    group_len:       usize;
-    signatures:      *tls13.SignatureScheme;
-    signature_len:   usize;
-    client_identity: *credentials.Identity;
-    entropy:         *secret.Entropy;
+    server_name:          contracts.Bytes;
+    alpn:                 *ProtocolName;
+    alpn_len:             usize;
+    trust:                *cert.TrustStore;
+    versions:             *u16;
+    version_len:          usize;
+    suites:               *tls13.CipherSuite;
+    suite_len:            usize;
+    groups:               *tls13.NamedGroup;
+    group_len:            usize;
+    signatures:           *tls13.SignatureScheme;
+    signature_len:        usize;
+    client_identity:      *credentials.Identity;
+    entropy:              *secret.Entropy;
     entropy_context_size: usize;
-    sessions:        *session.ClientStore;
-    limits:          Limits;
+    sessions:             *session.ClientStore;
+    limits:               Limits;
 }
 
 # client authentication policy belongs to the published credential generation,
 # so the listener configuration deliberately does not restate it
 pub rec ServerConfig {
-    credentials:        *credentials.Store;
-    alpn:               *ProtocolName;
-    alpn_len:           usize;
-    require_alpn:       bool;
-    versions:           *u16;
-    version_len:        usize;
-    suites:             *tls13.CipherSuite;
-    suite_len:          usize;
-    groups:             *tls13.NamedGroup;
-    group_len:          usize;
-    signatures:         *tls13.SignatureScheme;
-    signature_len:      usize;
-    entropy:            *secret.Entropy;
-    entropy_context_size: usize;
-    tickets:            *session.KeyRing;
-    replay:             *session.ReplayWindow;
-    replay_policy:      session.ReplayPolicy;
+    credentials:            *credentials.Store;
+    alpn:                   *ProtocolName;
+    alpn_len:               usize;
+    require_alpn:           bool;
+    versions:               *u16;
+    version_len:            usize;
+    suites:                 *tls13.CipherSuite;
+    suite_len:              usize;
+    groups:                 *tls13.NamedGroup;
+    group_len:              usize;
+    signatures:             *tls13.SignatureScheme;
+    signature_len:          usize;
+    entropy:                *secret.Entropy;
+    entropy_context_size:   usize;
+    tickets:                *session.KeyRing;
+    replay:                 *session.ReplayWindow;
+    replay_policy:          session.ReplayPolicy;
     tickets_per_connection: u8;
-    limits:             Limits;
+    limits:                 Limits;
 }
 
 # a value cleared by declaration rather than by an empty literal: a record
@@ -96,13 +96,13 @@ pub fun no_entropy() secret.Entropy {
 pub fun production_limits() Limits {
     var limits: Limits;
     limits.max_receive_record_plaintext = 16384;
-    limits.max_send_record_plaintext = 16384;
-    limits.max_peer_handshake_bytes = 1048576;
-    limits.max_client_hello_bytes = 65536;
-    limits.max_client_flight_bytes = 525312;
-    limits.max_server_flight_bytes = 525312;
-    limits.max_chain_bytes = 524288;
-    limits.max_ticket_bytes = 16384;
+    limits.max_send_record_plaintext    = 16384;
+    limits.max_peer_handshake_bytes     = 1048576;
+    limits.max_client_hello_bytes       = 65536;
+    limits.max_client_flight_bytes      = 525312;
+    limits.max_server_flight_bytes      = 525312;
+    limits.max_chain_bytes              = 524288;
+    limits.max_ticket_bytes             = 16384;
     ret limits;
 }
 
