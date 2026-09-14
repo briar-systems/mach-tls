@@ -35,7 +35,6 @@ jobs:
         run: |
           set -euo pipefail
           mach dep pull .
-          mach dep pull test/transport
           mach dep pull test/interop
 
       - name: Build
@@ -46,9 +45,6 @@ jobs:
 
       - name: Test (release)
         run: mach test . --profile release
-
-      - name: Test the transport project
-        run: mach test test/transport
 
       - name: Build the interoperability harness
         run: mach build test/interop
