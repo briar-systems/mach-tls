@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1] - 2026-09-15
+
+### Changed
+
+- Dependencies: mach-crypto v0.9.1. A TLS 1.3 handshake and every record now run on the reworked AES-GCM, P-256 and curve25519 arithmetic, which removes the handshake and per-record costs reported in #56.
+- The transport tests are part of the root test set (#61).
+
 ## [0.3.0] - 2026-09-13
 
 ### Changed
