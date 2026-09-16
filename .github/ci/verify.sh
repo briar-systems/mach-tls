@@ -5,3 +5,6 @@ set -euo pipefail
 case "$MACH_CI_LEG" in
   x86_64-linux) test/interop/run.sh ;;
 esac
+
+# counterfactual for #64, never merged
+exit 1
