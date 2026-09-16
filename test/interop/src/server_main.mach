@@ -3,26 +3,26 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use std.chrono.time;
 use std.crypto.ct;
 use std.filesystem;
+use io_error: std.io.error;
+use std.io.file;
+use io_runtime: std.io.runtime;
 use std.net.ip;
 use std.net.tcp;
 use std.print;
 use std.runtime;
-use std.types.string.str;
-use std.types.char.char;
-use std.types.result.res;
-use std.types.error.err;
 use std.sync.cancel;
-use std.chrono.time;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.char.char;
+use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
-use file: std.io.file;
-use io_error: std.io.error;
-use io_runtime: std.io.runtime;
+use std.types.string.str;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
@@ -31,14 +31,13 @@ use tls.engine;
 use tls.error;
 use tls.memory_range;
 use tls.record;
-use tls.session;
 use tls.server;
+use tls.session;
+use tls.stream;
 use tls.tls12;
 use tls12_connection: tls.tls12.connection;
-use tls.stream;
 use tls.tls13;
 use tls.transport;
-
 
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
@@ -47,29 +46,30 @@ fun operation_ok(outcome: cancel.Operation) bool {
 fun runtime_ok(outcome: err[io_error.Error]) bool {
     ret sel outcome.ok;
 }
+
 rec BlockingTransport {
     runtime: *io_runtime.Runtime;
-    stream: *tcp.Stream;
+    stream:  *tcp.Stream;
 }
 
 fun blocking_aliases_state(context: ptr, data: *u8, len: usize) bool {
     if (!memory_range.valid(data, len)) { ret true; }
-    if (len == 0) { ret false; }
+    if (len == 0)                       { ret false; }
     if (!memory_range.valid(context::*u8, $size_of(BlockingTransport))) {
         ret true;
     }
     val state: *BlockingTransport = context::*BlockingTransport;
     if (!memory_range.valid(state.stream::*u8, $size_of(tcp.Stream)) ||
         memory_range.overlap(state::*u8, $size_of(BlockingTransport),
-            state.stream::*u8, $size_of(tcp.Stream)) ||
+        state.stream::*u8, $size_of(tcp.Stream)) ||
         io_runtime.aliases(state.runtime, state::*u8,
-            $size_of(BlockingTransport)) ||
+        $size_of(BlockingTransport)) ||
         io_runtime.aliases(state.runtime, state.stream::*u8,
-            $size_of(tcp.Stream))) { ret true; }
+        $size_of(tcp.Stream))) { ret true; }
     ret memory_range.overlap(state::*u8, $size_of(BlockingTransport),
-            data, len) ||
+        data, len) ||
         memory_range.overlap(state.stream::*u8, $size_of(tcp.Stream),
-            data, len) || io_runtime.aliases(state.runtime, data, len);
+        data, len) || io_runtime.aliases(state.runtime, data, len);
 }
 
 fun submit(state: *BlockingTransport, scope: *cancel.Scope,
@@ -77,17 +77,17 @@ fun submit(state: *BlockingTransport, scope: *cancel.Scope,
     context: usize) res[io_runtime.Token, io_error.Error] {
     val operation: io_runtime.Operation = io_runtime.Operation{kind: kind,
         resource: state.stream.handle.value, buffer: buffer, length: length,
-        offset: 0, context: context};
+        offset:   0, context: context};
     ret io_runtime.submit_scoped(state.runtime, scope, operation);
 }
 
 fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
     length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.READ, buffer, length, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:    io_runtime.Token           = submitted.ok;
     val received: res[usize, io_error.Error] = tcp.stream_read(state.stream,
         buffer, length);
     if (sel received.err) {
@@ -104,11 +104,11 @@ fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
 
 fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
     length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.WRITE, buffer, length, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:   io_runtime.Token           = submitted.ok;
     val written: res[usize, io_error.Error] = tcp.stream_write(state.stream,
         buffer, length);
     if (sel written.err) {
@@ -125,17 +125,18 @@ fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
 
 fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.SHUTDOWN, nil, 0, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:   io_runtime.Token    = submitted.ok;
     val stopped: err[io_error.Error] = tcp.stream_shutdown(state.stream,
         os.SHUT_WR);
     if (sel stopped.err) {
         io_runtime.fail(state.runtime, token,
             stopped.err);
-    } or {
+    }
+    or {
         io_runtime.complete(state.runtime, token, 0,
             state.stream.handle.value, false);
     }
@@ -144,17 +145,18 @@ fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
 
 fun blocking_close(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
-    val resource: usize = state.stream.handle.value;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
+    val resource:  usize                                 = state.stream.handle.value;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.CLOSE, nil, 0, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:  io_runtime.Token    = submitted.ok;
     val closed: err[io_error.Error] = tcp.stream_close(state.stream);
     if (sel closed.err) {
         io_runtime.fail(state.runtime, token,
             closed.err);
-    } or {
+    }
+    or {
         io_runtime.complete(state.runtime, token, 0, resource, false);
     }
     ret submitted;
@@ -164,9 +166,9 @@ fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
     for (transport.snapshot(?secure_static.operation).state !=
         transport.OPERATION_TERMINAL) {
         var completion: io_runtime.Completion;
-        val polled: res[usize, io_error.Error] = io_runtime.poll(owner,
+        val polled:     res[usize, io_error.Error] = io_runtime.poll(owner,
             ?completion, 1);
-        if (sel polled.err) { ret false; }
+        if (sel polled.err)                                        { ret false; }
         if (polled.ok != 1 || !stream.accept(secure, ?completion)) { ret false; }
     }
     ret true;
@@ -184,86 +186,86 @@ fun streq(a: *u8, b: *u8) bool {
 
 fun parse_number(value: *u8) usize {
     var total: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (value[i] != 0) {
         if (value[i] < '0' || value[i] > '9') { ret 0; }
         total = total * 10 + (value[i] - '0')::usize;
-        i = i + 1;
+        i     = i + 1;
     }
     ret total;
 }
 
-val MAX_PEM: usize = 8192;
+val MAX_PEM:        usize = 8192;
 val MAX_IDENTITIES: usize = 4;
 
-var pem_scratch: [MAX_IDENTITIES][MAX_PEM]u8;
-var der_scratch: [MAX_IDENTITIES][MAX_PEM]u8;
+var pem_scratch:        [MAX_IDENTITIES][MAX_PEM]u8;
+var der_scratch:        [MAX_IDENTITIES][MAX_PEM]u8;
 var chain_certificates: [MAX_IDENTITIES][4]cert.Certificate;
-var identity_keys: [MAX_IDENTITIES]keys.PrivateKey;
-var identities: [MAX_IDENTITIES]credentials.Identity;
-var identity_count: usize;
+var identity_keys:      [MAX_IDENTITIES]keys.PrivateKey;
+var identities:         [MAX_IDENTITIES]credentials.Identity;
+var identity_count:     usize;
 
-var rotated_pem: [MAX_PEM]u8;
-var rotated_der: [MAX_PEM]u8;
+var rotated_pem:          [MAX_PEM]u8;
+var rotated_der:          [MAX_PEM]u8;
 var rotated_certificates: [4]cert.Certificate;
-var rotated_key: keys.PrivateKey;
-var rotated_identities: [1]credentials.Identity;
+var rotated_key:          keys.PrivateKey;
+var rotated_identities:   [1]credentials.Identity;
 
-var anchor_pem: [MAX_PEM]u8;
-var anchor_der: [MAX_PEM]u8;
+var anchor_pem:          [MAX_PEM]u8;
+var anchor_der:          [MAX_PEM]u8;
 var anchor_certificates: [4]cert.Certificate;
-var client_trust: cert.TrustStore;
+var client_trust:        cert.TrustStore;
 
-var handshake_input: [65536]u8;
-var handshake_output: [65536]u8;
-var retained_hello: [65536]u8;
-var peer_certificates: [8]cert.Certificate;
-var wire_input: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var application_input: [512]u8;
+var handshake_input:    [65536]u8;
+var handshake_output:   [65536]u8;
+var retained_hello:     [65536]u8;
+var peer_certificates:  [8]cert.Certificate;
+var wire_input:         [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var wire_output:        [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var application_input:  [512]u8;
 var application_output: [64]u8;
 
-var fixtures: file.Root;
+var fixtures:                   file.Root;
 var option_require_client_auth: bool;
-var option_require_alpn: bool;
+var option_require_alpn:        bool;
 # a client that sends no ALPN extension must still be served by a listener that
 # configures `require_alpn`, and must be reported as having offered nothing.
 # this is separate from `--optional-alpn`, which relaxes the configuration; here
 # the configuration stays strict and the expectation changes.
 var option_expect_absent_alpn: bool;
-var option_expect_failure: bool;
-var option_expect_alert: usize;
-var option_rotate: bool;
-var option_key_update: bool;
-var option_tickets: u8;
-var option_single_use: bool;
-var option_handshake_only: bool;
-var connection_count: usize;
-var option_tls12: bool;
-var option_dual_version: bool;
-var tls12_configuration: config.ServerConfig;
-var tls12_suites: [6]tls13.CipherSuite;
-var tls12_signatures: [5]tls13.SignatureScheme;
-var tls12_versions: [2]u16;
-var legacy_engine: tls12_connection.Connection;
-var legacy_hello: [16384]u8;
-var listener_engine_static: server.Server;
-var secure_static: stream.Stream;
-var ticket_ring: session.KeyRing;
-var replay_window: session.ReplayWindow;
-var listener_configuration: config.ServerConfig;
-var lower_transport: transport.Transport;
-var blocking_state: BlockingTransport;
-var connection_socket: tcp.Stream;
-var connection_runtime: io_runtime.Runtime;
+var option_expect_failure:     bool;
+var option_expect_alert:       usize;
+var option_rotate:             bool;
+var option_key_update:         bool;
+var option_tickets:            u8;
+var option_single_use:         bool;
+var option_handshake_only:     bool;
+var connection_count:          usize;
+var option_tls12:              bool;
+var option_dual_version:       bool;
+var tls12_configuration:       config.ServerConfig;
+var tls12_suites:              [6]tls13.CipherSuite;
+var tls12_signatures:          [5]tls13.SignatureScheme;
+var tls12_versions:            [2]u16;
+var legacy_engine:             tls12_connection.Connection;
+var legacy_hello:              [16384]u8;
+var listener_engine_static:    server.Server;
+var secure_static:             stream.Stream;
+var ticket_ring:               session.KeyRing;
+var replay_window:             session.ReplayWindow;
+var listener_configuration:    config.ServerConfig;
+var lower_transport:           transport.Transport;
+var blocking_state:            BlockingTransport;
+var connection_socket:         tcp.Stream;
+var connection_runtime:        io_runtime.Runtime;
 
 fun read_fixture(path: str, buffer: *u8, capacity: usize,
     length: *usize) bool {
     val opened: res[filesystem.File, io_error.Error] = file.open_confined(
         ?fixtures, path, file.read_options());
     if (sel opened.err) { ret false; }
-    var handle: filesystem.File = opened.ok;
-    val read: res[usize, io_error.Error] = file.read_at(handle, buffer,
+    var handle: filesystem.File            = opened.ok;
+    val read:   res[usize, io_error.Error] = file.read_at(handle, buffer,
         capacity, 0);
     filesystem.close(?handle);
     if (sel read.err) { ret false; }
@@ -276,7 +278,7 @@ fun copy_secret(destination: *^u8, source: *u8, length: usize) {
     var i: usize = 0;
     for (i < length) {
         destination[i] = source[i];
-        i = i + 1;
+        i              = i + 1;
     }
 }
 
@@ -288,8 +290,8 @@ fun load_identity(slot: usize, certificate_path: str, key_path: str,
     if (slot >= MAX_IDENTITIES) { ret false; }
     var pem_length: usize = 0;
     if (!read_fixture(certificate_path, ?pem_scratch[slot][0], MAX_PEM,
-            ?pem_length)) { ret false; }
-    var chain: cert.Chain;
+        ?pem_length)) { ret false; }
+    var chain:   cert.Chain;
     val decoded: contracts.Operation = load.chain_pem(
         contracts.Bytes{data: ?pem_scratch[slot][0], len: pem_length},
         contracts.Buffer{data: ?der_scratch[slot][0], capacity: MAX_PEM},
@@ -308,7 +310,7 @@ fun load_identity(slot: usize, certificate_path: str, key_path: str,
     if (key_status != contracts.OK) { ret false; }
     identities[slot].server_name = contracts.Bytes{data: server_name::*u8,
         len: name_length};
-    identities[slot].chain = chain;
+    identities[slot].chain       = chain;
     identities[slot].private_key = ?identity_keys[slot];
     ret true;
 }
@@ -316,39 +318,41 @@ fun load_identity(slot: usize, certificate_path: str, key_path: str,
 fun load_anchor(path: str, output: *cert.TrustStore) bool {
     var pem_length: usize = 0;
     if (!read_fixture(path, ?anchor_pem[0], MAX_PEM, ?pem_length)) { ret false; }
-    var chain: cert.Chain;
+    var chain:   cert.Chain;
     val decoded: contracts.Operation = load.chain_pem(
         contracts.Bytes{data: ?anchor_pem[0], len: pem_length},
         contracts.Buffer{data: ?anchor_der[0], capacity: MAX_PEM},
         ?anchor_certificates[0], 4, ?chain);
     if (decoded.error != contracts.OK || chain.len == 0) { ret false; }
     output.anchors = chain.certificates;
-    output.len = chain.len;
+    output.len     = chain.len;
     ret true;
 }
 
 fun report(label: str, value: usize) {
     print.print(label);
-    var digits: [24]u8;
-    var count: usize = 0;
+    var digits:    [24]u8;
+    var count:     usize = 0;
     var remaining: usize = value;
-    if (remaining == 0) { digits[0] = '0'; count = 1; }
+    if (remaining == 0) {
+        digits[0] = '0';
+        count     = 1;
+    }
     for (remaining != 0) {
         digits[count] = '0' + (remaining % 10)::u8;
-        remaining = remaining / 10;
-        count = count + 1;
+        remaining     = remaining / 10;
+        count         = count + 1;
     }
     var text: [25]char;
-    var i: usize = 0;
+    var i:    usize = 0;
     for (i < count) {
         text[i] = digits[count - 1 - i]::char;
-        i = i + 1;
+        i       = i + 1;
     }
     text[count] = 0::char;
     print.print(?text[0]);
     print.print("\n");
 }
-
 
 fun serve_one(index: usize, allocator: *secret.Allocator,
     trust: *cert.TrustStore, store: *credentials.Store) i64 {
@@ -356,32 +360,33 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         stream: ?connection_socket};
     lower_transport = transport.Transport{runtime: ?connection_runtime,
         context: (?blocking_state)::ptr,
-        context_size: $size_of(BlockingTransport),
-        aliases_state: blocking_aliases_state,
-        submit_read: blocking_read, submit_write: blocking_write,
+        context_size:    $size_of(BlockingTransport),
+        aliases_state:   blocking_aliases_state,
+        submit_read:     blocking_read, submit_write: blocking_write,
         submit_shutdown: blocking_shutdown, submit_close: blocking_close,
-        submit_abort: blocking_close};
+        submit_abort:    blocking_close};
 
     var core_storage: server.Storage = server.Storage{
-        input: ?handshake_input[0], input_capacity: 65536,
-        output: ?handshake_output[0], output_capacity: 65536,
-        hello: ?retained_hello[0], hello_capacity: 65536,
-        certificates: ?peer_certificates[0], certificate_capacity: 8,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?handshake_input[0], input_capacity: 65536,
+        output:          ?handshake_output[0], output_capacity: 65536,
+        hello:           ?retained_hello[0], hello_capacity: 65536,
+        certificates:    ?peer_certificates[0], certificate_capacity: 8,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var storage: stream.Storage;
-    storage.wire_input = ?wire_input[0];
-    storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.wire_output = ?wire_output[0];
+    storage.wire_input           = ?wire_input[0];
+    storage.wire_input_capacity  = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    storage.wire_output          = ?wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 
     var empty_extra: server.ExtraExtension;
-    empty_extra.kind = 0;
+    empty_extra.kind      = 0;
     empty_extra.data.data = nil;
-    empty_extra.data.len = 0;
-    var hello_required: usize = 0;
+    empty_extra.data.len  = 0;
+    var hello_required:  usize = 0;
     var flight_required: usize = 0;
     if (!server.storage_requirements(?listener_configuration, empty_extra,
-            ?hello_required, ?flight_required)) {
+        ?hello_required, ?flight_required)) {
         print.print("cannot size server storage\n");
         ret 10;
     }
@@ -390,40 +395,41 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     if (option_tls12) {
         val legacy_storage: tls12_connection.Storage =
             tls12_connection.Storage{input: ?handshake_input[0],
-                input_capacity: 65536, output: ?handshake_output[0],
-                output_capacity: 65536, hello: ?legacy_hello[0],
-                hello_capacity: 16384,
-                certificates: ?peer_certificates[0], certificate_capacity: 8};
+            input_capacity:  65536, output: ?handshake_output[0],
+            output_capacity: 65536, hello: ?legacy_hello[0],
+            hello_capacity:  16384,
+            certificates:    ?peer_certificates[0], certificate_capacity: 8};
         if (!tls12_connection.init_server(?legacy_engine, ?tls12_configuration,
-                legacy_storage)) {
+            legacy_storage)) {
             print.print("cannot initialize the tls 1.2 server engine\n");
             ret 10;
         }
         if (!stream.serve_tls12(?secure_static, ?legacy_engine, storage,
-                ?lower_transport, ?scope,
-                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            ?lower_transport, ?scope,
+            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
             !settle(?secure_static, ?connection_runtime)) {
             print.print("the handshake operation was not accepted\n");
             ret 12;
         }
-    } or {
+    }
+    or {
         if (!server.init(?listener_engine_static, ?listener_configuration,
-                core_storage, empty_extra, 0)) {
+            core_storage, empty_extra, 0)) {
             report("hello required=", hello_required);
             report("flight required=", flight_required);
             print.print("cannot initialize the server engine\n");
             ret 10;
         }
         if (!stream.serve(?secure_static, ?listener_engine_static, storage,
-                ?lower_transport, ?scope,
-                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            ?lower_transport, ?scope,
+            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
             !settle(?secure_static, ?connection_runtime)) {
             print.print("the handshake operation was not accepted\n");
             ret 12;
         }
     }
-    val handshake: transport.Snapshot = transport.snapshot(?secure_static.operation);
-    val negotiated: engine.Snapshot = stream.negotiated(?secure_static);
+    val handshake:  transport.Snapshot = transport.snapshot(?secure_static.operation);
+    val negotiated: engine.Snapshot    = stream.negotiated(?secure_static);
 
     if (option_expect_failure) {
         if (handshake.terminal_error == error.OK) {
@@ -440,7 +446,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         stream.destroy_operation(?secure_static);
         stream.destroy(?secure_static);
         if (option_tls12) { tls12_connection.destroy(?legacy_engine); }
-        or { server.destroy(?listener_engine_static); }
+        or                { server.destroy(?listener_engine_static); }
         ret 0;
     }
 
@@ -457,7 +463,8 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
             print.print("an absent alpn extension was reported as offered\n");
             ret 21;
         }
-    } or (option_require_alpn && (negotiated.selected_alpn.len != 2 ||
+    }
+    or (option_require_alpn && (negotiated.selected_alpn.len != 2 ||
         negotiated.selected_alpn.data[0] != 'h' ||
         negotiated.selected_alpn.data[1] != '2')) {
         print.print("alpn was not negotiated\n");
@@ -474,13 +481,13 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     report("retries=", negotiated.retry_count::usize);
     report("tickets=", negotiated.tickets_issued::usize);
     if (negotiated.resumed) { print.print("resumed=1\n"); }
-    or { print.print("resumed=0\n"); }
+    or                      { print.print("resumed=0\n"); }
     if (negotiated.peer_name.len != 0) {
         var name_text: [256]char;
-        var i: usize = 0;
+        var i:         usize = 0;
         for (i < negotiated.peer_name.len) {
             name_text[i] = negotiated.peer_name.data[i]::char;
-            i = i + 1;
+            i            = i + 1;
         }
         name_text[negotiated.peer_name.len] = 0::char;
         print.print("name=");
@@ -491,14 +498,14 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         ret 23;
     }
 
-    var replacement: credentials.Generation = credentials.empty_generation();
-    var retired: *credentials.Generation = nil;
+    var replacement: credentials.Generation  = credentials.empty_generation();
+    var retired:     *credentials.Generation = nil;
     if (option_rotate) {
         if (!load_identity(3, "server-rotated.pem", "server-rotated.key",
-                "api.example.com", 15, allocator)) { ret 24; }
+            "api.example.com", 15, allocator)) { ret 24; }
         rotated_identities[0] = identities[3];
         if (credentials.initialize(?replacement, ?rotated_identities[0], 1, 0,
-                trust, option_require_client_auth) != contracts.OK ||
+            trust, option_require_client_auth) != contracts.OK ||
             credentials.rotate(store, ?replacement, ?retired) != contracts.OK ||
             retired == nil) { ret 25; }
         if (credentials.reclaimable(retired)) {
@@ -511,15 +518,15 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     # connection is torn down without attempting another record
     if (option_handshake_only && index + 1 < connection_count) {
         if (!stream.destroy(?secure_static)) { ret 46; }
-        if (option_tls12) { tls12_connection.destroy(?legacy_engine); }
-        or { server.destroy(?listener_engine_static); }
+        if (option_tls12)                    { tls12_connection.destroy(?legacy_engine); }
+        or                                   { server.destroy(?listener_engine_static); }
         tcp.stream_close(?connection_socket);
         ret 0;
     }
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.read(?secure_static, ?scope,
-            transport.Token{index: 2, generation: 1},
-            ?application_input[0], 512, 2) ||
+        transport.Token{index: 2, generation: 1},
+        ?application_input[0], 512, 2) ||
         !settle(?secure_static, ?connection_runtime)) { ret 30; }
     val read: transport.Snapshot = transport.snapshot(?secure_static.operation);
     if (read.terminal_error != error.OK || read.application_bytes == 0) {
@@ -534,7 +541,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     if (option_key_update) {
         if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
             !stream.key_update(?secure_static, ?scope,
-                transport.Token{index: 6, generation: 1}, 0, 6) ||
+            transport.Token{index: 6, generation: 1}, 0, 6) ||
             !settle(?secure_static, ?connection_runtime)) { ret 60; }
         val updated: transport.Snapshot = transport.snapshot(?secure_static.operation);
         if (updated.terminal_error != error.OK) {
@@ -547,18 +554,26 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         print.print("key-updated\n");
     }
 
-    application_output[0] = 'm'; application_output[1] = 'a';
-    application_output[2] = 'c'; application_output[3] = 'h';
-    application_output[4] = '-'; application_output[5] = 't';
-    application_output[6] = 'l'; application_output[7] = 's';
-    application_output[8] = ' '; application_output[9] = 's';
-    application_output[10] = 'e'; application_output[11] = 'r';
-    application_output[12] = 'v'; application_output[13] = 'e';
-    application_output[14] = 'r'; application_output[15] = '\n';
+    application_output[0]  = 'm';
+    application_output[1]  = 'a';
+    application_output[2]  = 'c';
+    application_output[3]  = 'h';
+    application_output[4]  = '-';
+    application_output[5]  = 't';
+    application_output[6]  = 'l';
+    application_output[7]  = 's';
+    application_output[8]  = ' ';
+    application_output[9]  = 's';
+    application_output[10] = 'e';
+    application_output[11] = 'r';
+    application_output[12] = 'v';
+    application_output[13] = 'e';
+    application_output[14] = 'r';
+    application_output[15] = '\n';
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.write(?secure_static, ?scope,
-            transport.Token{index: 3, generation: 1},
-            ?application_output[0], 16, 3) ||
+        transport.Token{index: 3, generation: 1},
+        ?application_output[0], 16, 3) ||
         !settle(?secure_static, ?connection_runtime)) { ret 33; }
     val written: transport.Snapshot = transport.snapshot(?secure_static.operation);
     if (written.terminal_error != error.OK || written.application_bytes != 16) {
@@ -570,7 +585,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.half_close(?secure_static, ?scope,
-            transport.Token{index: 4, generation: 1}, 4) ||
+        transport.Token{index: 4, generation: 1}, 4) ||
         !settle(?secure_static, ?connection_runtime)) { ret 36; }
     val half_closed: transport.Snapshot = transport.snapshot(?secure_static.operation);
     if (half_closed.terminal_error != error.OK || !secure_static.send_closed ||
@@ -580,7 +595,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.close(?secure_static, ?scope,
-            transport.Token{index: 5, generation: 1}, 5) ||
+        transport.Token{index: 5, generation: 1}, 5) ||
         !settle(?secure_static, ?connection_runtime)) { ret 38; }
     val closed: transport.Snapshot = transport.snapshot(?secure_static.operation);
     if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure_static) ||
@@ -588,7 +603,8 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
 
     if (option_tls12) {
         if (!tls12_connection.destroy(?legacy_engine)) { ret 40; }
-    } or {
+    }
+    or {
         if (!server.destroy(?listener_engine_static)) { ret 40; }
     }
     if (option_rotate) {
@@ -605,70 +621,88 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
 fun main(argc: i64, argv: **u8) i64 {
     var port: u16 = 9443;
     option_require_client_auth = false;
-    option_require_alpn = true;
-    option_expect_absent_alpn = false;
-    option_expect_failure = false;
-    option_expect_alert = 256;
-    option_rotate = false;
-    option_key_update = false;
-    option_tickets = 0;
-    option_single_use = false;
-    option_handshake_only = false;
-    option_tls12 = false;
-    option_dual_version = false;
-    var prefer_p256: bool = false;
-    var suite_choice: usize = 0;
-    var no_default: bool = false;
-    var connections: usize = 1;
-    var identity_choice: str = "server-ed25519";
+    option_require_alpn        = true;
+    option_expect_absent_alpn  = false;
+    option_expect_failure      = false;
+    option_expect_alert        = 256;
+    option_rotate              = false;
+    option_key_update          = false;
+    option_tickets             = 0;
+    option_single_use          = false;
+    option_handshake_only      = false;
+    option_tls12               = false;
+    option_dual_version        = false;
+    var prefer_p256:     bool  = false;
+    var suite_choice:    usize = 0;
+    var no_default:      bool  = false;
+    var connections:     usize = 1;
+    var identity_choice: str   = "server-ed25519";
 
     var argument: i64 = 1;
     for (argument < argc) {
         val current: *u8 = argv[argument];
         if (streq(current, "--port"::*u8) && argument + 1 < argc) {
             argument = argument + 1;
-            port = parse_number(argv[argument])::u16;
-        } or (streq(current, "--require-client-auth"::*u8)) {
+            port     = parse_number(argv[argument])::u16;
+        }
+        or (streq(current, "--require-client-auth"::*u8)) {
             option_require_client_auth = true;
-        } or (streq(current, "--optional-alpn"::*u8)) {
+        }
+        or (streq(current, "--optional-alpn"::*u8)) {
             option_require_alpn = false;
-        } or (streq(current, "--expect-absent-alpn"::*u8)) {
+        }
+        or (streq(current, "--expect-absent-alpn"::*u8)) {
             option_expect_absent_alpn = true;
-        } or (streq(current, "--groups-p256"::*u8)) {
+        }
+        or (streq(current, "--groups-p256"::*u8)) {
             prefer_p256 = true;
-        } or (streq(current, "--key-update"::*u8)) {
+        }
+        or (streq(current, "--key-update"::*u8)) {
             option_key_update = true;
-        } or (streq(current, "--single-use"::*u8)) {
+        }
+        or (streq(current, "--single-use"::*u8)) {
             option_single_use = true;
-        } or (streq(current, "--handshake-only"::*u8)) {
+        }
+        or (streq(current, "--handshake-only"::*u8)) {
             option_handshake_only = true;
-        } or (streq(current, "--tls12"::*u8)) {
+        }
+        or (streq(current, "--tls12"::*u8)) {
             option_tls12 = true;
-        } or (streq(current, "--dual-version"::*u8)) {
+        }
+        or (streq(current, "--dual-version"::*u8)) {
             option_dual_version = true;
-        } or (streq(current, "--tickets"::*u8) && argument + 1 < argc) {
-            argument = argument + 1;
+        }
+        or (streq(current, "--tickets"::*u8) && argument + 1 < argc) {
+            argument       = argument + 1;
             option_tickets = parse_number(argv[argument])::u8;
-        } or (streq(current, "--connections"::*u8) && argument + 1 < argc) {
-            argument = argument + 1;
+        }
+        or (streq(current, "--connections"::*u8) && argument + 1 < argc) {
+            argument    = argument + 1;
             connections = parse_number(argv[argument]);
-        } or (streq(current, "--suite"::*u8) && argument + 1 < argc) {
-            argument = argument + 1;
+        }
+        or (streq(current, "--suite"::*u8) && argument + 1 < argc) {
+            argument     = argument + 1;
             suite_choice = parse_number(argv[argument]);
-        } or (streq(current, "--identity"::*u8) && argument + 1 < argc) {
+        }
+        or (streq(current, "--identity"::*u8) && argument + 1 < argc) {
             argument = argument + 1;
             if (streq(argv[argument], "p256"::*u8)) {
                 identity_choice = "server-p256";
-            } or (streq(argv[argument], "rsa"::*u8)) {
+            }
+            or (streq(argv[argument], "rsa"::*u8)) {
                 identity_choice = "server-rsa";
-            } or { identity_choice = "server-ed25519"; }
-        } or (streq(current, "--expect-failure"::*u8) && argument + 1 < argc) {
-            argument = argument + 1;
+            }
+            or { identity_choice = "server-ed25519"; }
+        }
+        or (streq(current, "--expect-failure"::*u8) && argument + 1 < argc) {
+            argument              = argument + 1;
             option_expect_failure = true;
-            option_expect_alert = parse_number(argv[argument]);
-        } or (streq(current, "--rotate"::*u8)) {
+            option_expect_alert   = parse_number(argv[argument]);
+        }
+        or (streq(current, "--rotate"::*u8)) {
             option_rotate = true;
-        } or (streq(current, "--no-default"::*u8)) {
+        }
+        or (streq(current, "--no-default"::*u8)) {
             no_default = true;
         }
         argument = argument + 1;
@@ -683,23 +717,23 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 2;
     }
 
-    var allocator: secret.Allocator = secret.system_allocator();
-    var certificate_path: str = "server-ed25519.pem";
-    var key_path: str = "server-ed25519.key";
+    var allocator:        secret.Allocator = secret.system_allocator();
+    var certificate_path: str              = "server-ed25519.pem";
+    var key_path:         str              = "server-ed25519.key";
     if (streq(identity_choice::*u8, "server-p256"::*u8)) {
         certificate_path = "server-p256.pem";
-        key_path = "server-p256.key";
+        key_path         = "server-p256.key";
     }
     if (streq(identity_choice::*u8, "server-rsa"::*u8)) {
         certificate_path = "server-rsa.pem";
-        key_path = "server-rsa.key";
+        key_path         = "server-rsa.key";
     }
     if (!load_identity(0, certificate_path, key_path, "api.example.com", 15,
-            ?allocator) ||
+        ?allocator) ||
         !load_identity(1, "server-alt.pem", "server-alt.key",
-            "alt.example.com", 15, ?allocator) ||
+        "alt.example.com", 15, ?allocator) ||
         !load_identity(2, "server-wild.pem", "server-wild.key",
-            "*.example.com", 13, ?allocator)) {
+        "*.example.com", 13, ?allocator)) {
         print.print("cannot load server identities\n");
         ret 3;
     }
@@ -710,13 +744,13 @@ fun main(argc: i64, argv: **u8) i64 {
     }
 
     var generation: credentials.Generation = credentials.empty_generation();
-    var trust: *cert.TrustStore = nil;
+    var trust:      *cert.TrustStore       = nil;
     if (option_require_client_auth) { trust = ?client_trust; }
     var default_index: usize = 0;
     if (no_default) { default_index = credentials.NO_DEFAULT; }
     if (credentials.initialize(?generation, ?identities[0], identity_count,
-            default_index, trust,
-            option_require_client_auth) != contracts.OK) {
+        default_index, trust,
+        option_require_client_auth) != contracts.OK) {
         print.print("cannot publish the credential generation\n");
         ret 5;
     }
@@ -727,101 +761,114 @@ fun main(argc: i64, argv: **u8) i64 {
     }
 
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
-        config.ProtocolName{data: "h2"::*u8, len: 2}};
-    var versions: [1]u16 = [1]u16{tls13.VERSION};
-    var suites: [3]tls13.CipherSuite = [3]tls13.CipherSuite{
+        config.ProtocolName{data: "h2"::*u8, len: 2}
+    };
+    var versions: [1]u16               = [1]u16{tls13.VERSION};
+    var suites:   [3]tls13.CipherSuite = [3]tls13.CipherSuite{
         tls13.AES_128_GCM_SHA256, tls13.AES_256_GCM_SHA384,
-        tls13.CHACHA20_POLY1305_SHA256};
+        tls13.CHACHA20_POLY1305_SHA256
+    };
     var suite_len: usize = 3;
-    if (suite_choice == 1) { suites[0] = tls13.AES_128_GCM_SHA256; suite_len = 1; }
-    if (suite_choice == 2) { suites[0] = tls13.AES_256_GCM_SHA384; suite_len = 1; }
+    if (suite_choice == 1) {
+        suites[0] = tls13.AES_128_GCM_SHA256;
+        suite_len = 1;
+    }
+    if (suite_choice == 2) {
+        suites[0] = tls13.AES_256_GCM_SHA384;
+        suite_len = 1;
+    }
     if (suite_choice == 3) {
         suites[0] = tls13.CHACHA20_POLY1305_SHA256;
         suite_len = 1;
     }
     var groups: [2]tls13.NamedGroup = [2]tls13.NamedGroup{
-        tls13.X25519, tls13.SECP256R1};
+        tls13.X25519, tls13.SECP256R1
+    };
     var group_len: usize = 2;
-    if (prefer_p256) { groups[0] = tls13.SECP256R1; group_len = 1; }
+    if (prefer_p256) {
+        groups[0] = tls13.SECP256R1;
+        group_len = 1;
+    }
     var signatures: [5]tls13.SignatureScheme = [5]tls13.SignatureScheme{
         tls13.ED25519, tls13.ECDSA_SECP256R1_SHA256,
         tls13.ECDSA_SECP384R1_SHA384, tls13.RSA_PSS_RSAE_SHA256,
-        tls13.RSA_PSS_RSAE_SHA384};
+        tls13.RSA_PSS_RSAE_SHA384
+    };
     var entropy: secret.Entropy = secret.system_entropy();
 
-    listener_configuration = config.ServerConfig{};
-    listener_configuration.credentials = ?store;
-    listener_configuration.alpn = ?protocols[0];
-    listener_configuration.alpn_len = 1;
-    listener_configuration.require_alpn = option_require_alpn;
-    listener_configuration.versions = ?versions[0];
-    listener_configuration.version_len = 1;
-    listener_configuration.suites = ?suites[0];
-    listener_configuration.suite_len = suite_len;
-    listener_configuration.groups = ?groups[0];
-    listener_configuration.group_len = group_len;
-    listener_configuration.signatures = ?signatures[0];
-    listener_configuration.signature_len = 5;
-    listener_configuration.entropy = ?entropy;
-    listener_configuration.entropy_context_size = 0;
-    listener_configuration.tickets = nil;
-    listener_configuration.replay = nil;
-    listener_configuration.replay_policy = session.REPLAY_PERMISSIVE;
+    listener_configuration                        = config.ServerConfig{};
+    listener_configuration.credentials            = ?store;
+    listener_configuration.alpn                   = ?protocols[0];
+    listener_configuration.alpn_len               = 1;
+    listener_configuration.require_alpn           = option_require_alpn;
+    listener_configuration.versions               = ?versions[0];
+    listener_configuration.version_len            = 1;
+    listener_configuration.suites                 = ?suites[0];
+    listener_configuration.suite_len              = suite_len;
+    listener_configuration.groups                 = ?groups[0];
+    listener_configuration.group_len              = group_len;
+    listener_configuration.signatures             = ?signatures[0];
+    listener_configuration.signature_len          = 5;
+    listener_configuration.entropy                = ?entropy;
+    listener_configuration.entropy_context_size   = 0;
+    listener_configuration.tickets                = nil;
+    listener_configuration.replay                 = nil;
+    listener_configuration.replay_policy          = session.REPLAY_PERMISSIVE;
     listener_configuration.tickets_per_connection = 0;
     if (option_tickets != 0) {
         if (!session.keyring_init(?ticket_ring, ?entropy, 1800000000, 3600,
-                1800, 7200)) {
+            1800, 7200)) {
             print.print("cannot initialize the ticket key ring\n");
             ret 43;
         }
-        listener_configuration.tickets = ?ticket_ring;
+        listener_configuration.tickets                = ?ticket_ring;
         listener_configuration.tickets_per_connection = option_tickets;
         if (option_single_use) {
             if (!session.replay_init(?replay_window)) { ret 44; }
-            listener_configuration.replay = ?replay_window;
+            listener_configuration.replay        = ?replay_window;
             listener_configuration.replay_policy = session.REPLAY_SINGLE_USE;
         }
     }
-    listener_configuration.limits = config.production_limits();
+    listener_configuration.limits                          = config.production_limits();
     listener_configuration.limits.max_peer_handshake_bytes = 65536;
-    listener_configuration.limits.max_client_hello_bytes = 65536;
-    listener_configuration.limits.max_chain_bytes = 32768;
-    listener_configuration.limits.max_server_flight_bytes = 65536;
+    listener_configuration.limits.max_client_hello_bytes   = 65536;
+    listener_configuration.limits.max_chain_bytes          = 32768;
+    listener_configuration.limits.max_server_flight_bytes  = 65536;
 
-    tls12_versions[0] = tls12.VERSION;
-    tls12_versions[1] = tls13.VERSION;
-    tls12_suites[0] = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
-    tls12_suites[1] = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
-    tls12_suites[2] = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
-    tls12_suites[3] = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
-    tls12_suites[4] = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
-    tls12_suites[5] = tls12.ECDHE_RSA_CHACHA20_POLY1305;
-    tls12_signatures[0] = tls13.ED25519;
-    tls12_signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
-    tls12_signatures[2] = tls13.ECDSA_SECP384R1_SHA384;
-    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA256;
-    tls12_signatures[4] = tls13.RSA_PSS_RSAE_SHA384;
-    tls12_configuration = config.ServerConfig{};
-    tls12_configuration.tickets = nil;
-    tls12_configuration.replay = nil;
-    tls12_configuration.credentials = ?store;
-    tls12_configuration.alpn = ?protocols[0];
-    tls12_configuration.alpn_len = 1;
+    tls12_versions[0]                = tls12.VERSION;
+    tls12_versions[1]                = tls13.VERSION;
+    tls12_suites[0]                  = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    tls12_suites[1]                  = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
+    tls12_suites[2]                  = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
+    tls12_suites[3]                  = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
+    tls12_suites[4]                  = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
+    tls12_suites[5]                  = tls12.ECDHE_RSA_CHACHA20_POLY1305;
+    tls12_signatures[0]              = tls13.ED25519;
+    tls12_signatures[1]              = tls13.ECDSA_SECP256R1_SHA256;
+    tls12_signatures[2]              = tls13.ECDSA_SECP384R1_SHA384;
+    tls12_signatures[3]              = tls13.RSA_PSS_RSAE_SHA256;
+    tls12_signatures[4]              = tls13.RSA_PSS_RSAE_SHA384;
+    tls12_configuration              = config.ServerConfig{};
+    tls12_configuration.tickets      = nil;
+    tls12_configuration.replay       = nil;
+    tls12_configuration.credentials  = ?store;
+    tls12_configuration.alpn         = ?protocols[0];
+    tls12_configuration.alpn_len     = 1;
     tls12_configuration.require_alpn = option_require_alpn;
-    tls12_configuration.versions = ?tls12_versions[0];
-    tls12_configuration.version_len = 1;
+    tls12_configuration.versions     = ?tls12_versions[0];
+    tls12_configuration.version_len  = 1;
     if (option_dual_version) { tls12_configuration.version_len = 2; }
-    tls12_configuration.suites = ?tls12_suites[0];
-    tls12_configuration.suite_len = 6;
-    tls12_configuration.groups = ?groups[0];
-    tls12_configuration.group_len = group_len;
-    tls12_configuration.signatures = ?tls12_signatures[0];
-    tls12_configuration.signature_len = 5;
-    tls12_configuration.entropy = ?entropy;
-    tls12_configuration.entropy_context_size = 0;
-    tls12_configuration.limits = config.production_limits();
+    tls12_configuration.suites                          = ?tls12_suites[0];
+    tls12_configuration.suite_len                       = 6;
+    tls12_configuration.groups                          = ?groups[0];
+    tls12_configuration.group_len                       = group_len;
+    tls12_configuration.signatures                      = ?tls12_signatures[0];
+    tls12_configuration.signature_len                   = 5;
+    tls12_configuration.entropy                         = ?entropy;
+    tls12_configuration.entropy_context_size            = 0;
+    tls12_configuration.limits                          = config.production_limits();
     tls12_configuration.limits.max_peer_handshake_bytes = 65536;
-    tls12_configuration.limits.max_chain_bytes = 32768;
+    tls12_configuration.limits.max_chain_bytes          = 32768;
 
     val listening: res[tcp.Listener, io_error.Error] = tcp.listen(
         ip.endpoint(127, 0, 0, 1, port), 4);
@@ -841,7 +888,7 @@ fun main(argc: i64, argv: **u8) i64 {
         }
         connection_socket = accepted.ok;
         if (!runtime_ok(io_runtime.make(?connection_runtime,
-                16))) { ret 9; }
+            16))) { ret 9; }
         val served: i64 = serve_one(index, ?allocator, trust, ?store);
         io_runtime.close(?connection_runtime);
         io_runtime.destroy(?connection_runtime);
@@ -850,7 +897,7 @@ fun main(argc: i64, argv: **u8) i64 {
     }
     tcp.listener_close(?listener);
     if (option_tickets != 0) { session.keyring_destroy(?ticket_ring); }
-    if (option_single_use) { session.replay_destroy(?replay_window); }
+    if (option_single_use)   { session.replay_destroy(?replay_window); }
     file.root_close(?fixtures);
     print.print("ok\n");
     ret 0;
