@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1] - 2026-09-16
+
+### Changed
+
+- Dependencies: mach-std v3.2.0 and mach-crypto v0.10.1 (#73). Consumers now resolve std 3.2.0 or later, which carries the Windows owner-only permission security fix.
+
 ## [0.4.0] - 2026-09-16
 
 ### Changed
