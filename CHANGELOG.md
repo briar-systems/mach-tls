@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0] - 2026-09-16
+
+### Changed
+
+- Dependencies: mach-std v3.1.0 and mach-crypto v0.10.0 (#69). Consumers now resolve std 3.1.0 or later. The transport runs on the std 3 io runtime, whose tables grow on demand, so a submission past the runtime's initial size grows it instead of being refused, and a `RESOURCE_LIMIT` from the transport now means the allocator refused.
+- CI is the shared family pipeline (#64): a pull request into `dev` runs linux x86_64, and a pull request into `main` also runs native aarch64 linux, x86_64 windows and both darwin hosts. The interoperability matrix runs on linux x86_64 in both tiers.
+- The source tree and the interoperability harness are formatted with mach 5.1.0 (#64, #67).
+
 ## [0.3.1] - 2026-09-15
 
 ### Changed
