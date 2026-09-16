@@ -3,22 +3,22 @@ use crypto.encoding.keys;
 use crypto.secret;
 use std.chrono.time;
 use std.crypto.ct;
+use io_error:   std.io.error;
+use io_runtime: std.io.runtime;
 use std.net.ip;
 use std.net.tcp;
 use std.print;
 use std.runtime;
-use std.types.char.char;
-use std.types.string.str;
 use std.sync.cancel;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.result.res;
+use std.types.char.char;
 use std.types.error.err;
+use std.types.result.res;
 use std.types.size.usize;
-use io_error: std.io.error;
-use io_runtime: std.io.runtime;
+use std.types.string.str;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
@@ -26,15 +26,14 @@ use tls.client;
 use tls.config;
 use tls.engine;
 use tls.error;
+use tls.memory_range;
 use tls.record;
 use tls.session;
+use tls.stream;
 use tls.tls12;
 use tls12_connection: tls.tls12.connection;
-use tls.stream;
 use tls.tls13;
 use tls.transport;
-use tls.memory_range;
-
 
 fun operation_ok(outcome: cancel.Operation) bool {
     ret sel outcome.ok;
@@ -51,29 +50,30 @@ fun runtime_ok(outcome: err[io_error.Error]) bool {
 fun runtime_closed(outcome: res[bool, io_error.Error]) bool {
     ret (sel outcome.ok) && outcome.ok;
 }
+
 rec BlockingTransport {
     runtime: *io_runtime.Runtime;
-    stream: *tcp.Stream;
+    stream:  *tcp.Stream;
 }
 
 fun blocking_aliases_state(context: ptr, data: *u8, len: usize) bool {
     if (!memory_range.valid(data, len)) { ret true; }
-    if (len == 0) { ret false; }
+    if (len == 0)                       { ret false; }
     if (!memory_range.valid(context::*u8, $size_of(BlockingTransport))) {
         ret true;
     }
     val state: *BlockingTransport = context::*BlockingTransport;
     if (!memory_range.valid(state.stream::*u8, $size_of(tcp.Stream)) ||
         memory_range.overlap(state::*u8, $size_of(BlockingTransport),
-            state.stream::*u8, $size_of(tcp.Stream)) ||
+        state.stream::*u8, $size_of(tcp.Stream)) ||
         io_runtime.aliases(state.runtime, state::*u8,
-            $size_of(BlockingTransport)) ||
+        $size_of(BlockingTransport)) ||
         io_runtime.aliases(state.runtime, state.stream::*u8,
-            $size_of(tcp.Stream))) { ret true; }
+        $size_of(tcp.Stream))) { ret true; }
     ret memory_range.overlap(state::*u8, $size_of(BlockingTransport),
-            data, len) ||
+        data, len) ||
         memory_range.overlap(state.stream::*u8, $size_of(tcp.Stream),
-            data, len) || io_runtime.aliases(state.runtime, data, len);
+        data, len) || io_runtime.aliases(state.runtime, data, len);
 }
 
 fun submit(state: *BlockingTransport, scope: *cancel.Scope,
@@ -81,17 +81,17 @@ fun submit(state: *BlockingTransport, scope: *cancel.Scope,
     context: usize) res[io_runtime.Token, io_error.Error] {
     val operation: io_runtime.Operation = io_runtime.Operation{kind: kind,
         resource: state.stream.handle.value, buffer: buffer, length: length,
-        offset: 0, context: context};
+        offset:   0, context: context};
     ret io_runtime.submit_scoped(state.runtime, scope, operation);
 }
 
 fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
     length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.READ, buffer, length, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:    io_runtime.Token           = submitted.ok;
     val received: res[usize, io_error.Error] = tcp.stream_read(state.stream,
         buffer, length);
     if (sel received.err) {
@@ -108,11 +108,11 @@ fun blocking_read(context: ptr, scope: *cancel.Scope, buffer: *u8,
 
 fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
     length: usize, token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.WRITE, buffer, length, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:   io_runtime.Token           = submitted.ok;
     val written: res[usize, io_error.Error] = tcp.stream_write(state.stream,
         buffer, length);
     if (sel written.err) {
@@ -128,17 +128,18 @@ fun blocking_write(context: ptr, scope: *cancel.Scope, buffer: *u8,
 
 fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.SHUTDOWN, nil, 0, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:   io_runtime.Token    = submitted.ok;
     val stopped: err[io_error.Error] = tcp.stream_shutdown(state.stream,
         os.SHUT_WR);
     if (sel stopped.err) {
         io_runtime.fail(state.runtime, token,
             stopped.err);
-    } or {
+    }
+    or {
         io_runtime.complete(state.runtime, token, 0, state.stream.handle.value, false);
     }
     ret submitted;
@@ -146,25 +147,32 @@ fun blocking_shutdown(context: ptr, scope: *cancel.Scope,
 
 fun blocking_close(context: ptr, scope: *cancel.Scope,
     token_context: usize) res[io_runtime.Token, io_error.Error] {
-    val state: *BlockingTransport = context::*BlockingTransport;
-    val resource: usize = state.stream.handle.value;
+    val state:     *BlockingTransport                    = context::*BlockingTransport;
+    val resource:  usize                                 = state.stream.handle.value;
     val submitted: res[io_runtime.Token, io_error.Error] = submit(state, scope,
         io_runtime.CLOSE, nil, 0, token_context);
     if (sel submitted.err) { ret submitted; }
-    val token: io_runtime.Token = submitted.ok;
+    val token:  io_runtime.Token    = submitted.ok;
     val closed: err[io_error.Error] = tcp.stream_close(state.stream);
     if (sel closed.err) {
         io_runtime.fail(state.runtime, token,
             closed.err);
-    } or {
+    }
+    or {
         io_runtime.complete(state.runtime, token, 0, resource, false);
     }
     ret submitted;
 }
 
 fun hex_nibble(value: u8, output: *u8) bool {
-    if (value >= '0' && value <= '9') { output[0] = value - '0'; ret true; }
-    if (value >= 'a' && value <= 'f') { output[0] = value - 'a' + 10; ret true; }
+    if (value >= '0' && value <= '9') {
+        output[0] = value - '0';
+        ret true;
+    }
+    if (value >= 'a' && value <= 'f') {
+        output[0] = value - 'a' + 10;
+        ret true;
+    }
     ret false;
 }
 
@@ -175,11 +183,11 @@ fun decode_hex(input: *u8, length: usize, output: *u8,
     var i: usize = 0;
     for (i < length / 2) {
         var high: u8;
-        var low: u8;
+        var low:  u8;
         if (!hex_nibble(input[i * 2], ?high) ||
             !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
         output[i] = (high << 4) | low;
-        i = i + 1;
+        i         = i + 1;
     }
     ret true;
 }
@@ -192,11 +200,11 @@ fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
     var i: usize = 0;
     for (i < length / 2) {
         var high: u8;
-        var low: u8;
+        var low:  u8;
         if (!hex_nibble(input[i * 2], ?high) ||
             !hex_nibble(input[i * 2 + 1], ?low)) { ret false; }
         output[i] = (high << 4) | low;
-        i = i + 1;
+        i         = i + 1;
     }
     ret true;
 }
@@ -205,34 +213,34 @@ fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
     for (transport.snapshot(?secure.operation).state !=
         transport.OPERATION_TERMINAL) {
         var completion: io_runtime.Completion;
-        val polled: res[usize, io_error.Error] = io_runtime.poll(owner,
+        val polled:     res[usize, io_error.Error] = io_runtime.poll(owner,
             ?completion, 1);
-        if (sel polled.err) { ret false; }
+        if (sel polled.err)                                        { ret false; }
         if (polled.ok != 1 || !stream.accept(secure, ?completion)) { ret false; }
     }
     ret true;
 }
 
-var client_sessions: session.ClientStore;
-var dial_configuration: config.ClientConfig;
-var option_key_update: bool;
-var option_tls12: bool;
+var client_sessions:     session.ClientStore;
+var dial_configuration:  config.ClientConfig;
+var option_key_update:   bool;
+var option_tls12:        bool;
 var tls12_configuration: config.ClientConfig;
-var tls12_suites: [6]tls13.CipherSuite;
-var tls12_signatures: [7]tls13.SignatureScheme;
-var tls12_versions: [1]u16;
-var legacy_engine: tls12_connection.Connection;
-var legacy_hello: [16384]u8;
-var handshake_input: [65536]u8;
-var handshake_output: [65536]u8;
-var hello_storage: [65536]u8;
-var peer_certificates: [8]cert.Certificate;
-var wire_input_storage: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var tls12_suites:        [6]tls13.CipherSuite;
+var tls12_signatures:    [7]tls13.SignatureScheme;
+var tls12_versions:      [1]u16;
+var legacy_engine:       tls12_connection.Connection;
+var legacy_hello:        [16384]u8;
+var handshake_input:     [65536]u8;
+var handshake_output:    [65536]u8;
+var hello_storage:       [65536]u8;
+var peer_certificates:   [8]cert.Certificate;
+var wire_input_storage:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var wire_output_storage: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var dial_socket: tcp.Stream;
-var dial_runtime: io_runtime.Runtime;
-var dial_blocking: BlockingTransport;
-var dial_lower: transport.Transport;
+var dial_socket:         tcp.Stream;
+var dial_runtime:        io_runtime.Runtime;
+var dial_blocking:       BlockingTransport;
+var dial_lower:          transport.Transport;
 
 fun streq(a: *u8, b: *u8) bool {
     if (a == nil || b == nil) { ret false; }
@@ -246,31 +254,34 @@ fun streq(a: *u8, b: *u8) bool {
 
 fun parse_number(value: *u8) usize {
     var total: usize = 0;
-    var i: usize = 0;
+    var i:     usize = 0;
     for (value[i] != 0) {
         if (value[i] < '0' || value[i] > '9') { ret 0; }
         total = total * 10 + (value[i] - '0')::usize;
-        i = i + 1;
+        i     = i + 1;
     }
     ret total;
 }
 
 fun report(label: str, value: usize) {
     print.print(label);
-    var digits: [24]u8;
-    var count: usize = 0;
+    var digits:    [24]u8;
+    var count:     usize = 0;
     var remaining: usize = value;
-    if (remaining == 0) { digits[0] = '0'; count = 1; }
+    if (remaining == 0) {
+        digits[0] = '0';
+        count     = 1;
+    }
     for (remaining != 0) {
         digits[count] = '0' + (remaining % 10)::u8;
-        remaining = remaining / 10;
-        count = count + 1;
+        remaining     = remaining / 10;
+        count         = count + 1;
     }
     var text: [25]char;
-    var i: usize = 0;
+    var i:    usize = 0;
     for (i < count) {
         text[i] = digits[count - 1 - i]::char;
-        i = i + 1;
+        i       = i + 1;
     }
     text[count] = 0::char;
     print.print(?text[0]);
@@ -290,54 +301,56 @@ fun dial_one(index: usize) i64 {
         stream: ?dial_socket};
     dial_lower = transport.Transport{runtime: ?dial_runtime,
         context: (?dial_blocking)::ptr,
-        context_size: $size_of(BlockingTransport),
-        aliases_state: blocking_aliases_state,
-        submit_read: blocking_read, submit_write: blocking_write,
+        context_size:    $size_of(BlockingTransport),
+        aliases_state:   blocking_aliases_state,
+        submit_read:     blocking_read, submit_write: blocking_write,
         submit_shutdown: blocking_shutdown, submit_close: blocking_close,
-        submit_abort: blocking_close};
+        submit_abort:    blocking_close};
 
     var core_storage: client.Storage = client.Storage{
-        input: ?handshake_input[0], input_capacity: 65536,
-        output: ?handshake_output[0], output_capacity: 65536,
-        hello: ?hello_storage[0], hello_capacity: 65536,
-        certificates: ?peer_certificates[0], certificate_capacity: 8,
-        peer_parameters: nil, peer_parameters_capacity: 0};
+        input:           ?handshake_input[0], input_capacity: 65536,
+        output:          ?handshake_output[0], output_capacity: 65536,
+        hello:           ?hello_storage[0], hello_capacity: 65536,
+        certificates:    ?peer_certificates[0], certificate_capacity: 8,
+        peer_parameters: nil, peer_parameters_capacity: 0
+    };
     var storage: stream.Storage;
-    storage.wire_input = ?wire_input_storage[0];
-    storage.wire_input_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.wire_output = ?wire_output_storage[0];
+    storage.wire_input           = ?wire_input_storage[0];
+    storage.wire_input_capacity  = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    storage.wire_output          = ?wire_output_storage[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 4; }
-    var secure: stream.Stream;
-    var core: client.Client;
+    var secure:      stream.Stream;
+    var core:        client.Client;
     var empty_extra: client.ExtraExtension;
-    empty_extra.kind = 0;
+    empty_extra.kind      = 0;
     empty_extra.data.data = nil;
-    empty_extra.data.len = 0;
+    empty_extra.data.len  = 0;
     if (option_tls12) {
         val legacy_storage: tls12_connection.Storage =
             tls12_connection.Storage{input: ?handshake_input[0],
-                input_capacity: 65536, output: ?handshake_output[0],
-                output_capacity: 65536, hello: ?legacy_hello[0],
-                hello_capacity: 16384,
-                certificates: ?peer_certificates[0], certificate_capacity: 8};
+            input_capacity:  65536, output: ?handshake_output[0],
+            output_capacity: 65536, hello: ?legacy_hello[0],
+            hello_capacity:  16384,
+            certificates:    ?peer_certificates[0], certificate_capacity: 8};
         if (!tls12_connection.init_client(?legacy_engine, ?tls12_configuration,
-                legacy_storage)) { ret 10; }
+            legacy_storage)) { ret 10; }
         if (!stream.connect_tls12(?secure, ?legacy_engine, storage,
-                ?dial_lower, ?scope,
-                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
-            !settle(?secure, ?dial_runtime)) { ret 5; }
-    } or {
-        if (!client.init(?core, ?dial_configuration, core_storage,
-                empty_extra, 0)) { ret 10; }
-        if (!stream.connect(?secure, ?core, storage, ?dial_lower, ?scope,
-                transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            ?dial_lower, ?scope,
+            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
-    val handshake: transport.Snapshot = transport.snapshot(?secure.operation);
-    val negotiated: engine.Snapshot = stream.negotiated(?secure);
+    or {
+        if (!client.init(?core, ?dial_configuration, core_storage,
+            empty_extra, 0)) { ret 10; }
+        if (!stream.connect(?secure, ?core, storage, ?dial_lower, ?scope,
+            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            !settle(?secure, ?dial_runtime)) { ret 5; }
+    }
+    val handshake:  transport.Snapshot = transport.snapshot(?secure.operation);
+    val negotiated: engine.Snapshot    = stream.negotiated(?secure);
     if (handshake.terminal_error != error.OK) {
         ret 20 + handshake.terminal_error::i64;
     }
@@ -348,8 +361,8 @@ fun dial_one(index: usize) i64 {
     report("connection=", index);
     report("version=", negotiated.version::usize);
     report("suite=", negotiated.suite::usize);
-    if (negotiated.resumed) { print.print("resumed=1\n"); }
-    or { print.print("resumed=0\n"); }
+    if (negotiated.resumed)                                                          { print.print("resumed=1\n"); }
+    or                                                                               { print.print("resumed=0\n"); }
     if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
 
     var application_input: [64]u8;
@@ -357,8 +370,8 @@ fun dial_one(index: usize) i64 {
         if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
             !transition_ok(cancel.cancel(?scope)) ||
             !stream.read(?secure, ?scope,
-                transport.Token{index: 2, generation: 1},
-                ?application_input[0], 64, 2)) { ret 44; }
+            transport.Token{index: 2, generation: 1},
+            ?application_input[0], 64, 2)) { ret 44; }
         val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
         if (cancelled.terminal_error != error.CANCELLED ||
             !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
@@ -367,8 +380,8 @@ fun dial_one(index: usize) i64 {
         if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
             !transition_ok(cancel.timeout(?scope)) ||
             !stream.read(?secure, ?scope,
-                transport.Token{index: 2, generation: 2},
-                ?application_input[0], 64, 3)) { ret 46; }
+            transport.Token{index: 2, generation: 2},
+            ?application_input[0], 64, 3)) { ret 46; }
         val timed_out: transport.Snapshot = transport.snapshot(?secure.operation);
         if (timed_out.terminal_error != error.TIMEOUT ||
             !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
@@ -379,7 +392,7 @@ fun dial_one(index: usize) i64 {
     if (option_key_update) {
         if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
             !stream.key_update(?secure, ?scope,
-                transport.Token{index: 7, generation: 1}, 0, 7) ||
+            transport.Token{index: 7, generation: 1}, 0, 7) ||
             !settle(?secure, ?dial_runtime)) { ret 60; }
         val updated: transport.Snapshot = transport.snapshot(?secure.operation);
         if (updated.terminal_error != error.OK) {
@@ -394,11 +407,12 @@ fun dial_one(index: usize) i64 {
 
     var application_output: [16]u8 = [16]u8{
         'm', 'a', 'c', 'h', '-', 't', 'l', 's', ' ', 'i', 'n', 't', 'e', 'r',
-        '\n', 0};
+        '\n', 0
+    };
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.write(?secure, ?scope,
-            transport.Token{index: 3, generation: 1},
-            ?application_output[0], 15, 4) ||
+        transport.Token{index: 3, generation: 1},
+        ?application_output[0], 15, 4) ||
         !settle(?secure, ?dial_runtime)) { ret 48; }
     val written: transport.Snapshot = transport.snapshot(?secure.operation);
     if (written.terminal_error != error.OK || written.application_bytes != 15 ||
@@ -408,8 +422,8 @@ fun dial_one(index: usize) i64 {
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.read(?secure, ?scope,
-            transport.Token{index: 4, generation: 1},
-            ?application_input[0], 64, 5) ||
+        transport.Token{index: 4, generation: 1},
+        ?application_input[0], 64, 5) ||
         !settle(?secure, ?dial_runtime)) { ret 50; }
     val read: transport.Snapshot = transport.snapshot(?secure.operation);
     if (read.terminal_error != error.OK || read.application_bytes == 0 ||
@@ -419,7 +433,7 @@ fun dial_one(index: usize) i64 {
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.half_close(?secure, ?scope,
-            transport.Token{index: 5, generation: 1}, 6) ||
+        transport.Token{index: 5, generation: 1}, 6) ||
         !settle(?secure, ?dial_runtime)) { ret 52; }
     val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (half_closed.terminal_error != error.OK || !secure.send_closed ||
@@ -429,7 +443,7 @@ fun dial_one(index: usize) i64 {
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
         !stream.close(?secure, ?scope,
-            transport.Token{index: 6, generation: 1}, 7) ||
+        transport.Token{index: 6, generation: 1}, 7) ||
         !settle(?secure, ?dial_runtime)) { ret 7; }
     val closed: transport.Snapshot = transport.snapshot(?secure.operation);
     if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
@@ -441,7 +455,8 @@ fun dial_one(index: usize) i64 {
     }
     if (option_tls12) {
         if (!tls12_connection.destroy(?legacy_engine)) { ret 9; }
-    } or {
+    }
+    or {
         if (!client.destroy(?core)) { ret 9; }
     }
     ret 0;
@@ -449,33 +464,36 @@ fun dial_one(index: usize) i64 {
 
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
-    val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
-    val p384_root_hex: *u8 = "3082020a30820190a003020102020101300a06082a8648ce3d040303303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f74301e170d3236303833313138353133375a170d3336303832383138353133375a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f743076301006072a8648ce3d020106052b81040022036200047d75bfcce4046b92abec5888d18a67b3c2d605e70401c09dcb4f8cf43f106c2f13854a0afabc9529fa96604f00631141b31294348150ea12cc8e960e8b321a2af2f16f30729a923e40de4f856e10a20bf07dee074f4a272912db48d738abc586a3663064301f0603551d23041830168014ded0082f54cba5a1f86938525c08c2d259399cc830120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e04160414ded0082f54cba5a1f86938525c08c2d259399cc8300a06082a8648ce3d0403030368003065023100e492d957772464ce3b1b9d75c1d71304ad239eac892803114005a7c3ce56c09256e3378f96e84be8187046b66f35c90302301f676226a26fe6b4e93676fe231e30678b846074977d380208b50f84803227b4c4350731458e0e396561754f85dbf7ec"::*u8;
-    val client_hex: *u8 = "3082016530820117a00302010202147da845f0ef3c4bedac9ebe18bdafc1e948a3424a300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133343832305a170d3237303832383133343832305a30183116301406035504030c0d4d616368544c53436c69656e74302a300506032b657003210033e63a8f44421a42ed9b8120e72beee01e147bde123fe0489ccb27e41993c527a3753073300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070302301d0603551d0e04160414928fd5e4ed358ed2992a33dbb12e18ffade4f16b301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300506032b65700341002a1880fbe668a98aef6514366d6ea77a10f26b8018955f559791658fae49d564d27b240dcd44fa613414aceb9b09d1cec53acc280568a38378c5dcfb032e8a0b"::*u8;
+    val root_hex:       *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
+    val p384_root_hex:  *u8 = "3082020a30820190a003020102020101300a06082a8648ce3d040303303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f74301e170d3236303833313138353133375a170d3336303832383138353133375a303c310b300906035504061302555331133011060355040a0c0a427269617220546573743118301606035504030c0f4272696172205033383420526f6f743076301006072a8648ce3d020106052b81040022036200047d75bfcce4046b92abec5888d18a67b3c2d605e70401c09dcb4f8cf43f106c2f13854a0afabc9529fa96604f00631141b31294348150ea12cc8e960e8b321a2af2f16f30729a923e40de4f856e10a20bf07dee074f4a272912db48d738abc586a3663064301f0603551d23041830168014ded0082f54cba5a1f86938525c08c2d259399cc830120603551d130101ff040830060101ff020100300e0603551d0f0101ff040403020106301d0603551d0e04160414ded0082f54cba5a1f86938525c08c2d259399cc8300a06082a8648ce3d0403030368003065023100e492d957772464ce3b1b9d75c1d71304ad239eac892803114005a7c3ce56c09256e3378f96e84be8187046b66f35c90302301f676226a26fe6b4e93676fe231e30678b846074977d380208b50f84803227b4c4350731458e0e396561754f85dbf7ec"::*u8;
+    val client_hex:     *u8 = "3082016530820117a00302010202147da845f0ef3c4bedac9ebe18bdafc1e948a3424a300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133343832305a170d3237303832383133343832305a30183116301406035504030c0d4d616368544c53436c69656e74302a300506032b657003210033e63a8f44421a42ed9b8120e72beee01e147bde123fe0489ccb27e41993c527a3753073300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070302301d0603551d0e04160414928fd5e4ed358ed2992a33dbb12e18ffade4f16b301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300506032b65700341002a1880fbe668a98aef6514366d6ea77a10f26b8018955f559791658fae49d564d27b240dcd44fa613414aceb9b09d1cec53acc280568a38378c5dcfb032e8a0b"::*u8;
     val client_key_hex: *u8 = "302e020100300506032b6570042204206dd175e2faad594759fd8fb1cd1eeea1f40d01f11189bfd4a6dda111ebee0935"::*u8;
-    var root_der: [341]u8;
-    var p384_root_der: [526]u8;
-    var client_der: [361]u8;
+    var root_der:       [341]u8;
+    var p384_root_der:  [526]u8;
+    var client_der:     [361]u8;
     var client_key_der: [48]^u8;
     if (!decode_hex(root_hex, 682, ?root_der[0], 341) ||
         !decode_hex(p384_root_hex, 1052, ?p384_root_der[0], 526) ||
         !decode_hex(client_hex, 722, ?client_der[0], 361) ||
         !decode_secret_hex(client_key_hex, 96, ?client_key_der[0], 48)) { ret 1; }
-    var connections: usize = 1;
-    var use_sessions: bool = false;
+    var connections:  usize = 1;
+    var use_sessions: bool  = false;
     option_key_update = false;
-    option_tls12 = false;
+    option_tls12      = false;
     var argument: i64 = 1;
     for (argument < argc) {
         val current: *u8 = argv[argument];
         if (streq(current, "--connections"::*u8) && argument + 1 < argc) {
-            argument = argument + 1;
+            argument    = argument + 1;
             connections = parse_number(argv[argument]);
-        } or (streq(current, "--sessions"::*u8)) {
+        }
+        or (streq(current, "--sessions"::*u8)) {
             use_sessions = true;
-        } or (streq(current, "--key-update"::*u8)) {
+        }
+        or (streq(current, "--key-update"::*u8)) {
             option_key_update = true;
-        } or (streq(current, "--tls12"::*u8)) {
+        }
+        or (streq(current, "--tls12"::*u8)) {
             option_tls12 = true;
         }
         argument = argument + 1;
@@ -486,46 +504,59 @@ fun main(argc: i64, argv: **u8) i64 {
         cert.Certificate{der: ?root_der[0], der_len: 341},
         cert.Certificate{der: ?p384_root_der[0], der_len: 526},
     };
-    var trust: cert.TrustStore = cert.TrustStore{anchors: ?anchors[0], len: 2};
+    var trust:     cert.TrustStore        = cert.TrustStore{anchors: ?anchors[0], len: 2};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
-        config.ProtocolName{data: "h2"::*u8, len: 2}};
-    var versions: [1]u16 = [1]u16{tls13.VERSION};
-    var suites: [3]tls13.CipherSuite = [3]tls13.CipherSuite{
+        config.ProtocolName{data: "h2"::*u8, len: 2}
+    };
+    var versions: [1]u16               = [1]u16{tls13.VERSION};
+    var suites:   [3]tls13.CipherSuite = [3]tls13.CipherSuite{
         tls13.AES_128_GCM_SHA256, tls13.AES_256_GCM_SHA384,
-        tls13.CHACHA20_POLY1305_SHA256};
+        tls13.CHACHA20_POLY1305_SHA256
+    };
     var groups: [2]tls13.NamedGroup = [2]tls13.NamedGroup{
-        tls13.X25519, tls13.SECP256R1};
+        tls13.X25519, tls13.SECP256R1
+    };
     var signatures: [5]tls13.SignatureScheme = [5]tls13.SignatureScheme{
         tls13.ED25519, tls13.ECDSA_SECP256R1_SHA256,
         tls13.ECDSA_SECP384R1_SHA384, tls13.RSA_PSS_RSAE_SHA256,
-        tls13.RSA_PSS_RSAE_SHA384};
-    var entropy: secret.Entropy = secret.system_entropy();
-    var allocator: secret.Allocator = secret.system_allocator();
-    var client_key: keys.PrivateKey = keys.empty_private();
-    val loaded_key: contracts.Error = load.private_der(
+        tls13.RSA_PSS_RSAE_SHA384
+    };
+    var entropy:    secret.Entropy   = secret.system_entropy();
+    var allocator:  secret.Allocator = secret.system_allocator();
+    var client_key: keys.PrivateKey  = keys.empty_private();
+    val loaded_key: contracts.Error  = load.private_der(
         contracts.SecretBytes{data: ?client_key_der[0], len: 48}, cert.PKCS8_DER,
         ?allocator, ?client_key);
     ct.zeroize(?client_key_der[0], 48);
     if (loaded_key != contracts.OK) { ret 9; }
     var client_certificate: cert.Certificate = cert.Certificate{
-        der: ?client_der[0], der_len: 361};
+        der: ?client_der[0], der_len: 361
+    };
     var client_chain: cert.Chain = cert.Chain{
-        certificates: ?client_certificate, len: 1};
+        certificates: ?client_certificate, len: 1
+    };
     var client_identity: credentials.Identity = credentials.Identity{
         server_name: contracts.Bytes{data: nil, len: 0}, chain: client_chain,
-        private_key: ?client_key};
-    dial_configuration = config.ClientConfig{};
+        private_key: ?client_key
+    };
+    dial_configuration             = config.ClientConfig{};
     dial_configuration.server_name = contracts.Bytes{
-        data: "api.example.com"::*u8, len: 15};
-    dial_configuration.alpn = ?protocols[0]; dial_configuration.alpn_len = 1;
-    dial_configuration.trust = ?trust;
-    dial_configuration.versions = ?versions[0]; dial_configuration.version_len = 1;
-    dial_configuration.suites = ?suites[0]; dial_configuration.suite_len = 3;
-    dial_configuration.groups = ?groups[0]; dial_configuration.group_len = 2;
-    dial_configuration.signatures = ?signatures[0]; dial_configuration.signature_len = 5;
-    dial_configuration.client_identity = ?client_identity;
-    dial_configuration.entropy = ?entropy;
-    dial_configuration.limits = config.production_limits();
+        data: "api.example.com"::*u8, len: 15
+    };
+    dial_configuration.alpn                            = ?protocols[0];
+    dial_configuration.alpn_len                        = 1;
+    dial_configuration.trust                           = ?trust;
+    dial_configuration.versions                        = ?versions[0];
+    dial_configuration.version_len                     = 1;
+    dial_configuration.suites                          = ?suites[0];
+    dial_configuration.suite_len                       = 3;
+    dial_configuration.groups                          = ?groups[0];
+    dial_configuration.group_len                       = 2;
+    dial_configuration.signatures                      = ?signatures[0];
+    dial_configuration.signature_len                   = 5;
+    dial_configuration.client_identity                 = ?client_identity;
+    dial_configuration.entropy                         = ?entropy;
+    dial_configuration.limits                          = config.production_limits();
     dial_configuration.limits.max_peer_handshake_bytes = 65536;
 
     dial_configuration.sessions = nil;
@@ -534,40 +565,41 @@ fun main(argc: i64, argv: **u8) i64 {
         dial_configuration.sessions = ?client_sessions;
     }
 
-    tls12_versions[0] = tls12.VERSION;
-    tls12_suites[0] = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
-    tls12_suites[1] = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
-    tls12_suites[2] = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
-    tls12_suites[3] = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
-    tls12_suites[4] = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
-    tls12_suites[5] = tls12.ECDHE_RSA_CHACHA20_POLY1305;
-    tls12_signatures[0] = tls13.ED25519;
-    tls12_signatures[1] = tls13.ECDSA_SECP256R1_SHA256;
-    tls12_signatures[2] = tls13.ECDSA_SECP384R1_SHA384;
-    tls12_signatures[3] = tls13.RSA_PSS_RSAE_SHA256;
-    tls12_signatures[4] = tls13.RSA_PSS_RSAE_SHA384;
-    tls12_signatures[5] = 0x0401;
-    tls12_signatures[6] = 0x0501;
-    tls12_configuration = config.ClientConfig{};
+    tls12_versions[0]                   = tls12.VERSION;
+    tls12_suites[0]                     = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    tls12_suites[1]                     = tls12.ECDHE_ECDSA_AES_256_GCM_SHA384;
+    tls12_suites[2]                     = tls12.ECDHE_ECDSA_CHACHA20_POLY1305;
+    tls12_suites[3]                     = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
+    tls12_suites[4]                     = tls12.ECDHE_RSA_AES_256_GCM_SHA384;
+    tls12_suites[5]                     = tls12.ECDHE_RSA_CHACHA20_POLY1305;
+    tls12_signatures[0]                 = tls13.ED25519;
+    tls12_signatures[1]                 = tls13.ECDSA_SECP256R1_SHA256;
+    tls12_signatures[2]                 = tls13.ECDSA_SECP384R1_SHA384;
+    tls12_signatures[3]                 = tls13.RSA_PSS_RSAE_SHA256;
+    tls12_signatures[4]                 = tls13.RSA_PSS_RSAE_SHA384;
+    tls12_signatures[5]                 = 0x0401;
+    tls12_signatures[6]                 = 0x0501;
+    tls12_configuration                 = config.ClientConfig{};
     tls12_configuration.client_identity = nil;
-    tls12_configuration.sessions = nil;
-    tls12_configuration.server_name = contracts.Bytes{
-        data: "api.example.com"::*u8, len: 15};
-    tls12_configuration.alpn = ?protocols[0];
-    tls12_configuration.alpn_len = 1;
-    tls12_configuration.trust = ?trust;
-    tls12_configuration.versions = ?tls12_versions[0];
-    tls12_configuration.version_len = 1;
-    tls12_configuration.suites = ?tls12_suites[0];
-    tls12_configuration.suite_len = 6;
-    tls12_configuration.groups = ?groups[0];
-    tls12_configuration.group_len = 2;
-    tls12_configuration.signatures = ?tls12_signatures[0];
-    tls12_configuration.signature_len = 7;
-    tls12_configuration.entropy = ?entropy;
-    tls12_configuration.limits = config.production_limits();
+    tls12_configuration.sessions        = nil;
+    tls12_configuration.server_name     = contracts.Bytes{
+        data: "api.example.com"::*u8, len: 15
+    };
+    tls12_configuration.alpn                            = ?protocols[0];
+    tls12_configuration.alpn_len                        = 1;
+    tls12_configuration.trust                           = ?trust;
+    tls12_configuration.versions                        = ?tls12_versions[0];
+    tls12_configuration.version_len                     = 1;
+    tls12_configuration.suites                          = ?tls12_suites[0];
+    tls12_configuration.suite_len                       = 6;
+    tls12_configuration.groups                          = ?groups[0];
+    tls12_configuration.group_len                       = 2;
+    tls12_configuration.signatures                      = ?tls12_signatures[0];
+    tls12_configuration.signature_len                   = 7;
+    tls12_configuration.entropy                         = ?entropy;
+    tls12_configuration.limits                          = config.production_limits();
     tls12_configuration.limits.max_peer_handshake_bytes = 65536;
-    tls12_configuration.limits.max_chain_bytes = 32768;
+    tls12_configuration.limits.max_chain_bytes          = 32768;
 
     var index: usize = 0;
     for (index < connections) {
