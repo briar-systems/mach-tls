@@ -25,6 +25,7 @@ use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
 use tls.client;
+use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -212,6 +213,15 @@ fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
     ret true;
 }
 
+# the fixtures are valid for a fixed window, so the wall reading is pinned to a
+# time inside it. the monotonic reading is the process clock, so ticket ages
+# are real
+fun harness_moment(output: *clock.Moment) bool {
+    if (!clock.now(output)) { ret false; }
+    output.wall = time.unix(1800000000, 0);
+    ret true;
+}
+
 # an operation parked for memory is resumed once the connection's account is ready
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
     for (transport.snapshot(?secure.operation).state !=
@@ -316,6 +326,8 @@ fun dial_one(index: usize) i64 {
 
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
+    var moment: clock.Moment;
+    if (!harness_moment(?moment)) { ret 6; }
     var secure:      stream.Stream;
     var core:        client.Handshake;
     var empty_extra: client.ExtraExtension;
@@ -327,14 +339,14 @@ fun dial_one(index: usize) i64 {
             memory)) { ret 10; }
         if (!stream.connect_tls12(?secure, ?legacy_engine, memory, secrets,
             ?dial_lower, ?scope,
-            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            transport.Token{index: 1, generation: 1}, moment, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
     or {
         if (!client.init(?core, ?dial_configuration, memory,
             empty_extra, 0)) { ret 10; }
         if (!stream.connect(?secure, ?core, memory, secrets, ?dial_lower, ?scope,
-            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            transport.Token{index: 1, generation: 1}, moment, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
     val handshake:  transport.Snapshot = transport.snapshot(?secure.operation);

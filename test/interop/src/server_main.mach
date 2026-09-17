@@ -30,6 +30,7 @@ use tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
+use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -166,6 +167,15 @@ fun blocking_close(context: ptr, scope: *cancel.Scope,
         io_runtime.complete(state.runtime, token, 0, resource, false);
     }
     ret submitted;
+}
+
+# the fixtures are valid for a fixed window, so the wall reading is pinned to a
+# time inside it. the monotonic reading is the process clock, so ticket ages
+# are real
+fun harness_moment(output: *clock.Moment) bool {
+    if (!clock.now(output)) { ret false; }
+    output.wall = time.unix(1800000000, 0);
+    ret true;
 }
 
 # an operation parked for memory is resumed once the connection's account is ready
@@ -499,6 +509,11 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 11; }
+    var moment: clock.Moment;
+    if (!harness_moment(?moment)) {
+        print.print("cannot read the clocks\n");
+        ret 49;
+    }
     if (option_tls12) {
         if (!tls12_connection.init_server(?legacy_engine, ?tls12_configuration,
             memory)) {
@@ -507,7 +522,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         }
         if (!stream.serve_tls12(?cur.secure, ?legacy_engine, memory, secrets,
             ?lower_transport, ?scope,
-            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            transport.Token{index: 1, generation: 1}, moment, 1) ||
             !settle(?cur.secure, ?connection_runtime)) {
             print.print("the handshake operation was not accepted\n");
             ret 12;
@@ -523,7 +538,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         }
         if (!stream.serve(?cur.secure, cur_engine, memory, secrets,
             ?lower_transport, ?scope,
-            transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
+            transport.Token{index: 1, generation: 1}, moment, 1) ||
             !settle(?cur.secure, ?connection_runtime)) {
             print.print("the handshake operation was not accepted\n");
             ret 12;
@@ -941,7 +956,9 @@ fun main(argc: i64, argv: **u8) i64 {
     listener_configuration.replay_policy          = session.REPLAY_PERMISSIVE;
     listener_configuration.tickets_per_connection = 0;
     if (option_tickets != 0) {
-        if (!session.keyring_init(?ticket_ring, ?entropy, 1800000000, 3600,
+        var ring_moment: clock.Moment;
+        if (!harness_moment(?ring_moment) ||
+            !session.keyring_init(?ticket_ring, ?entropy, ring_moment, 3600,
             1800, 7200)) {
             print.print("cannot initialize the ticket key ring\n");
             ret 43;
