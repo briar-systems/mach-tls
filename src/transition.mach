@@ -13,6 +13,11 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 
+# the identity a caller enters with
+pub fun current() i64 {
+    ret os.thread_current_id();
+}
+
 # false when owner is invalid or already holds the word, which refuses reentry
 pub fun enter(word: *i64, owner: i64) bool {
     if (word == nil || owner <= 0) { ret false; }
