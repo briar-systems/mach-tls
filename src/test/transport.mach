@@ -10,7 +10,6 @@ use std.runtime;
 use std.sync.atomic;
 use std.sync.cancel;
 use std.sync.thread;
-use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -141,7 +140,7 @@ fun test_submit(context: ptr, scope: *cancel.Scope, kind: io_runtime.Kind, buffe
         state.descriptor.context_size = state.descriptor.context_size + 1;
     }
     if (state.fail_during_submit) {
-        ret res[io_runtime.Token, io_error.Error].err{io_error.from_code(os.EIO, io_error.OP_SUBMIT)};
+        ret res[io_runtime.Token, io_error.Error].err{io_error.make(io_error.IO, io_error.OP_SUBMIT)};
     }
     val operation: io_runtime.Operation = io_runtime.Operation{kind: kind, resource: 1, buffer: buffer, length: length, offset: 0, context: token_context};
     ret io_runtime.submit_scoped(state.runtime, scope, operation);
