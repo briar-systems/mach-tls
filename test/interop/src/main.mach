@@ -225,11 +225,27 @@ fun harness_read(context: ptr, output: *clock.Moment) bool {
 var harness_clock: clock.Source = clock.Source{context: nil, context_size: 0,
     read_fn: harness_read};
 
+# the harness runs one operation at a time, so the live lane is the only one
+# not yet destroyed
+fun lane(secure: *stream.Stream) *stream.Lane {
+    val state: transport.OperationState = transport.snapshot(?secure.writing.operation).state;
+    if (state == 0 || state == transport.OPERATION_DESTROYED) { ret ?secure.reading; }
+    ret ?secure.writing;
+}
+
+fun operation(secure: *stream.Stream) *transport.Operation {
+    ret ?lane(secure).operation;
+}
+
+fun release(secure: *stream.Stream) bool {
+    ret stream.destroy_operation(secure, operation(secure).token);
+}
+
 # an operation parked for memory is resumed once the connection's account is ready
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
-    for (transport.snapshot(?secure.operation).state !=
+    for (transport.snapshot(operation(secure)).state !=
         transport.OPERATION_TERMINAL) {
-        if (secure.pending_action == transport.TRANSPORT_WAIT) {
+        if (lane(secure).park == stream.PARK_MEMORY) {
             if (!pool.ready(?dial_memory) || !stream.resume(secure)) { ret false; }
         }
         var completion: io_runtime.Completion;
@@ -350,7 +366,7 @@ fun dial_one(index: usize) i64 {
             transport.Token{index: 1, generation: 1}, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
-    val handshake:  transport.Snapshot = transport.snapshot(?secure.operation);
+    val handshake:  transport.Snapshot = transport.snapshot(operation(?secure));
     val negotiated: engine.Snapshot    = stream.negotiated(?secure);
     if (handshake.terminal_error != error.OK) {
         ret 20 + handshake.terminal_error::i64;
@@ -366,7 +382,7 @@ fun dial_one(index: usize) i64 {
     if (option_sessions && index != 0 && !negotiated.resumed)                        { ret 44; }
     if (negotiated.resumed)                                                          { print.print("resumed=1\n"); }
     or                                                                               { print.print("resumed=0\n"); }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
+    if (!release(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
 
     var application_input: [64]u8;
     if (index == 0) {
@@ -375,9 +391,9 @@ fun dial_one(index: usize) i64 {
             !stream.read(?secure, ?scope,
             transport.Token{index: 2, generation: 1},
             ?application_input[0], 64, 2)) { ret 44; }
-        val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
+        val cancelled: transport.Snapshot = transport.snapshot(operation(?secure));
         if (cancelled.terminal_error != error.CANCELLED ||
-            !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
+            !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 45;
         }
         if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
@@ -385,9 +401,9 @@ fun dial_one(index: usize) i64 {
             !stream.read(?secure, ?scope,
             transport.Token{index: 2, generation: 2},
             ?application_input[0], 64, 3)) { ret 46; }
-        val timed_out: transport.Snapshot = transport.snapshot(?secure.operation);
+        val timed_out: transport.Snapshot = transport.snapshot(operation(?secure));
         if (timed_out.terminal_error != error.TIMEOUT ||
-            !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
+            !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 47;
         }
     }
@@ -397,12 +413,12 @@ fun dial_one(index: usize) i64 {
             !stream.key_update(?secure, ?scope,
             transport.Token{index: 7, generation: 1}, 0, 7) ||
             !settle(?secure, ?dial_runtime)) { ret 60; }
-        val updated: transport.Snapshot = transport.snapshot(?secure.operation);
+        val updated: transport.Snapshot = transport.snapshot(operation(?secure));
         if (updated.terminal_error != error.OK) {
             report("key update error=", updated.terminal_error::usize);
             ret 61;
         }
-        if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        if (!release(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 62;
         }
         print.print("key-updated\n");
@@ -417,9 +433,9 @@ fun dial_one(index: usize) i64 {
         transport.Token{index: 3, generation: 1},
         ?application_output[0], 15, 4) ||
         !settle(?secure, ?dial_runtime)) { ret 48; }
-    val written: transport.Snapshot = transport.snapshot(?secure.operation);
+    val written: transport.Snapshot = transport.snapshot(operation(?secure));
     if (written.terminal_error != error.OK || written.application_bytes != 15 ||
-        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 49;
     }
 
@@ -428,9 +444,9 @@ fun dial_one(index: usize) i64 {
         transport.Token{index: 4, generation: 1},
         ?application_input[0], 64, 5) ||
         !settle(?secure, ?dial_runtime)) { ret 50; }
-    val read: transport.Snapshot = transport.snapshot(?secure.operation);
+    val read: transport.Snapshot = transport.snapshot(operation(?secure));
     if (read.terminal_error != error.OK || read.application_bytes == 0 ||
-        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 51;
     }
 
@@ -438,9 +454,9 @@ fun dial_one(index: usize) i64 {
         !stream.half_close(?secure, ?scope,
         transport.Token{index: 5, generation: 1}, 6) ||
         !settle(?secure, ?dial_runtime)) { ret 52; }
-    val half_closed: transport.Snapshot = transport.snapshot(?secure.operation);
+    val half_closed: transport.Snapshot = transport.snapshot(operation(?secure));
     if (half_closed.terminal_error != error.OK || !secure.send_closed ||
-        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 53;
     }
 
@@ -448,8 +464,8 @@ fun dial_one(index: usize) i64 {
         !stream.close(?secure, ?scope,
         transport.Token{index: 6, generation: 1}, 7) ||
         !settle(?secure, ?dial_runtime)) { ret 7; }
-    val closed: transport.Snapshot = transport.snapshot(?secure.operation);
-    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure) ||
+    val closed: transport.Snapshot = transport.snapshot(operation(?secure));
+    if (closed.terminal_error != error.OK || !release(?secure) ||
         !stream.destroy(?secure) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?dial_runtime)) ||
