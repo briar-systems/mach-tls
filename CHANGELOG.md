@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.7.1] - 2026-09-17
+
+A cancelled, timed-out or failed completion now keeps the transfer it reports. From mach-std 5.3.0 on, every backend reports that transfer (#104).
+
+### Fixed
+
+- A cancelled, timed-out or failed read lost the end of stream its completion reported. The next read then made one more lower read before it resolved as `CLOSED`. No bytes were lost: a cancelled read's bytes already reached the record layer in 0.7.0 and earlier (#104).
+- A write cancelled or timed out after its whole record had gone out made the stream `FAILED` and reported 0 application bytes, although the peer had the record. It now settles the record: the bytes count and the stream stays `OPEN`. A write cancelled with a record partly sent still fails the stream (#104).
+  - Before mach-std 5.3.0 the runtime itself reported 0 bytes for such a write, so tls and std gave the same wrong answer. The bytes arrive only from 5.3.0 on. tls did not silently lose data in earlier releases.
+- A completion's transfer is bounded by the submitted length however the request ended. A larger one resolves as `INTERNAL_ERROR` and is not counted (#104).
+
+### Embedders: audit retry-on-timeout paths
+
+Before this release, a write that was cancelled or timed out reported `application_bytes == 0` even when its record had reached the peer. A caller that trusted that count and retried the payload, on the same stream or a new connection, could deliver it twice at the application layer. Review any code that retries writes after a cancellation or timeout. From 0.7.1 on, `application_bytes` counts every record the peer was sent in full.
+
+### Changed
+
+- Requires mach-std v5.3.0 and mach-crypto v0.13.2, and the mach 5.3 compiler (`mach = "^5.3"`) (#104).
+- `transport.advance` also accepts a terminal operation, so the owner can count the transfer of the completion that ended it. This widens what the call accepts, and nothing that worked before changes (#104).
+
 ## [0.7.0] - 2026-09-17
 
 An idle established TLS 1.3 connection now takes 1 resident page and holds no buffer, down from 6 pages. Every variable-size buffer comes from the caller's `std.memory.buffers` pool when it is needed and goes back when it is not (#98).
