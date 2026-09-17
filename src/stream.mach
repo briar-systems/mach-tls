@@ -1,4 +1,26 @@
 # completion-driven tls 1.3 secure stream
+#
+# a stream carries one read and one write at once, each in its own lane. the
+# handshake, a full close and a caller alert need both lanes free and run in the
+# write lane. a half close and a key update need only the write lane.
+#
+# one lane at a time owns wire_out, from preparing a record until its last byte
+# is sent, so records never interleave. the engine's events are taken in order
+# by whichever lane finds them, and a record an event owes is sent by that lane
+# once wire_out is free; a lane that finds wire_out owned by the other parks
+# until the other releases it.
+#
+# a lane short of memory parks until `resume`. while both lanes are parked for
+# memory only the lane holding the turn may reserve, and the turn passes to the
+# other lane once its holder acquires; it starts with the write lane, whose
+# record gives its memory back once sent. a lane parked for the other lane is
+# not a contender for memory and never holds up one that is.
+#
+# a lane that fails the stream leaves the other lane's lower action in flight.
+# that action's transfer is still accounted when it completes, and the lane then
+# resolves with the error that failed the stream. a failed stream must be closed:
+# `close` on a failed stream is abortive and is allowed while the other lane is
+# outstanding, and the lower abort is what ends that lane's action.
 
 use crypto.contracts;
 use std.crypto.ct;
@@ -51,20 +73,40 @@ val CONTROL_HALF_CLOSE: Control = 2;
 val CONTROL_CLOSE:      Control = 3;
 val CONTROL_ABORT:      Control = 4;
 
+# why a lane's pending wait was submitted
+pub def Park: u8;
+pub val PARK_NONE:   Park = 0;
+pub val PARK_MEMORY: Park = 1;
+pub val PARK_PEER:   Park = 2;
+
+# a lane, or none
+pub def LaneId: u8;
+pub val NO_LANE:    LaneId = 0;
+pub val READ_LANE:  LaneId = 1;
+pub val WRITE_LANE: LaneId = 2;
+
+# one caller operation and the lower action it is waiting on
+pub rec Lane {
+    operation:      transport.Operation;
+    pending_action: transport.ActionKind;
+    park:           Park;
+}
+
 pub rec Snapshot {
     state:              State;
-    operation:          transport.Snapshot;
+    read:               transport.Snapshot;
+    write:              transport.Snapshot;
     handshake_complete: bool;
     send_closed:        bool;
     peer_closed:        bool;
     alert:              record.AlertDescription;
+    failure:            error.Error;
 }
 
-# one operation is active at a time, while read and write cipher sequences remain independent
 # exactly one engine pointer is set; both are caller-owned and outlive the stream
 pub rec Stream {
-    transport:       *transport.Transport;
-    lower_transport: transport.Transport;
+    # the stream's own validated copy of the caller's transport
+    lower: transport.Provider;
     # the connection's lease on both sources, charging one account
     memory:  buffer.Lease;
     secrets: buffer.SecretLease;
@@ -88,24 +130,32 @@ pub rec Stream {
     legacy:         *tls12_connection.Handshake;
     # once the handshake operation is destroyed the engine is finished into
     # one of these and the handshake object is released to its owner
-    finished:                 bool;
-    core13:                   established.Established;
-    core12:                   tls12_established.Established;
-    operation:                transport.Operation;
-    read_cipher:              record.Cipher;
-    write_cipher:             record.Cipher;
-    state:                    State;
-    control:                  Control;
-    pending_action:           transport.ActionKind;
-    wire_input_len:           usize;
-    wire_input_read:          usize;
-    wire_output_len:          usize;
-    wire_output_sent:         usize;
-    plaintext_len:            usize;
-    plaintext_read:           usize;
-    application_chunk:        usize;
-    core_event:               engine.Event;
-    core_event_sending:       bool;
+    finished: bool;
+    core13:   established.Established;
+    core12:   tls12_established.Established;
+    reading:  Lane;
+    writing:  Lane;
+    # the lane that owns wire_out, the lane that may reserve memory while both
+    # are parked for it, and whether this step freed what a parked peer awaits
+    sender:             LaneId;
+    turn:               LaneId;
+    peer_released:      bool;
+    failure:            error.Error;
+    read_cipher:        record.Cipher;
+    write_cipher:       record.Cipher;
+    state:              State;
+    control:            Control;
+    wire_input_len:     usize;
+    wire_input_read:    usize;
+    wire_output_len:    usize;
+    wire_output_sent:   usize;
+    plaintext_len:      usize;
+    plaintext_read:     usize;
+    application_chunk:  usize;
+    core_event:         engine.Event;
+    core_event_sending: bool;
+    # wire_out holds a record of the borrowed core event
+    event_record:             bool;
     core_event_alert:         bool;
     core_event_offset:        usize;
     core_event_chunk:         usize;
@@ -136,6 +186,34 @@ fun stream_owner_overlaps(stream: *Stream, data: *u8, len: usize) bool {
     val owner: *u8 = stream_owner_data(stream);
     ret owner == nil || !memory_range.valid(data, len) ||
         memory_range.overlap(owner, $size_of(Stream), data, len);
+}
+
+fun lane_id(stream: *Stream, lane: *Lane) LaneId {
+    if (lane == ?stream.reading) { ret READ_LANE; }
+    ret WRITE_LANE;
+}
+
+# the write lane holds the turn unless it names the read lane
+fun holds_turn(stream: *Stream, lane: *Lane) bool {
+    ret (stream.turn == READ_LANE) == (lane == ?stream.reading);
+}
+
+fun other(stream: *Stream, lane: *Lane) *Lane {
+    if (lane == ?stream.reading) { ret ?stream.writing; }
+    ret ?stream.reading;
+}
+
+fun lane_state(lane: *Lane) transport.OperationState {
+    ret transport.snapshot(?lane.operation).state;
+}
+
+fun lane_available(lane: *Lane) bool {
+    val state: transport.OperationState = lane_state(lane);
+    ret state == 0 || state == transport.OPERATION_DESTROYED;
+}
+
+fun lane_terminal(lane: *Lane) bool {
+    ret lane_state(lane) == transport.OPERATION_TERMINAL;
 }
 
 fun region_overlaps(region: buffer.Region, data: *u8, len: usize) bool {
@@ -357,9 +435,9 @@ fun operation_inputs_valid(stream: *Stream, scope: *cancel.Scope,
     buffer: *u8, len: usize) bool {
     if (!externally_owned(stream, scope::*u8, $size_of(cancel.Scope)) ||
         !externally_owned(stream, buffer, len) ||
-        transport.state_overlaps(stream.transport, scope::*u8,
+        transport.state_overlaps(?stream.lower.descriptor, scope::*u8,
         $size_of(cancel.Scope)) ||
-        transport.state_overlaps(stream.transport, buffer, len)) { ret false; }
+        transport.state_overlaps(?stream.lower.descriptor, buffer, len)) { ret false; }
     ret !memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer, len);
 }
 
@@ -417,14 +495,22 @@ fun install_secret(stream: *Stream, event: *engine.Event) bool {
     ret installed;
 }
 
+# the first failure is the one the other lane reports
+fun fail_stream(stream: *Stream, failure: error.Error) {
+    stream.state = FAILED;
+    if (stream.failure == error.OK) {
+        stream.failure = failure;
+        if (failure == error.OK) { stream.failure = error.INTERNAL_ERROR; }
+    }
+}
+
 # an operation ended between records leaves the stream intact; one ended with
-# a sealed record partly unsent, or mid-handshake or mid-close, does not.
-# wire_output_len is nonzero exactly while a sealed record is not fully sent
-fun terminal_requires_failure(stream: *Stream,
+# a record of its own partly unsent, or mid-handshake or mid-close, does not
+fun terminal_requires_failure(stream: *Stream, lane: *Lane,
     snapshot: transport.Snapshot) bool {
     ret stream != nil && snapshot.state == transport.OPERATION_TERMINAL &&
         snapshot.terminal_error != error.OK &&
-        (stream.wire_output_len != 0 ||
+        ((stream.sender == lane_id(stream, lane) && stream.wire_output_len != 0) ||
         snapshot.kind == transport.HANDSHAKE ||
         snapshot.kind == transport.APPLICATION_CLOSE);
 }
@@ -434,59 +520,87 @@ fun clear_core_event(stream: *Stream) {
         engine_complete_event(stream, stream.core_event.token, false);
     }
     stream.core_event_sending = false;
+    stream.event_record       = false;
     stream.core_event_alert   = false;
     stream.core_event_offset  = 0;
     stream.core_event_chunk   = 0;
 }
 
-fun settle_terminal(stream: *Stream) bool {
-    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
+fun settle_terminal(stream: *Stream, lane: *Lane) bool {
+    val snapshot: transport.Snapshot = transport.snapshot(?lane.operation);
     if (snapshot.state != transport.OPERATION_TERMINAL) { ret false; }
-    clear_core_event(stream);
-    if (terminal_requires_failure(stream, snapshot)) { stream.state = FAILED; }
+    val owned: bool = stream.sender == lane_id(stream, lane);
+    # an event this lane was sending cannot be finished by anyone once its
+    # record is cut short; one it had not started stays for the other lane
+    if ((owned && stream.event_record) || lane_available(other(stream, lane)) ||
+        stream.failure != error.OK) {
+        clear_core_event(stream);
+    }
+    if (terminal_requires_failure(stream, lane, snapshot)) {
+        fail_stream(stream, snapshot.terminal_error);
+    }
     if ((stream.control == CONTROL_CLOSE || stream.control == CONTROL_ABORT) &&
-        (stream.pending_action == transport.TRANSPORT_CLOSE ||
-        stream.pending_action == transport.TRANSPORT_ABORT) &&
+        (lane.pending_action == transport.TRANSPORT_CLOSE ||
+        lane.pending_action == transport.TRANSPORT_ABORT) &&
         snapshot.terminal_error == error.OK) { stream.state = CLOSED; }
-    stream.pending_action = 0;
+    if (owned) {
+        stream.sender        = NO_LANE;
+        stream.peer_released = true;
+    }
+    lane.pending_action = 0;
+    lane.park           = PARK_NONE;
     release_idle(stream);
     ret true;
 }
 
-fun finish(stream: *Stream, failure: error.Error, end_of_stream: bool) bool {
+fun finish(stream: *Stream, lane: *Lane, failure: error.Error, end_of_stream: bool) bool {
     if (failure != error.OK && failure != error.CANCELLED &&
-        failure != error.TIMEOUT) { stream.state = FAILED; }
-    if (transport.finish(?stream.operation, failure, end_of_stream)) {
-        settle_terminal(stream);
-        ret true;
-    }
-    ret settle_terminal(stream);
+        failure != error.TIMEOUT) { fail_stream(stream, failure); }
+    transport.finish(?lane.operation, failure, end_of_stream);
+    ret settle_terminal(stream, lane);
 }
 
-fun submit(stream: *Stream, kind: transport.ActionKind, buffer: *u8,
+fun submit(stream: *Stream, lane: *Lane, kind: transport.ActionKind, buffer: *u8,
     length: usize) bool {
     val action: transport.Action = transport.Action{kind: kind, buffer: buffer,
-        length: length, context: stream.operation.context};
-    if (!transport.begin_action(?stream.operation, stream.transport, action)) {
-        land_regions(stream);
-        if (settle_terminal(stream)) { ret true; }
-        ret finish(stream, error.INTERNAL_ERROR, false);
+        length: length, context: lane.operation.context};
+    if (!transport.begin_action(?lane.operation, ?stream.lower, action)) {
+        land_region(stream, kind);
+        if (settle_terminal(stream, lane)) { ret true; }
+        ret finish(stream, lane, error.INTERNAL_ERROR, false);
     }
-    stream.pending_action = kind;
+    lane.pending_action = kind;
+    ret true;
+}
+
+fun park(stream: *Stream, lane: *Lane, reason: Park) bool {
+    if (!submit(stream, lane, transport.TRANSPORT_WAIT, nil, 0)) { ret false; }
+    if (lane.pending_action == transport.TRANSPORT_WAIT)         { lane.park = reason; }
     ret true;
 }
 
 # a read or write that ended, or never started, gives its region back
-fun land_regions(stream: *Stream) {
-    if (stream.wire_in.flying)  { buffer.land(stream.memory, ?stream.wire_in); }
-    if (stream.wire_out.flying) { buffer.land(stream.memory, ?stream.wire_out); }
+fun land_region(stream: *Stream, kind: transport.ActionKind) {
+    if (kind == transport.TRANSPORT_READ && stream.wire_in.flying) {
+        buffer.land(stream.memory, ?stream.wire_in);
+    }
+    if (kind == transport.TRANSPORT_WRITE && stream.wire_out.flying) {
+        buffer.land(stream.memory, ?stream.wire_out);
+    }
 }
 
-# a refusal to wait parks the operation on a scoped wake; any other refusal
-# fails it. either way the caller has nothing more to do this round
-fun refused(stream: *Stream, outcome: buffer.Outcome) bool {
-    if (outcome == buffer.WAIT) { ret submit(stream, transport.TRANSPORT_WAIT, nil, 0); }
-    ret finish(stream, error.RESOURCE_LIMIT, false);
+# a refusal to wait parks the lane for memory, giving back a record region it
+# reserved but could not fill; any other refusal fails it. either way the
+# caller has nothing more to do this round
+fun refused(stream: *Stream, lane: *Lane, outcome: buffer.Outcome) bool {
+    if (outcome == buffer.WAIT) {
+        if (stream.wire_output_len == 0 && !stream.wire_out.flying) {
+            buffer.release(stream.memory, ?stream.wire_out, 0);
+        }
+        buffer.secret_release(stream.secrets, ?stream.sealing);
+        ret park(stream, lane, PARK_MEMORY);
+    }
+    ret finish(stream, lane, error.RESOURCE_LIMIT, false);
 }
 
 fun compact_input(stream: *Stream) {
@@ -521,12 +635,13 @@ fun release_idle(stream: *Stream) {
     buffer.secret_release(stream.secrets, ?stream.sealing);
 }
 
-# seal or encode one record into wire_out. content never lives in the stream
-# past this call
-fun prepare_record(stream: *Stream, content_type: record.ContentType,
+# seal or encode one record into wire_out for the lane. content never lives in
+# the stream past this call
+fun prepare_record(stream: *Stream, lane: *Lane, content_type: record.ContentType,
     content: contracts.Bytes) buffer.Outcome {
     if (content.len > record.MAX_PLAINTEXT ||
-        (stream.write_cipher.installed && content.len > stream.send_record_plaintext)) {
+        (stream.write_cipher.installed && content.len > stream.send_record_plaintext) ||
+        stream.wire_output_len != 0) {
         ret buffer.FAIL;
     }
     val out: buffer.Outcome = buffer.reserve(stream.memory, ?stream.wire_out,
@@ -556,49 +671,50 @@ fun prepare_record(stream: *Stream, content_type: record.ContentType,
     if (sealed.error != error.OK) { ret buffer.FAIL; }
     stream.wire_output_len  = sealed.written;
     stream.wire_output_sent = 0;
+    stream.sender           = lane_id(stream, lane);
     ret buffer.HELD;
 }
 
-fun prepare_application_record(stream: *Stream) buffer.Outcome {
-    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
-    if (snapshot.application_bytes >= stream.operation.application_length) {
+fun prepare_application_record(stream: *Stream, lane: *Lane) buffer.Outcome {
+    val snapshot: transport.Snapshot = transport.snapshot(?lane.operation);
+    if (snapshot.application_bytes >= lane.operation.application_length) {
         ret buffer.FAIL;
     }
-    var amount: usize = stream.operation.application_length - snapshot.application_bytes;
+    var amount: usize = lane.operation.application_length - snapshot.application_bytes;
     if (amount > stream.send_record_plaintext) { amount = stream.send_record_plaintext; }
-    val prepared: buffer.Outcome = prepare_record(stream, record.APPLICATION_DATA,
-        contracts.Bytes{data: ?stream.operation.application_buffer[snapshot.application_bytes],
+    val prepared: buffer.Outcome = prepare_record(stream, lane, record.APPLICATION_DATA,
+        contracts.Bytes{data: ?lane.operation.application_buffer[snapshot.application_bytes],
         len: amount});
     if (prepared == buffer.HELD) { stream.application_chunk = amount; }
     ret prepared;
 }
 
-fun prepare_alert(stream: *Stream, description: record.AlertDescription) buffer.Outcome {
+fun prepare_alert(stream: *Stream, lane: *Lane, description: record.AlertDescription) buffer.Outcome {
     var bytes: [2]u8;
     bytes[0] = record.FATAL;
     if (description == record.CLOSE_NOTIFY || description == record.USER_CANCELED_ALERT) {
         bytes[0] = record.WARNING;
     }
     bytes[1] = description;
-    ret prepare_record(stream, record.ALERT, contracts.Bytes{data: ?bytes[0], len: 2});
+    ret prepare_record(stream, lane, record.ALERT, contracts.Bytes{data: ?bytes[0], len: 2});
 }
 
 # the record the borrowed core event still owes, prepared once wire_out is free
-fun prepare_core_record(stream: *Stream) buffer.Outcome {
+fun prepare_core_record(stream: *Stream, lane: *Lane) buffer.Outcome {
     if (stream.core_event.kind == engine.ALERT) {
-        ret prepare_alert(stream, stream.core_event.alert);
+        ret prepare_alert(stream, lane, stream.core_event.alert);
     }
     if (stream.core_event.kind == engine.CHANGE_CIPHER_SPEC) {
         var marker: [1]u8;
         marker[0] = 1;
-        ret prepare_record(stream, record.CHANGE_CIPHER_SPEC,
+        ret prepare_record(stream, lane, record.CHANGE_CIPHER_SPEC,
             contracts.Bytes{data: ?marker[0], len: 1});
     }
     if (stream.core_event.kind != engine.CRYPTO ||
         stream.core_event_offset >= stream.core_event.data.len) { ret buffer.FAIL; }
     var amount: usize = stream.core_event.data.len - stream.core_event_offset;
     if (amount > stream.send_record_plaintext) { amount = stream.send_record_plaintext; }
-    val prepared: buffer.Outcome = prepare_record(stream, record.HANDSHAKE,
+    val prepared: buffer.Outcome = prepare_record(stream, lane, record.HANDSHAKE,
         contracts.Bytes{data: ?stream.core_event.data.data[stream.core_event_offset],
         len: amount});
     if (prepared == buffer.HELD) { stream.core_event_chunk = amount; }
@@ -606,21 +722,40 @@ fun prepare_core_record(stream: *Stream) buffer.Outcome {
 }
 
 # a borrowed event with nothing prepared yet. true when the step settled the
-# round: a record is ready, the operation parked, or it failed
-fun owe_core_record(stream: *Stream) bool {
-    if (!stream.core_event_sending || stream.wire_output_len != 0) { ret false; }
-    val prepared: buffer.Outcome = prepare_core_record(stream);
-    if (prepared == buffer.HELD) { ret false; }
-    if (prepared == buffer.WAIT) { ret refused(stream, prepared); }
+# round: a record is ready and sent, the lane parked, or it failed
+fun owe_core_record(stream: *Stream, lane: *Lane) bool {
+    if (!stream.core_event_sending) { ret false; }
+    if (stream.wire_output_len != 0) {
+        if (stream.sender == lane_id(stream, lane)) { ret false; }
+        ret park(stream, lane, PARK_PEER);
+    }
+    # nothing is sent after close_notify: a key update owed then is dropped,
+    # and an alert owed then only fails the stream
+    if (stream.send_closed && stream.handshake_complete) {
+        val alert_event: bool = stream.core_event_alert;
+        stream.core_event_sending = false;
+        stream.core_event_alert   = false;
+        stream.core_event_offset  = 0;
+        engine_complete_event(stream, stream.core_event.token, !alert_event);
+        stream.peer_released = true;
+        if (alert_event) { ret finish(stream, lane, engine_failure(stream), false); }
+        ret false;
+    }
+    val prepared: buffer.Outcome = prepare_core_record(stream, lane);
+    if (prepared == buffer.HELD) {
+        stream.event_record = true;
+        ret false;
+    }
+    if (prepared == buffer.WAIT) { ret refused(stream, lane, prepared); }
     engine_complete_event(stream, stream.core_event.token, false);
     stream.core_event_sending = false;
     stream.core_event_alert   = false;
-    ret finish(stream, error.INTERNAL_ERROR, false);
+    ret finish(stream, lane, error.INTERNAL_ERROR, false);
 }
 
-fun handle_core_event(stream: *Stream) bool {
+fun handle_core_event(stream: *Stream, lane: *Lane) bool {
     var event: engine.Event;
-    if (!engine_next_event(stream, ?event)) { ret false; }
+    if (stream.core_event_sending || !engine_next_event(stream, ?event)) { ret false; }
     stream.send_record_plaintext = engine_send_limit(stream);
     if (event.kind == engine.CRYPTO || event.kind == engine.ALERT ||
         event.kind == engine.CHANGE_CIPHER_SPEC) {
@@ -634,7 +769,7 @@ fun handle_core_event(stream: *Stream) bool {
     }
     if (event.kind == engine.TRAFFIC_SECRET && !install_secret(stream, ?event)) {
         engine_complete_event(stream, event.token, false);
-        finish(stream, error.INTERNAL_ERROR, false);
+        finish(stream, lane, error.INTERNAL_ERROR, false);
         ret true;
     }
     if (event.kind == engine.HANDSHAKE_COMPLETE) {
@@ -642,47 +777,48 @@ fun handle_core_event(stream: *Stream) bool {
         stream.state              = OPEN;
     }
     engine_complete_event(stream, event.token, true);
+    stream.peer_released = true;
     ret true;
 }
 
-fun handle_alert(stream: *Stream, data: *u8, length: usize) bool {
+fun handle_alert(stream: *Stream, lane: *Lane, data: *u8, length: usize) bool {
     var alert: record.AlertMessage;
     if (record.decode_alert(stream_protocol(stream), data, length,
         ?alert) != error.OK) {
-        finish(stream, error.DECODE_ERROR, false);
+        finish(stream, lane, error.DECODE_ERROR, false);
         ret true;
     }
     stream.peer_alert = alert.description;
     if (alert.description == record.CLOSE_NOTIFY) {
         if (!stream.handshake_complete) {
-            finish(stream, error.UNEXPECTED_MESSAGE, false);
+            finish(stream, lane, error.UNEXPECTED_MESSAGE, false);
             ret true;
         }
         stream.peer_closed = true;
-        finish(stream, error.OK, true);
+        finish(stream, lane, error.OK, true);
     }
     or (alert.fatal) {
-        finish(stream, error.ALERT_RECEIVED, false);
+        finish(stream, lane, error.ALERT_RECEIVED, false);
     }
     ret true;
 }
 
-fun consume_plaintext(stream: *Stream) bool {
+fun consume_plaintext(stream: *Stream, lane: *Lane) bool {
     if (stream.plaintext_read >= stream.plaintext_len) { ret false; }
-    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
-    if (stream.operation.kind != transport.APPLICATION_READ) { ret false; }
+    val snapshot: transport.Snapshot = transport.snapshot(?lane.operation);
+    if (lane.operation.kind != transport.APPLICATION_READ) { ret false; }
     val available: usize = stream.plaintext_len - stream.plaintext_read;
-    val remaining: usize = stream.operation.application_length - snapshot.application_bytes;
+    val remaining: usize = lane.operation.application_length - snapshot.application_bytes;
     var amount:    usize = available;
     if (amount > remaining) { amount = remaining; }
     var i: usize = 0;
     for (i < amount) {
-        stream.operation.application_buffer[snapshot.application_bytes + i] =
+        lane.operation.application_buffer[snapshot.application_bytes + i] =
             stream.opened.data[stream.plaintext_read + i]:>u8;
         i = i + 1;
     }
-    if (!transport.advance(?stream.operation, amount)) {
-        finish(stream, error.INTERNAL_ERROR, false);
+    if (!transport.advance(?lane.operation, amount)) {
+        finish(stream, lane, error.INTERNAL_ERROR, false);
         ret true;
     }
     stream.plaintext_read = stream.plaintext_read + amount;
@@ -691,22 +827,22 @@ fun consume_plaintext(stream: *Stream) bool {
         stream.plaintext_len  = 0;
         buffer.secret_release(stream.secrets, ?stream.opened);
     }
-    if (transport.snapshot(?stream.operation).application_bytes ==
-        stream.operation.application_length || amount != 0) {
-        finish(stream, error.OK, false);
+    if (transport.snapshot(?lane.operation).application_bytes ==
+        lane.operation.application_length || amount != 0) {
+        finish(stream, lane, error.OK, false);
     }
     ret true;
 }
 
 # hand a handshake message to the engine. when the engine must wait for memory
-# the message stays where it is and the operation parks; it is offered again
-# before anything else
-fun offer_handshake(stream: *Stream) bool {
+# the message stays where it is and the lane parks; it is offered again before
+# anything else
+fun offer_handshake(stream: *Stream, lane: *Lane) bool {
     val data:     *u8           = ?stream.wire_in.chunk.data[stream.held_offset];
     val progress: engine.Result = engine_ingest(stream, stream.held_level, data,
         stream.held_length);
     if (progress.status == engine.WAITING) {
-        ret submit(stream, transport.TRANSPORT_WAIT, nil, 0);
+        ret park(stream, lane, PARK_MEMORY);
     }
     if (stream.held_protected) {
         var i: usize = 0;
@@ -718,24 +854,24 @@ fun offer_handshake(stream: *Stream) bool {
     stream.holding     = false;
     stream.held_length = 0;
     if (progress.status == engine.FAILED) {
-        if (!handle_core_event(stream)) { finish(stream, progress.error, false); }
+        if (!handle_core_event(stream, lane)) { finish(stream, lane, progress.error, false); }
     }
     ret true;
 }
 
 # a record that needs more bytes than wire_in can hold grows it, up to the
 # largest record the peer may send
-fun needs_input(stream: *Stream, required: usize) bool {
+fun needs_input(stream: *Stream, lane: *Lane, required: usize) bool {
     if (required > record_limit(stream)) {
-        finish(stream, error.RECORD_OVERFLOW, false);
+        finish(stream, lane, error.RECORD_OVERFLOW, false);
         ret true;
     }
     stream.wire_needed = required;
     ret false;
 }
 
-fun process_record(stream: *Stream) bool {
-    if (stream.holding)                                  { ret offer_handshake(stream); }
+fun process_record(stream: *Stream, lane: *Lane) bool {
+    if (stream.holding)                                  { ret offer_handshake(stream, lane); }
     if (stream.wire_input_read >= stream.wire_input_len) { ret false; }
     val start:     usize = stream.wire_input_read;
     val input:     *u8   = ?stream.wire_in.chunk.data[start];
@@ -745,12 +881,12 @@ fun process_record(stream: *Stream) bool {
         val compatibility: record.Parsed = record.inspect(input, available,
             stream_protocol(stream), false);
         if (compatibility.status == record.PARSE_MORE) {
-            ret needs_input(stream, compatibility.required);
+            ret needs_input(stream, lane, compatibility.required);
         }
         if (compatibility.status != record.PARSE_READY ||
             compatibility.frame.length != 1 || compatibility.frame.fragment[0] != 1 ||
             stream.ccs_count >= 8) {
-            finish(stream, error.UNEXPECTED_MESSAGE, false);
+            finish(stream, lane, error.UNEXPECTED_MESSAGE, false);
             ret true;
         }
         stream.ccs_count       = stream.ccs_count + 1;
@@ -766,14 +902,14 @@ fun process_record(stream: *Stream) bool {
     if (!stream.read_cipher.installed) {
         val parsed: record.Parsed = record.inspect(input, available,
             stream_protocol(stream), false);
-        if (parsed.status == record.PARSE_MORE) { ret needs_input(stream, parsed.required); }
+        if (parsed.status == record.PARSE_MORE) { ret needs_input(stream, lane, parsed.required); }
         if (parsed.status != record.PARSE_READY ||
             parsed.frame.length > stream.receive_record_plaintext) {
             if (parsed.status == record.PARSE_READY) {
-                finish(stream, error.RECORD_OVERFLOW, false);
+                finish(stream, lane, error.RECORD_OVERFLOW, false);
                 ret true;
             }
-            finish(stream, parsed.error, false);
+            finish(stream, lane, parsed.error, false);
             ret true;
         }
         content_type   = parsed.frame.header.content_type;
@@ -785,23 +921,23 @@ fun process_record(stream: *Stream) bool {
         protected = true;
         val bounded: record.Parsed = record.inspect(input, available,
             stream_protocol(stream), true);
-        if (bounded.status == record.PARSE_MORE) { ret needs_input(stream, bounded.required); }
+        if (bounded.status == record.PARSE_MORE) { ret needs_input(stream, lane, bounded.required); }
         if (bounded.status != record.PARSE_READY ||
             bounded.frame.length > stream.receive_record_plaintext +
             record.MAX_CIPHERTEXT_EXTRA) {
-            finish(stream, error.RECORD_OVERFLOW, false);
+            finish(stream, lane, error.RECORD_OVERFLOW, false);
             ret true;
         }
         # opening advances the cipher, so its plaintext room is held first
         val room: buffer.Outcome = buffer.secret_reserve(stream.secrets, ?stream.opened,
             bounded.frame.length, 0);
-        if (room != buffer.HELD) { ret refused(stream, room); }
+        if (room != buffer.HELD) { ret refused(stream, lane, room); }
         val opened: record.Opened = record.open(?stream.read_cipher, input, available,
             contracts.SecretBuffer{data: stream.opened.data,
             capacity: stream.opened.capacity});
-        if (opened.status == record.PARSE_MORE) { ret needs_input(stream, opened.required); }
+        if (opened.status == record.PARSE_MORE) { ret needs_input(stream, lane, opened.required); }
         if (opened.status != record.PARSE_READY || opened.error != error.OK) {
-            finish(stream, opened.error, false);
+            finish(stream, lane, opened.error, false);
             ret true;
         }
         content_type   = opened.content_type;
@@ -809,7 +945,7 @@ fun process_record(stream: *Stream) bool {
         consumed       = opened.consumed;
         if (content_length > stream.receive_record_plaintext) {
             buffer.secret_release(stream.secrets, ?stream.opened);
-            finish(stream, error.RECORD_OVERFLOW, false);
+            finish(stream, lane, error.RECORD_OVERFLOW, false);
             ret true;
         }
     }
@@ -817,7 +953,7 @@ fun process_record(stream: *Stream) bool {
     stream.wire_needed     = 0;
     if (content_type == record.CHANGE_CIPHER_SPEC) {
         if (protected || content_length != 1 || content[0] != 1) {
-            finish(stream, error.UNEXPECTED_MESSAGE, false);
+            finish(stream, lane, error.UNEXPECTED_MESSAGE, false);
         }
         ret true;
     }
@@ -828,7 +964,7 @@ fun process_record(stream: *Stream) bool {
             alert_bytes[1] = stream.opened.data[1]:>u8;
             content        = ?alert_bytes[0];
         }
-        val handled: bool = handle_alert(stream, content, content_length);
+        val handled: bool = handle_alert(stream, lane, content, content_length);
         if (protected) { buffer.secret_release(stream.secrets, ?stream.opened); }
         ret handled;
     }
@@ -852,23 +988,23 @@ fun process_record(stream: *Stream) bool {
         stream.held_level     = level;
         stream.held_offset    = content::usize - stream.wire_in.chunk.data::usize;
         stream.held_length    = content_length;
-        ret offer_handshake(stream);
+        ret offer_handshake(stream, lane);
     }
     if (content_type == record.APPLICATION_DATA && stream.handshake_complete &&
-        stream.operation.kind == transport.APPLICATION_READ) {
+        lane.operation.kind == transport.APPLICATION_READ) {
         stream.plaintext_len  = content_length;
         stream.plaintext_read = 0;
-        ret consume_plaintext(stream);
+        ret consume_plaintext(stream, lane);
     }
     if (protected) { buffer.secret_release(stream.secrets, ?stream.opened); }
-    finish(stream, error.UNEXPECTED_MESSAGE, false);
+    finish(stream, lane, error.UNEXPECTED_MESSAGE, false);
     ret true;
 }
 
-fun submit_read(stream: *Stream) bool {
+fun submit_read(stream: *Stream, lane: *Lane) bool {
     if (stream.lower_eof) {
-        if (stream.peer_closed) { ret finish(stream, error.OK, true); }
-        ret finish(stream, error.CLOSED, true);
+        if (stream.peer_closed) { ret finish(stream, lane, error.OK, true); }
+        ret finish(stream, lane, error.CLOSED, true);
     }
     val unread: usize = stream.wire_input_len - stream.wire_input_read;
     var target: usize = stream.wire_needed;
@@ -883,159 +1019,205 @@ fun submit_read(stream: *Stream) bool {
     if (stream.wire_in.chunk.bytes < target) {
         val grown: buffer.Outcome = buffer.reserve_from(stream.memory, ?stream.wire_in,
             target, stream.wire_input_read, unread);
-        if (grown != buffer.HELD) { ret refused(stream, grown); }
+        if (grown != buffer.HELD) { ret refused(stream, lane, grown); }
         stream.wire_input_read = 0;
         stream.wire_input_len  = unread;
     }
     compact_input(stream);
     if (stream.wire_input_len == stream.wire_in.chunk.bytes) {
-        ret finish(stream, error.RESOURCE_LIMIT, false);
+        ret finish(stream, lane, error.RESOURCE_LIMIT, false);
     }
     if (!buffer.fly(stream.memory, ?stream.wire_in)) {
-        ret finish(stream, error.INTERNAL_ERROR, false);
+        ret finish(stream, lane, error.INTERNAL_ERROR, false);
     }
-    ret submit(stream, transport.TRANSPORT_READ,
+    ret submit(stream, lane, transport.TRANSPORT_READ,
         ?stream.wire_in.chunk.data[stream.wire_input_len],
         stream.wire_in.chunk.bytes - stream.wire_input_len);
 }
 
-fun submit_write(stream: *Stream) bool {
+fun submit_write(stream: *Stream, lane: *Lane) bool {
     if (!buffer.fly(stream.memory, ?stream.wire_out)) {
-        ret finish(stream, error.INTERNAL_ERROR, false);
+        ret finish(stream, lane, error.INTERNAL_ERROR, false);
     }
-    ret submit(stream, transport.TRANSPORT_WRITE,
+    ret submit(stream, lane, transport.TRANSPORT_WRITE,
         ?stream.wire_out.chunk.data[stream.wire_output_sent],
         stream.wire_output_len - stream.wire_output_sent);
 }
 
-fun drive_handshake(stream: *Stream) bool {
+# whether this lane has a record of its own left to send
+fun sending(stream: *Stream, lane: *Lane) bool {
+    ret stream.sender == lane_id(stream, lane) &&
+        stream.wire_output_sent < stream.wire_output_len;
+}
+
+fun settled(stream: *Stream, lane: *Lane) bool {
+    ret lane.pending_action != 0 || lane_terminal(lane);
+}
+
+# the handshake owns both directions: the other lane is idle throughout
+fun drive_handshake(stream: *Stream, lane: *Lane) bool {
     for (true) {
-        if (stream.wire_output_sent < stream.wire_output_len) { ret submit_write(stream); }
-        if (owe_core_record(stream))                          { ret true; }
-        if (stream.wire_output_len != 0)                      { cnt; }
+        if (sending(stream, lane))         { ret submit_write(stream, lane); }
+        if (owe_core_record(stream, lane)) { ret true; }
+        if (stream.wire_output_len != 0)   { cnt; }
         var advanced: bool = false;
         if (stream.holding) {
-            offer_handshake(stream);
-            if (stream.pending_action != 0 ||
-                transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
-                ret true;
-            }
+            offer_handshake(stream, lane);
+            if (settled(stream, lane)) { ret true; }
             advanced = true;
         }
-        if (!advanced && handle_core_event(stream)) {
-            if (transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
-                ret true;
-            }
+        if (!advanced && handle_core_event(stream, lane)) {
+            if (lane_terminal(lane)) { ret true; }
             if (stream.handshake_complete && !stream.core_event_sending) {
-                ret finish(stream, error.OK, false);
+                ret finish(stream, lane, error.OK, false);
             }
             advanced = true;
         }
         if (!advanced) {
             val polled: engine.Result = engine_poll(stream);
             if (polled.status == engine.WAITING) {
-                ret submit(stream, transport.TRANSPORT_WAIT, nil, 0);
+                ret park(stream, lane, PARK_MEMORY);
             }
             if (polled.status == engine.FAILED) {
-                if (handle_core_event(stream)) { advanced = true; }
-                or                             { ret finish(stream, polled.error, false); }
+                if (handle_core_event(stream, lane)) { advanced = true; }
+                or                                   { ret finish(stream, lane, polled.error, false); }
             }
         }
-        if (!advanced && handle_core_event(stream)) { advanced = true; }
-        if (!advanced && process_record(stream)) {
-            if (stream.pending_action != 0 ||
-                transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
-                ret true;
-            }
+        if (!advanced && handle_core_event(stream, lane)) { advanced = true; }
+        if (!advanced && process_record(stream, lane)) {
+            if (settled(stream, lane)) { ret true; }
             advanced = true;
         }
-        if (!advanced) { ret submit_read(stream); }
+        if (!advanced) { ret submit_read(stream, lane); }
     }
     ret false;
 }
 
-fun drive_write(stream: *Stream) bool {
-    if (stream.holding) {
-        offer_handshake(stream);
-        if (stream.pending_action != 0 ||
-            transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
-            ret true;
-        }
+# a key update sends its flight and installs its secret, and never reads: a
+# read may be outstanding in the other lane
+fun drive_key_update(stream: *Stream, lane: *Lane) bool {
+    for (true) {
+        if (sending(stream, lane))            { ret submit_write(stream, lane); }
+        if (owe_core_record(stream, lane))    { ret true; }
+        if (sending(stream, lane))            { cnt; }
+        if (stream.wire_output_len != 0)      { ret park(stream, lane, PARK_PEER); }
+        if (!handle_core_event(stream, lane)) { ret finish(stream, lane, error.OK, false); }
+        if (lane_terminal(lane))              { ret true; }
     }
-    if (stream.wire_output_sent < stream.wire_output_len) { ret submit_write(stream); }
-    val snapshot: transport.Snapshot = transport.snapshot(?stream.operation);
-    if (snapshot.application_bytes == stream.operation.application_length) {
-        ret finish(stream, error.OK, false);
-    }
-    val prepared: buffer.Outcome = prepare_application_record(stream);
-    if (prepared == buffer.WAIT) { ret refused(stream, prepared); }
-    if (prepared == buffer.FAIL) { ret finish(stream, error.INTERNAL_ERROR, false); }
-    ret drive_write(stream);
+    ret false;
 }
 
-fun drive_read(stream: *Stream) bool {
+# a write first sends whatever the engine owes, then its own records
+fun drive_write(stream: *Stream, lane: *Lane) bool {
     for (true) {
-        if (stream.wire_output_sent < stream.wire_output_len) { ret submit_write(stream); }
-        if (owe_core_record(stream))                          { ret true; }
-        if (stream.wire_output_len != 0)                      { cnt; }
-        if (handle_core_event(stream)) {
-            if (transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
-                ret true;
-            }
+        if (sending(stream, lane))         { ret submit_write(stream, lane); }
+        if (owe_core_record(stream, lane)) { ret true; }
+        if (sending(stream, lane))         { cnt; }
+        if (stream.wire_output_len != 0)   { ret park(stream, lane, PARK_PEER); }
+        if (handle_core_event(stream, lane)) {
+            if (lane_terminal(lane)) { ret true; }
             cnt;
         }
-        if (consume_plaintext(stream)) { ret true; }
-        if (!process_record(stream))   { ret submit_read(stream); }
-        if (stream.pending_action != 0 ||
-            transport.snapshot(?stream.operation).state == transport.OPERATION_TERMINAL) {
-            ret true;
+        val snapshot: transport.Snapshot = transport.snapshot(?lane.operation);
+        if (snapshot.application_bytes == lane.operation.application_length) {
+            ret finish(stream, lane, error.OK, false);
         }
+        val prepared: buffer.Outcome = prepare_application_record(stream, lane);
+        if (prepared == buffer.WAIT) { ret refused(stream, lane, prepared); }
+        if (prepared == buffer.FAIL) { ret finish(stream, lane, error.INTERNAL_ERROR, false); }
     }
     ret false;
 }
 
-fun drive_control(stream: *Stream) bool {
+# a read takes the engine's events as it meets them, sends what they owe when
+# wire_out is free, and reads no further record while one is still owed
+fun drive_read(stream: *Stream, lane: *Lane) bool {
+    for (true) {
+        if (sending(stream, lane))         { ret submit_write(stream, lane); }
+        if (owe_core_record(stream, lane)) { ret true; }
+        if (sending(stream, lane))         { cnt; }
+        if (handle_core_event(stream, lane)) {
+            if (lane_terminal(lane)) { ret true; }
+            cnt;
+        }
+        if (consume_plaintext(stream, lane)) { ret true; }
+        if (!process_record(stream, lane))   { ret submit_read(stream, lane); }
+        if (settled(stream, lane))           { ret true; }
+    }
+    ret false;
+}
+
+fun drive_control(stream: *Stream, lane: *Lane) bool {
     if (stream.control == CONTROL_ABORT) {
         stream.state = CLOSING;
-        ret submit(stream, transport.TRANSPORT_ABORT, nil, 0);
+        ret submit(stream, lane, transport.TRANSPORT_ABORT, nil, 0);
     }
-    if (!stream.control_record_sent && stream.wire_output_len == 0) {
-        val prepared: buffer.Outcome = prepare_alert(stream, stream.control_alert);
-        if (prepared == buffer.WAIT) { ret refused(stream, prepared); }
-        if (prepared == buffer.FAIL) { ret finish(stream, error.INTERNAL_ERROR, false); }
+    # what the engine owes goes out before the alert that ends sending
+    for (!stream.control_record_sent) {
+        if (sending(stream, lane))         { ret submit_write(stream, lane); }
+        if (owe_core_record(stream, lane)) { ret true; }
+        if (sending(stream, lane))         { cnt; }
+        if (stream.wire_output_len != 0)   { ret park(stream, lane, PARK_PEER); }
+        if (handle_core_event(stream, lane)) {
+            if (lane_terminal(lane)) { ret true; }
+            cnt;
+        }
+        val prepared: buffer.Outcome = prepare_alert(stream, lane, stream.control_alert);
+        if (prepared == buffer.WAIT) { ret refused(stream, lane, prepared); }
+        if (prepared == buffer.FAIL) { ret finish(stream, lane, error.INTERNAL_ERROR, false); }
     }
-    if (stream.wire_output_sent < stream.wire_output_len) { ret submit_write(stream); }
-    stream.control_record_sent = true;
     if (stream.control == CONTROL_ALERT) {
         if (stream.control_alert != record.USER_CANCELED_ALERT) {
             stream.send_closed = true;
-            stream.state       = FAILED;
+            fail_stream(stream, error.CLOSED);
         }
-        ret finish(stream, error.OK, false);
+        ret finish(stream, lane, error.OK, false);
     }
     stream.send_closed = true;
     if (stream.control == CONTROL_HALF_CLOSE) {
-        ret submit(stream, transport.TRANSPORT_SHUTDOWN, nil, 0);
+        ret submit(stream, lane, transport.TRANSPORT_SHUTDOWN, nil, 0);
     }
     stream.state = CLOSING;
-    ret submit(stream, transport.TRANSPORT_CLOSE, nil, 0);
+    ret submit(stream, lane, transport.TRANSPORT_CLOSE, nil, 0);
 }
 
-fun drive(stream: *Stream) bool {
-    if (stream == nil || transport.snapshot(?stream.operation).state !=
-        transport.OPERATION_OPEN) { ret false; }
-    if (stream.operation.kind == transport.HANDSHAKE)         { ret drive_handshake(stream); }
-    if (stream.operation.kind == transport.APPLICATION_WRITE) { ret drive_write(stream); }
-    if (stream.operation.kind == transport.APPLICATION_READ)  { ret drive_read(stream); }
-    ret drive_control(stream);
-}
-
-fun drive_owned(stream: *Stream) bool {
-    if (settle_terminal(stream)) { ret true; }
-    if (!drive(stream)) {
-        finish(stream, error.INTERNAL_ERROR, false);
+fun drive(stream: *Stream, lane: *Lane) bool {
+    if (stream == nil || lane_state(lane) != transport.OPERATION_OPEN) { ret false; }
+    val kind: transport.ApplicationKind = lane.operation.kind;
+    if (kind == transport.HANDSHAKE && stream.handshake_complete) {
+        ret drive_key_update(stream, lane);
     }
-    settle_terminal(stream);
+    if (kind == transport.HANDSHAKE)         { ret drive_handshake(stream, lane); }
+    if (kind == transport.APPLICATION_WRITE) { ret drive_write(stream, lane); }
+    if (kind == transport.APPLICATION_READ)  { ret drive_read(stream, lane); }
+    ret drive_control(stream, lane);
+}
+
+# a lane parked for the other is woken once this step freed what it waits on
+fun wake_peer(stream: *Stream, lane: *Lane) {
+    if (!stream.peer_released) { ret; }
+    stream.peer_released = false;
+    val waiting: *Lane = other(stream, lane);
+    if (waiting.park == PARK_PEER) { transport.wake(?waiting.operation); }
+}
+
+# a failed stream ends the other lane too: a parked lane is woken to resolve,
+# and a lane with a lower action in flight resolves when that action completes
+fun wake_failed(stream: *Stream, lane: *Lane) {
+    if (stream.failure == error.OK) { ret; }
+    val waiting: *Lane = other(stream, lane);
+    if (waiting.park != PARK_NONE) { transport.wake(?waiting.operation); }
+}
+
+fun drive_owned(stream: *Stream, lane: *Lane) bool {
+    if (!settle_terminal(stream, lane)) {
+        if (!drive(stream, lane)) {
+            finish(stream, lane, error.INTERNAL_ERROR, false);
+        }
+        settle_terminal(stream, lane);
+    }
+    wake_peer(stream, lane);
+    wake_failed(stream, lane);
     ret true;
 }
 
@@ -1051,12 +1233,29 @@ fun leave(stream: *Stream, accepted: bool) bool {
 
 # every operation after the handshake starts from a finished engine; a finish
 # the handshake operation's destruction could not make yet is retried here
-fun operation_available(stream: *Stream) bool {
-    if (stream == nil) { ret false; }
-    val state:     transport.OperationState = transport.snapshot(?stream.operation).state;
-    val available: bool                     = state == 0 || state == transport.OPERATION_DESTROYED;
-    if (available) { finish_engine(stream); }
-    ret available;
+fun lane_ready(stream: *Stream, lane: *Lane) bool {
+    if (stream == nil || !lane_available(lane)) { ret false; }
+    finish_engine(stream);
+    ret true;
+}
+
+# two live operations never share a token, so a token names one lane
+fun token_free(stream: *Stream, lane: *Lane, token: transport.Token) bool {
+    val peer: *Lane = other(stream, lane);
+    if (lane_available(peer)) { ret true; }
+    ret peer.operation.token.index != token.index ||
+        peer.operation.token.generation != token.generation;
+}
+
+fun begin_lane(stream: *Stream, lane: *Lane, token: transport.Token,
+    kind: transport.ApplicationKind, scope: *cancel.Scope, buffer: *u8,
+    length: usize, context: usize) bool {
+    if (!token_free(stream, lane, token) ||
+        !transport.begin(?lane.operation, token, kind, scope, buffer, length,
+        context)) { ret false; }
+    lane.pending_action = 0;
+    lane.park           = PARK_NONE;
+    ret true;
 }
 
 fun init_inner(stream: *Stream, role: engine.Role,
@@ -1065,8 +1264,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
     secrets: buffer.SecretLease, lower: *transport.Transport) bool {
     if (stream_owner_data(stream) == nil ||
         (stream.state != 0 && stream.state != DESTROYED) ||
-        (stream.operation.state != 0 &&
-        stream.operation.state != transport.OPERATION_DESTROYED) ||
+        !lane_available(?stream.reading) || !lane_available(?stream.writing) ||
         stream.read_cipher.installed || stream.write_cipher.installed ||
         (role != engine.CLIENT && role != engine.SERVER &&
         !engine.is_tls12(role)) ||
@@ -1100,45 +1298,55 @@ fun init_inner(stream: *Stream, role: engine.Role,
     }
     stream.receive_record_plaintext = engine_receive_limit(stream);
     stream.send_record_plaintext    = engine_send_limit(stream);
+    stream.lower.descriptor         = lower[0];
     if (stream.receive_record_plaintext == 0 || stream.send_record_plaintext == 0 ||
         stream.receive_record_plaintext > record.MAX_PLAINTEXT ||
-        stream.send_record_plaintext > record.MAX_PLAINTEXT) {
+        stream.send_record_plaintext > record.MAX_PLAINTEXT ||
+        !transport.pin(?stream.lower, ?stream.lower.descriptor)) {
+        stream.lower  = transport.no_provider();
         stream.role   = 0;
         stream.client = nil;
         stream.server = nil;
         stream.legacy = nil;
         ret false;
     }
-    stream.lower_transport    = lower[0];
-    stream.transport          = ?stream.lower_transport;
-    stream.memory             = memory;
-    stream.secrets            = secrets;
-    stream.wire_in            = buffer.empty();
-    stream.wire_out           = buffer.empty();
-    stream.opened             = buffer.secret_empty();
-    stream.sealing            = buffer.secret_empty();
-    stream.wire_needed        = 0;
-    stream.holding            = false;
-    stream.held_length        = 0;
-    stream.state              = NEW;
-    stream.control            = CONTROL_NONE;
-    stream.pending_action     = 0;
-    stream.wire_input_len     = 0;
-    stream.wire_input_read    = 0;
-    stream.wire_output_len    = 0;
-    stream.wire_output_sent   = 0;
-    stream.plaintext_len      = 0;
-    stream.plaintext_read     = 0;
-    stream.core_event_sending = false;
-    stream.core_event_alert   = false;
-    stream.core_event_offset  = 0;
-    stream.core_event_chunk   = 0;
-    stream.handshake_complete = false;
-    stream.send_closed        = false;
-    stream.peer_closed        = false;
-    stream.lower_eof          = false;
-    stream.peer_alert         = record.NO_ALERT;
-    stream.ccs_count          = 0;
+    stream.memory                 = memory;
+    stream.secrets                = secrets;
+    stream.wire_in                = buffer.empty();
+    stream.wire_out               = buffer.empty();
+    stream.opened                 = buffer.secret_empty();
+    stream.sealing                = buffer.secret_empty();
+    stream.wire_needed            = 0;
+    stream.holding                = false;
+    stream.held_length            = 0;
+    stream.state                  = NEW;
+    stream.control                = CONTROL_NONE;
+    stream.reading.pending_action = 0;
+    stream.reading.park           = PARK_NONE;
+    stream.writing.pending_action = 0;
+    stream.writing.park           = PARK_NONE;
+    stream.sender                 = NO_LANE;
+    stream.turn                   = WRITE_LANE;
+    stream.peer_released          = false;
+    stream.failure                = error.OK;
+    stream.wire_input_len         = 0;
+    stream.wire_input_read        = 0;
+    stream.wire_output_len        = 0;
+    stream.wire_output_sent       = 0;
+    stream.plaintext_len          = 0;
+    stream.plaintext_read         = 0;
+    stream.application_chunk      = 0;
+    stream.core_event_sending     = false;
+    stream.event_record           = false;
+    stream.core_event_alert       = false;
+    stream.core_event_offset      = 0;
+    stream.core_event_chunk       = 0;
+    stream.handshake_complete     = false;
+    stream.send_closed            = false;
+    stream.peer_closed            = false;
+    stream.lower_eof              = false;
+    stream.peer_alert             = record.NO_ALERT;
+    stream.ccs_count              = 0;
     ret true;
 }
 
@@ -1173,20 +1381,23 @@ pub fun init_server(stream: *Stream, core: *server.Handshake, memory: buffer.Lea
         lower));
 }
 
+# the handshake runs in the write lane and needs the read lane free
 fun handshake_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     context: usize) bool {
-    if (stream == nil || stream.state != NEW || !operation_available(stream) ||
+    val lane: *Lane = ?stream.writing;
+    if (stream == nil || stream.state != NEW || !lane_available(?stream.reading) ||
+        !lane_ready(stream, lane) ||
         !operation_inputs_valid(stream, scope, nil, 0) ||
-        !transport.begin(?stream.operation,
-        token, transport.HANDSHAKE, scope, nil, 0, context)) { ret false; }
+        !begin_lane(stream, lane, token, transport.HANDSHAKE, scope, nil, 0,
+        context)) { ret false; }
     stream.state = HANDSHAKING;
-    if (settle_terminal(stream)) { ret true; }
+    if (settle_terminal(stream, lane)) { ret true; }
     val started: engine.Result = engine_start(stream);
     if (started.status != engine.OK) {
-        finish(stream, started.error, false);
+        finish(stream, lane, started.error, false);
         ret true;
     }
-    ret drive_owned(stream);
+    ret drive_owned(stream, lane);
 }
 
 pub fun handshake(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
@@ -1197,17 +1408,18 @@ pub fun handshake(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
 
 fun read_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     buffer: *u8, length: usize, context: usize) bool {
+    val lane: *Lane = ?stream.reading;
     if (stream == nil || stream.state != OPEN || stream.peer_closed ||
-        !operation_available(stream) ||
+        !lane_ready(stream, lane) ||
         !operation_inputs_valid(stream, scope, buffer, length) ||
-        !transport.begin(?stream.operation, token, transport.APPLICATION_READ,
+        !begin_lane(stream, lane, token, transport.APPLICATION_READ,
         scope, buffer, length, context)) { ret false; }
-    if (settle_terminal(stream)) { ret true; }
+    if (settle_terminal(stream, lane)) { ret true; }
     if (length == 0) {
-        finish(stream, error.OK, false);
+        finish(stream, lane, error.OK, false);
         ret true;
     }
-    ret drive_owned(stream);
+    ret drive_owned(stream, lane);
 }
 
 pub fun read(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
@@ -1218,17 +1430,18 @@ pub fun read(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
 
 fun write_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     buffer: *u8, length: usize, context: usize) bool {
+    val lane: *Lane = ?stream.writing;
     if (stream == nil || stream.state != OPEN || stream.send_closed ||
-        !operation_available(stream) ||
+        !lane_ready(stream, lane) ||
         !operation_inputs_valid(stream, scope, buffer, length) ||
-        !transport.begin(?stream.operation, token, transport.APPLICATION_WRITE,
+        !begin_lane(stream, lane, token, transport.APPLICATION_WRITE,
         scope, buffer, length, context)) { ret false; }
-    if (settle_terminal(stream)) { ret true; }
+    if (settle_terminal(stream, lane)) { ret true; }
     if (length == 0) {
-        finish(stream, error.OK, false);
+        finish(stream, lane, error.OK, false);
         ret true;
     }
-    ret drive_owned(stream);
+    ret drive_owned(stream, lane);
 }
 
 pub fun write(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
@@ -1237,20 +1450,21 @@ pub fun write(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     ret leave(stream, write_inner(stream, scope, token, buffer, length, context));
 }
 
+# a half close needs only the write lane; a full close or an alert needs both
 fun begin_control(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     control: Control, description: record.AlertDescription, context: usize) bool {
+    val lane: *Lane = ?stream.writing;
     if (stream == nil || stream.state != OPEN || stream.send_closed ||
-        !operation_available(stream) ||
+        (control != CONTROL_HALF_CLOSE && !lane_available(?stream.reading)) ||
+        !lane_ready(stream, lane) ||
         !operation_inputs_valid(stream, scope, nil, 0) ||
-        !transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
+        !begin_lane(stream, lane, token, transport.APPLICATION_CLOSE,
         scope, nil, 0, context)) { ret false; }
     stream.control             = control;
     stream.control_alert       = description;
     stream.control_record_sent = false;
-    stream.wire_output_len     = 0;
-    stream.wire_output_sent    = 0;
-    if (settle_terminal(stream)) { ret true; }
-    ret drive_owned(stream);
+    if (settle_terminal(stream, lane)) { ret true; }
+    ret drive_owned(stream, lane);
 }
 
 pub fun alert(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
@@ -1271,30 +1485,32 @@ pub fun half_close(stream: *Stream, scope: *cancel.Scope,
         record.CLOSE_NOTIFY, context));
 }
 
+# a failed stream is closed abortively, and that close is allowed while a read
+# is outstanding: the lower abort is what ends it. any other close needs both
+# lanes free
 pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
     context: usize) bool {
     if (!enter(stream)) { ret false; }
-    if (stream != nil && stream.state == FAILED && operation_available(stream) &&
+    val lane: *Lane = ?stream.writing;
+    if (stream != nil && stream.state == FAILED && lane_ready(stream, lane) &&
         operation_inputs_valid(stream, scope, nil, 0) &&
-        transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
+        begin_lane(stream, lane, token, transport.APPLICATION_CLOSE,
         scope, nil, 0, context)) {
         stream.control             = CONTROL_ABORT;
         stream.control_record_sent = true;
-        if (settle_terminal(stream)) { ret leave(stream, true); }
-        ret leave(stream, drive_owned(stream));
+        if (settle_terminal(stream, lane)) { ret leave(stream, true); }
+        ret leave(stream, drive_owned(stream, lane));
     }
     if (stream != nil && stream.state == OPEN && stream.send_closed &&
-        operation_available(stream) &&
+        lane_available(?stream.reading) && lane_ready(stream, lane) &&
         operation_inputs_valid(stream, scope, nil, 0) &&
-        transport.begin(?stream.operation, token, transport.APPLICATION_CLOSE,
+        begin_lane(stream, lane, token, transport.APPLICATION_CLOSE,
         scope, nil, 0, context)) {
         stream.control             = CONTROL_CLOSE;
         stream.control_alert       = record.CLOSE_NOTIFY;
         stream.control_record_sent = true;
-        stream.wire_output_len     = 0;
-        stream.wire_output_sent    = 0;
-        if (settle_terminal(stream)) { ret leave(stream, true); }
-        ret leave(stream, drive_owned(stream));
+        if (settle_terminal(stream, lane)) { ret leave(stream, true); }
+        ret leave(stream, drive_owned(stream, lane));
     }
     ret leave(stream, begin_control(stream, scope, token, CONTROL_CLOSE,
         record.CLOSE_NOTIFY, context));
@@ -1302,18 +1518,20 @@ pub fun close(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
 
 fun key_update_inner(stream: *Stream, scope: *cancel.Scope,
     token: transport.Token, request: u8, context: usize) bool {
+    val lane: *Lane = ?stream.writing;
     if (stream == nil || stream.state != OPEN || stream.send_closed ||
-        !operation_available(stream) ||
+        !lane_ready(stream, lane) || stream.core_event_sending ||
         !operation_inputs_valid(stream, scope, nil, 0) ||
+        !token_free(stream, lane, token) ||
         engine_request_key_update(stream, request).status != engine.OK ||
-        !transport.begin(?stream.operation, token, transport.HANDSHAKE, scope,
+        !begin_lane(stream, lane, token, transport.HANDSHAKE, scope,
         nil, 0, context)) { ret false; }
-    if (settle_terminal(stream)) { ret true; }
-    ret drive_owned(stream);
+    if (settle_terminal(stream, lane)) { ret true; }
+    ret drive_owned(stream, lane);
 }
 
-# post-handshake rekeying reuses the handshake driver: one flight out, one
-# secret transition, and the operation settles
+# post-handshake rekeying runs in the write lane: one flight out, one secret
+# transition, and the operation settles. a read may be outstanding
 pub fun key_update(stream: *Stream, scope: *cancel.Scope,
     token: transport.Token, request: u8, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1384,12 +1602,15 @@ pub fun negotiated(stream: *Stream) engine.Snapshot {
     ret value;
 }
 
-# a write that finished its record settles it: the event or application bytes
-# it carried are done, and the next record may be prepared
-fun record_written(stream: *Stream) {
+# a record that went out in full settles: the event or application bytes it
+# carried are done, and wire_out is free for either lane
+fun record_written(stream: *Stream, lane: *Lane) {
     stream.wire_output_len  = 0;
     stream.wire_output_sent = 0;
-    if (stream.core_event_sending) {
+    stream.sender           = NO_LANE;
+    stream.peer_released    = true;
+    if (stream.event_record) {
+        stream.event_record = false;
         val alert_event: bool = stream.core_event_alert;
         if (stream.core_event.kind == engine.CRYPTO) {
             stream.core_event_offset = stream.core_event_offset + stream.core_event_chunk;
@@ -1402,36 +1623,46 @@ fun record_written(stream: *Stream) {
             stream.core_event_alert   = false;
             stream.core_event_offset  = 0;
             engine_complete_event(stream, stream.core_event.token, true);
-            if (alert_event) { finish(stream, engine_failure(stream), false); }
+            if (alert_event) { finish(stream, lane, engine_failure(stream), false); }
         }
+        ret;
     }
     if (stream.application_chunk != 0) {
-        transport.advance(?stream.operation, stream.application_chunk);
+        transport.advance(?lane.operation, stream.application_chunk);
         stream.application_chunk = 0;
     }
-    if (stream.operation.kind == transport.APPLICATION_CLOSE &&
+    if (lane.operation.kind == transport.APPLICATION_CLOSE &&
         stream.control != CONTROL_NONE) {
         stream.control_record_sent = true;
     }
 }
 
+fun completion_lane(stream: *Stream, completion: *runtime.Completion) *Lane {
+    if (transport.accept(?stream.reading.operation, completion)) { ret ?stream.reading; }
+    if (transport.accept(?stream.writing.operation, completion)) { ret ?stream.writing; }
+    ret nil;
+}
+
 fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
     if (completion == nil ||
         !externally_owned(stream, completion::*u8,
-        $size_of(runtime.Completion)) ||
-        !transport.accept(?stream.operation,
-        completion)) { ret false; }
-    land_regions(stream);
-    val snapshot: transport.Snapshot   = transport.snapshot(?stream.operation);
-    val action:   transport.ActionKind = stream.pending_action;
-    val moved:    usize                = snapshot.last_transport_bytes;
+        $size_of(runtime.Completion))) { ret false; }
+    val lane: *Lane = completion_lane(stream, completion);
+    if (lane == nil) { ret false; }
+    val action: transport.ActionKind = lane.pending_action;
+    val reason: Park                 = lane.park;
+    land_region(stream, action);
+    lane.park = PARK_NONE;
+    val snapshot: transport.Snapshot = transport.snapshot(?lane.operation);
+    val moved:    usize              = snapshot.last_transport_bytes;
     # the transfer a completion reports is real however the operation resolved:
     # a cancelled read's bytes are already in wire_in and a cancelled write's
     # already left. accounting for it before the terminal check keeps the
     # stream at the record position the peer sees
     if (action == transport.TRANSPORT_READ) {
         if (moved > stream.wire_in.chunk.bytes - stream.wire_input_len) {
-            finish(stream, error.INTERNAL_ERROR, false);
+            finish(stream, lane, error.INTERNAL_ERROR, false);
+            wake_failed(stream, lane);
             ret true;
         }
         stream.wire_input_len = stream.wire_input_len + moved;
@@ -1439,32 +1670,57 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
     }
     or (action == transport.TRANSPORT_WRITE) {
         if (moved > stream.wire_output_len - stream.wire_output_sent) {
-            finish(stream, error.INTERNAL_ERROR, false);
+            finish(stream, lane, error.INTERNAL_ERROR, false);
+            wake_failed(stream, lane);
             ret true;
         }
         stream.wire_output_sent = stream.wire_output_sent + moved;
         if (moved != 0 && stream.wire_output_sent == stream.wire_output_len) {
-            record_written(stream);
+            record_written(stream, lane);
         }
     }
-    if (settle_terminal(stream)) { ret true; }
-    stream.pending_action = 0;
+    if (settle_terminal(stream, lane)) {
+        wake_peer(stream, lane);
+        wake_failed(stream, lane);
+        ret true;
+    }
+    lane.pending_action = 0;
+    # a stream the other lane failed ends this one with the same error
+    if (stream.failure != error.OK) {
+        finish(stream, lane, stream.failure, false);
+        ret true;
+    }
     # a successful transfer must make progress
     if (action == transport.TRANSPORT_WRITE &&
         (moved == 0 || snapshot.last_end_of_stream)) {
-        finish(stream, error.INTERNAL_ERROR, false);
+        finish(stream, lane, error.INTERNAL_ERROR, false);
+        wake_failed(stream, lane);
         ret true;
     }
     if (action == transport.TRANSPORT_READ && moved == 0) {
         if (!snapshot.last_end_of_stream) {
-            finish(stream, error.INTERNAL_ERROR, false);
+            finish(stream, lane, error.INTERNAL_ERROR, false);
+            wake_failed(stream, lane);
             ret true;
         }
-        if (stream.peer_closed) { finish(stream, error.OK, true); }
-        or                      { finish(stream, error.CLOSED, true); }
+        if (stream.peer_closed) { finish(stream, lane, error.OK, true); }
+        or                      { finish(stream, lane, error.CLOSED, true); }
+        wake_peer(stream, lane);
         ret true;
     }
-    drive_owned(stream);
+    # while both lanes are parked for memory only the turn's holder reserves
+    val peer: *Lane = other(stream, lane);
+    if (reason == PARK_MEMORY && peer.park == PARK_MEMORY && !holds_turn(stream, lane)) {
+        park(stream, lane, PARK_MEMORY);
+        ret true;
+    }
+    drive_owned(stream, lane);
+    # the turn passes once its holder acquires, and a lane that stood aside for
+    # it is woken to take its own
+    if (reason == PARK_MEMORY && lane.park != PARK_MEMORY && holds_turn(stream, lane)) {
+        stream.turn = lane_id(stream, peer);
+        if (peer.park == PARK_MEMORY) { transport.wake(?peer.operation); }
+    }
     ret true;
 }
 
@@ -1473,25 +1729,31 @@ pub fun accept(stream: *Stream, completion: *runtime.Completion) bool {
     ret leave(stream, accept_inner(stream, completion));
 }
 
-# retry an operation parked for memory. the caller calls this when the pool
-# reports the connection's account ready; the wake may have been for its own
-# chunks, and a stream with nothing parked ignores it. the retry arrives as a
+# retry the lanes parked for memory. the caller calls this when the pool reports
+# the connection's account ready; the wake may have been for its own chunks, and
+# a stream with nothing parked for memory ignores it. each retry arrives as a
 # completion for accept, like cancellation and deadlines do
 pub fun resume(stream: *Stream) bool {
-    if (!enter(stream))                                    { ret false; }
-    if (stream.pending_action != transport.TRANSPORT_WAIT) { ret leave(stream, false); }
-    ret leave(stream, transport.wake(?stream.operation));
+    if (!enter(stream)) { ret false; }
+    var woken: bool = false;
+    if (stream.reading.park == PARK_MEMORY &&
+        transport.wake(?stream.reading.operation)) { woken = true; }
+    if (stream.writing.park == PARK_MEMORY &&
+        transport.wake(?stream.writing.operation)) { woken = true; }
+    ret leave(stream, woken);
 }
 
 pub fun snapshot(stream: *Stream) Snapshot {
     var value: Snapshot;
     if (!enter(stream)) { ret value; }
     value.state              = stream.state;
-    value.operation          = transport.snapshot(?stream.operation);
+    value.read               = transport.snapshot(?stream.reading.operation);
+    value.write              = transport.snapshot(?stream.writing.operation);
     value.handshake_complete = stream.handshake_complete;
     value.send_closed        = stream.send_closed;
     value.peer_closed        = stream.peer_closed;
     value.alert              = stream.peer_alert;
+    value.failure            = stream.failure;
     leave(stream, true);
     ret value;
 }
@@ -1517,35 +1779,54 @@ fun finish_engine(stream: *Stream) {
     stream.legacy   = nil;
 }
 
-fun destroy_operation_inner(stream: *Stream) bool {
-    val current: transport.Snapshot = transport.snapshot(?stream.operation);
-    if (current.state == transport.OPERATION_SUBMITTING ||
-        current.state == transport.OPERATION_WAITING ||
-        current.state == transport.OPERATION_ACCEPTING) {
-        ret false;
+fun token_lane(stream: *Stream, token: transport.Token) *Lane {
+    if (!lane_available(?stream.reading) &&
+        stream.reading.operation.token.index == token.index &&
+        stream.reading.operation.token.generation == token.generation) {
+        ret ?stream.reading;
     }
-    settle_terminal(stream);
-    if (!transport.destroy_operation(?stream.operation)) { ret false; }
+    if (!lane_available(?stream.writing) &&
+        stream.writing.operation.token.index == token.index &&
+        stream.writing.operation.token.generation == token.generation) {
+        ret ?stream.writing;
+    }
+    ret nil;
+}
+
+fun destroy_operation_inner(stream: *Stream, token: transport.Token) bool {
+    val lane: *Lane = token_lane(stream, token);
+    if (lane == nil || !lane_terminal(lane)) { ret false; }
+    settle_terminal(stream, lane);
+    if (!transport.destroy_operation(?lane.operation)) { ret false; }
     finish_engine(stream);
     ret true;
 }
 
-pub fun destroy_operation(stream: *Stream) bool {
+# release the terminal operation the token names
+pub fun destroy_operation(stream: *Stream, token: transport.Token) bool {
     if (!enter(stream)) { ret false; }
-    ret leave(stream, destroy_operation_inner(stream));
+    ret leave(stream, destroy_operation_inner(stream, token));
+}
+
+fun destroy_lane(lane: *Lane) bool {
+    val state: transport.OperationState = lane_state(lane);
+    if (state == 0 || state == transport.OPERATION_DESTROYED) { ret true; }
+    if (state != transport.OPERATION_TERMINAL)                { ret false; }
+    if (!transport.destroy_operation(?lane.operation))        { ret false; }
+    lane.pending_action = 0;
+    lane.park           = PARK_NONE;
+    ret true;
 }
 
 fun destroy_inner(stream: *Stream) bool {
-    if (stream.state == DESTROYED ||
-        engine_event_active(stream)) { ret false; }
-    val operation_state: transport.OperationState =
-        transport.snapshot(?stream.operation).state;
-    if (operation_state == transport.OPERATION_OPEN ||
-        operation_state == transport.OPERATION_WAITING ||
-        operation_state == transport.OPERATION_SUBMITTING ||
-        operation_state == transport.OPERATION_ACCEPTING) { ret false; }
-    if (operation_state == transport.OPERATION_TERMINAL &&
-        !transport.destroy_operation(?stream.operation)) { ret false; }
+    if (stream.state == DESTROYED || engine_event_active(stream)) { ret false; }
+    val read_state:  transport.OperationState = lane_state(?stream.reading);
+    val write_state: transport.OperationState = lane_state(?stream.writing);
+    if ((read_state != 0 && read_state != transport.OPERATION_TERMINAL &&
+        read_state != transport.OPERATION_DESTROYED) ||
+        (write_state != 0 && write_state != transport.OPERATION_TERMINAL &&
+        write_state != transport.OPERATION_DESTROYED)) { ret false; }
+    if (!destroy_lane(?stream.reading) || !destroy_lane(?stream.writing)) { ret false; }
     stream.holding = false;
     if (!buffer.release(stream.memory, ?stream.wire_in, stream.wire_input_len) ||
         !buffer.release(stream.memory, ?stream.wire_out, stream.wire_output_len) ||
@@ -1557,20 +1838,20 @@ fun destroy_inner(stream: *Stream) bool {
     stream.wire_output_sent = 0;
     stream.plaintext_len    = 0;
     stream.plaintext_read   = 0;
+    stream.sender           = NO_LANE;
     record.destroy(?stream.read_cipher);
     record.destroy(?stream.write_cipher);
     established.wipe(?stream.core13);
     tls12_established.wipe(?stream.core12);
-    stream.finished        = false;
-    stream.role            = 0;
-    stream.client          = nil;
-    stream.server          = nil;
-    stream.legacy          = nil;
-    stream.transport       = nil;
-    stream.lower_transport = transport.no_transport();
-    stream.memory          = buffer.no_lease();
-    stream.secrets         = buffer.no_secret_lease();
-    stream.state           = DESTROYED;
+    stream.finished = false;
+    stream.role     = 0;
+    stream.client   = nil;
+    stream.server   = nil;
+    stream.legacy   = nil;
+    stream.lower    = transport.no_provider();
+    stream.memory   = buffer.no_lease();
+    stream.secrets  = buffer.no_secret_lease();
+    stream.state    = DESTROYED;
     ret true;
 }
 
@@ -1658,7 +1939,7 @@ fun header_stream(stream: *Stream, length: usize) bool {
 test "stream: a record header sizes the next read within the record limit" {
     var stream: Stream;
     if (!header_stream(?stream, 60)) { ret 1; }
-    if (process_record(?stream) || stream.wire_needed != record.HEADER_SIZE + 60 ||
+    if (process_record(?stream, ?stream.reading) || stream.wire_needed != record.HEADER_SIZE + 60 ||
         stream.state != HANDSHAKING) { ret 2; }
     ret 0;
 }
@@ -1666,10 +1947,10 @@ test "stream: a record header sizes the next read within the record limit" {
 test "stream: an incomplete record cannot exceed the record limit" {
     var stream: Stream;
     if (!header_stream(?stream, 100)) { ret 1; }
-    if (!process_record(?stream) || stream.state != FAILED ||
-        transport.snapshot(?stream.operation).state !=
+    if (!process_record(?stream, ?stream.reading) || stream.state != FAILED ||
+        transport.snapshot(?stream.reading.operation).state !=
         transport.OPERATION_TERMINAL ||
-        transport.snapshot(?stream.operation).terminal_error !=
+        transport.snapshot(?stream.reading.operation).terminal_error !=
         error.RECORD_OVERFLOW) { ret 2; }
     ret 0;
 }
@@ -1680,7 +1961,7 @@ test "stream: tls 1.3 user canceled warning keeps the stream open" {
     stream.handshake_complete = true;
     var alert: [2]u8 = [2]u8{record.WARNING,
         record.USER_CANCELED_ALERT};
-    if (!handle_alert(?stream, ?alert[0], 2) || stream.state != OPEN ||
+    if (!handle_alert(?stream, ?stream.reading, ?alert[0], 2) || stream.state != OPEN ||
         stream.peer_closed || stream.peer_alert != record.USER_CANCELED_ALERT) {
         ret 1;
     }
