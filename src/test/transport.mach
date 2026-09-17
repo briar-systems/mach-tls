@@ -22,6 +22,7 @@ use tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.client;
+use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -748,7 +749,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     if (!client.init(?core_b, ?configuration, core_storage,
         client.ExtraExtension{}, 0)) { ret 30; }
     if (stream.connect(?secure, ?core_b, core_storage, secrets, ?adapter,
-        ?scope, transport.Token{index: 31, generation: 0}, 0, 0)) { ret 31; }
+        ?scope, transport.Token{index: 31, generation: 0}, clock.at(0, 0), 0)) { ret 31; }
     if (secure.state != stream.DESTROYED) { ret 32; }
     if (secure.transport != nil)          { ret 33; }
     if (secure.memory.source != nil || secure.client != nil ||

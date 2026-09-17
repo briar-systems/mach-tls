@@ -21,6 +21,7 @@ use tls.cert.load;
 use tls.cert.name;
 use tls.cert.verify;
 use tls.cert.x509;
+use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -132,7 +133,7 @@ pub rec Handshake {
     pending_alert:               record.AlertDescription;
     suite:                       tls13.CipherSuite;
     group:                       tls13.NamedGroup;
-    verification_time:           i64;
+    at:                          clock.Moment;
     input_len:                   usize;
     input_read:                  usize;
     hello_len:                   usize;
@@ -1272,7 +1273,7 @@ fun fail(client: *Handshake, failure: error.Error,
     ret result(FAILED, failure, 0, 0);
 }
 
-fun start_inner(client: *Handshake, verification_time: i64) engine.Result {
+fun start_inner(client: *Handshake, at: clock.Moment) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state != EXPECT_SERVER_HELLO ||
         client.output_pending || client.hello_len != 0) {
@@ -1284,10 +1285,10 @@ fun start_inner(client: *Handshake, verification_time: i64) engine.Result {
     val output: engine.Result = reserved(client, buffer.reserve(client.memory,
         ?client.buffers.output, client.output_required, 0));
     if (output.status != OK) { ret output; }
-    client.verification_time = verification_time;
+    client.at = at;
     if (client.sessions != nil &&
         session.client_store_take(client.sessions, client.config.server_name,
-        verification_time, ?client.offered_ticket) &&
+        at.monotonic, ?client.offered_ticket) &&
         client.offered_ticket.valid) {
         if (configured_suite_value(client, client.offered_ticket.suite) &&
             key_schedule.init(?client.schedule, client.offered_ticket.suite,
@@ -1309,11 +1310,11 @@ fun start_inner(client: *Handshake, verification_time: i64) engine.Result {
     ret result(OK, error.OK, 0, client.output_len);
 }
 
-pub fun start(client: *Handshake, verification_time: i64) engine.Result {
+pub fun start(client: *Handshake, at: clock.Moment) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val started: engine.Result = start_inner(client, verification_time);
+    val started: engine.Result = start_inner(client, at);
     leave(client);
     ret started;
 }
@@ -1702,7 +1703,7 @@ fun handle_certificate(client: *Handshake, frame: contracts.Bytes,
     var options: verify.Options;
     options.identity             = name;
     options.purpose              = verify.SERVER_AUTH;
-    options.now                  = client.verification_time;
+    options.now                  = client.at.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
     failure                      = verify.chain(client.config.trust, ?chain, ?options);
@@ -2410,7 +2411,7 @@ fun discard_completed(client: *Handshake) {
     seed.max_message_bytes     = client.config.limits.max_peer_handshake_bytes;
     seed.max_ticket_bytes      = client.config.limits.max_ticket_bytes;
     seed.sessions              = client.sessions;
-    seed.verification_time     = client.verification_time;
+    seed.started_at            = client.at.monotonic;
     var resumption: *key_schedule.Secret = nil;
     if (client.schedule.resumption_ready) {
         resumption = ?client.schedule.resumption_master;
@@ -2811,7 +2812,7 @@ var hostile_entropy_calls:  usize;
 fun reentrant_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     if (reentry_client != nil) {
-        if (start(reentry_client, 0).status == FAILED) {
+        if (start(reentry_client, clock.at(0, 0)).status == FAILED) {
             reentry_rejections = reentry_rejections + 1;
         }
         if (!destroy(reentry_client)) {
@@ -2928,7 +2929,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     var local_bound_client: Handshake;
     if (!init(?local_bound_client, ?local_bound_configuration, memory,
         no_extra_extension(), 0) ||
-        start(?local_bound_client, 1787875200).status != OK ||
+        start(?local_bound_client, clock.at(1787875200, 1787875200)).status != OK ||
         local_bound_client.hello_len <=
         local_bound_configuration.limits.max_peer_handshake_bytes) {
         ret 73;
@@ -2945,7 +2946,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     hostile_entropy_calls  = 0;
     if (!init(?hostile_client, ?hostile_configuration, memory,
         no_extra_extension(), 0)) { ret 75; }
-    val hostile_started: engine.Result = start(?hostile_client, 1787875200);
+    val hostile_started: engine.Result = start(?hostile_client, clock.at(1787875200, 1787875200));
     if (hostile_started.status != FAILED ||
         hostile_started.error != error.INTERNAL_ERROR ||
         !lease_equal(hostile_client.memory, memory) ||
@@ -3052,7 +3053,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
         !value.config.entropy.initialized || value.config.trust.len != 1) {
         ret 57;
     }
-    val started: engine.Result = start(?value, 1787875200);
+    val started: engine.Result = start(?value, clock.at(1787875200, 1787875200));
     if (started.status != OK || !value.output_pending ||
         reentry_rejections < 6 ||
         atomic.load(?value.transition_owner) != 0) { ret 2; }
@@ -3165,7 +3166,7 @@ test "client: event rejection has one terminal alert ownership path" {
     var empty_extra: ExtraExtension;
     var value:       Handshake;
     if (!init(?value, ?configuration, memory, empty_extra, 0) ||
-        start(?value, 1787875200).status != OK) { ret 1; }
+        start(?value, clock.at(1787875200, 1787875200)).status != OK) { ret 1; }
     var event: engine.Event;
     if (!next_event(?value, ?event) || !complete_event(?value, event.token, false)) {
         ret 2;
@@ -3217,8 +3218,8 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     val memory:      buffer.Lease = pool.shared();
     var empty_extra: ExtraExtension;
     var value:       Handshake;
-    if (!init(?value, ?configuration, memory, empty_extra, 0)) { ret 1; }
-    if (start(?value, 1787875200).status != OK)                { ret 4; }
+    if (!init(?value, ?configuration, memory, empty_extra, 0))        { ret 1; }
+    if (start(?value, clock.at(1787875200, 1787875200)).status != OK) { ret 4; }
     var event: engine.Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO ||
         !complete_event(?value, event.token, true)) { ret 2; }
@@ -3348,7 +3349,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     var value: Handshake;
     if (!init(?value, ?configuration, memory, client_extra,
         QUIC_TRANSPORT_PARAMETERS) ||
-        start(?value, 1800000000).status != OK) { ret 2; }
+        start(?value, clock.at(1800000000, 1800000000)).status != OK) { ret 2; }
     var event: engine.Event;
     if (!next_event(?value, ?event) || event.kind != CRYPTO) { ret 3; }
     var server_transcript: transcript.Transcript = transcript.empty();

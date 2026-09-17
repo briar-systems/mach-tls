@@ -16,6 +16,7 @@ use tls.cert;
 use tls.cert.credentials;
 use tls.cert.x509;
 use tls.client;
+use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -207,16 +208,16 @@ fun engine_aliases_configuration(stream: *Stream, data: *u8, len: usize) bool {
     ret server.aliases_configuration(stream.server, data, len);
 }
 
-fun engine_start(stream: *Stream, verification_time: i64) engine.Result {
+fun engine_start(stream: *Stream, at: clock.Moment) engine.Result {
     if (!engine_bound(stream)) {
         ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     if (stream.finished) { ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
     if (stream.role == engine.CLIENT) {
-        ret client.start(stream.client, verification_time);
+        ret client.start(stream.client, at);
     }
-    if (engine.is_tls12(stream.role)) { ret tls12_connection.start(stream.legacy, verification_time); }
-    ret server.start(stream.server, verification_time);
+    if (engine.is_tls12(stream.role)) { ret tls12_connection.start(stream.legacy, at); }
+    ret server.start(stream.server, at);
 }
 
 fun engine_ingest(stream: *Stream, level: engine.Level, data: *u8,
@@ -1174,14 +1175,14 @@ pub fun init_server(stream: *Stream, core: *server.Handshake, memory: buffer.Lea
 }
 
 fun handshake_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
-    verification_time: i64, context: usize) bool {
+    at: clock.Moment, context: usize) bool {
     if (stream == nil || stream.state != NEW || !operation_available(stream) ||
         !operation_inputs_valid(stream, scope, nil, 0) ||
         !transport.begin(?stream.operation,
         token, transport.HANDSHAKE, scope, nil, 0, context)) { ret false; }
     stream.state = HANDSHAKING;
     if (settle_terminal(stream)) { ret true; }
-    val started: engine.Result = engine_start(stream, verification_time);
+    val started: engine.Result = engine_start(stream, at);
     if (started.status != engine.OK) {
         finish(stream, started.error, false);
         ret true;
@@ -1190,9 +1191,9 @@ fun handshake_inner(stream: *Stream, scope: *cancel.Scope, token: transport.Toke
 }
 
 pub fun handshake(stream: *Stream, scope: *cancel.Scope, token: transport.Token,
-    verification_time: i64, context: usize) bool {
+    at: clock.Moment, context: usize) bool {
     if (!enter(stream)) { ret false; }
-    ret leave(stream, handshake_inner(stream, scope, token, verification_time,
+    ret leave(stream, handshake_inner(stream, scope, token, at,
         context));
 }
 
@@ -1323,12 +1324,12 @@ pub fun key_update(stream: *Stream, scope: *cancel.Scope,
 
 pub fun connect(stream: *Stream, core: *client.Handshake, memory: buffer.Lease,
     secrets: buffer.SecretLease, lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
-    verification_time: i64, context: usize) bool {
+    at: clock.Moment, context: usize) bool {
     if (!enter(stream)) { ret false; }
     if (!init_inner(stream, engine.CLIENT, core, nil, nil, memory, secrets, lower)) {
         ret leave(stream, false);
     }
-    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+    if (!handshake_inner(stream, scope, token, at, context)) {
         destroy_inner(stream);
         ret leave(stream, false);
     }
@@ -1339,11 +1340,11 @@ pub fun connect(stream: *Stream, core: *client.Handshake, memory: buffer.Lease,
 pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Handshake,
     memory: buffer.Lease, secrets: buffer.SecretLease, lower: *transport.Transport,
     scope: *cancel.Scope,
-    token: transport.Token, verification_time: i64, context: usize) bool {
+    token: transport.Token, at: clock.Moment, context: usize) bool {
     if (!enter(stream)) { ret false; }
     if (!init_inner(stream, engine.TLS12_CLIENT, nil, nil, core, memory, secrets,
         lower)) { ret leave(stream, false); }
-    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+    if (!handshake_inner(stream, scope, token, at, context)) {
         destroy_inner(stream);
         ret leave(stream, false);
     }
@@ -1353,11 +1354,11 @@ pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Handshake,
 pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Handshake,
     memory: buffer.Lease, secrets: buffer.SecretLease, lower: *transport.Transport,
     scope: *cancel.Scope,
-    token: transport.Token, verification_time: i64, context: usize) bool {
+    token: transport.Token, at: clock.Moment, context: usize) bool {
     if (!enter(stream)) { ret false; }
     if (!init_inner(stream, engine.TLS12_SERVER, nil, nil, core, memory, secrets,
         lower)) { ret leave(stream, false); }
-    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+    if (!handshake_inner(stream, scope, token, at, context)) {
         destroy_inner(stream);
         ret leave(stream, false);
     }
@@ -1366,12 +1367,12 @@ pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Handshake,
 
 pub fun serve(stream: *Stream, core: *server.Handshake, memory: buffer.Lease,
     secrets: buffer.SecretLease, lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
-    verification_time: i64, context: usize) bool {
+    at: clock.Moment, context: usize) bool {
     if (!enter(stream)) { ret false; }
     if (!init_inner(stream, engine.SERVER, nil, core, nil, memory, secrets, lower)) {
         ret leave(stream, false);
     }
-    if (!handshake_inner(stream, scope, token, verification_time, context)) {
+    if (!handshake_inner(stream, scope, token, at, context)) {
         destroy_inner(stream);
         ret leave(stream, false);
     }

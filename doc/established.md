@@ -19,7 +19,7 @@ enough to hold a very large number of connections (#87).
 | TLS 1.2, both roles | `tls12.connection.Handshake`, 4,032 bytes | `tls12.established.Established`, 88 bytes |
 
 Sizes are for x86_64. The established records are bounded by
-`established.MAX_BYTES` (512) and `tls12.established.MAX_BYTES` (256), and tests
+`established.MAX_BYTES` (520) and `tls12.established.MAX_BYTES` (256), and tests
 enforce both bounds.
 
 The TLS 1.3 established record holds:

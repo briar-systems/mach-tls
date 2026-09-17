@@ -9,6 +9,7 @@
 # bytes it is given
 
 use crypto.contracts;
+use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -34,7 +35,7 @@ pub val CLOSING:   State = 2;
 pub val TERMINAL:  State = 3;
 pub val DESTROYED: State = 4;
 
-pub val MAX_BYTES:     usize = 512;
+pub val MAX_BYTES:     usize = 520;
 val     MAX_QUEUED:    usize = 4;
 val     OUTPUT_BYTES:  usize = 8;
 val     PARTIAL_BYTES: usize = 8;
@@ -63,7 +64,8 @@ pub rec Seed {
     max_message_bytes:    usize;
     max_ticket_bytes:     usize;
     sessions:             *session.ClientStore;
-    verification_time:    i64;
+    # the handshake's monotonic reading; a ticket's age is measured from it
+    started_at: time.Instant;
 }
 
 rec Pending {
@@ -105,7 +107,7 @@ pub rec Established {
     event_generation:      u64;
     secret_generation:     [2]u64;
     transition_owner:      i64;
-    verification_time:     i64;
+    started_at:            time.Instant;
     receive_record_limit:  usize;
     send_record_limit:     usize;
     max_message_bytes:     usize;
@@ -252,7 +254,7 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     core.send_record_limit     = seed.send_record_limit;
     core.max_message_bytes     = seed.max_message_bytes;
     core.max_ticket_bytes      = seed.max_ticket_bytes;
-    core.verification_time     = seed.verification_time;
+    core.started_at            = seed.started_at;
     core.memory                = memory;
     # quic never updates tls keys, so it keeps no application secret
     if (!seed.quic) {
@@ -361,7 +363,7 @@ fun retain_ticket(core: *Established, value: *codec.NewSessionTicket) {
     copy_bytes(?retained.identity[0], value.ticket.data, value.ticket.len);
     retained.identity_len     = value.ticket.len;
     retained.suite            = core.suite;
-    retained.received_at      = core.verification_time;
+    retained.received_at      = core.started_at;
     retained.lifetime_seconds = value.lifetime;
     retained.age_add          = value.age_add;
     retained.max_early_data   = 0;
