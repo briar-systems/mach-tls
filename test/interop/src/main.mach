@@ -323,7 +323,7 @@ fun dial_one(index: usize) i64 {
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var secure:      stream.Stream;
-    var core:        client.Client;
+    var core:        client.Handshake;
     var empty_extra: client.ExtraExtension;
     empty_extra.kind      = 0;
     empty_extra.data.data = nil;

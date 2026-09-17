@@ -516,13 +516,13 @@ var open_signatures:       [1]tls13.SignatureScheme;
 var open_entropy:          secret.Entropy;
 var open_configuration:    config.ClientConfig;
 var open_identity:         credentials.Identity;
-var core_a:                client.Client;
-var core_b:                client.Client;
-var core_c:                client.Client;
-var core_d:                client.Client;
+var core_a:                client.Handshake;
+var core_b:                client.Handshake;
+var core_c:                client.Handshake;
+var core_d:                client.Handshake;
 
 # an open stream still borrows a real engine, so ownership queries stay honest
-fun make_test_client(core: *client.Client) bool {
+fun make_test_client(core: *client.Handshake) bool {
     client.destroy(core);
     open_entropy_counter = 1;
     open_entropy         = secret.Entropy{context: ?open_entropy_counter,
@@ -572,7 +572,7 @@ fun make_test_client(core: *client.Client) bool {
     ret client.init(core, ?open_configuration, storage, extra, 0);
 }
 
-fun make_open_stream(value: *stream.Stream, core: *client.Client,
+fun make_open_stream(value: *stream.Stream, core: *client.Handshake,
     adapter: *transport.Transport, wire_input: *u8, wire_output: *u8) bool {
     if (!make_test_client(core)) { ret false; }
     value.role                         = engine.CLIENT;

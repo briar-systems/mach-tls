@@ -354,7 +354,7 @@ val PEER_CERTIFICATES: usize = 8;
 val WIRE_BYTES:        usize = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 
 rec Connection {
-    engine:            server.Server;
+    engine:            server.Handshake;
     secure:            stream.Stream;
     handshake_input:   [HANDSHAKE_BYTES]u8;
     handshake_output:  [HANDSHAKE_BYTES]u8;
@@ -419,7 +419,7 @@ fun footprint(phase: str) {
     report("  process_pages=", resident_pages() - footprint_base);
     report("  region_pages=", present_pages(base, $size_of(Connection)));
     report("  engine_pages=", present_pages(base + $offset_of(Connection, engine),
-        $size_of(server.Server)));
+        $size_of(server.Handshake)));
     report("  stream_secret_pages=", present_pages(secure + $offset_of(stream.Stream, secret),
         stream.SECRET_STORAGE_BYTES));
     report("  wire_pages=", present_pages(base + $offset_of(Connection, wire_input),

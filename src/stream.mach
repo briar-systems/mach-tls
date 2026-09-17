@@ -68,8 +68,8 @@ pub rec Stream {
     lower_transport:          transport.Transport;
     storage:                  Storage;
     role:                     engine.Role;
-    client:                   *client.Client;
-    server:                   *server.Server;
+    client:                   *client.Handshake;
+    server:                   *server.Handshake;
     legacy:                   *tls12_connection.Connection;
     operation:                transport.Operation;
     read_cipher:              record.Cipher;
@@ -974,7 +974,7 @@ fun operation_available(stream: *Stream) bool {
 }
 
 fun init_inner(stream: *Stream, role: engine.Role,
-    client_engine: *client.Client, server_engine: *server.Server,
+    client_engine: *client.Handshake, server_engine: *server.Handshake,
     legacy_engine: *tls12_connection.Connection, storage: Storage,
     lower: *transport.Transport) bool {
     if (stream_owner_data(stream) == nil ||
@@ -1053,7 +1053,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
 }
 
 # the caller initializes and owns the engine; the stream only borrows it
-pub fun init_client(stream: *Stream, core: *client.Client, storage: Storage,
+pub fun init_client(stream: *Stream, core: *client.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.CLIENT, core, nil, nil, storage,
@@ -1076,7 +1076,7 @@ pub fun init_tls12_server(stream: *Stream,
         storage, lower));
 }
 
-pub fun init_server(stream: *Stream, core: *server.Server, storage: Storage,
+pub fun init_server(stream: *Stream, core: *server.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.SERVER, nil, core, nil, storage,
@@ -1231,7 +1231,7 @@ pub fun key_update(stream: *Stream, scope: *cancel.Scope,
     ret leave(stream, key_update_inner(stream, scope, token, request, context));
 }
 
-pub fun connect(stream: *Stream, core: *client.Client, storage: Storage,
+pub fun connect(stream: *Stream, core: *client.Handshake, storage: Storage,
     lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1272,7 +1272,7 @@ pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Connection,
     ret leave(stream, true);
 }
 
-pub fun serve(stream: *Stream, core: *server.Server, storage: Storage,
+pub fun serve(stream: *Stream, core: *server.Handshake, storage: Storage,
     lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1457,7 +1457,7 @@ pub fun destroy(stream: *Stream) bool {
 # of them fails here rather than in a consumer.
 #
 # Eight public types deliberately cannot erase, because key material lives
-# inline in them: client.Client, server.Server, Stream, config.ClientConfig,
+# inline in them: client.Handshake, server.Handshake, Stream, config.ClientConfig,
 # config.ServerConfig, credentials.Identity, engine.Event and
 # tls12.connection.Connection. No consumer needs to erase one today, and
 # mach-quic does not. If one ever must, that is the shape of laurel#27 and the
@@ -1502,8 +1502,8 @@ test "stream: an unbound or uninitialized engine cannot take ownership" {
     var stream:   Stream;
     var storage:  Storage;
     var lower:    transport.Transport;
-    var core:     client.Client;
-    var listener: server.Server;
+    var core:     client.Handshake;
+    var listener: server.Handshake;
     if (init_client(?stream, nil, storage, ?lower) ||
         init_server(?stream, nil, storage, ?lower)) { ret 1; }
     if (init_client(?stream, ?core, storage, ?lower))     { ret 2; }
