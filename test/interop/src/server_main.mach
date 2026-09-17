@@ -22,8 +22,8 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.char.char;
 use std.types.error.err;
-use std.types.result.res;
 use std.types.option.opt;
+use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use tls.buffer;
@@ -442,7 +442,7 @@ fun idle_cost() {
     if (!option_footprint) { ret; }
     var event:   engine.Event;
     val started: time.InstantClock = time.instant();
-    var i:       usize      = 0;
+    var i:       usize             = 0;
     for (i < IDLE_CALLS) {
         if (established.next_event(?cur.secure.core13, ?event)) { ret; }
         i = i + 1;
@@ -1014,10 +1014,10 @@ fun main(argc: i64, argv: **u8) i64 {
         connection_socket = accepted.ok;
         if (!runtime_ok(io_runtime.make(?connection_runtime,
             16))) { ret 9; }
-        footprint_base   = resident_pages();
-        cur              = mem_secret.allocate_typed[Connection](1);
-        cur_engine       = mem_secret.allocate_typed[server.Handshake](1);
-        handshake_held   = true;
+        footprint_base = resident_pages();
+        cur            = mem_secret.allocate_typed[Connection](1);
+        cur_engine     = mem_secret.allocate_typed[server.Handshake](1);
+        handshake_held = true;
         if (cur == nil || cur_engine == nil || !pool.make(?cur_memory, 1 << 24, 1 << 22)) {
             print.print("cannot allocate the connection\n");
             ret 9;
