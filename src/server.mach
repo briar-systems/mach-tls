@@ -32,6 +32,7 @@ use tls.record;
 use tls.session;
 use tls.signature_scheme;
 use tls.tls13;
+use tls.tls13.established;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
 use tls.transition;
@@ -215,6 +216,9 @@ pub rec Handshake {
     receive_record_plaintext: usize;
     send_record_plaintext:    usize;
     record_limit_seen:        bool;
+    # the established core, seeded when the handshake queue drains
+    delegating: bool;
+    core:       established.Established;
 }
 
 fun result(status: engine.Status, failure: error.Error, consumed: usize,
@@ -603,6 +607,7 @@ fun configuration_equal(first: config.ServerConfig,
         first.tickets == second.tickets && first.replay == second.replay &&
         first.replay_policy == second.replay_policy &&
         first.tickets_per_connection == second.tickets_per_connection &&
+        first.retain_exporter == second.retain_exporter &&
         limits_equal(first.limits, second.limits);
 }
 
@@ -869,6 +874,8 @@ fun init_inner(server: *Handshake, configuration: *config.ServerConfig,
     server.lease_held               = false;
     server.selector                 = selector;
     server.state                    = EXPECT_CLIENT_HELLO;
+    server.delegating               = false;
+    server.core                     = established.empty();
     server.failure                  = error.OK;
     server.pending_alert            = record.NO_ALERT;
     server.suite                    = 0;
@@ -2368,83 +2375,6 @@ fun issue_tickets(server: *Handshake) error.Error {
     ret error.OK;
 }
 
-fun request_key_update_inner(server: *Handshake, request: u8) engine.Result {
-    if (!server_owner_valid(server) || server.state != ESTABLISHED ||
-        request > codec.UPDATE_REQUESTED) {
-        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
-    }
-    if (server.queue_head == server.queue_len) { server.output_used = 0; }
-    val encoded: handshake.Progress = codec.encode_key_update(
-        codec.KeyUpdate{request: request},
-        contracts.Buffer{data: ?server.storage.output[server.output_used],
-        capacity: server.storage.output_capacity - server.output_used});
-    if (encoded.status != handshake.COMPLETE) {
-        ret result(engine.FAILED, error.RESOURCE_LIMIT, 0, 0);
-    }
-    val failure: error.Error = key_schedule.update_traffic(?server.schedule,
-        ?server.schedule.server_application_traffic);
-    if (failure != error.OK) {
-        ret fail(server, failure, engine.alert_for(failure));
-    }
-    if (!queue_crypto(server, engine.APPLICATION, server.output_used,
-        encoded.produced) ||
-        !queue_secret(server, engine.APPLICATION, engine.SEND,
-        SEND_APPLICATION)) {
-        ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
-    }
-    server.output_used = server.output_used + encoded.produced;
-    ret result(engine.OK, error.OK, 0, 0);
-}
-
-# ask the peer for a fresh send key, and optionally for one of its own
-pub fun request_key_update(server: *Handshake, request: u8) engine.Result {
-    if (!enter(server)) {
-        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
-    }
-    val requested: engine.Result = request_key_update_inner(server, request);
-    leave(server);
-    ret requested;
-}
-
-fun handle_post_handshake(server: *Handshake,
-    message: *handshake.Message) error.Error {
-    if (message.header.message_type == handshake.KEY_UPDATE) {
-        if (server.peer_extension == QUIC_TRANSPORT_PARAMETERS) {
-            ret error.UNEXPECTED_MESSAGE;
-        }
-        var update:  codec.KeyUpdate;
-        var failure: error.Error = codec.decode_key_update(message, ?update);
-        if (failure != error.OK) { ret failure; }
-        failure = key_schedule.update_traffic(?server.schedule,
-            ?server.schedule.client_application_traffic);
-        if (failure != error.OK) { ret failure; }
-        if (!queue_secret(server, engine.APPLICATION, engine.RECEIVE,
-            RECEIVE_APPLICATION)) { ret error.INTERNAL_ERROR; }
-        if (update.request == codec.UPDATE_REQUESTED) {
-            if (server.output_used != 0 && server.queue_len == server.queue_head) {
-                server.output_used = 0;
-            }
-            val encoded: handshake.Progress = codec.encode_key_update(
-                codec.KeyUpdate{request: codec.UPDATE_NOT_REQUESTED},
-                contracts.Buffer{data: ?server.storage.output[server.output_used],
-                capacity: server.storage.output_capacity - server.output_used});
-            if (encoded.status != handshake.COMPLETE) {
-                ret error.RESOURCE_LIMIT;
-            }
-            failure = key_schedule.update_traffic(?server.schedule,
-                ?server.schedule.server_application_traffic);
-            if (failure != error.OK) { ret failure; }
-            if (!queue_crypto(server, engine.APPLICATION, server.output_used,
-                encoded.produced) ||
-                !queue_secret(server, engine.APPLICATION, engine.SEND,
-                SEND_APPLICATION)) { ret error.INTERNAL_ERROR; }
-            server.output_used = server.output_used + encoded.produced;
-        }
-        ret error.OK;
-    }
-    ret error.UNEXPECTED_MESSAGE;
-}
-
 fun process_frame(server: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     if (server.state == EXPECT_CLIENT_HELLO ||
@@ -2471,9 +2401,6 @@ fun process_frame(server: *Handshake, frame: contracts.Bytes,
             ret error.UNEXPECTED_MESSAGE;
         }
         ret handle_client_finished(server, frame, message);
-    }
-    if (server.state == ESTABLISHED) {
-        ret handle_post_handshake(server, message);
     }
     ret error.UNEXPECTED_MESSAGE;
 }
@@ -2573,7 +2500,14 @@ pub fun ingest(server: *Handshake, level: engine.Level, data: *u8,
     if (!enter(server)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: engine.Result = ingest_inner(server, level, data, length);
+    var progress: engine.Result;
+    if (server.delegating) {
+        if (server_owner_overlaps(server, data, length)) {
+            progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+        }
+        or { progress = established.ingest(?server.core, level, data, length); }
+    }
+    or { progress = ingest_inner(server, level, data, length); }
     leave(server);
     ret progress;
 }
@@ -2590,7 +2524,9 @@ pub fun poll(server: *Handshake) engine.Result {
     if (!enter(server)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: engine.Result = poll_inner(server);
+    var progress: engine.Result;
+    if (server.delegating) { progress = established.poll(?server.core); }
+    or                     { progress = poll_inner(server); }
     leave(server);
     ret progress;
 }
@@ -2669,19 +2605,76 @@ fun next_event_inner(server: *Handshake, output: *engine.Event) bool {
 
 pub fun next_event(server: *Handshake, output: *engine.Event) bool {
     if (!enter(server)) { ret false; }
-    val available: bool = next_event_inner(server, output);
+    var available: bool = false;
+    if (server.delegating) {
+        available = output != nil && !server_owner_overlaps(server,
+            (?output.token)::*u8, $size_of(engine.Event)) &&
+            established.next_event(?server.core, output);
+    }
+    or { available = next_event_inner(server, output); }
     leave(server);
     ret available;
 }
 
-# once the last handshake event is accepted, nothing reads the handshake-only
-# secrets, the transcript or the resumed psk again, and the credential
-# generation no longer needs pinning
+# the configured protocol the handshake selected, borrowed from the caller
+fun configured_alpn(server: *Handshake) contracts.Bytes {
+    var i: usize = 0;
+    for (server.selected_alpn.len != 0 && i < server.config.alpn_len) {
+        val name: config.ProtocolName = server.config.alpn[i];
+        if (bytes_equal(contracts.Bytes{data: name.data, len: name.len},
+            server.selected_alpn)) {
+            ret contracts.Bytes{data: name.data, len: name.len};
+        }
+        i = i + 1;
+    }
+    ret contracts.Bytes{data: nil, len: 0};
+}
+
+# once the last handshake event is accepted the established core takes over:
+# it is seeded with the application secrets, and the schedule, transcript,
+# resumed psk and credential lease go with the handshake
 fun discard_completed(server: *Handshake) {
-    key_schedule.discard_handshake(?server.schedule);
+    var seed: established.Seed;
+    seed.role                  = engine.SERVER;
+    seed.suite                 = server.suite;
+    seed.group                 = server.group;
+    seed.retry_count           = server.retry_count;
+    seed.tickets_issued        = server.tickets_issued;
+    seed.authenticated         = server.authenticated;
+    seed.resumed               = server.resumed;
+    seed.peer_offered_alpn     = server.peer_offered_alpn;
+    seed.client_auth_requested = server.client_auth_required;
+    seed.quic                  = server.peer_extension == QUIC_TRANSPORT_PARAMETERS;
+    seed.retain_exporter       = server.config.retain_exporter;
+    seed.alpn                  = configured_alpn(server);
+    seed.server_name.data      = nil;
+    seed.server_name.len       = 0;
+    seed.receive_record_limit  = server.receive_record_plaintext;
+    seed.send_record_limit     = server.send_record_plaintext;
+    seed.max_message_bytes     = server.config.limits.max_peer_handshake_bytes;
+    seed.max_ticket_bytes      = server.config.limits.max_ticket_bytes;
+    seed.sessions              = nil;
+    seed.verification_time     = server.verification_time;
+    val seeded: bool = established.begin(?server.core, seed,
+        ?server.schedule.server_application_traffic,
+        ?server.schedule.client_application_traffic, nil,
+        ?server.schedule.exporter_master, established.no_storage());
+    key_schedule.destroy(?server.schedule);
     transcript.destroy(?server.transcript);
     session.state_destroy(?server.ticket_state);
     release_lease(server);
+    if (!seeded) {
+        fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+        ret;
+    }
+    server.delegating = true;
+    # bytes the peer sent behind its finished belong to the core
+    if (server.input_read < server.input_len) {
+        established.feed(?server.core, ?server.storage.input[server.input_read],
+            server.input_len - server.input_read);
+    }
+    server.input_read = 0;
+    server.input_len  = 0;
 }
 
 fun complete_event_inner(server: *Handshake, token: u64, accepted: bool) bool {
@@ -2707,7 +2700,11 @@ fun complete_event_inner(server: *Handshake, token: u64, accepted: bool) bool {
 
 pub fun complete_event(server: *Handshake, token: u64, accepted: bool) bool {
     if (!enter(server)) { ret false; }
-    val completed: bool = complete_event_inner(server, token, accepted);
+    var completed: bool = false;
+    if (server.delegating) {
+        completed = established.complete_event(?server.core, token, accepted);
+    }
+    or { completed = complete_event_inner(server, token, accepted); }
     leave(server);
     ret completed;
 }
@@ -2747,7 +2744,11 @@ pub fun traffic_keys(server: *Handshake, event: *engine.Event,
     key: contracts.SecretBuffer, iv: contracts.Buffer,
     key_length: *usize) bool {
     if (!enter(server)) { ret false; }
-    val derived: bool = traffic_keys_inner(server, event, key, iv, key_length);
+    var derived: bool = false;
+    if (server.delegating) {
+        derived = established.traffic_keys(?server.core, event, key, iv, key_length);
+    }
+    or { derived = traffic_keys_inner(server, event, key, iv, key_length); }
     leave(server);
     ret derived;
 }
@@ -2781,13 +2782,18 @@ pub fun close(server: *Handshake,
     if (!enter(server)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val closed: engine.Result = close_inner(server, description);
+    var closed: engine.Result;
+    if (server.delegating) { closed = established.close(?server.core, description); }
+    or                     { closed = close_inner(server, description); }
     leave(server);
     ret closed;
 }
 
 fun destroy_inner(server: *Handshake) bool {
-    if (!server_owner_valid(server) || server.event_active) { ret false; }
+    if (!server_owner_valid(server) || server.event_active ||
+        established.event_active(?server.core)) { ret false; }
+    established.wipe(?server.core);
+    server.delegating = false;
     ct.zeroize(?server.private_key[0], 32);
     transcript.destroy(?server.transcript);
     transcript.destroy(?server.binder_transcript);
@@ -2829,6 +2835,36 @@ pub fun destroy(server: *Handshake) bool {
     ret destroyed;
 }
 
+# move the established connection into core and release the handshake, which
+# init may then reuse. refused, changing nothing, until the handshake queue
+# has drained and no event is active. take the snapshot first: the peer's
+# name and quic parameters are not kept past this call
+pub fun finish(server: *Handshake, core: *established.Established,
+    storage: established.Storage) contracts.Error {
+    if (!enter(server)) { ret contracts.INVALID_STATE; }
+    var finished: contracts.Error = contracts.INVALID_STATE;
+    if (server.delegating && !server.event_active && !pending(server) &&
+        established.move(core, ?server.core, storage)) {
+        destroy_inner(server);
+        finished = contracts.OK;
+    }
+    leave(server);
+    ret finished;
+}
+
+# a key update, served by the established core once the handshake has drained
+pub fun request_key_update(server: *Handshake, request: u8) engine.Result {
+    if (!enter(server)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    var requested: engine.Result = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    if (server.delegating) {
+        requested = established.request_key_update(?server.core, request);
+    }
+    leave(server);
+    ret requested;
+}
+
 fun snapshot_inner(server: *Handshake) engine.Snapshot {
     var value: engine.Snapshot = engine.empty_snapshot();
     if (!server_owner_valid(server)) { ret value; }
@@ -2858,7 +2894,14 @@ fun snapshot_inner(server: *Handshake) engine.Snapshot {
 
 pub fun snapshot(server: *Handshake) engine.Snapshot {
     if (!enter(server)) { ret engine.empty_snapshot(); }
-    val value: engine.Snapshot = snapshot_inner(server);
+    var value: engine.Snapshot;
+    if (server.delegating) {
+        # the peer's name and parameters are the handshake's to report, until finish
+        value                 = established.snapshot(?server.core);
+        value.peer_name       = server.server_name;
+        value.peer_parameters = server.peer_parameters;
+    }
+    or { value = snapshot_inner(server); }
     leave(server);
     ret value;
 }
@@ -2866,7 +2909,8 @@ pub fun snapshot(server: *Handshake) engine.Snapshot {
 pub fun receive_record_limit(server: *Handshake) usize {
     if (!enter(server)) { ret 0; }
     var limit: usize = 0;
-    if (server.config != nil && server.state != DESTROYED) {
+    if (server.delegating) { limit = established.receive_record_limit(?server.core); }
+    or (server.config != nil && server.state != DESTROYED) {
         limit = server.receive_record_plaintext;
     }
     leave(server);
@@ -2876,7 +2920,8 @@ pub fun receive_record_limit(server: *Handshake) usize {
 pub fun send_record_limit(server: *Handshake) usize {
     if (!enter(server)) { ret 0; }
     var limit: usize = 0;
-    if (server.config != nil && server.state != DESTROYED) {
+    if (server.delegating) { limit = established.send_record_limit(?server.core); }
+    or (server.config != nil && server.state != DESTROYED) {
         limit = server.send_record_plaintext;
     }
     leave(server);
@@ -4048,19 +4093,17 @@ fun pump_post(local: *Handshake, peer: *client.Handshake) i64 {
 }
 
 fun secrets_match(local: *Handshake, peer: *client.Handshake, server_send: bool) bool {
-    val size: usize = key_schedule.hash_size(local.schedule.algorithm);
-    if (size == 0 || size != key_schedule.hash_size(peer.schedule.algorithm)) {
-        ret false;
-    }
+    val size: usize = key_schedule.hash_size(key_schedule.algorithm_for_suite(local.suite));
+    if (size == 0 || !local.delegating || !peer.delegating) { ret false; }
     var mine:   contracts.SecretBytes;
     var theirs: contracts.SecretBytes;
     if (server_send) {
-        mine   = key_schedule.bytes(?local.schedule.server_application_traffic);
-        theirs = key_schedule.bytes(?peer.schedule.server_application_traffic);
+        mine   = key_schedule.bytes(?local.core.send);
+        theirs = key_schedule.bytes(?peer.core.receive);
     }
     or {
-        mine   = key_schedule.bytes(?local.schedule.client_application_traffic);
-        theirs = key_schedule.bytes(?peer.schedule.client_application_traffic);
+        mine   = key_schedule.bytes(?local.core.receive);
+        theirs = key_schedule.bytes(?peer.core.send);
     }
     if (mine.len != size || theirs.len != size) { ret false; }
     var i: usize = 0;

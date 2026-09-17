@@ -48,7 +48,9 @@ pub rec ClientConfig {
     entropy:              *secret.Entropy;
     entropy_context_size: usize;
     sessions:             *session.ClientStore;
-    limits:               Limits;
+    # keep the exporter master for export_keying_material (rfc 8446 section 7.5)
+    retain_exporter: bool;
+    limits:          Limits;
 }
 
 # client authentication policy belongs to the published credential generation,
@@ -72,7 +74,9 @@ pub rec ServerConfig {
     replay:                 *session.ReplayWindow;
     replay_policy:          session.ReplayPolicy;
     tickets_per_connection: u8;
-    limits:                 Limits;
+    # keep the exporter master for export_keying_material (rfc 8446 section 7.5)
+    retain_exporter: bool;
+    limits:          Limits;
 }
 
 # a value cleared by declaration rather than by an empty literal: a record

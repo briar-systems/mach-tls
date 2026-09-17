@@ -277,17 +277,18 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     ret true;
 }
 
-# move source into destination, leaving source empty and wiped. refused while
-# an event is active, or while a ticket is half assembled in source's storage
+# move source into destination, leaving source empty and wiped. a ticket half
+# assembled in source's storage is carried into the new storage
 pub fun move(destination: *Established, source: *Established,
     storage: Storage) bool {
     if (!owner_valid(destination) || !owner_valid(source) ||
         destination.state != EMPTY || !live(source) || source.event_active ||
-        source.input_len != 0 ||
         !memory_range.valid(storage.input, storage.input_capacity) ||
-        (storage.input == nil && storage.input_capacity != 0)) { ret false; }
-    if (source.sessions != nil && storage.input_capacity <
-        source.max_ticket_bytes + handshake.HEADER_SIZE) { ret false; }
+        (storage.input == nil && storage.input_capacity != 0) ||
+        storage.input_capacity < source.input_len) { ret false; }
+    if (source.input_len != 0) {
+        copy_bytes(storage.input, source.storage.input, source.input_len);
+    }
     val owner: i64 = destination.transition_owner;
     @destination                 = @source;
     destination.transition_owner = owner;
@@ -522,6 +523,24 @@ fun ingest_inner(core: *Established, level: engine.Level, data: *u8,
     }
     if (pending(core)) { ret result(engine.OK, error.OK, length, 0); }
     ret result(engine.MORE, error.OK, length, handshake.HEADER_SIZE);
+}
+
+# hand over post-handshake bytes a handshake had already buffered. data may lie
+# in the core's own storage, at or after the bytes it assembles there
+pub fun feed(core: *Established, data: *u8, length: usize) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var progress: engine.Result = result(engine.MORE, error.OK, length, 0);
+    if (!live(core) || (length != 0 && data == nil)) {
+        progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    or (length != 0) {
+        val failure: error.Error = absorb(core, data, length);
+        if (failure != error.OK) {
+            progress = fail(core, failure, engine.alert_for(failure));
+        }
+    }
+    leave(core);
+    ret progress;
 }
 
 pub fun ingest(core: *Established, level: engine.Level, data: *u8,
