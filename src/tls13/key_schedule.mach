@@ -148,6 +148,24 @@ fun move_secret(destination: *Secret, source: *Secret) {
     clear(source);
 }
 
+# wipe one secret
+pub fun clear_secret(value: *Secret) {
+    clear(value);
+}
+
+# copy one secret, leaving the source intact
+pub fun copy_secret(destination: *Secret, source: *Secret) {
+    clear(destination);
+    if (source == nil || source.len > MAX_HASH_SIZE) { ret; }
+    var i: usize = 0;
+    for (i < source.len) {
+        destination.data[i] = source.data[i];
+        i                   = i + 1;
+    }
+    destination.len    = source.len;
+    destination.active = source.active;
+}
+
 fun empty_hash(algorithm: HashAlgorithm) contracts.Bytes {
     if (algorithm == SHA256) {
         ret contracts.Bytes{data: ?EMPTY_SHA256[0], len: 32};
@@ -545,23 +563,55 @@ pub fun verify_finished(schedule: *Schedule, base: *Secret,
 
 pub fun traffic_key(schedule: *Schedule, traffic_secret: *Secret,
     output: contracts.SecretBuffer) error.Error {
-    var length: usize = 0;
-    if (schedule != nil) { length = key_size(schedule.suite); }
-    if (schedule == nil || traffic_secret == nil || !traffic_secret.active
-        || length == 0 || output.capacity < length || output.data == nil) {
-        ret error.ILLEGAL_PARAMETER;
-    }
-    ret expand_label(schedule.algorithm, bytes(traffic_secret),
-        contracts.Bytes{data: "key"::*u8, len: 3}, contracts.Bytes{data: nil, len: 0},
-        contracts.SecretBuffer{data: output.data, capacity: length});
+    if (schedule == nil) { ret error.ILLEGAL_PARAMETER; }
+    ret secret_traffic_key(schedule.algorithm, schedule.suite, traffic_secret, output);
 }
 
 pub fun traffic_iv(schedule: *Schedule, traffic_secret: *Secret,
     output: contracts.Buffer) error.Error {
-    if (schedule == nil || traffic_secret == nil || !traffic_secret.active
+    if (schedule == nil) { ret error.ILLEGAL_PARAMETER; }
+    ret secret_traffic_iv(schedule.algorithm, traffic_secret, output);
+}
+
+pub fun update_traffic(schedule: *Schedule, traffic_secret: *Secret) error.Error {
+    if (schedule == nil) { ret error.ILLEGAL_PARAMETER; }
+    ret secret_update(schedule.algorithm, traffic_secret);
+}
+
+pub fun resumption_psk(schedule: *Schedule, ticket_nonce: contracts.Bytes,
+    output: contracts.SecretBuffer) error.Error {
+    if (schedule == nil || !schedule.resumption_ready) { ret error.ILLEGAL_PARAMETER; }
+    ret secret_resumption_psk(schedule.algorithm, ?schedule.resumption_master,
+        ticket_nonce, output);
+}
+
+pub fun export_keying_material(schedule: *Schedule, label: contracts.Bytes,
+    context_hash: contracts.Bytes, output: contracts.SecretBuffer) error.Error {
+    if (schedule == nil || schedule.stage != APPLICATION) { ret error.ILLEGAL_PARAMETER; }
+    ret secret_export(schedule.algorithm, ?schedule.exporter_master, label,
+        context_hash, output);
+}
+
+# the record key of one traffic secret, for a suite hashing with algorithm
+pub fun secret_traffic_key(algorithm: HashAlgorithm, suite: tls13.CipherSuite,
+    traffic_secret: *Secret, output: contracts.SecretBuffer) error.Error {
+    val length: usize = key_size(suite);
+    if (traffic_secret == nil || !traffic_secret.active || length == 0 ||
+        algorithm_for_suite(suite) != algorithm ||
+        output.capacity < length || output.data == nil) {
+        ret error.ILLEGAL_PARAMETER;
+    }
+    ret expand_label(algorithm, bytes(traffic_secret),
+        contracts.Bytes{data: "key"::*u8, len: 3}, contracts.Bytes{data: nil, len: 0},
+        contracts.SecretBuffer{data: output.data, capacity: length});
+}
+
+pub fun secret_traffic_iv(algorithm: HashAlgorithm, traffic_secret: *Secret,
+    output: contracts.Buffer) error.Error {
+    if (traffic_secret == nil || !traffic_secret.active || hash_size(algorithm) == 0
         || output.capacity < IV_SIZE || output.data == nil) { ret error.ILLEGAL_PARAMETER; }
     var secret_iv: [12]^u8;
-    val failure:   error.Error = expand_label(schedule.algorithm, bytes(traffic_secret),
+    val failure:   error.Error = expand_label(algorithm, bytes(traffic_secret),
         contracts.Bytes{data: "iv"::*u8, len: 2}, contracts.Bytes{data: nil, len: 0},
         contracts.SecretBuffer{data: ?secret_iv[0], capacity: IV_SIZE});
     if (failure != error.OK) {
@@ -577,11 +627,12 @@ pub fun traffic_iv(schedule: *Schedule, traffic_secret: *Secret,
     ret error.OK;
 }
 
-pub fun update_traffic(schedule: *Schedule, traffic_secret: *Secret) error.Error {
-    if (schedule == nil || traffic_secret == nil || !traffic_secret.active
-        || traffic_secret.len != hash_size(schedule.algorithm)) { ret error.ILLEGAL_PARAMETER; }
+# replace a traffic secret with its next generation (rfc 8446 section 7.2)
+pub fun secret_update(algorithm: HashAlgorithm, traffic_secret: *Secret) error.Error {
+    if (traffic_secret == nil || !traffic_secret.active
+        || traffic_secret.len != hash_size(algorithm)) { ret error.ILLEGAL_PARAMETER; }
     var updated: Secret;
-    val failure: error.Error = expand_secret(schedule.algorithm, bytes(traffic_secret),
+    val failure: error.Error = expand_secret(algorithm, bytes(traffic_secret),
         contracts.Bytes{data: "traffic upd"::*u8, len: 11},
         contracts.Bytes{data: nil, len: 0}, ?updated);
     if (failure != error.OK) {
@@ -592,30 +643,35 @@ pub fun update_traffic(schedule: *Schedule, traffic_secret: *Secret) error.Error
     ret error.OK;
 }
 
-pub fun resumption_psk(schedule: *Schedule, ticket_nonce: contracts.Bytes,
-    output: contracts.SecretBuffer) error.Error {
-    if (schedule == nil || !schedule.resumption_ready
+# the psk a ticket with this nonce resumes (rfc 8446 section 4.6.1)
+pub fun secret_resumption_psk(algorithm: HashAlgorithm, resumption_master: *Secret,
+    ticket_nonce: contracts.Bytes, output: contracts.SecretBuffer) error.Error {
+    if (resumption_master == nil || !resumption_master.active
+        || resumption_master.len != hash_size(algorithm)
         || ticket_nonce.len > 255 || (ticket_nonce.len != 0 && ticket_nonce.data == nil)
-        || output.capacity < hash_size(schedule.algorithm) || output.data == nil) {
+        || output.capacity < hash_size(algorithm) || output.data == nil) {
         ret error.ILLEGAL_PARAMETER;
     }
-    ret expand_label(schedule.algorithm, bytes(?schedule.resumption_master),
+    ret expand_label(algorithm, bytes(resumption_master),
         contracts.Bytes{data: "resumption"::*u8, len: 10}, ticket_nonce,
-        contracts.SecretBuffer{data: output.data, capacity: hash_size(schedule.algorithm)});
+        contracts.SecretBuffer{data: output.data, capacity: hash_size(algorithm)});
 }
 
-pub fun export_keying_material(schedule: *Schedule, label: contracts.Bytes,
-    context_hash: contracts.Bytes, output: contracts.SecretBuffer) error.Error {
-    if (schedule == nil || schedule.stage != APPLICATION
-        || !valid_hash(schedule.algorithm, context_hash)) { ret error.ILLEGAL_PARAMETER; }
+# keying material exported from the exporter master (rfc 8446 section 7.5)
+pub fun secret_export(algorithm: HashAlgorithm, exporter_master: *Secret,
+    label: contracts.Bytes, context_hash: contracts.Bytes,
+    output: contracts.SecretBuffer) error.Error {
+    if (exporter_master == nil || !exporter_master.active
+        || exporter_master.len != hash_size(algorithm)
+        || !valid_hash(algorithm, context_hash)) { ret error.ILLEGAL_PARAMETER; }
     var exporter_secret: Secret;
-    val failure:         error.Error = derive(schedule.algorithm, bytes(?schedule.exporter_master),
-        label, empty_hash(schedule.algorithm), ?exporter_secret);
+    val failure:         error.Error = derive(algorithm, bytes(exporter_master),
+        label, empty_hash(algorithm), ?exporter_secret);
     if (failure != error.OK) {
         clear(?exporter_secret);
         ret failure;
     }
-    val expanded: error.Error = expand_label(schedule.algorithm, bytes(?exporter_secret),
+    val expanded: error.Error = expand_label(algorithm, bytes(?exporter_secret),
         contracts.Bytes{data: "exporter"::*u8, len: 8}, context_hash, output);
     clear(?exporter_secret);
     ret expanded;
