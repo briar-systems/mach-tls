@@ -1,0 +1,38 @@
+# the two timebases tls reads, taken together
+#
+# a value only ever compared with other readings taken in this process is an
+# interval and lives on `monotonic`: the ticket-key rotation schedule and a
+# client's ticket age. a value that must be compared with something from
+# outside the process lives on `wall`: certificate validity, a ticket's issue
+# time and lifetime, and the replay window's expiry.
+
+use std.chrono.time;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+# both clocks read at one point by the caller. the two fields are separate
+# readings, not one: neither is ever derived from the other, and no field of
+# one moment is compared with the other field of another
+pub rec Moment {
+    wall:      time.Time;
+    monotonic: time.Instant;
+}
+
+# the moment now, or false when either clock cannot be read
+pub fun now(output: *Moment) bool {
+    if (output == nil) { ret false; }
+    val wall:      time.Clock        = time.now();
+    val monotonic: time.InstantClock = time.instant();
+    if (sel wall.err)      { ret false; }
+    if (sel monotonic.err) { ret false; }
+    output.wall      = wall.ok;
+    output.monotonic = monotonic.ok;
+    ret true;
+}
+
+# a moment built from explicit readings, for tests and replayed traces
+pub fun at(wall_seconds: i64, monotonic_seconds: i64) Moment {
+    ret Moment{wall: time.unix(wall_seconds, 0),
+        monotonic: time.Instant{sec: monotonic_seconds, nsec: 0}};
+}
