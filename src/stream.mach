@@ -417,14 +417,14 @@ fun install_secret(stream: *Stream, event: *engine.Event) bool {
     ret installed;
 }
 
-# an application write ended between records leaves the stream intact; one
-# ended with a sealed record partly unsent does not
+# an operation ended between records leaves the stream intact; one ended with
+# a sealed record partly unsent, or mid-handshake or mid-close, does not.
+# wire_output_len is nonzero exactly while a sealed record is not fully sent
 fun terminal_requires_failure(stream: *Stream,
     snapshot: transport.Snapshot) bool {
     ret stream != nil && snapshot.state == transport.OPERATION_TERMINAL &&
         snapshot.terminal_error != error.OK &&
-        (stream.pending_action == transport.TRANSPORT_WRITE ||
-        (snapshot.kind == transport.APPLICATION_WRITE && stream.wire_output_len != 0) ||
+        (stream.wire_output_len != 0 ||
         snapshot.kind == transport.HANDSHAKE ||
         snapshot.kind == transport.APPLICATION_CLOSE);
 }
@@ -1385,6 +1385,37 @@ pub fun negotiated(stream: *Stream) engine.Snapshot {
     ret value;
 }
 
+# a write that finished its record settles it: the event or application bytes
+# it carried are done, and the next record may be prepared
+fun record_written(stream: *Stream) {
+    stream.wire_output_len  = 0;
+    stream.wire_output_sent = 0;
+    if (stream.core_event_sending) {
+        val alert_event: bool = stream.core_event_alert;
+        if (stream.core_event.kind == engine.CRYPTO) {
+            stream.core_event_offset = stream.core_event_offset + stream.core_event_chunk;
+            stream.core_event_chunk  = 0;
+        }
+        # a crypto event with bytes left is prepared by the next drive
+        if (stream.core_event.kind != engine.CRYPTO ||
+            stream.core_event_offset >= stream.core_event.data.len) {
+            stream.core_event_sending = false;
+            stream.core_event_alert   = false;
+            stream.core_event_offset  = 0;
+            engine_complete_event(stream, stream.core_event.token, true);
+            if (alert_event) { finish(stream, engine_failure(stream), false); }
+        }
+    }
+    if (stream.application_chunk != 0) {
+        transport.advance(?stream.operation, stream.application_chunk);
+        stream.application_chunk = 0;
+    }
+    if (stream.operation.kind == transport.APPLICATION_CLOSE &&
+        stream.control != CONTROL_NONE) {
+        stream.control_record_sent = true;
+    }
+}
+
 fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
     if (completion == nil ||
         !externally_owned(stream, completion::*u8,
@@ -1394,73 +1425,45 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
     land_regions(stream);
     val snapshot: transport.Snapshot   = transport.snapshot(?stream.operation);
     val action:   transport.ActionKind = stream.pending_action;
-    # bytes the transport already settled are physically in wire_input and
-    # belong to the record layer however the operation resolved. accounting for
-    # them before the terminal check is what keeps a cancelled read from
-    # leaving the stream mid-record.
+    val moved:    usize                = snapshot.last_transport_bytes;
+    # the transfer a completion reports is real however the operation resolved:
+    # a cancelled read's bytes are already in wire_in and a cancelled write's
+    # already left. accounting for it before the terminal check keeps the
+    # stream at the record position the peer sees
     if (action == transport.TRANSPORT_READ) {
-        if (snapshot.last_transport_bytes >
-            stream.wire_in.chunk.bytes - stream.wire_input_len) {
+        if (moved > stream.wire_in.chunk.bytes - stream.wire_input_len) {
             finish(stream, error.INTERNAL_ERROR, false);
             ret true;
         }
-        stream.wire_input_len = stream.wire_input_len +
-            snapshot.last_transport_bytes;
+        stream.wire_input_len = stream.wire_input_len + moved;
+        if (snapshot.last_end_of_stream) { stream.lower_eof = true; }
+    }
+    or (action == transport.TRANSPORT_WRITE) {
+        if (moved > stream.wire_output_len - stream.wire_output_sent) {
+            finish(stream, error.INTERNAL_ERROR, false);
+            ret true;
+        }
+        stream.wire_output_sent = stream.wire_output_sent + moved;
+        if (moved != 0 && stream.wire_output_sent == stream.wire_output_len) {
+            record_written(stream);
+        }
     }
     if (settle_terminal(stream)) { ret true; }
     stream.pending_action = 0;
-    if (action == transport.TRANSPORT_WRITE) {
-        if (snapshot.last_end_of_stream || snapshot.last_transport_bytes == 0 ||
-            snapshot.last_transport_bytes >
-            stream.wire_output_len - stream.wire_output_sent) {
+    # a successful transfer must make progress
+    if (action == transport.TRANSPORT_WRITE &&
+        (moved == 0 || snapshot.last_end_of_stream)) {
+        finish(stream, error.INTERNAL_ERROR, false);
+        ret true;
+    }
+    if (action == transport.TRANSPORT_READ && moved == 0) {
+        if (!snapshot.last_end_of_stream) {
             finish(stream, error.INTERNAL_ERROR, false);
             ret true;
         }
-        stream.wire_output_sent = stream.wire_output_sent + snapshot.last_transport_bytes;
-        if (stream.wire_output_sent == stream.wire_output_len) {
-            stream.wire_output_len  = 0;
-            stream.wire_output_sent = 0;
-            if (stream.core_event_sending) {
-                val alert_event: bool = stream.core_event_alert;
-                if (stream.core_event.kind == engine.CRYPTO) {
-                    stream.core_event_offset = stream.core_event_offset +
-                        stream.core_event_chunk;
-                    stream.core_event_chunk = 0;
-                }
-                # a crypto event with bytes left is prepared by the next drive
-                if (stream.core_event.kind != engine.CRYPTO ||
-                    stream.core_event_offset >= stream.core_event.data.len) {
-                    stream.core_event_sending = false;
-                    stream.core_event_alert   = false;
-                    stream.core_event_offset  = 0;
-                    engine_complete_event(stream, stream.core_event.token, true);
-                    if (alert_event) {
-                        finish(stream, engine_failure(stream), false);
-                        ret true;
-                    }
-                }
-            }
-            if (stream.application_chunk != 0) {
-                transport.advance(?stream.operation, stream.application_chunk);
-                stream.application_chunk = 0;
-            }
-            if (stream.operation.kind == transport.APPLICATION_CLOSE &&
-                stream.control != CONTROL_NONE) {
-                stream.control_record_sent = true;
-            }
-        }
-    }
-    or (action == transport.TRANSPORT_READ) {
-        if (snapshot.last_transport_bytes == 0) {
-            if (!snapshot.last_end_of_stream) {
-                finish(stream, error.INTERNAL_ERROR, false);
-                ret true;
-            }
-            if (stream.peer_closed) { finish(stream, error.OK, true); }
-            or                      { finish(stream, error.CLOSED, true); }
-            ret true;
-        }
-        if (snapshot.last_end_of_stream) { stream.lower_eof = true; }
+        if (stream.peer_closed) { finish(stream, error.OK, true); }
+        or                      { finish(stream, error.CLOSED, true); }
+        ret true;
     }
     drive_owned(stream);
     ret true;
