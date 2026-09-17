@@ -33,6 +33,7 @@ use tls.tls12.prf;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
+use tls.transition;
 use tls.validation;
 
 pub val MAX_POINT:                usize = 65;
@@ -185,22 +186,11 @@ fun owner_overlaps(value: *Connection, data: *u8, len: usize) bool {
 
 fun enter(value: *Connection) bool {
     if (!owner_valid(value)) { ret false; }
-    val owner: i64 = os.thread_current_id();
-    if (owner <= 0) { ret false; }
-    for (true) {
-        var expected: i64 = atomic.load(?value.transition_owner);
-        if (expected == owner) { ret false; }
-        if (expected == 0 && atomic.cas(?value.transition_owner, ?expected,
-            owner)) { ret true; }
-        if (expected != 0) {
-            os.thread_wait(?value.transition_owner, expected);
-        }
-    }
+    ret transition.enter(?value.transition_owner, os.thread_current_id());
 }
 
 fun leave(value: *Connection) {
-    atomic.store(?value.transition_owner, 0);
-    os.thread_wake(?value.transition_owner);
+    transition.leave(?value.transition_owner);
 }
 
 fun client_config_data(value: *config.ClientConfig) *u8 {
@@ -686,7 +676,7 @@ fun fail(value: *Connection, failure: error.Error,
 fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
     val owner: i64 = os.thread_current_id();
     if (!owner_valid(value) || owner <= 0 ||
-        atomic.load(?value.transition_owner) != owner ||
+        !transition.held_by(?value.transition_owner, owner) ||
         !value.entropy.initialized || value.entropy.fill_fn == nil ||
         output == nil) { ret false; }
     val descriptor:       secret.Entropy = value.entropy;
@@ -696,7 +686,7 @@ fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
     val expected_queue:   usize          = value.queue_len;
     val status:           i64            = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val stable: bool = atomic.load(?value.transition_owner) == owner &&
+    val stable: bool = transition.held_by(?value.transition_owner, owner) &&
         value.state == expected_state &&
         value.storage.input == expected_storage.input &&
         value.storage.output == expected_storage.output &&
@@ -2002,14 +1992,15 @@ pub fun poll(value: *Connection) engine.Result {
 }
 
 fun next_event_inner(value: *Connection, output: *engine.Event) bool {
-    if (!owner_valid(value) || output == nil ||
+    # nothing pending is answered before the borrowed descriptors are walked
+    if (!owner_valid(value) || output == nil || value.event_active ||
+        value.state == DESTROYED || !pending(value) ||
         !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
         owner_overlaps(value, (?output.token)::*u8, $size_of(engine.Event)) ||
         storage_overlaps(?value.storage, (?output.token)::*u8,
         $size_of(engine.Event)) ||
         borrowed_overlaps(value, (?output.token)::*u8,
-        $size_of(engine.Event)) || value.event_active ||
-        value.state == DESTROYED || !pending(value)) { ret false; }
+        $size_of(engine.Event))) { ret false; }
     val item:  Pending      = value.queue[value.queue_head];
     var event: engine.Event = engine.empty_event();
     event.token       = engine.next_generation(value.event_generation);
@@ -2062,6 +2053,13 @@ fun complete_event_inner(value: *Connection, token: u64,
     if (value.queue_head >= value.queue_len) {
         queue_clear(value);
         value.output_used = 0;
+    }
+    # both traffic secrets have been taken once the established queue drains,
+    # and tls 1.2 never derives another
+    if (value.state == ESTABLISHED && !pending(value) && value.secrets.keys_ready) {
+        transcript.destroy(?value.transcript);
+        prf.destroy(?value.secrets);
+        release_lease(value);
     }
     ret true;
 }
@@ -2463,10 +2461,29 @@ fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
     ret true;
 }
 
+# keys are captured while their event is active, because the engine wipes its
+# secrets once the established queue drains
+var captured_key:     [4][prf.MAX_KEY]^u8;
+var captured_key_len: [4]usize;
+
+fun capture_keys(source: *Connection, event: *engine.Event, dialer: bool) bool {
+    var slot: usize = 0;
+    if (!dialer)                           { slot = 2; }
+    if (event.direction == engine.RECEIVE) { slot = slot + 1; }
+    var iv: [prf.MAX_IV]u8;
+    ret traffic_keys(source, event, contracts.SecretBuffer{
+        data: ?captured_key[slot][0], capacity: prf.MAX_KEY
+    },
+        contracts.Buffer{data: ?iv[0], capacity: prf.MAX_IV},
+        ?captured_key_len[slot]);
+}
+
 fun drain_events(source: *Connection, into_listener: bool) i64 {
     var event: engine.Event;
     for (next_event(source, ?event)) {
         var stored: bool = true;
+        if (event.kind == engine.TRAFFIC_SECRET &&
+            !capture_keys(source, ?event, into_listener)) { ret 4; }
         if (event.kind == engine.CRYPTO && event.data.len != 0) {
             if (into_listener) {
                 stored = queue_segment(?to_listener[0], ?to_listener_level[0],
@@ -2603,24 +2620,27 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
     if (!dialer.extended_master_secret ||
         !listener.extended_master_secret) { ret 21; }
     if (dialer.downgrade_signalled) { ret 22; }
-    # both sides derived the same master secret and the same directional keys
+    # each direction's key was delivered identically to both sides
     var i: usize = 0;
-    for (i < tls12.MASTER_SECRET_SIZE) {
-        if (dialer.secrets.master[i]:>u8 != listener.secrets.master[i]:>u8) {
-            ret 23;
-        }
-        i = i + 1;
-    }
-    val client_key: contracts.SecretBytes = prf.key_bytes(?dialer.secrets,
-        true);
-    val server_view_key: contracts.SecretBytes = prf.key_bytes(
-        ?listener.secrets, true);
-    if (client_key.len == 0 || client_key.len != server_view_key.len) {
+    if (captured_key_len[0] == 0 || captured_key_len[0] != captured_key_len[3] ||
+        captured_key_len[1] == 0 || captured_key_len[1] != captured_key_len[2]) {
         ret 24;
     }
+    for (i < captured_key_len[0]) {
+        if (captured_key[0][i]:>u8 != captured_key[3][i]:>u8 ||
+            captured_key[1][i]:>u8 != captured_key[2][i]:>u8) { ret 25; }
+        i = i + 1;
+    }
+    # once established and drained, nothing tls 1.2 holds needs the secrets,
+    # the transcript or the credential lease
+    if (dialer.secrets.keys_ready || listener.secrets.keys_ready ||
+        dialer.secrets.master_ready || listener.secrets.master_ready ||
+        listener.lease_held ||
+        listener.transcript.state != transcript.DESTROYED) { ret 23; }
     i = 0;
-    for (i < client_key.len) {
-        if (client_key.data[i]:>u8 != server_view_key.data[i]:>u8) { ret 25; }
+    for (i < tls12.MASTER_SECRET_SIZE) {
+        if (dialer.secrets.master[i]:>u8 != 0 ||
+            listener.secrets.master[i]:>u8 != 0) { ret 29; }
         i = i + 1;
     }
     # renegotiation is refused by both roles once established

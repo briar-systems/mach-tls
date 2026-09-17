@@ -23,6 +23,7 @@ use tls.server;
 use tls12_connection: tls.tls12.connection;
 use tls.tls13;
 use tls.tls13.key_schedule;
+use tls.transition;
 use tls.transport;
 
 pub def State: u8;
@@ -777,14 +778,15 @@ fun process_record(stream: *Stream) bool {
         ret handled;
     }
     if (content_type == record.HANDSHAKE) {
-        var revealed: [record.MAX_INNER_PLAINTEXT]u8;
+        # a handshake message is revealed over its own consumed ciphertext, which
+        # is always longer than the plaintext it carried
         if (protected) {
             var i: usize = 0;
             for (i < content_length) {
-                revealed[i] = stream.plaintext[i]:>u8;
-                i           = i + 1;
+                input[i] = stream.plaintext[i]:>u8;
+                i        = i + 1;
             }
-            content = ?revealed[0];
+            content = input;
         }
         var level: engine.Level = engine.INITIAL;
         if (protected)                 { level = engine.HANDSHAKE; }
@@ -795,8 +797,8 @@ fun process_record(stream: *Stream) bool {
             ct.zeroize(stream.plaintext, content_length);
             var i: usize = 0;
             for (i < content_length) {
-                revealed[i] = 0;
-                i           = i + 1;
+                input[i] = 0;
+                i        = i + 1;
             }
         }
         if (progress.status == engine.FAILED) {
@@ -957,22 +959,11 @@ fun drive_owned(stream: *Stream) bool {
 
 fun enter(stream: *Stream) bool {
     if (stream_owner_data(stream) == nil) { ret false; }
-    val owner: i64 = os.thread_current_id();
-    if (owner <= 0) { ret false; }
-    for (true) {
-        var expected: i64 = atomic.load(?stream.transition_owner);
-        if (expected == owner) { ret false; }
-        if (expected == 0 && atomic.cas(?stream.transition_owner,
-            ?expected, owner)) { ret true; }
-        if (expected != 0) {
-            os.thread_wait(?stream.transition_owner, expected);
-        }
-    }
+    ret transition.enter(?stream.transition_owner, os.thread_current_id());
 }
 
 fun leave(stream: *Stream, accepted: bool) bool {
-    atomic.store(?stream.transition_owner, 0);
-    os.thread_wake(?stream.transition_owner);
+    transition.leave(?stream.transition_owner);
     ret accepted;
 }
 

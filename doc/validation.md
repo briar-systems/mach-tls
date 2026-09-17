@@ -88,9 +88,14 @@ pre-timed-out read against a live peer and requires the exact terminal error.
 
 ```sh
 mach dep pull test/interop
+mach dep update test/interop tls
 mach build test/interop
 ./test/interop/run.sh
 ```
+
+`test/interop` takes the library as a path dependency, and `mach dep pull` does
+not refresh an existing path copy. Run `mach dep update test/interop tls` after
+changing the library, or the harness builds against the copy taken earlier.
 
 The runner executes every leg in `test/interop/README.md`, prints a pass or
 FAILED line per leg, prints the peer versions and the release evidence, and
@@ -104,6 +109,16 @@ selection, ALPN, client authentication, session resumption, ticket reuse under
 both replay policies, credential rotation during a live connection, key updates
 mid-session, downgrade protection, and the protocol-correct rejection of each
 named failure.
+
+The footprint leg serves four TLS 1.3 connections with `--footprint`. Each
+connection lives in its own `std.memory.secret` region. The server reads
+`/proc/self/pagemap` and prints the resident pages of the region, the engine,
+the Stream's record region, and the wire and handshake buffers: once idle after
+the handshake, once after a request, and once after destroy. It also prints the
+cost of an idle `next_event`. The leg fails when the last connection's idle or
+destroyed region exceeds the bound in `run.sh`. The bounds are the v0.5.2
+baseline plus two pages, and they tighten as the per-connection memory work in
+#87 lands.
 
 ## Release evidence
 

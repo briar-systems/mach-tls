@@ -259,6 +259,41 @@ client_leg_must_fail "1.2 client refuses a tls 1.3 only server" "--tls12" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_3 -alpn h2 -rev -quiet"
 
 echo
+echo "== per-connection footprint =="
+# resident pages of one established connection's region (engine, stream and
+# every buffer), read from /proc/self/pagemap. the bounds are the v0.5.2
+# baseline plus two pages and tighten as #87 lands
+FOOTPRINT_IDLE_PAGES=11
+FOOTPRINT_DESTROYED_PAGES=20
+footprint_leg() {
+  local connections=4
+  $SERVER --footprint --connections $connections >"$WORK/footprint.log" 2>&1 &
+  local pid=$!
+  if ! wait_for_listener "$WORK/footprint.log"; then
+    kill $pid 2>/dev/null; wait $pid 2>/dev/null
+    record "footprint" "fail"
+    return
+  fi
+  for _ in $(seq 1 $connections); do
+    printf 'mach-tls footprint\n' | timeout 25 bash -c "$TLS13" >/dev/null 2>&1
+  done
+  wait $pid
+  local served=$?
+  # the last connection's readings, so allocator warm-up is excluded
+  local idle destroyed
+  idle="$(awk '/^footprint idle/{f=1;next} /^footprint/{f=0} f && /region_pages=/{sub(/.*=/,"");v=$0} END{print v}' "$WORK/footprint.log")"
+  destroyed="$(awk '/^footprint destroyed/{f=1;next} /^footprint/{f=0} f && /region_pages=/{sub(/.*=/,"");v=$0} END{print v}' "$WORK/footprint.log")"
+  awk '/^footprint idle/{n++} n=='"$connections"' && /^footprint|pages=|_ns=/' "$WORK/footprint.log"
+  if [ $served -eq 0 ] && [ -n "$idle" ] && [ -n "$destroyed" ] &&
+     [ "$idle" -le $FOOTPRINT_IDLE_PAGES ] && [ "$destroyed" -le $FOOTPRINT_DESTROYED_PAGES ]; then
+    record "footprint idle $idle <= $FOOTPRINT_IDLE_PAGES, destroyed $destroyed <= $FOOTPRINT_DESTROYED_PAGES pages" "ok"
+  else
+    record "footprint idle ${idle:-?} <= $FOOTPRINT_IDLE_PAGES, destroyed ${destroyed:-?} <= $FOOTPRINT_DESTROYED_PAGES pages" "fail"
+  fi
+}
+footprint_leg
+
+echo
 echo "== versions =="
 openssl version
 gnutls-cli --version | head -1

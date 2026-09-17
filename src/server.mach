@@ -34,6 +34,7 @@ use tls.signature_scheme;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
+use tls.transition;
 use tls.validation;
 
 pub val MAX_KEY_SHARE:              usize = 65;
@@ -283,22 +284,11 @@ fun server_owner_overlaps(server: *Server, data: *u8, len: usize) bool {
 
 fun enter(server: *Server) bool {
     if (!server_owner_valid(server)) { ret false; }
-    val owner: i64 = os.thread_current_id();
-    if (owner <= 0) { ret false; }
-    for (true) {
-        var expected: i64 = atomic.load(?server.transition_owner);
-        if (expected == owner) { ret false; }
-        if (expected == 0 && atomic.cas(?server.transition_owner,
-            ?expected, owner)) { ret true; }
-        if (expected != 0) {
-            os.thread_wait(?server.transition_owner, expected);
-        }
-    }
+    ret transition.enter(?server.transition_owner, os.thread_current_id());
 }
 
 fun leave(server: *Server) {
-    atomic.store(?server.transition_owner, 0);
-    os.thread_wake(?server.transition_owner);
+    transition.leave(?server.transition_owner);
 }
 
 # the configuration is secret-welded through its credential store, so its own
@@ -633,7 +623,7 @@ fun server_storage_equal(first: Storage, second: Storage) bool {
 fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
     val owner: i64 = os.thread_current_id();
     if (!server_owner_valid(server) || owner <= 0 ||
-        atomic.load(?server.transition_owner) != owner ||
+        !transition.held_by(?server.transition_owner, owner) ||
         server.config != ?server.configuration || !server.entropy.initialized ||
         server.entropy.fill_fn == nil || output == nil) { ret false; }
     val descriptor:              secret.Entropy          = server.entropy;
@@ -656,7 +646,7 @@ fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
     val expected_send_limit:     usize                   = server.send_record_plaintext;
     val status:                  i64                     = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val valid: bool = atomic.load(?server.transition_owner) == owner &&
+    val valid: bool = transition.held_by(?server.transition_owner, owner) &&
         server.config == expected_config && server.state == expected_state &&
         entropy_equal(server.entropy, descriptor) &&
         configuration_equal(server.configuration, expected_configuration) &&
@@ -2631,15 +2621,16 @@ fun secret_for(server: *Server, index: usize) *key_schedule.Secret {
 }
 
 fun next_event_inner(server: *Server, output: *engine.Event) bool {
-    if (!server_owner_valid(server) || output == nil ||
+    # nothing pending is answered before the borrowed descriptors are walked
+    if (!server_owner_valid(server) || output == nil || server.event_active ||
+        server.state == DESTROYED || !pending(server) ||
         !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
         server_owner_overlaps(server, (?output.token)::*u8,
         $size_of(engine.Event)) ||
         storage_overlaps(?server.storage, (?output.token)::*u8,
         $size_of(engine.Event)) ||
         borrowed_overlaps(server.config, server.extra, (?output.token)::*u8,
-        $size_of(engine.Event), true, true) || server.event_active ||
-        server.state == DESTROYED || !pending(server)) { ret false; }
+        $size_of(engine.Event), true, true)) { ret false; }
     val item:  Pending      = server.queue[server.queue_head];
     var event: engine.Event = engine.empty_event();
     event.token       = engine.next_generation(server.event_generation);
@@ -2683,6 +2674,16 @@ pub fun next_event(server: *Server, output: *engine.Event) bool {
     ret available;
 }
 
+# once the last handshake event is accepted, nothing reads the handshake-only
+# secrets, the transcript or the resumed psk again, and the credential
+# generation no longer needs pinning
+fun discard_completed(server: *Server) {
+    key_schedule.discard_handshake(?server.schedule);
+    transcript.destroy(?server.transcript);
+    session.state_destroy(?server.ticket_state);
+    release_lease(server);
+}
+
 fun complete_event_inner(server: *Server, token: u64, accepted: bool) bool {
     if (!server_owner_valid(server) || !server.event_active || token == 0 ||
         token != server.active_event.token) { ret false; }
@@ -2699,7 +2700,7 @@ fun complete_event_inner(server: *Server, token: u64, accepted: bool) bool {
     if (server.state == ESTABLISHED && !pending(server) &&
         server.schedule.stage == key_schedule.APPLICATION &&
         server.schedule.master_secret.active) {
-        key_schedule.discard_handshake(?server.schedule);
+        discard_completed(server);
     }
     ret true;
 }
@@ -3054,7 +3055,9 @@ fun exchange(local: *Server, peer: *client.Client) i64 {
             }
             if (!client.complete_event(peer, peer_event.token, true)) { ret 103; }
         }
-        if (snapshot(local).status == engine.COMPLETE &&
+        # complete means both sides are established and drained, as a caller
+        # would leave them
+        if (!progressed && snapshot(local).status == engine.COMPLETE &&
             client.snapshot(peer).status == engine.COMPLETE) { ret 0; }
         if (!progressed) {
             poll(local);
@@ -3315,11 +3318,17 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
         if (dialer_engine.secret_generation[i] > 1) { ret 44; }
         i = i + 1;
     }
-    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 45; }
+    # a completed connection pins no credential generation, so a rotation is
+    # reclaimable while it is still live
+    if (listener_engine.lease_held || listener_engine.schedule.master_secret.active ||
+        listener_engine.transcript.state != transcript.DESTROYED ||
+        dialer_engine.schedule.master_secret.active ||
+        dialer_engine.transcript.state != transcript.DESTROYED) { ret 49; }
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK ||
         !credentials.reclaimable(retired)) { ret 38; }
-    if (keys.destroy_private(?key) != contracts.OK) { ret 39; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 45; }
+    if (keys.destroy_private(?key) != contracts.OK)                    { ret 39; }
     ret 0;
 }
 
@@ -4112,7 +4121,14 @@ test "session: a ticket resumes one connection and a key update rekeys it" {
     if (server_view.selected_alpn.len != 2)            { ret 55; }
     if (!secrets_match(?second_listener, ?second_dialer, true) ||
         !secrets_match(?second_listener, ?second_dialer, false)) { ret 56; }
-    if (session.client_store_count(?resume_store) != 1) { ret 57; }
+    # the resumed connection consumed one ticket and delivered its own two
+    if (session.client_store_count(?resume_store) != 3) { ret 57; }
+    # a completed resumption keeps neither side's psk, transcript or lease
+    if (second_listener.ticket_state.secret_len != 0 ||
+        second_dialer.offered_ticket.secret_len != 0 ||
+        second_dialer.offered_ticket.valid || second_listener.lease_held ||
+        second_listener.transcript.state != transcript.DESTROYED ||
+        second_dialer.transcript.state != transcript.DESTROYED) { ret 61; }
     if (!destroy(?second_listener) || !client.destroy(?second_dialer)) {
         ret 58;
     }
