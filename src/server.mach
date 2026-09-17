@@ -34,6 +34,7 @@ use tls.signature_scheme;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
+use tls.transition;
 use tls.validation;
 
 pub val MAX_KEY_SHARE:              usize = 65;
@@ -283,22 +284,11 @@ fun server_owner_overlaps(server: *Server, data: *u8, len: usize) bool {
 
 fun enter(server: *Server) bool {
     if (!server_owner_valid(server)) { ret false; }
-    val owner: i64 = os.thread_current_id();
-    if (owner <= 0) { ret false; }
-    for (true) {
-        var expected: i64 = atomic.load(?server.transition_owner);
-        if (expected == owner) { ret false; }
-        if (expected == 0 && atomic.cas(?server.transition_owner,
-            ?expected, owner)) { ret true; }
-        if (expected != 0) {
-            os.thread_wait(?server.transition_owner, expected);
-        }
-    }
+    ret transition.enter(?server.transition_owner, os.thread_current_id());
 }
 
 fun leave(server: *Server) {
-    atomic.store(?server.transition_owner, 0);
-    os.thread_wake(?server.transition_owner);
+    transition.leave(?server.transition_owner);
 }
 
 # the configuration is secret-welded through its credential store, so its own
@@ -633,7 +623,7 @@ fun server_storage_equal(first: Storage, second: Storage) bool {
 fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
     val owner: i64 = os.thread_current_id();
     if (!server_owner_valid(server) || owner <= 0 ||
-        atomic.load(?server.transition_owner) != owner ||
+        !transition.held_by(?server.transition_owner, owner) ||
         server.config != ?server.configuration || !server.entropy.initialized ||
         server.entropy.fill_fn == nil || output == nil) { ret false; }
     val descriptor:              secret.Entropy          = server.entropy;
@@ -656,7 +646,7 @@ fun entropy_fill(server: *Server, output: *^u8, length: usize) bool {
     val expected_send_limit:     usize                   = server.send_record_plaintext;
     val status:                  i64                     = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val valid: bool = atomic.load(?server.transition_owner) == owner &&
+    val valid: bool = transition.held_by(?server.transition_owner, owner) &&
         server.config == expected_config && server.state == expected_state &&
         entropy_equal(server.entropy, descriptor) &&
         configuration_equal(server.configuration, expected_configuration) &&

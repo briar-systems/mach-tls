@@ -33,6 +33,7 @@ use tls.tls12.prf;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
+use tls.transition;
 use tls.validation;
 
 pub val MAX_POINT:                usize = 65;
@@ -185,22 +186,11 @@ fun owner_overlaps(value: *Connection, data: *u8, len: usize) bool {
 
 fun enter(value: *Connection) bool {
     if (!owner_valid(value)) { ret false; }
-    val owner: i64 = os.thread_current_id();
-    if (owner <= 0) { ret false; }
-    for (true) {
-        var expected: i64 = atomic.load(?value.transition_owner);
-        if (expected == owner) { ret false; }
-        if (expected == 0 && atomic.cas(?value.transition_owner, ?expected,
-            owner)) { ret true; }
-        if (expected != 0) {
-            os.thread_wait(?value.transition_owner, expected);
-        }
-    }
+    ret transition.enter(?value.transition_owner, os.thread_current_id());
 }
 
 fun leave(value: *Connection) {
-    atomic.store(?value.transition_owner, 0);
-    os.thread_wake(?value.transition_owner);
+    transition.leave(?value.transition_owner);
 }
 
 fun client_config_data(value: *config.ClientConfig) *u8 {
@@ -686,7 +676,7 @@ fun fail(value: *Connection, failure: error.Error,
 fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
     val owner: i64 = os.thread_current_id();
     if (!owner_valid(value) || owner <= 0 ||
-        atomic.load(?value.transition_owner) != owner ||
+        !transition.held_by(?value.transition_owner, owner) ||
         !value.entropy.initialized || value.entropy.fill_fn == nil ||
         output == nil) { ret false; }
     val descriptor:       secret.Entropy = value.entropy;
@@ -696,7 +686,7 @@ fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
     val expected_queue:   usize          = value.queue_len;
     val status:           i64            = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val stable: bool = atomic.load(?value.transition_owner) == owner &&
+    val stable: bool = transition.held_by(?value.transition_owner, owner) &&
         value.state == expected_state &&
         value.storage.input == expected_storage.input &&
         value.storage.output == expected_storage.output &&
