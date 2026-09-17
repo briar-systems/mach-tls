@@ -3,6 +3,7 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use std.chrono.duration;
 use std.chrono.time;
 use std.crypto.ct;
 use std.filesystem;
@@ -22,6 +23,7 @@ use std.types.bool.true;
 use std.types.char.char;
 use std.types.error.err;
 use std.types.result.res;
+use std.types.option.opt;
 use std.types.size.usize;
 use std.types.string.str;
 use tls.cert;
@@ -463,17 +465,16 @@ fun footprint(phase: str) {
 fun idle_cost() {
     if (!option_footprint) { ret; }
     var event:   engine.Event;
-    val started: time.Clock = time.monotonic();
+    val started: time.InstantClock = time.instant();
     var i:       usize      = 0;
     for (i < IDLE_CALLS) {
         if (established.next_event(?cur.secure.core13, ?event)) { ret; }
         i = i + 1;
     }
-    val finished: time.Clock = time.monotonic();
+    val finished: time.InstantClock = time.instant();
     if (sel started.err)  { ret; }
     if (sel finished.err) { ret; }
-    val spent: i64 = (finished.ok.sec - started.ok.sec) * 1000000000 +
-        finished.ok.nsec - started.ok.nsec;
+    val spent: duration.Duration = time.instant_sub(finished.ok, started.ok);
     report("  idle_next_event_ns=", spent::usize / IDLE_CALLS);
 }
 
@@ -537,7 +538,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         ret 10;
     }
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 11; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 11; }
     if (option_tls12) {
         val legacy_storage: tls12_connection.Storage =
             tls12_connection.Storage{input: ?cur_input.data[0],
@@ -687,7 +688,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         tcp.stream_close(?connection_socket);
         ret 0;
     }
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.read(?cur.secure, ?scope,
         transport.Token{index: 2, generation: 1},
         ?application_input[0], 512, 2) ||
@@ -704,7 +705,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     }
 
     if (option_key_update) {
-        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+        if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
             !stream.key_update(?cur.secure, ?scope,
             transport.Token{index: 6, generation: 1}, 0, 6) ||
             !settle(?cur.secure, ?connection_runtime)) { ret 60; }
@@ -735,7 +736,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     application_output[13] = 'e';
     application_output[14] = 'r';
     application_output[15] = '\n';
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.write(?cur.secure, ?scope,
         transport.Token{index: 3, generation: 1},
         ?application_output[0], 16, 3) ||
@@ -748,7 +749,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         ret 35;
     }
 
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.half_close(?cur.secure, ?scope,
         transport.Token{index: 4, generation: 1}, 4) ||
         !settle(?cur.secure, ?connection_runtime)) { ret 36; }
@@ -758,7 +759,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         ret 37;
     }
 
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.close(?cur.secure, ?scope,
         transport.Token{index: 5, generation: 1}, 5) ||
         !settle(?cur.secure, ?connection_runtime)) { ret 38; }
