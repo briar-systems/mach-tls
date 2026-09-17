@@ -1075,6 +1075,7 @@ fun drive_key_update(stream: *Stream, lane: *Lane) bool {
     for (true) {
         if (sending(stream, lane))            { ret submit_write(stream, lane); }
         if (owe_core_record(stream, lane))    { ret true; }
+        if (sending(stream, lane))            { cnt; }
         if (stream.wire_output_len != 0)      { ret park(stream, lane, PARK_PEER); }
         if (!handle_core_event(stream, lane)) { ret finish(stream, lane, error.OK, false); }
         if (lane_terminal(lane))              { ret true; }
@@ -1087,6 +1088,7 @@ fun drive_write(stream: *Stream, lane: *Lane) bool {
     for (true) {
         if (sending(stream, lane))         { ret submit_write(stream, lane); }
         if (owe_core_record(stream, lane)) { ret true; }
+        if (sending(stream, lane))         { cnt; }
         if (stream.wire_output_len != 0)   { ret park(stream, lane, PARK_PEER); }
         if (handle_core_event(stream, lane)) {
             if (lane_terminal(lane)) { ret true; }
