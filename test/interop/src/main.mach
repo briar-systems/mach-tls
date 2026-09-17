@@ -379,9 +379,9 @@ fun dial_one(index: usize) i64 {
     report("version=", negotiated.version::usize);
     report("suite=", negotiated.suite::usize);
     # a client with a store must resume every connection after its first
-    if (option_sessions && index != 0 && !negotiated.resumed)                        { ret 44; }
-    if (negotiated.resumed)                                                          { print.print("resumed=1\n"); }
-    or                                                                               { print.print("resumed=0\n"); }
+    if (option_sessions && index != 0 && !negotiated.resumed)       { ret 44; }
+    if (negotiated.resumed)                                         { print.print("resumed=1\n"); }
+    or                                                              { print.print("resumed=0\n"); }
     if (!release(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
 
     var application_input: [64]u8;
