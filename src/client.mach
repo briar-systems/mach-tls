@@ -2289,13 +2289,14 @@ fun pending(client: *Client) bool {
 }
 
 fun next_event_inner(client: *Client, output: *engine.Event) bool {
-    if (!client_owner_valid(client) || output == nil ||
+    # nothing pending is answered before the borrowed descriptors are walked
+    if (!client_owner_valid(client) || output == nil || client.event_active ||
+        client.state == DESTROYED || !pending(client) ||
         !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
         client_owner_overlaps(client, (?output.token)::*u8, $size_of(engine.Event)) ||
         storage_overlaps(?client.storage, (?output.token)::*u8, $size_of(engine.Event)) ||
         borrowed_overlaps(client.config, client.extra, (?output.token)::*u8,
-        $size_of(engine.Event), true, true) || client.event_active ||
-        client.state == DESTROYED || !pending(client)) { ret false; }
+        $size_of(engine.Event), true, true)) { ret false; }
     var event: engine.Event = engine.empty_event();
     event.token = next_generation(client.event_generation);
     event.suite = client.suite;
@@ -2378,6 +2379,14 @@ pub fun next_event(client: *Client, output: *engine.Event) bool {
     ret available;
 }
 
+# once the last handshake event is accepted, nothing reads the handshake-only
+# secrets, the transcript or the offered psk again
+fun discard_completed(client: *Client) {
+    key_schedule.discard_handshake(?client.schedule);
+    transcript.destroy(?client.transcript);
+    session.ticket_destroy(?client.offered_ticket);
+}
+
 fun complete_event_inner(client: *Client, token: u64, accepted: bool) bool {
     if (!client_owner_valid(client) ||
         !client.event_active || token == 0 ||
@@ -2435,7 +2444,7 @@ fun complete_event_inner(client: *Client, token: u64, accepted: bool) bool {
         !client.handshake_send_pending && !client.handshake_receive_pending &&
         client.schedule.stage == key_schedule.APPLICATION &&
         client.schedule.master_secret.active) {
-        key_schedule.discard_handshake(?client.schedule);
+        discard_completed(client);
     }
     ret true;
 }
