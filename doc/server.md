@@ -101,14 +101,18 @@ queue is cleared and replaced by a single alert on failure.
 
 ## Certificate selection and rotation
 
-A connection acquires exactly one credential lease and holds it until the engine
-is destroyed. `credentials.rotate` retires the published generation and installs
-a replacement; the retired generation keeps every live lease valid and does not
-report itself reclaimable until the last lease is released. An established
-connection therefore keeps the certificate, chain, private key, client trust
+A connection acquires exactly one credential lease and holds it for as long as
+its handshake can still read the generation. When the last handshake event is
+accepted the engine releases the lease, together with the transcript and the
+resumed PSK, because nothing an established connection does reads them again.
+`credentials.rotate` retires the published generation and installs a
+replacement. The retired generation keeps every live lease valid and does not
+report itself reclaimable until the last lease is released. A handshake in
+progress therefore keeps the certificate, chain, private key, client trust
 store, and client-authentication requirement it started with, and a rotation
-cannot alter any of them mid-connection. The caller may reclaim the retired
-arrays and keys only after `credentials.reclaimable` returns true.
+cannot alter any of them mid-handshake. An established connection pins no
+generation. The caller may reclaim the retired arrays and keys only after
+`credentials.reclaimable` returns true.
 
 `credentials.initialize_tls_alpn_challenge` creates the one-identity,
 one-certificate transient generation RFC 8737 requires. It accepts the
