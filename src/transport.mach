@@ -97,6 +97,51 @@ fun state_overlaps_loaded(owner: *Transport, descriptor: *Transport,
     ret !descriptor_equal(descriptor, owner);
 }
 
+# a lower transport pinned once for every operation that submits to it. the
+# descriptor is the validated copy submissions use, and the owner is the record
+# it was taken from, compared again at each submission and completion. a
+# provider stays unchanged while any operation that names it is waiting
+pub rec Provider {
+    descriptor: Transport;
+    owner:      *Transport;
+}
+
+pub fun no_provider() Provider {
+    var value: Provider;
+    ret value;
+}
+
+# the owner may be the provider's own descriptor, for an owner that keeps its
+# own copy of the caller's transport
+pub fun pin(provider: *Provider, transport: *Transport) bool {
+    if (provider == nil ||
+        !memory_range.valid(provider::*u8, $size_of(Provider))) { ret false; }
+    var descriptor: Transport;
+    if (!load(transport, ?descriptor)) { ret false; }
+    val owned: bool = transport::*u8 == (?provider.descriptor)::*u8;
+    # a provider that is its own owner only has to stay clear of the state
+    # behind the descriptor; any other provider stays clear of its owner too
+    if (owned &&
+        (memory_range.overlap(descriptor.context::*u8, descriptor.context_size,
+        provider::*u8, $size_of(Provider)) ||
+        io_runtime.aliases(descriptor.runtime, provider::*u8, $size_of(Provider)) ||
+        descriptor.aliases_state(descriptor.context, provider::*u8,
+        $size_of(Provider)))) { ret false; }
+    if (!owned && state_overlaps_loaded(transport, ?descriptor, provider::*u8,
+        $size_of(Provider))) { ret false; }
+    provider.descriptor = descriptor;
+    provider.owner      = transport;
+    ret true;
+}
+
+fun provider_valid(provider: *Provider) bool {
+    ret provider != nil &&
+        memory_range.valid(provider::*u8, $size_of(Provider)) &&
+        provider.owner != nil &&
+        memory_range.valid(provider.owner::*u8, $size_of(Transport)) &&
+        descriptor_equal(?provider.descriptor, provider.owner);
+}
+
 pub fun state_overlaps(transport: *Transport, data: *u8, len: usize) bool {
     var descriptor: Transport;
     if (!load(transport, ?descriptor)) { ret true; }
@@ -341,8 +386,7 @@ pub rec Operation {
     cancellation_active:    bool;
     cancellation_requested: bool;
     cancellation_error:     error.Error;
-    provider:               Transport;
-    provider_owner:         *Transport;
+    provider:               *Provider;
     provider_drifted:       bool;
     lock:                   mutex.Mutex;
 }
@@ -433,8 +477,7 @@ pub fun begin(
     operation.cancellation_active    = false;
     operation.cancellation_requested = false;
     operation.cancellation_error     = error.OK;
-    operation.provider               = no_transport();
-    operation.provider_owner         = nil;
+    operation.provider               = nil;
     operation.provider_drifted       = false;
     operation.lock                   = mutex.make();
     cancel.init_registration(?operation.cancellation);
@@ -486,8 +529,10 @@ fun action_submission(transport: *Transport, operation: *Operation, action: Acti
 }
 
 # engines may sequence reads and writes under one stable application token
-pub fun begin_action(operation: *Operation, transport: *Transport, action: Action) bool {
-    if (operation == nil ||
+pub fun begin_action(operation: *Operation, provider: *Provider, action: Action) bool {
+    if (operation == nil || !provider_valid(provider) ||
+        memory_range.overlap(operation::*u8, $size_of(Operation),
+        provider::*u8, $size_of(Provider)) ||
         !memory_range.valid(operation::*u8, $size_of(Operation)) ||
         !memory_range.valid(action.buffer, action.length) ||
         memory_range.overlap(operation::*u8, $size_of(Operation),
@@ -509,8 +554,10 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
     operation.state = OPERATION_SUBMITTING;
     mutex.unlock(?operation.lock);
 
+    val transport:        *Transport = provider.owner;
     var descriptor:       Transport;
-    val valid_submission: bool = load(transport, ?descriptor) &&
+    val valid_submission: bool       = load(transport, ?descriptor) &&
+        descriptor_equal(?descriptor, ?provider.descriptor) &&
         !state_overlaps_loaded(transport, ?descriptor, operation::*u8,
         $size_of(Operation)) &&
         !state_overlaps_loaded(transport, ?descriptor, action.buffer,
@@ -532,8 +579,7 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
         mutex.unlock(?operation.lock);
         ret false;
     }
-    operation.provider       = descriptor;
-    operation.provider_owner = transport;
+    operation.provider = provider;
     mutex.unlock(?operation.lock);
 
     val submitted: res[io_runtime.Token, io_error.Error] =
@@ -545,9 +591,8 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
         ret false;
     }
     if (sel submitted.err) {
-        operation.state          = OPERATION_OPEN;
-        operation.provider       = no_transport();
-        operation.provider_owner = nil;
+        operation.state    = OPERATION_OPEN;
+        operation.provider = nil;
         if (!descriptor_stable) {
             terminal_locked(operation, error.INTERNAL_ERROR, false, false);
         }
@@ -565,9 +610,8 @@ pub fun begin_action(operation: *Operation, transport: *Transport, action: Actio
     val lower_token: io_runtime.Token =
         submitted.ok;
     if (lower_token.generation == 0) {
-        operation.state          = OPERATION_OPEN;
-        operation.provider       = no_transport();
-        operation.provider_owner = nil;
+        operation.state    = OPERATION_OPEN;
+        operation.provider = nil;
         terminal_locked(operation, error.INTERNAL_ERROR, false, false);
         mutex.unlock(?operation.lock);
         ret false;
@@ -642,12 +686,12 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
         mutex.unlock(?operation.lock);
         ret false;
     }
-    val provider:       Transport             = operation.provider;
-    val provider_owner: *Transport            = operation.provider_owner;
-    val settled:        io_runtime.Completion = @completion;
+    val provider: *Provider             = operation.provider;
+    val settled:  io_runtime.Completion = @completion;
     operation.state = OPERATION_ACCEPTING;
     mutex.unlock(?operation.lock);
-    val aliases_provider: bool = provider_state_overlaps(?provider,
+    val aliases_provider: bool = provider == nil ||
+        provider_state_overlaps(?provider.descriptor,
         completion::*u8, $size_of(io_runtime.Completion));
     mutex.lock(?operation.lock);
     if (operation.state != OPERATION_ACCEPTING) {
@@ -657,16 +701,13 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
     val lower_kind:        ActionKind = operation.lower_kind;
     val lower_length:      usize      = operation.lower_length;
     val completion_stable: bool       = completion_equal(?settled, completion);
-    val provider_stable:   bool       = provider_owner != nil &&
-        memory_range.valid(provider_owner::*u8, $size_of(Transport)) &&
-        descriptor_equal(?provider, provider_owner);
-    val provider_drifted: bool = operation.provider_drifted || !provider_stable;
+    val provider_stable:   bool       = provider_valid(provider);
+    val provider_drifted:  bool       = operation.provider_drifted || !provider_stable;
     operation.state            = OPERATION_OPEN;
     operation.lower_kind       = 0;
     operation.lower_buffer     = nil;
     operation.lower_length     = 0;
-    operation.provider         = no_transport();
-    operation.provider_owner   = nil;
+    operation.provider         = nil;
     operation.provider_drifted = false;
     # a cancelled, timed-out or failed completion still reports the transfer
     # that finished before it, and that transfer is as real as a successful one
@@ -704,7 +745,11 @@ pub fun wake(operation: *Operation) bool {
         mutex.unlock(?operation.lock);
         ret false;
     }
-    val runtime: *io_runtime.Runtime = operation.provider.runtime;
+    if (operation.provider == nil) {
+        mutex.unlock(?operation.lock);
+        ret false;
+    }
+    val runtime: *io_runtime.Runtime = operation.provider.descriptor.runtime;
     val token:   io_runtime.Token    = operation.lower_token;
     mutex.unlock(?operation.lock);
     val completed: err[io_error.Error] = io_runtime.complete(runtime, token, 0, 0, false);
@@ -760,8 +805,7 @@ pub fun destroy_operation(operation: *Operation) bool {
     operation.application_length = 0;
     operation.lower_buffer       = nil;
     operation.lower_length       = 0;
-    operation.provider           = no_transport();
-    operation.provider_owner     = nil;
+    operation.provider           = nil;
     operation.provider_drifted   = false;
     operation.state              = OPERATION_DESTROYED;
     mutex.unlock(?operation.lock);

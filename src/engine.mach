@@ -106,6 +106,9 @@ pub rec Snapshot {
     client_auth_requested: bool;
     resumed:               bool;
     tickets_issued:        u8;
+    # tickets a client received but could not keep because its clock source
+    # could not be read, saturating at 255
+    ticket_clock_failures: u8;
     output_pending:        bool;
     event_active:          bool;
     destroyed:             bool;
@@ -157,6 +160,7 @@ pub fun empty_snapshot() Snapshot {
     value.client_auth_requested = false;
     value.resumed               = false;
     value.tickets_issued        = 0;
+    value.ticket_clock_failures = 0;
     value.output_pending        = false;
     value.event_active          = false;
     value.destroyed             = false;

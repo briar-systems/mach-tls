@@ -21,8 +21,9 @@ not depend on a terminator scan. The configuration requires one TLS 1.3 version,
 one to three supported cipher
 suites, one or two supported groups, one to five supported signature schemes,
 at least one ALPN name, a bounded trust store, an operating-system or
-application entropy source, and explicit finite limits. SNI is required and is
-always authenticated against the leaf certificate subject alternative name.
+application entropy source, a clock source, and explicit finite limits. SNI is
+required and is always authenticated against the leaf certificate subject
+alternative name.
 An application entropy source declares the exact size of its public callback
 context with `entropy_context_size`. The context is retained and must contain
 all mutable provider state. TLS rejects secret callback context so provider
@@ -191,11 +192,42 @@ into a wire buffer that starts at `stream.READ_START` and grows to what a
 record header announces, seals and opens records in secret chunks held only
 for that record, and returns every buffer when an operation ends. `connect`
 combines initialization and handshake. Separate `handshake`, `read`, `write`,
-`alert`, `half_close`, and `close` operations are also available. Every
-operation retains its application token, cancellation scope, deadline, and
-application buffer through terminal resolution. The caller must inspect the
-terminal snapshot and call `destroy_operation` before starting the next
-operation.
+`alert`, `half_close`, `close` and `key_update` operations are also
+available. Every operation retains its application token, cancellation scope,
+deadline, and application buffer through terminal resolution. The caller
+inspects the terminal snapshot (`stream.snapshot` reports the read and write
+lanes separately) and calls `destroy_operation(stream, token)` before starting
+another operation in the same lane. Two live operations never share a token.
+
+### Concurrent read and write
+
+A stream carries one read and one write at once, each in its own lane:
+
+- The read lane takes `read`. The write lane takes `write`, `key_update`,
+  `half_close`, and the handshake, `alert` and `close`.
+- The handshake, `alert` and `close` need both lanes free. With a read
+  outstanding they are refused and change nothing. `half_close` and
+  `key_update` need only the write lane.
+- A received close_notify resolves the read as clean end of stream and leaves
+  the write lane unaffected: a write in flight finishes and further writes are
+  allowed until the caller closes.
+- `destroy` needs both lanes terminal or destroyed.
+- One lane at a time owns the outgoing wire buffer, from sealing a record until
+  its last byte is sent, so records from the two lanes never interleave.
+- A record the engine owes (a KeyUpdate answer or a fatal alert) is sent by
+  whichever lane finds it. The read lane sends it itself when the write lane is
+  idle. If the write lane is mid-record, the read lane parks, the write lane
+  sends the owed record next, then wakes the read lane. Nothing is sent after
+  close_notify: an update owed then is dropped.
+- A lane short of memory parks as described in [`memory.md`](memory.md). While
+  both lanes are parked for memory, only the lane holding the turn reserves. The
+  other parks again without reserving. The turn starts with the write lane and
+  passes to the other lane, which is woken, once its holder acquires. The turn
+  only ever decides between two lanes that are both parked for memory, so a
+  read that keeps finding memory cannot starve a parked write.
+
+The lower transport must accept two concurrent submissions, one per lane. Stream
+calls still pass one entrant gate, so two threads never run stream code at once.
 
 An operation that must wait for memory parks until `stream.resume`, and
 settles through `stream.accept` like any other. The contract is in
@@ -220,8 +252,8 @@ state, then fails terminally. Completion fields are snapshotted before the
 provider alias query. Query reentry or mutation is consumed as the matching
 lower completion and resolves to internal error without stranding its buffer.
 
-The stream serializes application operations over one ordered transport. Read
-and write record sequence numbers remain independent. Each operation can submit
+Both lanes share one ordered transport. Read and write record sequence numbers
+remain independent. Each operation can submit
 as many partial lower reads and writes as needed while keeping one stable
 application token. Incoming records and handshake messages can fragment at every
 byte. Outgoing handshake flights and application writes split at the TLS
@@ -250,6 +282,21 @@ every backend.
 After the terminal operation is destroyed, `close` on a failed stream submits
 the distinct abortive lower-close callback without attempting another TLS
 record.
+
+A lane that fails the stream cannot cancel the other lane's lower action, so
+that action stays in flight:
+
+- A lane parked in the stream is woken and resolves with the error that failed
+  the stream.
+- A lane with a lower read or write in flight resolves when that action
+  completes. Its transfer is accounted first by the rules above, so a write
+  whose record went out in full still counts its bytes, and the lane then
+  resolves with the stream's failure.
+- A `FAILED` stream MUST be closed. This is the one exception to the rule that
+  `close` needs both lanes free: `close` on a `FAILED` stream is allowed while
+  the read lane is outstanding, and its abortive lower close is what ends that
+  read. An outstanding lower action that stays in flight until then is not a
+  leak.
 
 A lower transport must report in a cancelled completion the bytes its request
 already moved. A transfer larger than the request is refused as

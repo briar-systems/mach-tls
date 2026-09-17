@@ -9,11 +9,13 @@
 # bytes it is given
 
 use crypto.contracts;
+use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
+use tls.clock;
 use tls.engine;
 use tls.error;
 use tls.handshake;
@@ -63,7 +65,8 @@ pub rec Seed {
     max_message_bytes:    usize;
     max_ticket_bytes:     usize;
     sessions:             *session.ClientStore;
-    verification_time:    i64;
+    # read when a ticket arrives, so its age runs from its receipt
+    clock: *clock.Source;
 }
 
 rec Pending {
@@ -78,6 +81,7 @@ pub rec Established {
     quic:                  bool;
     retry_count:           u8;
     tickets_issued:        u8;
+    ticket_clock_failures: u8;
     authenticated:         bool;
     resumed:               bool;
     peer_offered_alpn:     bool;
@@ -105,7 +109,6 @@ pub rec Established {
     event_generation:      u64;
     secret_generation:     [2]u64;
     transition_owner:      i64;
-    verification_time:     i64;
     receive_record_limit:  usize;
     send_record_limit:     usize;
     max_message_bytes:     usize;
@@ -116,6 +119,7 @@ pub rec Established {
     input_len:      usize;
     skip_remaining: usize;
     sessions:       *session.ClientStore;
+    clock:          *clock.Source;
     alpn:           contracts.Bytes;
     server_name:    contracts.Bytes;
 }
@@ -252,7 +256,7 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     core.send_record_limit     = seed.send_record_limit;
     core.max_message_bytes     = seed.max_message_bytes;
     core.max_ticket_bytes      = seed.max_ticket_bytes;
-    core.verification_time     = seed.verification_time;
+    core.ticket_clock_failures = 0;
     core.memory                = memory;
     # quic never updates tls keys, so it keeps no application secret
     if (!seed.quic) {
@@ -261,6 +265,7 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     }
     if (seed.role == engine.CLIENT && seed.sessions != nil && resumption != nil) {
         core.sessions = seed.sessions;
+        core.clock    = seed.clock;
         key_schedule.copy_secret(?core.resumption, resumption);
     }
     if (seed.retain_exporter && exporter != nil) {
@@ -349,6 +354,14 @@ fun retain_ticket(core: *Established, value: *codec.NewSessionTicket) {
         value.nonce.len > 255) { ret; }
     val size: usize = key_schedule.hash_size(core.algorithm);
     if (size == 0 || size > session.MAX_SECRET) { ret; }
+    # read before anything is derived, so a failed read leaves nothing behind
+    var now: clock.Moment;
+    if (!clock.read(core.clock, ?now)) {
+        if (core.ticket_clock_failures != 255) {
+            core.ticket_clock_failures = core.ticket_clock_failures + 1;
+        }
+        ret;
+    }
     var retained: session.Ticket;
     session.ticket_destroy(?retained);
     if (key_schedule.secret_resumption_psk(core.algorithm, ?core.resumption,
@@ -361,7 +374,7 @@ fun retain_ticket(core: *Established, value: *codec.NewSessionTicket) {
     copy_bytes(?retained.identity[0], value.ticket.data, value.ticket.len);
     retained.identity_len     = value.ticket.len;
     retained.suite            = core.suite;
-    retained.received_at      = core.verification_time;
+    retained.received_at      = now.monotonic;
     retained.lifetime_seconds = value.lifetime;
     retained.age_add          = value.age_add;
     retained.max_early_data   = 0;
@@ -822,6 +835,7 @@ pub fun snapshot(core: *Established) engine.Snapshot {
     value.client_auth_requested = core.client_auth_requested;
     value.resumed               = core.resumed;
     value.tickets_issued        = core.tickets_issued;
+    value.ticket_clock_failures = core.ticket_clock_failures;
     value.output_pending        = pending(core);
     value.event_active          = core.event_active;
     value.destroyed             = core.state == DESTROYED;
@@ -868,6 +882,13 @@ fun test_secret(fill: u8) key_schedule.Secret {
     ret value;
 }
 
+var test_moment: clock.Moment;
+var test_clock:  clock.Source;
+
+fun unreadable(context: ptr, output: *clock.Moment) bool {
+    ret false;
+}
+
 fun test_seed(role: engine.Role) Seed {
     var seed: Seed;
     seed.role                 = role;
@@ -880,6 +901,9 @@ fun test_seed(role: engine.Role) Seed {
     seed.max_ticket_bytes     = 256;
     if (role == engine.CLIENT) {
         seed.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+        test_moment      = clock.at(1800000000, 100);
+        test_clock       = clock.frozen(?test_moment);
+        seed.clock       = ?test_clock;
     }
     ret seed;
 }
@@ -1047,5 +1071,73 @@ test "established: a ticket waits for memory without consuming anything" {
         session.client_store_count(?store) != 1) { ret 7; }
     session.client_store_destroy(?store);
     if (!destroy(?core) || !pool.destroy(?harness)) { ret 8; }
+    ret 0;
+}
+
+test "established: a ticket's age runs from its receipt, not the handshake" {
+    var send:       key_schedule.Secret = test_secret(15);
+    var receive:    key_schedule.Secret = test_secret(16);
+    var resumption: key_schedule.Secret = test_secret(17);
+    var store:      session.ClientStore;
+    if (!session.client_store_init(?store)) { ret 1; }
+    var harness: pool.Harness;
+    if (!pool.make(?harness, 1 << 20, 1 << 20)) { ret 2; }
+    var seed: Seed = test_seed(engine.CLIENT);
+    seed.sessions = ?store;
+    var core: Established = empty();
+    if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
+        pool.lease(?harness))) { ret 3; }
+    # the ticket arrives 150s into the connection
+    test_moment = clock.at(1800000000, 250);
+    var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
+        0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE) { ret 4; }
+    var taken: session.Ticket;
+    if (!session.client_store_take(?store,
+        contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        time.Instant{sec: 253, nsec: 0}, ?taken) ||
+        taken.age_milliseconds != 3000) { ret 5; }
+    if (snapshot(?core).ticket_clock_failures != 0) { ret 6; }
+    session.ticket_destroy(?taken);
+    session.client_store_destroy(?store);
+    if (!destroy(?core) || !pool.destroy(?harness)) { ret 7; }
+    ret 0;
+}
+
+test "established: a ticket the clock cannot stamp is counted and leaves nothing" {
+    var send:       key_schedule.Secret = test_secret(18);
+    var receive:    key_schedule.Secret = test_secret(19);
+    var resumption: key_schedule.Secret = test_secret(20);
+    var store:      session.ClientStore;
+    if (!session.client_store_init(?store)) { ret 1; }
+    var harness: pool.Harness;
+    if (!pool.make(?harness, 1 << 20, 1 << 20)) { ret 2; }
+    var broken: clock.Source = clock.Source{context: nil, context_size: 0,
+        read_fn: unreadable};
+    var seed: Seed = test_seed(engine.CLIENT);
+    seed.sessions = ?store;
+    seed.clock    = ?broken;
+    var core: Established = empty();
+    if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
+        pool.lease(?harness))) { ret 3; }
+    var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
+        0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
+    # the connection stays open, the ticket is consumed, and nothing is kept
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE ||
+        ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE) { ret 4; }
+    val seen: engine.Snapshot = snapshot(?core);
+    if (seen.status != engine.COMPLETE || seen.ticket_clock_failures != 2) { ret 5; }
+    if (session.client_store_count(?store) != 0 || pool.held(?harness) != 0 ||
+        core.ticket.held || core.input_len != 0) { ret 6; }
+    # the counter saturates rather than wrapping
+    core.ticket_clock_failures = 255;
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE ||
+        snapshot(?core).ticket_clock_failures != 255) { ret 7; }
+    # a clock that recovers stamps the next ticket
+    core.clock = ?test_clock;
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE ||
+        session.client_store_count(?store) != 1) { ret 8; }
+    session.client_store_destroy(?store);
+    if (!destroy(?core) || !pool.destroy(?harness)) { ret 9; }
     ret 0;
 }

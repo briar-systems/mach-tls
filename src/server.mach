@@ -6,6 +6,8 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use std.chrono.duration;
+use std.chrono.time;
 use std.crypto.ct;
 use std.memory.buffers;
 use std.sync.atomic;
@@ -22,6 +24,7 @@ use tls.cert.name;
 use tls.cert.verify;
 use tls.cert.x509;
 use tls.client;
+use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
@@ -179,7 +182,6 @@ pub rec Handshake {
     suite:                    tls13.CipherSuite;
     group:                    tls13.NamedGroup;
     signature_scheme:         tls13.SignatureScheme;
-    verification_time:        i64;
     input_len:                usize;
     input_read:               usize;
     hello_len:                usize;
@@ -328,7 +330,8 @@ fun config_descriptor_valid(value: *config.ServerConfig) bool {
         $size_of(secret.Entropy))) { ret false; }
     if (value.credentials == nil ||
         !memory_range.valid((?value.credentials.lock)::*u8,
-        $size_of(credentials.Store))) { ret false; }
+        $size_of(credentials.Store)) ||
+        !clock.source_valid(value.clock)) { ret false; }
     ret true;
 }
 
@@ -342,7 +345,9 @@ fun descriptor_overlaps(value: *config.ServerConfig, data: *u8,
         memory_range.overlap(data, len, (?value.entropy.context)::*u8,
         $size_of(secret.Entropy)) ||
         memory_range.overlap(data, len, (?value.credentials.lock)::*u8,
-        $size_of(credentials.Store));
+        $size_of(credentials.Store)) ||
+        memory_range.overlap(data, len, value.clock::*u8,
+        $size_of(clock.Source));
 }
 
 fun config_borrows_valid(value: *config.ServerConfig,
@@ -403,8 +408,10 @@ fun borrowed_overlaps(value: *config.ServerConfig, extra: ExtraExtension,
         ret true;
     }
     if (include_callback_context &&
-        memory_range.overlap(data, len, value.entropy.context::*u8,
-        value.entropy_context_size)) { ret true; }
+        (memory_range.overlap(data, len, value.entropy.context::*u8,
+        value.entropy_context_size) ||
+        memory_range.overlap(data, len, value.clock.context::*u8,
+        value.clock.context_size))) { ret true; }
     var alpn_bytes:      usize = 0;
     var version_bytes:   usize = 0;
     var suite_bytes:     usize = 0;
@@ -478,6 +485,13 @@ fun config_sources_disjoint(server: *Handshake, value: *config.ServerConfig,
         value.entropy_context_size) ||
         borrowed_overlaps(value, extra, value.entropy.context::*u8,
         value.entropy_context_size, true, false))) { ret false; }
+    if (value.clock.context_size != 0 &&
+        (server_owner_overlaps(server, value.clock.context::*u8,
+        value.clock.context_size) ||
+        buffer.lease_overlaps(memory, value.clock.context::*u8,
+        value.clock.context_size) ||
+        borrowed_overlaps(value, extra, value.clock.context::*u8,
+        value.clock.context_size, true, false))) { ret false; }
     ret !borrowed_overlaps(value, extra, memory.source::*u8,
         $size_of(buffers.Source), true, true) &&
         !borrowed_overlaps(value, extra, memory.account::*u8,
@@ -573,6 +587,7 @@ fun configuration_equal(first: config.ServerConfig,
         first.signature_len == second.signature_len &&
         first.entropy == second.entropy &&
         first.entropy_context_size == second.entropy_context_size &&
+        first.clock == second.clock &&
         first.tickets == second.tickets && first.replay == second.replay &&
         first.replay_policy == second.replay_policy &&
         first.tickets_per_connection == second.tickets_per_connection &&
@@ -1016,7 +1031,7 @@ fun fail(server: *Handshake, failure: error.Error,
     ret result(engine.FAILED, failure, 0, 0);
 }
 
-fun start_inner(server: *Handshake, verification_time: i64) engine.Result {
+fun start_inner(server: *Handshake) engine.Result {
     if (!server_owner_valid(server) || server.config == nil ||
         server.state != EXPECT_CLIENT_HELLO || server.hello_len != 0 ||
         pending(server)) {
@@ -1025,7 +1040,6 @@ fun start_inner(server: *Handshake, verification_time: i64) engine.Result {
     val output: engine.Result = reserved(server, buffer.reserve(server.memory,
         ?server.buffers.output, server.output_required, 0));
     if (output.status != engine.OK) { ret output; }
-    server.verification_time = verification_time;
     if (!fill_public(server, ?server.random[0], 32)) {
         ret fail(server, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
     }
@@ -1043,11 +1057,11 @@ fun start_inner(server: *Handshake, verification_time: i64) engine.Result {
     ret result(engine.OK, error.OK, 0, handshake.HEADER_SIZE);
 }
 
-pub fun start(server: *Handshake, verification_time: i64) engine.Result {
+pub fun start(server: *Handshake) engine.Result {
     if (!enter(server)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val started: engine.Result = start_inner(server, verification_time);
+    val started: engine.Result = start_inner(server);
     leave(server);
     ret started;
 }
@@ -1308,6 +1322,8 @@ fun try_resume(server: *Handshake, hello: *codec.ClientHello,
     if (!offered_psk_dhe(hello)) { ret error.OK; }
     val count: usize = psk_identity_count(psk);
     if (count == 0) { ret error.OK; }
+    var now: clock.Moment;
+    if (!clock.read(server.config.clock, ?now)) { ret error.INTERNAL_ERROR; }
     var index: usize = 0;
     for (index < count) {
         var identity:       contracts.Bytes;
@@ -1315,14 +1331,13 @@ fun try_resume(server: *Handshake, hello: *codec.ClientHello,
         var state:          session.State;
         if (psk_identity_at(psk, index, ?identity, ?obfuscated_age) &&
             identity.len != 0 &&
-            session.open(server.config.tickets, identity,
-            server.verification_time, ?state)) {
+            session.open(server.config.tickets, identity, now, ?state)) {
             val usable: bool = configured_suite(server, state.suite) &&
                 offered_suite_value(hello, state.suite) &&
                 ticket_name_matches(server, ?state);
             if (usable) {
                 val failure: error.Error = accept_ticket(server, hello, frame,
-                    psk, index, identity, ?state);
+                    psk, index, identity, ?state, now.wall);
                 if (failure != error.OK) {
                     session.state_destroy(?state);
                     ret failure;
@@ -1353,7 +1368,7 @@ fun offered_suite_value(hello: *codec.ClientHello,
 # verify the binder over the truncated client hello on a separate transcript
 fun accept_ticket(server: *Handshake, hello: *codec.ClientHello,
     frame: contracts.Bytes, psk: extensions.Extension, index: usize,
-    identity: contracts.Bytes, state: *session.State) error.Error {
+    identity: contracts.Bytes, state: *session.State, now: time.Time) error.Error {
     var offered: contracts.Bytes;
     if (!psk_binder_at(psk, index, ?offered)) { ret error.ILLEGAL_PARAMETER; }
     val size: usize = key_schedule.hash_size(
@@ -1407,8 +1422,8 @@ fun accept_ticket(server: *Handshake, hello: *codec.ClientHello,
     # ticket identity, which is what a single-use policy actually bounds
     if (server.config.replay_policy == session.REPLAY_SINGLE_USE &&
         !session.replay_admit(server.config.replay, identity,
-        state.issued_at + state.lifetime_seconds::i64,
-        server.verification_time)) {
+        time.time_add(state.issued_at, state.lifetime_seconds::i64 * duration.SECOND),
+        now)) {
         key_schedule.destroy(?server.schedule);
         ret error.OK;
     }
@@ -2188,10 +2203,12 @@ fun handle_client_certificate(server: *Handshake, frame: contracts.Bytes,
     val chain: cert.Chain = cert.Chain{
         certificates: ?server.certificates[0], len: count
     };
+    var now: clock.Moment;
+    if (!clock.read(server.config.clock, ?now)) { ret error.INTERNAL_ERROR; }
     var options: verify.Options;
     options.identity             = contracts.Bytes{data: nil, len: 0};
     options.purpose              = verify.CLIENT_AUTH;
-    options.now                  = server.verification_time;
+    options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
     failure                      = verify.chain(server.client_trust, ?chain, ?options);
@@ -2304,7 +2321,7 @@ fun handle_client_finished(server: *Handshake, frame: contracts.Bytes,
 }
 
 fun ticket_state_for(server: *Handshake, nonce: contracts.Bytes,
-    output: *session.State) bool {
+    issued_at: time.Time, output: *session.State) bool {
     val size: usize = key_schedule.hash_size(server.schedule.algorithm);
     @output = session.empty_state();
     if (key_schedule.resumption_psk(?server.schedule, nonce,
@@ -2316,7 +2333,7 @@ fun ticket_state_for(server: *Handshake, nonce: contracts.Bytes,
     output.version               = tls13.VERSION;
     output.suite                 = server.suite;
     output.secret_len            = size;
-    output.issued_at             = server.verification_time;
+    output.issued_at             = issued_at;
     output.lifetime_seconds      = server.config.tickets.ticket_lifetime_seconds;
     output.max_early_data        = 0;
     output.client_authenticated  = server.authenticated;
@@ -2341,6 +2358,9 @@ fun ticket_state_for(server: *Handshake, nonce: contracts.Bytes,
 fun issue_tickets(server: *Handshake) error.Error {
     if (server.config.tickets == nil ||
         server.config.tickets_per_connection == 0) { ret error.OK; }
+    # one reading for the whole batch, taken before any ticket is derived
+    var now: clock.Moment;
+    if (!clock.read(server.config.clock, ?now)) { ret error.INTERNAL_ERROR; }
     var issued: u8 = 0;
     for (issued < server.config.tickets_per_connection) {
         var nonce: [session.NONCE_SIZE]u8;
@@ -2354,7 +2374,7 @@ fun issue_tickets(server: *Handshake) error.Error {
         var state: session.State;
         if (!ticket_state_for(server,
             contracts.Bytes{data: ?nonce[0], len: session.NONCE_SIZE},
-            ?state)) { ret error.INTERNAL_ERROR; }
+            now.wall, ?state)) { ret error.INTERNAL_ERROR; }
         var age_add: [4]u8;
         if (!fill_public(server, ?age_add[0], 4)) {
             session.state_destroy(?state);
@@ -2364,7 +2384,7 @@ fun issue_tickets(server: *Handshake) error.Error {
             (age_add[2]::u32 << 8) | age_add[3]::u32;
         var sealed: [session.MAX_TICKET_BYTES]u8;
         val length: usize = session.seal(server.config.tickets, ?state,
-            server.verification_time, ?server.entropy,
+            now, ?server.entropy,
             contracts.Buffer{data: ?sealed[0],
             capacity: session.MAX_TICKET_BYTES});
         if (length == 0) {
@@ -2709,7 +2729,7 @@ fun discard_completed(server: *Handshake) {
     seed.max_message_bytes     = server.config.limits.max_peer_handshake_bytes;
     seed.max_ticket_bytes      = server.config.limits.max_ticket_bytes;
     seed.sessions              = nil;
-    seed.verification_time     = server.verification_time;
+    seed.clock                 = server.config.clock;
     val seeded: bool = established.begin(?server.core, seed,
         ?server.schedule.server_application_traffic,
         ?server.schedule.client_application_traffic, nil,
@@ -2987,13 +3007,51 @@ fun no_extra_extension() ExtraExtension {
     ret value;
 }
 
+var test_moment: clock.Moment;
+var test_clock:  clock.Source;
+
+# every test configuration reads this frozen clock, set by the helper below
+fun test_source() *clock.Source {
+    if (test_clock.read_fn == nil) { set_test_time(1800000000); }
+    ret ?test_clock;
+}
+
+fun set_test_time(seconds: i64) {
+    set_test_moment(clock.at(seconds, seconds));
+}
+
+fun set_test_moment(value: clock.Moment) {
+    test_moment = value;
+    test_clock  = clock.frozen(?test_moment);
+}
+
+fun start_at(value: *Handshake, seconds: i64) engine.Result {
+    set_test_time(seconds);
+    ret start(value);
+}
+
+fun start_moment(value: *Handshake, at: clock.Moment) engine.Result {
+    set_test_moment(at);
+    ret start(value);
+}
+
+fun client_start_moment(value: *client.Handshake, at: clock.Moment) engine.Result {
+    set_test_moment(at);
+    ret client.start(value);
+}
+
+fun client_start_at(value: *client.Handshake, seconds: i64) engine.Result {
+    set_test_time(seconds);
+    ret client.start(value);
+}
+
 test "server: configuration rejects unbounded and missing ownership" {
     var server:        Handshake;
     var configuration: config.ServerConfig;
     if (init(?server, ?configuration, pool.shared(), no_extra_extension(), 0)) { ret 1; }
     if (snapshot(?server).status != engine.MORE ||
         snapshot(?server).role != engine.SERVER) { ret 2; }
-    if (start(?server, 0).status != engine.FAILED ||
+    if (start_at(?server, 0).status != engine.FAILED ||
         ingest(?server, engine.INITIAL, nil, 0).status != engine.FAILED) { ret 3; }
     ret 0;
 }
@@ -3280,6 +3338,7 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     listener.signature_len                   = 1;
     listener.entropy                         = ?server_entropy;
     listener.entropy_context_size            = 1;
+    listener.clock                           = test_source();
     listener.limits                          = config.production_limits();
     listener.limits.max_peer_handshake_bytes = 8192;
     listener.limits.max_client_hello_bytes   = 8192;
@@ -3299,7 +3358,7 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     }
     var listener_engine: Handshake;
     if (!init(?listener_engine, ?listener, server_storage, extra, 0) ||
-        start(?listener_engine, 1800000000).status != engine.OK) { ret 5; }
+        start_at(?listener_engine, 1800000000).status != engine.OK) { ret 5; }
 
     var anchor: cert.Certificate = cert.Certificate{der: ?loopback_root[0],
         der_len: 341};
@@ -3325,6 +3384,7 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     dialer.client_identity                 = nil;
     dialer.entropy                         = ?client_entropy;
     dialer.entropy_context_size            = 1;
+    dialer.clock                           = test_source();
     dialer.limits                          = config.production_limits();
     dialer.limits.max_peer_handshake_bytes = 8192;
     dialer.limits.max_chain_bytes          = 7168;
@@ -3335,7 +3395,7 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     client_extra.data.len  = 0;
     var dialer_engine: client.Handshake;
     if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra, 0) ||
-        client.start(?dialer_engine, 1800000000).status != engine.OK) { ret 6; }
+        client_start_at(?dialer_engine, 1800000000).status != engine.OK) { ret 6; }
 
     val exchanged: i64 = exchange(?listener_engine, ?dialer_engine);
     if (exchanged != 0) { ret 10 + exchanged::i32; }
@@ -3376,9 +3436,9 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     # the same records and storage carry a second handshake whose secrets
     # start again at generation one
     if (!init(?listener_engine, ?listener, server_storage, extra, 0) ||
-        start(?listener_engine, 1800000001).status != engine.OK) { ret 40; }
+        start_at(?listener_engine, 1800000001).status != engine.OK) { ret 40; }
     if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra, 0) ||
-        client.start(?dialer_engine, 1800000001).status != engine.OK) { ret 41; }
+        client_start_at(?dialer_engine, 1800000001).status != engine.OK) { ret 41; }
     if (!client.snapshot(?dialer_engine).output_pending)       { ret 46; }
     if (client.snapshot(?dialer_engine).status != engine.MORE) { ret 47; }
     if (snapshot(?listener_engine).status != engine.MORE)      { ret 48; }
@@ -3457,6 +3517,7 @@ test "server: quic transport parameters reach the caller as an event" {
     listener.signature_len                   = 1;
     listener.entropy                         = ?server_entropy;
     listener.entropy_context_size            = 1;
+    listener.clock                           = test_source();
     listener.limits                          = config.production_limits();
     listener.limits.max_peer_handshake_bytes = 8192;
     listener.limits.max_client_hello_bytes   = 8192;
@@ -3473,7 +3534,7 @@ test "server: quic transport parameters reach the caller as an event" {
     var listener_engine: Handshake;
     if (!init(?listener_engine, ?listener, server_storage, extra,
         QUIC_TRANSPORT_PARAMETERS) ||
-        start(?listener_engine, 1800000000).status != engine.OK) { ret 4; }
+        start_at(?listener_engine, 1800000000).status != engine.OK) { ret 4; }
 
     var anchor: cert.Certificate = cert.Certificate{der: ?loopback_root[0],
         der_len: 341};
@@ -3499,6 +3560,7 @@ test "server: quic transport parameters reach the caller as an event" {
     dialer.client_identity                 = nil;
     dialer.entropy                         = ?client_entropy;
     dialer.entropy_context_size            = 1;
+    dialer.clock                           = test_source();
     dialer.limits                          = config.production_limits();
     dialer.limits.max_peer_handshake_bytes = 8192;
     dialer.limits.max_chain_bytes          = 7168;
@@ -3512,7 +3574,7 @@ test "server: quic transport parameters reach the caller as an event" {
     var dialer_engine: client.Handshake;
     if (!client.init(?dialer_engine, ?dialer, client_storage, client_extra,
         client.QUIC_TRANSPORT_PARAMETERS) ||
-        client.start(?dialer_engine, 1800000000).status != engine.OK) { ret 5; }
+        client_start_at(?dialer_engine, 1800000000).status != engine.OK) { ret 5; }
 
     val exchanged: i64 = exchange_recording(?listener_engine, ?dialer_engine);
     if (exchanged != 0) { ret 10 + exchanged::i32; }
@@ -3683,6 +3745,7 @@ fun corpus_listener(listener: *config.ServerConfig, store: *credentials.Store,
     listener.signature_len                   = 1;
     listener.entropy                         = entropy;
     listener.entropy_context_size            = 1;
+    listener.clock                           = test_source();
     listener.limits                          = config.production_limits();
     listener.limits.max_peer_handshake_bytes = 8192;
     listener.limits.max_client_hello_bytes   = 8192;
@@ -3701,7 +3764,7 @@ fun reject_code(listener: *config.ServerConfig, hello_len: usize,
     var value: Handshake;
     @failure = error.INTERNAL_ERROR;
     if (!init(?value, listener, storage, extra, 0) ||
-        start(?value, 1800000000).status != engine.OK) { ret record.NO_ALERT; }
+        start_at(?value, 1800000000).status != engine.OK) { ret record.NO_ALERT; }
     val fed: engine.Result = ingest(?value, engine.INITIAL, ?corpus_hello[0],
         hello_len);
     if (fed.status != engine.FAILED) {
@@ -3781,7 +3844,7 @@ test "server: malformed client hellos fail with protocol-correct alerts" {
     partial_extra.data.len  = 0;
     var partial: Handshake;
     if (!init(?partial, ?listener, accepted_storage, partial_extra, 0) ||
-        start(?partial, 1800000000).status != engine.OK) { ret 5; }
+        start_at(?partial, 1800000000).status != engine.OK) { ret 5; }
     var byte: usize = 0;
     for (byte + 1 < hello_len) {
         val fed: engine.Result = ingest(?partial, engine.INITIAL,
@@ -3952,7 +4015,7 @@ var resume_generation:        credentials.Generation;
 var resume_store_credentials: credentials.Store;
 
 fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
-    owner: *secret.Allocator, now: i64) bool {
+    owner: *secret.Allocator, now: clock.Moment) bool {
     if (!load_test_credentials(?resume_identity, ?resume_chain[0], ?resume_key,
         owner)) { ret false; }
     resume_generation = credentials.empty_generation();
@@ -3990,6 +4053,7 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     resume_listener.signature_len                   = 1;
     resume_listener.entropy                         = ?resume_server_entropy;
     resume_listener.entropy_context_size            = 1;
+    resume_listener.clock                           = test_source();
     resume_listener.tickets                         = ?resume_ring;
     resume_listener.replay                          = ?resume_window;
     resume_listener.replay_policy                   = policy;
@@ -4018,6 +4082,7 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     resume_dialer.signature_len                   = 1;
     resume_dialer.entropy                         = ?resume_client_entropy;
     resume_dialer.entropy_context_size            = 1;
+    resume_dialer.clock                           = test_source();
     resume_dialer.sessions                        = ?resume_store;
     resume_dialer.limits                          = config.production_limits();
     resume_dialer.limits.max_peer_handshake_bytes = 16384;
@@ -4027,14 +4092,14 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
 }
 
 fun resume_connect(listener_engine: *Handshake, dialer_engine: *client.Handshake,
-    now: i64) i64 {
+    now: clock.Moment) i64 {
     val server_storage: buffer.Lease = pool.shared();
     var extra:          ExtraExtension;
     extra.kind      = 0;
     extra.data.data = nil;
     extra.data.len  = 0;
     if (!init(listener_engine, ?resume_listener, server_storage, extra, 0) ||
-        start(listener_engine, now).status != engine.OK) { ret 1; }
+        start_moment(listener_engine, now).status != engine.OK) { ret 1; }
     val client_storage: buffer.Lease = pool.shared();
     var client_extra:   client.ExtraExtension;
     client_extra.kind      = 0;
@@ -4042,7 +4107,7 @@ fun resume_connect(listener_engine: *Handshake, dialer_engine: *client.Handshake
     client_extra.data.len  = 0;
     if (!client.init(dialer_engine, ?resume_dialer, client_storage,
         client_extra, 0) ||
-        client.start(dialer_engine, now).status != engine.OK) { ret 2; }
+        client_start_moment(dialer_engine, now).status != engine.OK) { ret 2; }
     val exchanged: i64 = exchange(listener_engine, dialer_engine);
     if (exchanged != 0) { ret 3; }
     ret 0;
@@ -4101,13 +4166,13 @@ fun secrets_match(local: *Handshake, peer: *client.Handshake, server_send: bool)
 
 test "session: a ticket resumes one connection and a key update rekeys it" {
     var owner: secret.Allocator = secret.system_allocator();
-    if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, 1800000000)) {
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
     var listener_engine: Handshake;
     var dialer_engine:   client.Handshake;
     val first:           i64 = resume_connect(?listener_engine, ?dialer_engine,
-        1800000000);
+        clock.at(1800000000, 1800000000));
     if (first != 0) { ret 10 + first::i32; }
     if (snapshot(?listener_engine).resumed ||
         client.snapshot(?dialer_engine).resumed) { ret 2; }
@@ -4139,7 +4204,7 @@ test "session: a ticket resumes one connection and a key update rekeys it" {
     var second_listener: Handshake;
     var second_dialer:   client.Handshake;
     val second:          i64 = resume_connect(?second_listener, ?second_dialer,
-        1800000100);
+        clock.at(1800000100, 1800000100));
     if (second != 0) { ret 60 + second::i32; }
     val server_view: engine.Snapshot = snapshot(?second_listener);
     val client_view: engine.Snapshot = client.snapshot(?second_dialer);
@@ -4220,13 +4285,13 @@ fun marks_equal(first: Marks, second: Marks) bool {
 
 # one pressured call: kind 0 start, 1 ingest, 2 poll
 fun pressed_server(local: *Handshake, kind: u8, level: engine.Level, data: *u8,
-    length: usize, now: i64) engine.Result {
+    length: usize, now: clock.Moment) engine.Result {
     hog();
     val before:  Marks = server_marks(local);
     var outcome: engine.Result;
     var round:   usize = 0;
     for (round < 2) {
-        if (kind == 0)                        { outcome = start(local, now); }
+        if (kind == 0)                        { outcome = start_moment(local, now); }
         or (kind == 1)                        { outcome = ingest(local, level, data, length); }
         or                                    { outcome = poll(local); }
         if (outcome.status != engine.WAITING) { brk; }
@@ -4242,13 +4307,13 @@ fun pressed_server(local: *Handshake, kind: u8, level: engine.Level, data: *u8,
 }
 
 fun pressed_client(peer: *client.Handshake, kind: u8, level: engine.Level, data: *u8,
-    length: usize, now: i64) engine.Result {
+    length: usize, now: clock.Moment) engine.Result {
     hog();
     val before:  Marks = client_marks(peer);
     var outcome: engine.Result;
     var round:   usize = 0;
     for (round < 2) {
-        if (kind == 0)                        { outcome = client.start(peer, now); }
+        if (kind == 0)                        { outcome = client_start_moment(peer, now); }
         or (kind == 1)                        { outcome = client.ingest(peer, level, data, length); }
         or                                    { outcome = client.poll(peer); }
         if (outcome.status != engine.WAITING) { brk; }
@@ -4272,7 +4337,7 @@ fun pressed_exchange(local: *Handshake, peer: *client.Handshake) i64 {
             progressed = true;
             if (event.kind == engine.CRYPTO &&
                 pressed_client(peer, 1, event.level, event.data.data,
-                event.data.len, 0).status == engine.FAILED) { ret 100; }
+                event.data.len, clock.at(0, 0)).status == engine.FAILED) { ret 100; }
             if (!complete_event(local, event.token, true)) { ret 101; }
         }
         var peer_event: engine.Event;
@@ -4280,14 +4345,14 @@ fun pressed_exchange(local: *Handshake, peer: *client.Handshake) i64 {
             progressed = true;
             if (peer_event.kind == engine.CRYPTO &&
                 pressed_server(local, 1, peer_event.level, peer_event.data.data,
-                peer_event.data.len, 0).status == engine.FAILED) { ret 102; }
+                peer_event.data.len, clock.at(0, 0)).status == engine.FAILED) { ret 102; }
             if (!client.complete_event(peer, peer_event.token, true)) { ret 103; }
         }
         if (!progressed && snapshot(local).status == engine.COMPLETE &&
             client.snapshot(peer).status == engine.COMPLETE) { ret 0; }
         if (!progressed) {
-            pressed_server(local, 2, 0, nil, 0, 0);
-            pressed_client(peer, 2, 0, nil, 0, 0);
+            pressed_server(local, 2, 0, nil, 0, clock.at(0, 0));
+            pressed_client(peer, 2, 0, nil, 0, clock.at(0, 0));
             if (!pending(local) && !client.snapshot(peer).output_pending) {
                 ret 104;
             }
@@ -4308,14 +4373,14 @@ fun copy_secret_bytes(from: *key_schedule.Secret, output: *u8) {
 
 test "memory: a handshake that waits for memory matches one that never did" {
     var owner: secret.Allocator = secret.system_allocator();
-    if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, 1800000000)) {
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
     var listener_engine: Handshake;
     var dialer_engine:   client.Handshake;
     val server_counter:  u8 = resume_server_counter;
     val client_counter:  u8 = resume_client_counter;
-    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) != 0) { ret 2; }
+    if (resume_connect(?listener_engine, ?dialer_engine, clock.at(1800000000, 1800000000)) != 0) { ret 2; }
     var calm: [128]u8;
     copy_secret_bytes(?listener_engine.core.send, ?calm[0]);
     copy_secret_bytes(?listener_engine.core.receive, ?calm[64]);
@@ -4335,8 +4400,8 @@ test "memory: a handshake that waits for memory matches one that never did" {
     client_extra.data.len  = 0;
     if (!init(?listener_engine, ?resume_listener, memory, extra, 0) ||
         !client.init(?dialer_engine, ?resume_dialer, memory, client_extra, 0)) { ret 5; }
-    if (pressed_server(?listener_engine, 0, 0, nil, 0, 1800000000).status != engine.OK ||
-        pressed_client(?dialer_engine, 0, 0, nil, 0, 1800000000).status != engine.OK) {
+    if (pressed_server(?listener_engine, 0, 0, nil, 0, clock.at(1800000000, 1800000000)).status != engine.OK ||
+        pressed_client(?dialer_engine, 0, 0, nil, 0, clock.at(1800000000, 1800000000)).status != engine.OK) {
         ret 6;
     }
     val exchanged: i64 = pressed_exchange(?listener_engine, ?dialer_engine);
@@ -4400,15 +4465,268 @@ fun cores_match(server_core: *established.Established,
     ret true;
 }
 
+fun unreadable(context: ptr, output: *clock.Moment) bool {
+    ret false;
+}
+
+var broken_clock: clock.Source;
+
+fun release_resume() i32 {
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 1; }
+    ret 0;
+}
+
+test "clock: a server that cannot read its clock issues no ticket" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, clock.at(1800000000, 1800000000))) {
+        ret 1;
+    }
+    broken_clock          = clock.Source{context: nil, context_size: 0, read_fn: unreadable};
+    resume_listener.clock = ?broken_clock;
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000000, 1800000000)) == 0) { ret 2; }
+    val seen: engine.Snapshot = snapshot(?listener_engine);
+    if (seen.status != engine.FAILED || seen.error != error.INTERNAL_ERROR ||
+        seen.tickets_issued != 0) { ret 3; }
+    # nothing reached the ring or the peer
+    if (session.keyring_generation(?resume_ring) != 1 ||
+        session.client_store_count(?resume_store) != 0) { ret 4; }
+    destroy(?listener_engine);
+    client.destroy(?dialer_engine);
+    resume_listener.clock = test_source();
+    if (release_resume() != 0) { ret 10; }
+    ret 0;
+}
+
+test "clock: a failed read refuses resumption and a client keeps its ticket" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, clock.at(1800000000, 1800000000))) {
+        ret 1;
+    }
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000000, 1800000000)) != 0 ||
+        pump_post(?listener_engine, ?dialer_engine) != 0) { ret 2; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 3; }
+    if (session.client_store_count(?resume_store) != 1)                { ret 4; }
+
+    # a client that cannot read its clock fails before it takes the ticket
+    broken_clock        = clock.Source{context: nil, context_size: 0, read_fn: unreadable};
+    resume_dialer.clock = ?broken_clock;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000100, 1800000100)) == 0) { ret 5; }
+    val dialer: engine.Snapshot = client.snapshot(?dialer_engine);
+    if (dialer.status != engine.FAILED || dialer.error != error.INTERNAL_ERROR ||
+        session.client_store_count(?resume_store) != 1) { ret 6; }
+    destroy(?listener_engine);
+    client.destroy(?dialer_engine);
+    resume_dialer.clock = test_source();
+
+    # a server that cannot read its clock fails the resumption, and the
+    # single-use window never saw the ticket
+    resume_listener.clock = ?broken_clock;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000200, 1800000200)) == 0) { ret 7; }
+    val listener: engine.Snapshot = snapshot(?listener_engine);
+    if (listener.status != engine.FAILED || listener.error != error.INTERNAL_ERROR ||
+        listener.resumed || resume_window.admitted != 0) { ret 8; }
+    destroy(?listener_engine);
+    client.destroy(?dialer_engine);
+    resume_listener.clock = test_source();
+    if (release_resume() != 0) { ret 20; }
+    ret 0;
+}
+
+var flight_digest: u64;
+var flight_bytes:  usize;
+
+fun digest(data: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        flight_digest = (flight_digest ^ data[i]::u64) * 0x100000001b3;
+        i             = i + 1;
+    }
+    flight_bytes = flight_bytes + length;
+}
+
+# the exchange of `exchange`, folding every flight either side sends into the
+# digest in the order it was sent
+fun exchange_digest(local: *Handshake, peer: *client.Handshake) i64 {
+    var rounds: usize = 0;
+    for (rounds < 64) {
+        var progressed: bool = false;
+        var event:      engine.Event;
+        for (next_event(local, ?event)) {
+            progressed = true;
+            if (event.kind == engine.CRYPTO) {
+                digest(event.data.data, event.data.len);
+                if (client.ingest(peer, event.level, event.data.data,
+                    event.data.len).status == engine.FAILED) { ret 1; }
+            }
+            if (!complete_event(local, event.token, true)) { ret 2; }
+        }
+        var peer_event: engine.Event;
+        for (client.next_event(peer, ?peer_event)) {
+            progressed = true;
+            if (peer_event.kind == engine.CRYPTO) {
+                digest(peer_event.data.data, peer_event.data.len);
+                if (ingest(local, peer_event.level, peer_event.data.data,
+                    peer_event.data.len).status == engine.FAILED) { ret 3; }
+            }
+            if (!client.complete_event(peer, peer_event.token, true)) { ret 4; }
+        }
+        if (!progressed && snapshot(local).status == engine.COMPLETE &&
+            client.snapshot(peer).status == engine.COMPLETE) { ret 0; }
+        if (!progressed) {
+            poll(local);
+            client.poll(peer);
+            if (!pending(local) && !client.snapshot(peer).output_pending) {
+                ret 5;
+            }
+        }
+        rounds = rounds + 1;
+    }
+    ret 6;
+}
+
+# a full handshake, its tickets, and a resumption, all under the frozen clock;
+# the digest covers every flight of both connections
+# a full handshake that issues a ticket, then a resumption `shift` monotonic
+# seconds later than otherwise, all under the frozen clock. the digest covers
+# every flight of both connections
+fun digest_run(shift: i64, output: *u64) i32 {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 9000))) {
+        ret 1;
+    }
+    flight_digest = 0xcbf29ce484222325;
+    flight_bytes  = 0;
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    val server_storage:  buffer.Lease = pool.shared();
+    var extra:           ExtraExtension;
+    extra.kind      = 0;
+    extra.data.data = nil;
+    extra.data.len  = 0;
+    var client_extra: client.ExtraExtension;
+    client_extra.kind      = 0;
+    client_extra.data.data = nil;
+    client_extra.data.len  = 0;
+    var round: usize = 0;
+    for (round < 2) {
+        val later: i64 = round::i64;
+        set_test_moment(clock.at(1800000000 + later * 60, 9000 + later * (7 + shift)));
+        if (!init(?listener_engine, ?resume_listener, server_storage, extra, 0) ||
+            start(?listener_engine).status != engine.OK ||
+            !client.init(?dialer_engine, ?resume_dialer, pool.shared(), client_extra, 0) ||
+            client.start(?dialer_engine).status != engine.OK) { ret 2; }
+        if (exchange_digest(?listener_engine, ?dialer_engine) != 0 ||
+            pump_post(?listener_engine, ?dialer_engine) != 0) { ret 3; }
+        if (snapshot(?listener_engine).resumed != (round == 1))            { ret 4; }
+        if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 5; }
+        round = round + 1;
+    }
+    @output = flight_digest;
+    if (flight_bytes == 0 || release_resume() != 0) { ret 6; }
+    ret 0;
+}
+
+test "clock: a frozen source makes the flights of two runs identical" {
+    var first:  u64 = 0;
+    var second: u64 = 0;
+    val a:      i32 = digest_run(0, ?first);
+    if (a != 0) { ret 10 + a; }
+    val first_bytes: usize = flight_bytes;
+    val b:           i32   = digest_run(0, ?second);
+    if (b != 0)                                         { ret 20 + b; }
+    if (first != second || flight_bytes != first_bytes) { ret 30; }
+    # the digest does see the clock: a resumption one second later differs
+    var shifted: u64 = 0;
+    val c:       i32 = digest_run(1, ?shifted);
+    if (c != 0)           { ret 40 + c; }
+    if (shifted == first) { ret 50; }
+    ret 0;
+}
+
+test "resume: the offered identity carries the ticket's obfuscated age" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 5000))) {
+        ret 1;
+    }
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000000, 5000)) != 0 ||
+        pump_post(?listener_engine, ?dialer_engine) != 0) { ret 2; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 3; }
+    if (session.client_store_count(?resume_store) != 1)                { ret 4; }
+
+    # the wall clock jumped ten minutes while the monotonic clock moved 3s
+    val later: clock.Moment = clock.at(1800000000 + 600, 5003);
+    var kept:  session.Ticket;
+    if (!session.client_store_take(?resume_store,
+        contracts.Bytes{data: "api.example.com"::*u8, len: 15}, later.monotonic,
+        ?kept) || kept.age_milliseconds != 3000) { ret 5; }
+    val expected: u32 = (3000::u64 + kept.age_add::u64)::u32;
+    kept.valid = true;
+    if (!session.client_store_save(?resume_store, ?kept)) { ret 6; }
+
+    val server_storage: buffer.Lease = pool.shared();
+    var extra:          ExtraExtension;
+    extra.kind      = 0;
+    extra.data.data = nil;
+    extra.data.len  = 0;
+    var client_extra: client.ExtraExtension;
+    client_extra.kind      = 0;
+    client_extra.data.data = nil;
+    client_extra.data.len  = 0;
+    if (!init(?listener_engine, ?resume_listener, server_storage, extra, 0) ||
+        start_moment(?listener_engine, later).status != engine.OK ||
+        !client.init(?dialer_engine, ?resume_dialer, pool.shared(), client_extra, 0) ||
+        client_start_moment(?dialer_engine, later).status != engine.OK) { ret 7; }
+    var event: engine.Event;
+    if (!client.next_event(?dialer_engine, ?event) || event.kind != engine.CRYPTO ||
+        ingest(?listener_engine, event.level, event.data.data,
+        event.data.len).status == engine.FAILED) { ret 8; }
+    var hello: codec.ClientHello;
+    var psk:   extensions.Extension;
+    if (decode_retained_hello(?listener_engine, ?hello) != error.OK ||
+        !extensions.find(hello.extensions, extensions.PRE_SHARED_KEY, ?psk)) { ret 9; }
+    var identity: contracts.Bytes;
+    var age:      u32 = 0;
+    if (!psk_identity_at(psk, 0, ?identity, ?age) || age != expected) { ret 10; }
+    if (!client.complete_event(?dialer_engine, event.token, true) ||
+        exchange(?listener_engine, ?dialer_engine) != 0 ||
+        !snapshot(?listener_engine).resumed) { ret 11; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 13; }
+
+    session.ticket_destroy(?kept);
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 12; }
+    ret 0;
+}
+
 test "finish: established cores carry the connection and the handshakes are reused" {
     var owner: secret.Allocator = secret.system_allocator();
-    if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, 1800000000)) {
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
     var listener_engine: Handshake;
     var dialer_engine:   client.Handshake;
     val connected:       i64 = resume_connect(?listener_engine, ?dialer_engine,
-        1800000000);
+        clock.at(1800000000, 1800000000));
     if (connected != 0) { ret 10 + connected::i32; }
     # the handshake still reports the peer's name before finish
     val before: engine.Snapshot = snapshot(?listener_engine);
@@ -4455,7 +4773,7 @@ test "finish: established cores carry the connection and the handshakes are reus
         pump_cores(?server_core, ?client_core) != 0) { ret 15; }
 
     # the released handshakes carry a second connection
-    val again: i64 = resume_connect(?listener_engine, ?dialer_engine, 1800000100);
+    val again: i64 = resume_connect(?listener_engine, ?dialer_engine, clock.at(1800000100, 1800000100));
     if (again != 0) { ret 30 + again::i32; }
     if (!established.destroy(?server_core) || !established.destroy(?client_core) ||
         server_core.send.active || client_core.resumption.active) { ret 16; }
@@ -4472,24 +4790,24 @@ test "finish: established cores carry the connection and the handshakes are reus
 
 test "limits: input grows for a long chain and an oversized entry is refused" {
     var owner: secret.Allocator = secret.system_allocator();
-    if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, 1800000000)) {
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
     var listener_engine: Handshake;
     var dialer_engine:   client.Handshake;
     # the default chain limit costs nothing until a chain arrives
     resume_dialer.limits.max_chain_bytes = config.production_limits().max_chain_bytes;
-    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) != 0) { ret 2; }
+    if (resume_connect(?listener_engine, ?dialer_engine, clock.at(1800000000, 1800000000)) != 0) { ret 2; }
     if (dialer_engine.buffers.input.chunk.bytes > 4096 ||
         !destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 3; }
     # an entry above its own limit fails the handshake even inside the chain limit
     resume_dialer.limits.max_chain_bytes       = 12288;
     resume_dialer.limits.max_certificate_bytes = 64;
-    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) == 0) { ret 4; }
-    if (client.snapshot(?dialer_engine).error != error.BAD_CERTIFICATE)    { ret 5; }
-    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine))     { ret 6; }
+    if (resume_connect(?listener_engine, ?dialer_engine, clock.at(1800000000, 1800000000)) == 0) { ret 4; }
+    if (client.snapshot(?dialer_engine).error != error.BAD_CERTIFICATE)                          { ret 5; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine))                           { ret 6; }
     resume_dialer.limits.max_certificate_bytes = 16384;
-    val served: i64 = resume_connect(?listener_engine, ?dialer_engine, 1800000000);
+    val served: i64 = resume_connect(?listener_engine, ?dialer_engine, clock.at(1800000000, 1800000000));
     if (served != 0)                                                   { ret 10 + served::i32; }
     if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 7; }
 
@@ -4504,12 +4822,12 @@ test "limits: input grows for a long chain and an oversized entry is refused" {
 
 test "session: replay control, rotation overlap, and long sessions hold" {
     var owner: secret.Allocator = secret.system_allocator();
-    if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, 1800000000)) {
+    if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
     var listener_engine: Handshake;
     var dialer_engine:   client.Handshake;
-    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) != 0) {
+    if (resume_connect(?listener_engine, ?dialer_engine, clock.at(1800000000, 1800000000)) != 0) {
         ret 2;
     }
     if (pump_post(?listener_engine, ?dialer_engine) != 0) { ret 3; }
@@ -4533,15 +4851,15 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     # keep a copy of the ticket so the same one can be presented twice
     var kept: session.Ticket;
     if (!session.client_store_take(?resume_store,
-        contracts.Bytes{data: "api.example.com"::*u8, len: 15}, 1800000000,
-        ?kept)) { ret 8; }
+        contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        clock.at(1800000000, 1800000000).monotonic, ?kept)) { ret 8; }
     var offered: session.Ticket = kept;
     offered.valid = true;
     if (!session.client_store_save(?resume_store, ?offered)) { ret 9; }
 
     var second_listener: Handshake;
     var second_dialer:   client.Handshake;
-    if (resume_connect(?second_listener, ?second_dialer, 1800000100) != 0) {
+    if (resume_connect(?second_listener, ?second_dialer, clock.at(1800000100, 1800000100)) != 0) {
         ret 10;
     }
     if (!snapshot(?second_listener).resumed) { ret 11; }
@@ -4555,7 +4873,7 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     if (!session.client_store_save(?resume_store, ?offered)) { ret 13; }
     var third_listener: Handshake;
     var third_dialer:   client.Handshake;
-    if (resume_connect(?third_listener, ?third_dialer, 1800000200) != 0) {
+    if (resume_connect(?third_listener, ?third_dialer, clock.at(1800000200, 1800000200)) != 0) {
         ret 14;
     }
     if (snapshot(?third_listener).resumed ||
@@ -4568,14 +4886,14 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     # a ticket sealed before rotation still resumes inside the overlap
     resume_listener.replay_policy = session.REPLAY_PERMISSIVE;
     if (!session.keyring_rotate(?resume_ring, ?resume_server_entropy,
-        1800000300)) { ret 19; }
-    if (session.keyring_openable(?resume_ring, 1800000300) != 2) { ret 20; }
+        clock.at(1800000300, 1800000300))) { ret 19; }
+    if (session.keyring_openable(?resume_ring, clock.at(1800000300, 1800000300).monotonic) != 2) { ret 20; }
     offered       = kept;
     offered.valid = true;
     if (!session.client_store_save(?resume_store, ?offered)) { ret 21; }
     var fourth_listener: Handshake;
     var fourth_dialer:   client.Handshake;
-    if (resume_connect(?fourth_listener, ?fourth_dialer, 1800000400) != 0) {
+    if (resume_connect(?fourth_listener, ?fourth_dialer, clock.at(1800000400, 1800000400)) != 0) {
         ret 22;
     }
     if (!snapshot(?fourth_listener).resumed) { ret 23; }
@@ -4589,7 +4907,7 @@ test "session: replay control, rotation overlap, and long sessions hold" {
     if (!session.client_store_save(?resume_store, ?offered)) { ret 25; }
     var fifth_listener: Handshake;
     var fifth_dialer:   client.Handshake;
-    if (resume_connect(?fifth_listener, ?fifth_dialer, 1800002200) != 0) {
+    if (resume_connect(?fifth_listener, ?fifth_dialer, clock.at(1800002200, 1800002200)) != 0) {
         ret 26;
     }
     if (snapshot(?fifth_listener).resumed)                           { ret 27; }
@@ -4618,7 +4936,7 @@ fun feed_mutation(listener: *config.ServerConfig, length: usize) i64 {
     extra.data.len  = 0;
     var value: Handshake;
     if (!init(?value, listener, storage, extra, 0) ||
-        start(?value, 1800000000).status != engine.OK) { ret 1; }
+        start_at(?value, 1800000000).status != engine.OK) { ret 1; }
     val fed: engine.Result = ingest(?value, engine.INITIAL,
         ?mutation_case[0], length);
     var outcome: i64 = 0;
