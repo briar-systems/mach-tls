@@ -77,6 +77,10 @@ A Stream operation that must wait parks. It submits a scoped `USER_WAKE`
   record boundary. Cancelling it leaves the stream `OPEN`.
 - A handshake message the engine cannot take yet stays in the wire buffer and
   is offered again, before anything else, when the operation resumes.
+- `resume` wakes each lane parked for memory. When both are parked, the lane
+  holding the turn retries first, and the other is woken again once it has
+  acquired, so a single `resume` is enough (see
+  [`client.md`](client.md#concurrent-read-and-write)).
 
 `std.memory.buffers.ready` reports accounts, not callers. A wake for the
 connection's account may be for tls or for the caller's own chunks on that
@@ -96,5 +100,5 @@ own `std.memory.secret` region and its own account, and reads
 | after one request | 1 | 0 |
 | after `stream.destroy` | 1 | 0 |
 
-The page is the Stream record itself (1,704 bytes, both established records
-included). `$size_of(stream.Stream)` is the whole cost of an idle connection.
+The page is the Stream record itself (1,864 bytes, both established records
+and both lanes included). `$size_of(stream.Stream)` is the whole cost of an idle connection.
