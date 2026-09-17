@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.5.2] - 2026-09-17
+
+### Changed
+
+- An idle `next_event` checks for a pending event before it walks the borrowed configuration, storage and callback descriptors. With nothing queued it no longer costs O(ALPN entries + trust anchors + chain) (#88).
+- Every engine and Stream call enters through one shared guard (`tls.transition`). The guard wakes a sleeping thread only when one is waiting, so an uncontended call no longer makes a futex syscall. An idle `next_event` goes from about 1.2 µs to 0.4 µs in a debug build (#88).
+- A protected handshake record is revealed over its own consumed ciphertext. The Stream no longer zero-fills a 16,639-byte buffer for every handshake-type record, post-handshake ones included (#88).
+- Once the last handshake event is accepted, the engines wipe what an established connection never reads again (#88):
+  - the transcript
+  - the server's resumed PSK state
+  - the client's offered ticket
+  - the TLS 1.2 PRF secrets
+- Once the last handshake event is accepted, the server and the TLS 1.2 engine also release their credential lease. A rotated generation becomes reclaimable as soon as the handshakes that used it finish, instead of when their connections close (#88).
+
+### Added
+
+- `--footprint` in the interoperability server, and a footprint leg in the matrix (#88):
+  - Each connection is served from its own `std.memory.secret` region.
+  - The leg reports resident pages per region and the cost of an idle `next_event`.
+  - It bounds one connection at 11 pages idle and 20 after destroy. The measured baseline is 9 and 18.
+
 ## [0.5.1] - 2026-09-17
 
 ### Changed
