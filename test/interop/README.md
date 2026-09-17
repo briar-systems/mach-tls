@@ -188,10 +188,10 @@ openssl s_client -connect 127.0.0.1:9443 -servername api.example.com \
 ```
 
 Credential rotation while the connection is established. The server rotates
-after the handshake and before the application exchange, asserts that the
-retired generation is not reclaimable while the connection holds its lease,
-completes the exchange on the original credential, and asserts the generation
-becomes reclaimable once the connection is destroyed:
+after the handshake and before the application exchange. Because a completed
+connection holds no lease, it asserts that the retired generation is already
+reclaimable while the connection is open. It then completes the exchange and
+asserts the generation is still reclaimable once the connection is destroyed:
 
 ```sh
 # server: --rotate
@@ -446,8 +446,20 @@ zero. The client counts include the two P-384 verification legs.
 
 ```sh
 mach dep pull test/interop
+mach dep update test/interop tls
 mach build test/interop
 ./test/interop/run.sh
+```
+
+`mach dep update test/interop tls` refreshes the harness's copy of the library.
+`mach dep pull` alone keeps a copy taken earlier.
+
+The footprint leg serves four TLS 1.3 connections with `--footprint` and bounds
+the resident pages of the last connection's region, idle and after destroy (see
+[`../../doc/validation.md`](../../doc/validation.md)):
+
+```sh
+# server: --footprint --connections 4
 ```
 
 The runner executes every leg above, prints a pass or FAILED line per leg,
@@ -455,7 +467,7 @@ prints the peer versions and the release evidence, and exits non-zero naming any
 leg that failed. It is the qualification record for a revision, and it is the
 only place the legs are written down once rather than pasted twice.
 
-The qualification recorded for this revision is 55 legs passed, 0 failed,
+The qualification recorded for this revision is 58 legs passed, 0 failed,
 against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64.
 
 What the matrix does not cover is written down in
