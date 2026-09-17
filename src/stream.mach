@@ -363,18 +363,15 @@ fun operation_inputs_valid(stream: *Stream, scope: *cancel.Scope,
     ret !memory_range.overlap(scope::*u8, $size_of(cancel.Scope), buffer, len);
 }
 
-fun configuration_disjoint(stream: *Stream, memory: buffer.Lease,
-    lower: *transport.Transport) bool {
-    if (engine_aliases_configuration(stream, stream_owner_data(stream),
-        $size_of(Stream)) ||
-        engine_aliases_borrowed(stream, lower::*u8,
-        $size_of(transport.Transport)) ||
-        engine_aliases_borrowed(stream, lower.context::*u8,
-        lower.context_size) ||
-        engine_aliases_borrowed(stream, lower.runtime::*u8,
-        $size_of(runtime.Runtime))) { ret false; }
-    ret !engine_aliases_borrowed(stream, memory.source::*u8, $size_of(buffers.Source)) &&
-        !engine_aliases_borrowed(stream, memory.account::*u8, $size_of(buffers.Account));
+fun configuration_disjoint(stream: *Stream, lower: *transport.Transport) bool {
+    ret !engine_aliases_configuration(stream, stream_owner_data(stream),
+        $size_of(Stream)) &&
+        !engine_aliases_borrowed(stream, lower::*u8,
+        $size_of(transport.Transport)) &&
+        !engine_aliases_borrowed(stream, lower.context::*u8,
+        lower.context_size) &&
+        !engine_aliases_borrowed(stream, lower.runtime::*u8,
+        $size_of(runtime.Runtime));
 }
 
 fun algorithm(kind: record.Algorithm) record.Aead {
@@ -1094,7 +1091,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
     val ready: engine.Snapshot = engine_snapshot(stream);
     if (!engine_bound(stream) || ready.role != role || ready.destroyed ||
         ready.status != engine.MORE || ready.event_active ||
-        ready.output_pending || !configuration_disjoint(stream, memory, lower)) {
+        ready.output_pending || !configuration_disjoint(stream, lower)) {
         stream.role   = 0;
         stream.client = nil;
         stream.server = nil;
