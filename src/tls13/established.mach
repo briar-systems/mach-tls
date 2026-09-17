@@ -885,6 +885,10 @@ fun test_secret(fill: u8) key_schedule.Secret {
 var test_moment: clock.Moment;
 var test_clock:  clock.Source;
 
+fun unreadable(context: ptr, output: *clock.Moment) bool {
+    ret false;
+}
+
 fun test_seed(role: engine.Role) Seed {
     var seed: Seed;
     seed.role                 = role;
@@ -1067,5 +1071,73 @@ test "established: a ticket waits for memory without consuming anything" {
         session.client_store_count(?store) != 1) { ret 7; }
     session.client_store_destroy(?store);
     if (!destroy(?core) || !pool.destroy(?harness)) { ret 8; }
+    ret 0;
+}
+
+test "established: a ticket's age runs from its receipt, not the handshake" {
+    var send:       key_schedule.Secret = test_secret(15);
+    var receive:    key_schedule.Secret = test_secret(16);
+    var resumption: key_schedule.Secret = test_secret(17);
+    var store:      session.ClientStore;
+    if (!session.client_store_init(?store)) { ret 1; }
+    var harness: pool.Harness;
+    if (!pool.make(?harness, 1 << 20, 1 << 20)) { ret 2; }
+    var seed: Seed = test_seed(engine.CLIENT);
+    seed.sessions = ?store;
+    var core: Established = empty();
+    if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
+        pool.lease(?harness))) { ret 3; }
+    # the ticket arrives 150s into the connection
+    test_moment = clock.at(1800000000, 250);
+    var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
+        0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE) { ret 4; }
+    var taken: session.Ticket;
+    if (!session.client_store_take(?store,
+        contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        time.Instant{sec: 253, nsec: 0}, ?taken) ||
+        taken.age_milliseconds != 3000) { ret 5; }
+    if (snapshot(?core).ticket_clock_failures != 0) { ret 6; }
+    session.ticket_destroy(?taken);
+    session.client_store_destroy(?store);
+    if (!destroy(?core) || !pool.destroy(?harness)) { ret 7; }
+    ret 0;
+}
+
+test "established: a ticket the clock cannot stamp is counted and leaves nothing" {
+    var send:       key_schedule.Secret = test_secret(18);
+    var receive:    key_schedule.Secret = test_secret(19);
+    var resumption: key_schedule.Secret = test_secret(20);
+    var store:      session.ClientStore;
+    if (!session.client_store_init(?store)) { ret 1; }
+    var harness: pool.Harness;
+    if (!pool.make(?harness, 1 << 20, 1 << 20)) { ret 2; }
+    var broken: clock.Source = clock.Source{context: nil, context_size: 0,
+        read_fn: unreadable};
+    var seed: Seed = test_seed(engine.CLIENT);
+    seed.sessions = ?store;
+    seed.clock    = ?broken;
+    var core: Established = empty();
+    if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
+        pool.lease(?harness))) { ret 3; }
+    var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
+        0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
+    # the connection stays open, the ticket is consumed, and nothing is kept
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE ||
+        ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE) { ret 4; }
+    val seen: engine.Snapshot = snapshot(?core);
+    if (seen.status != engine.COMPLETE || seen.ticket_clock_failures != 2) { ret 5; }
+    if (session.client_store_count(?store) != 0 || pool.held(?harness) != 0 ||
+        core.ticket.held || core.input_len != 0) { ret 6; }
+    # the counter saturates rather than wrapping
+    core.ticket_clock_failures = 255;
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE ||
+        snapshot(?core).ticket_clock_failures != 255) { ret 7; }
+    # a clock that recovers stamps the next ticket
+    core.clock = ?test_clock;
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 22).status != engine.MORE ||
+        session.client_store_count(?store) != 1) { ret 8; }
+    session.client_store_destroy(?store);
+    if (!destroy(?core) || !pool.destroy(?harness)) { ret 9; }
     ret 0;
 }

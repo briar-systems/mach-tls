@@ -4465,6 +4465,197 @@ fun cores_match(server_core: *established.Established,
     ret true;
 }
 
+fun unreadable(context: ptr, output: *clock.Moment) bool {
+    ret false;
+}
+
+var broken_clock: clock.Source;
+
+fun release_resume() i32 {
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 1; }
+    ret 0;
+}
+
+test "clock: a server that cannot read its clock issues no ticket" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, clock.at(1800000000, 1800000000))) {
+        ret 1;
+    }
+    broken_clock          = clock.Source{context: nil, context_size: 0, read_fn: unreadable};
+    resume_listener.clock = ?broken_clock;
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000000, 1800000000)) == 0) { ret 2; }
+    val seen: engine.Snapshot = snapshot(?listener_engine);
+    if (seen.status != engine.FAILED || seen.error != error.INTERNAL_ERROR ||
+        seen.tickets_issued != 0) { ret 3; }
+    # nothing reached the ring or the peer
+    if (session.keyring_generation(?resume_ring) != 1 ||
+        session.client_store_count(?resume_store) != 0) { ret 4; }
+    destroy(?listener_engine);
+    client.destroy(?dialer_engine);
+    resume_listener.clock = test_source();
+    if (release_resume() != 0) { ret 10; }
+    ret 0;
+}
+
+test "clock: a failed read refuses resumption and a client keeps its ticket" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, clock.at(1800000000, 1800000000))) {
+        ret 1;
+    }
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000000, 1800000000)) != 0 ||
+        pump_post(?listener_engine, ?dialer_engine) != 0) { ret 2; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 3; }
+    if (session.client_store_count(?resume_store) != 1)                { ret 4; }
+
+    # a client that cannot read its clock fails before it takes the ticket
+    broken_clock        = clock.Source{context: nil, context_size: 0, read_fn: unreadable};
+    resume_dialer.clock = ?broken_clock;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000100, 1800000100)) == 0) { ret 5; }
+    val dialer: engine.Snapshot = client.snapshot(?dialer_engine);
+    if (dialer.status != engine.FAILED || dialer.error != error.INTERNAL_ERROR ||
+        session.client_store_count(?resume_store) != 1) { ret 6; }
+    destroy(?listener_engine);
+    client.destroy(?dialer_engine);
+    resume_dialer.clock = test_source();
+
+    # a server that cannot read its clock fails the resumption, and the
+    # single-use window never saw the ticket
+    resume_listener.clock = ?broken_clock;
+    if (resume_connect(?listener_engine, ?dialer_engine,
+        clock.at(1800000200, 1800000200)) == 0) { ret 7; }
+    val listener: engine.Snapshot = snapshot(?listener_engine);
+    if (listener.status != engine.FAILED || listener.error != error.INTERNAL_ERROR ||
+        listener.resumed || resume_window.admitted != 0) { ret 8; }
+    destroy(?listener_engine);
+    client.destroy(?dialer_engine);
+    resume_listener.clock = test_source();
+    if (release_resume() != 0) { ret 20; }
+    ret 0;
+}
+
+var flight_digest: u64;
+var flight_bytes:  usize;
+
+fun digest(data: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        flight_digest = (flight_digest ^ data[i]::u64) * 0x100000001b3;
+        i             = i + 1;
+    }
+    flight_bytes = flight_bytes + length;
+}
+
+# the exchange of `exchange`, folding every flight either side sends into the
+# digest in the order it was sent
+fun exchange_digest(local: *Handshake, peer: *client.Handshake) i64 {
+    var rounds: usize = 0;
+    for (rounds < 64) {
+        var progressed: bool = false;
+        var event:      engine.Event;
+        for (next_event(local, ?event)) {
+            progressed = true;
+            if (event.kind == engine.CRYPTO) {
+                digest(event.data.data, event.data.len);
+                if (client.ingest(peer, event.level, event.data.data,
+                    event.data.len).status == engine.FAILED) { ret 1; }
+            }
+            if (!complete_event(local, event.token, true)) { ret 2; }
+        }
+        var peer_event: engine.Event;
+        for (client.next_event(peer, ?peer_event)) {
+            progressed = true;
+            if (peer_event.kind == engine.CRYPTO) {
+                digest(peer_event.data.data, peer_event.data.len);
+                if (ingest(local, peer_event.level, peer_event.data.data,
+                    peer_event.data.len).status == engine.FAILED) { ret 3; }
+            }
+            if (!client.complete_event(peer, peer_event.token, true)) { ret 4; }
+        }
+        if (!progressed && snapshot(local).status == engine.COMPLETE &&
+            client.snapshot(peer).status == engine.COMPLETE) { ret 0; }
+        if (!progressed) {
+            poll(local);
+            client.poll(peer);
+            if (!pending(local) && !client.snapshot(peer).output_pending) {
+                ret 5;
+            }
+        }
+        rounds = rounds + 1;
+    }
+    ret 6;
+}
+
+# a full handshake, its tickets, and a resumption, all under the frozen clock;
+# the digest covers every flight of both connections
+# a full handshake that issues a ticket, then a resumption `shift` monotonic
+# seconds later than otherwise, all under the frozen clock. the digest covers
+# every flight of both connections
+fun digest_run(shift: i64, output: *u64) i32 {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 9000))) {
+        ret 1;
+    }
+    flight_digest = 0xcbf29ce484222325;
+    flight_bytes  = 0;
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    val server_storage:  buffer.Lease = pool.shared();
+    var extra:           ExtraExtension;
+    extra.kind      = 0;
+    extra.data.data = nil;
+    extra.data.len  = 0;
+    var client_extra: client.ExtraExtension;
+    client_extra.kind      = 0;
+    client_extra.data.data = nil;
+    client_extra.data.len  = 0;
+    var round: usize = 0;
+    for (round < 2) {
+        val later: i64 = round::i64;
+        set_test_moment(clock.at(1800000000 + later * 60, 9000 + later * (7 + shift)));
+        if (!init(?listener_engine, ?resume_listener, server_storage, extra, 0) ||
+            start(?listener_engine).status != engine.OK ||
+            !client.init(?dialer_engine, ?resume_dialer, pool.shared(), client_extra, 0) ||
+            client.start(?dialer_engine).status != engine.OK) { ret 2; }
+        if (exchange_digest(?listener_engine, ?dialer_engine) != 0 ||
+            pump_post(?listener_engine, ?dialer_engine) != 0) { ret 3; }
+        if (snapshot(?listener_engine).resumed != (round == 1))            { ret 4; }
+        if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 5; }
+        round = round + 1;
+    }
+    @output = flight_digest;
+    if (flight_bytes == 0 || release_resume() != 0) { ret 6; }
+    ret 0;
+}
+
+test "clock: a frozen source makes the flights of two runs identical" {
+    var first:  u64 = 0;
+    var second: u64 = 0;
+    val a:      i32 = digest_run(0, ?first);
+    if (a != 0) { ret 10 + a; }
+    val first_bytes: usize = flight_bytes;
+    val b:           i32   = digest_run(0, ?second);
+    if (b != 0)                                         { ret 20 + b; }
+    if (first != second || flight_bytes != first_bytes) { ret 30; }
+    # the digest does see the clock: a resumption one second later differs
+    var shifted: u64 = 0;
+    val c:       i32 = digest_run(1, ?shifted);
+    if (c != 0)           { ret 40 + c; }
+    if (shifted == first) { ret 50; }
+    ret 0;
+}
+
 test "resume: the offered identity carries the ticket's obfuscated age" {
     var owner: secret.Allocator = secret.system_allocator();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 5000))) {
