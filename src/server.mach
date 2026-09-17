@@ -4185,6 +4185,117 @@ test "session: a ticket resumes one connection and a key update rekeys it" {
     ret 0;
 }
 
+var finish_ticket_input: [16388]u8;
+
+fun pump_cores(local: *established.Established,
+    peer: *established.Established) i64 {
+    var rounds: usize = 0;
+    for (rounds < 16) {
+        var progressed: bool = false;
+        var event:      engine.Event;
+        for (established.next_event(local, ?event)) {
+            progressed = true;
+            if (event.kind == engine.CRYPTO && established.ingest(peer, event.level,
+                event.data.data, event.data.len).status == engine.FAILED) { ret 1; }
+            if (!established.complete_event(local, event.token, true)) { ret 2; }
+        }
+        for (established.next_event(peer, ?event)) {
+            progressed = true;
+            if (event.kind == engine.CRYPTO && established.ingest(local, event.level,
+                event.data.data, event.data.len).status == engine.FAILED) { ret 3; }
+            if (!established.complete_event(peer, event.token, true)) { ret 4; }
+        }
+        if (!progressed) { ret 0; }
+        rounds = rounds + 1;
+    }
+    ret 5;
+}
+
+fun cores_match(server_core: *established.Established,
+    client_core: *established.Established) bool {
+    val sent:     contracts.SecretBytes = key_schedule.bytes(?server_core.send);
+    val received: contracts.SecretBytes = key_schedule.bytes(?client_core.receive);
+    if (sent.len == 0 || sent.len != received.len) { ret false; }
+    var i: usize = 0;
+    for (i < sent.len) {
+        if (sent.data[i]:>u8 != received.data[i]:>u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+test "finish: established cores carry the connection and the handshakes are reused" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, 1800000000)) {
+        ret 1;
+    }
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    val connected:       i64 = resume_connect(?listener_engine, ?dialer_engine,
+        1800000000);
+    if (connected != 0) { ret 10 + connected::i32; }
+    # the handshake still reports the peer's name before finish
+    val before: engine.Snapshot = snapshot(?listener_engine);
+    if (before.peer_name.len != 15 || before.selected_alpn.len != 2) { ret 2; }
+
+    # a key update in flight on the handshake refuses finish until accepted
+    var server_core: established.Established = established.empty();
+    var client_core: established.Established = established.empty();
+    if (request_key_update(?listener_engine, codec.UPDATE_REQUESTED).status !=
+        engine.OK) { ret 3; }
+    var event: engine.Event;
+    if (!next_event(?listener_engine, ?event) || event.kind != engine.CRYPTO) { ret 4; }
+    if (finish(?listener_engine, ?server_core, established.no_storage()) !=
+        contracts.INVALID_STATE || server_core.state != established.EMPTY) { ret 5; }
+    if (client.ingest(?dialer_engine, event.level, event.data.data,
+        event.data.len).status == engine.FAILED ||
+        !complete_event(?listener_engine, event.token, true)) { ret 6; }
+    # the queued secret event moves with the core
+    if (finish(?listener_engine, ?server_core, established.no_storage()) !=
+        contracts.OK) { ret 7; }
+    if (listener_engine.state != DESTROYED || listener_engine.delegating ||
+        listener_engine.core.state != established.EMPTY) { ret 8; }
+    if (client.finish(?dialer_engine, ?client_core, established.Storage{
+        input: ?finish_ticket_input[0], input_capacity: 16388
+    }) != contracts.OK) {
+        ret 9;
+    }
+    val pumped: i64 = pump_cores(?server_core, ?client_core);
+    if (pumped != 0) { ret 20 + pumped::i32; }
+    # the client answered the requested update, so both directions moved on
+    if (!cores_match(?server_core, ?client_core) ||
+        !cores_match(?client_core, ?server_core)) { ret 11; }
+    if (established.request_key_update(?client_core,
+        codec.UPDATE_NOT_REQUESTED).status != engine.OK ||
+        pump_cores(?client_core, ?server_core) != 0 ||
+        !cores_match(?client_core, ?server_core)) { ret 12; }
+
+    # after finish a server reports no peer name, and the alpn stays borrowed
+    val after: engine.Snapshot = established.snapshot(?server_core);
+    if (after.status != engine.COMPLETE || after.peer_name.len != 0 ||
+        after.selected_alpn.len != 2 || after.selected_alpn.data[0] != 'h') {
+        ret 13;
+    }
+    if (established.snapshot(?client_core).peer_name.len != 15) { ret 14; }
+    if (established.close(?server_core, record.CLOSE_NOTIFY).status != engine.OK ||
+        pump_cores(?server_core, ?client_core) != 0) { ret 15; }
+
+    # the released handshakes carry a second connection
+    val again: i64 = resume_connect(?listener_engine, ?dialer_engine, 1800000100);
+    if (again != 0) { ret 30 + again::i32; }
+    if (!established.destroy(?server_core) || !established.destroy(?client_core) ||
+        server_core.send.active || client_core.resumption.active) { ret 16; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 17; }
+
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 18; }
+    ret 0;
+}
+
 test "session: replay control, rotation overlap, and long sessions hold" {
     var owner: secret.Allocator = secret.system_allocator();
     if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, 1800000000)) {
