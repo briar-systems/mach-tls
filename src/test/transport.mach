@@ -54,7 +54,7 @@ rec TestTransport {
     last_scope:           *cancel.Scope;
     reentrant_operation:  *transport.Operation;
     reentrant_completion: *io_runtime.Completion;
-    reentrant_transport:  *transport.Transport;
+    reentrant_transport:  *transport.Provider;
     reentrant_action:     transport.Action;
     descriptor:           *transport.Transport;
     cancel_during_submit: bool;
@@ -243,6 +243,8 @@ test "transport: submission callbacks run outside the operation lock" {
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.pin(?provider, ?adapter)) { ret 90; }
     var invalid: transport.Transport = adapter;
     invalid.context_size = 0;
     if (transport.valid(?invalid)) { ret 9; }
@@ -251,7 +253,7 @@ test "transport: submission callbacks run outside the operation lock" {
     if (!transport.begin(?aliased,
         transport.Token{index: 7, generation: 1},
         transport.APPLICATION_READ, ?scope, (?state)::*u8, 1, 0) ||
-        transport.begin_action(?aliased, ?adapter,
+        transport.begin_action(?aliased, ?provider,
         transport.Action{kind: transport.TRANSPORT_READ,
         buffer: ?buffer[0], length: 4, context: 0}) ||
         !transport.finish(?aliased, error.INTERNAL_ERROR, false) ||
@@ -261,10 +263,10 @@ test "transport: submission callbacks run outside the operation lock" {
         transport.Token{index: 8, generation: 1},
         transport.APPLICATION_READ, ?scope, ?buffer[0], 4, 0)) { ret 3; }
     state.reentrant_operation = ?operation;
-    state.reentrant_transport = ?adapter;
+    state.reentrant_transport = ?provider;
     state.reentrant_action    = transport.Action{kind: transport.TRANSPORT_READ,
         buffer: ?buffer[0], length: 4, context: 0};
-    if (!transport.begin_action(?operation, ?adapter,
+    if (!transport.begin_action(?operation, ?provider,
         transport.Action{kind: transport.TRANSPORT_READ,
         buffer: ?buffer[0], length: 4, context: 0}) ||
         transport.snapshot(?operation).state != transport.OPERATION_WAITING ||
@@ -285,7 +287,7 @@ test "transport: submission callbacks run outside the operation lock" {
         transport.Token{index: 8, generation: 2},
         transport.APPLICATION_READ, ?scope, ?buffer[0], 4, 0)) { ret 6; }
     state.cancel_during_submit = true;
-    if (transport.begin_action(?operation, ?adapter,
+    if (transport.begin_action(?operation, ?provider,
         transport.Action{kind: transport.TRANSPORT_READ,
         buffer: ?buffer[0], length: 4, context: 0})) { ret 7; }
     val terminal: transport.Snapshot = transport.snapshot(?operation);
@@ -314,6 +316,8 @@ test "transport: one application write may drive write and read completions" {
     var transport_state: TestTransport;
     var adapter:         transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.pin(?provider, ?adapter)) { ret 90; }
     var application: [8]u8;
     var wire:        [16]u8;
     val token:       transport.Token = transport.Token{index: 4, generation: 7};
@@ -321,7 +325,7 @@ test "transport: one application write may drive write and read completions" {
     if (!transport.begin(?operation, token, transport.APPLICATION_WRITE, ?scope, ?application[0], 8, 99)) { ret 3; }
     if (transport.begin(?operation, token, transport.APPLICATION_WRITE, ?scope,
         ?application[0], 8, 99)) { ret 15; }
-    if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_WRITE, buffer: ?wire[0], length: 16, context: 101})) { ret 4; }
+    if (!transport.begin_action(?operation, ?provider, transport.Action{kind: transport.TRANSPORT_WRITE, buffer: ?wire[0], length: 16, context: 101})) { ret 4; }
     val first_lower: io_runtime.Token = operation.lower_token;
     if (!runtime_ok(io_runtime.complete(?runtime, first_lower, 5, 0, false))) { ret 5; }
     var completion: io_runtime.Completion;
@@ -329,7 +333,7 @@ test "transport: one application write may drive write and read completions" {
     if (transport.accept(?operation, ?completion))                                      { ret 7; }
     val after_write: transport.Snapshot = transport.snapshot(?operation);
     if (after_write.state != transport.OPERATION_OPEN || after_write.token.index != token.index || after_write.token.generation != token.generation || after_write.last_transport_bytes != 5 || transport_state.last_scope != ?scope) { ret 8; }
-    if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?wire[0], length: 16, context: 102}))                                                                                  { ret 9; }
+    if (!transport.begin_action(?operation, ?provider, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?wire[0], length: 16, context: 102}))                                                                                 { ret 9; }
     if (!runtime_ok(io_runtime.complete(?runtime, operation.lower_token, 9, 0, false)))                                                                                                                                               { ret 10; }
     if (!take_one(?runtime, ?completion) || !transport.accept(?operation, ?completion))                                                                                                                                               { ret 11; }
     if (!transport.advance(?operation, 8) || !transport.finish(?operation, error.OK, false) || transport.finish(?operation, error.OK, false))                                                                                         { ret 12; }
@@ -349,10 +353,12 @@ test "transport: cancellation waits for lower buffer ownership" {
     var transport_state: TestTransport;
     var adapter:         transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.pin(?provider, ?adapter)) { ret 90; }
     var buffer:    [4]u8;
     var operation: transport.Operation;
     if (!transport.begin(?operation, transport.Token{index: 1, generation: 1}, transport.APPLICATION_READ, ?scope, ?buffer[0], 4, 0))                              { ret 3; }
-    if (!transport.begin_action(?operation, ?adapter, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?buffer[0], length: 4, context: 0}))                { ret 4; }
+    if (!transport.begin_action(?operation, ?provider, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?buffer[0], length: 4, context: 0}))               { ret 4; }
     if (transport.finish(?operation, error.CANCELLED, false))                                                                                                      { ret 5; }
     if (!transition_ok(cancel.cancel(?scope)))                                                                                                                     { ret 6; }
     if (transport.snapshot(?operation).state != transport.OPERATION_WAITING || operation.application_buffer != ?buffer[0] || operation.lower_buffer != ?buffer[0]) { ret 7; }
@@ -372,6 +378,8 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.pin(?provider, ?adapter)) { ret 90; }
     val descriptor_size: usize = adapter.context_size;
     var buffer:          [4]u8;
     var operation:       transport.Operation;
@@ -379,7 +387,7 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
         transport.Token{index: 20, generation: 1},
         transport.APPLICATION_WRITE, ?scope, ?buffer[0], 4, 0)) { ret 3; }
     state.mutate_descriptor = true;
-    if (!transport.begin_action(?operation, ?adapter,
+    if (!transport.begin_action(?operation, ?provider,
         transport.Action{kind: transport.TRANSPORT_WRITE,
         buffer: ?buffer[0], length: 4, context: 0}) ||
         transport.snapshot(?operation).state != transport.OPERATION_WAITING ||
@@ -400,7 +408,7 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
     if (!transport.begin(?operation,
         transport.Token{index: 20, generation: 2},
         transport.APPLICATION_WRITE, ?scope, ?buffer[0], 4, 0) ||
-        !transport.begin_action(?operation, ?adapter,
+        !transport.begin_action(?operation, ?provider,
         transport.Action{kind: transport.TRANSPORT_WRITE,
         buffer: ?buffer[0], length: 4, context: 0})) { ret 7; }
     adapter.context_size = descriptor_size + 1;
@@ -416,7 +424,7 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
     if (!transport.begin(?operation,
         transport.Token{index: 20, generation: 3},
         transport.APPLICATION_CLOSE, ?scope, nil, 0, 0) ||
-        !transport.begin_action(?operation, ?adapter,
+        !transport.begin_action(?operation, ?provider,
         transport.Action{kind: transport.TRANSPORT_CLOSE,
         buffer: nil, length: 0, context: 0}) ||
         !runtime_ok(io_runtime.complete(?runtime,
@@ -431,7 +439,7 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
     if (!transport.begin(?operation,
         transport.Token{index: 20, generation: 4},
         transport.APPLICATION_CLOSE, ?scope, nil, 0, 0) ||
-        !transport.begin_action(?operation, ?adapter,
+        !transport.begin_action(?operation, ?provider,
         transport.Action{kind: transport.TRANSPORT_CLOSE,
         buffer: nil, length: 0, context: 0}) ||
         !runtime_ok(io_runtime.complete(?runtime,
@@ -459,18 +467,20 @@ test "transport: eof and close settle once" {
     var transport_state: TestTransport;
     var adapter:         transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.pin(?provider, ?adapter)) { ret 90; }
     var buffer:         [1]u8;
     var read_operation: transport.Operation;
-    if (!transport.begin(?read_operation, transport.Token{index: 1, generation: 2}, transport.APPLICATION_READ, ?scope, ?buffer[0], 1, 0))               { ret 3; }
-    if (!transport.begin_action(?read_operation, ?adapter, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?buffer[0], length: 1, context: 0})) { ret 4; }
-    if (!runtime_ok(io_runtime.complete(?runtime, read_operation.lower_token, 0, 0, true)))                                                              { ret 5; }
+    if (!transport.begin(?read_operation, transport.Token{index: 1, generation: 2}, transport.APPLICATION_READ, ?scope, ?buffer[0], 1, 0))                { ret 3; }
+    if (!transport.begin_action(?read_operation, ?provider, transport.Action{kind: transport.TRANSPORT_READ, buffer: ?buffer[0], length: 1, context: 0})) { ret 4; }
+    if (!runtime_ok(io_runtime.complete(?runtime, read_operation.lower_token, 0, 0, true)))                                                               { ret 5; }
     var completion: io_runtime.Completion;
     if (!take_one(?runtime, ?completion) || !transport.accept(?read_operation, ?completion))                                                                                        { ret 6; }
     if (!transport.snapshot(?read_operation).last_end_of_stream || !transport.finish(?read_operation, error.CLOSED, true) || transport.finish(?read_operation, error.CLOSED, true)) { ret 7; }
     if (!transport.destroy_operation(?read_operation))                                                                                                                              { ret 8; }
     var close_operation: transport.Operation;
     if (!transport.begin(?close_operation, transport.Token{index: 2, generation: 2}, transport.APPLICATION_CLOSE, ?scope, nil, 0, 0))                                                                                       { ret 9; }
-    if (!transport.begin_action(?close_operation, ?adapter, transport.Action{kind: transport.TRANSPORT_CLOSE, buffer: nil, length: 0, context: 0}))                                                                         { ret 10; }
+    if (!transport.begin_action(?close_operation, ?provider, transport.Action{kind: transport.TRANSPORT_CLOSE, buffer: nil, length: 0, context: 0}))                                                                        { ret 10; }
     if (!runtime_ok(io_runtime.complete(?runtime, close_operation.lower_token, 0, 0, false)))                                                                                                                               { ret 11; }
     if (!take_one(?runtime, ?completion) || !transport.accept(?close_operation, ?completion))                                                                                                                               { ret 12; }
     if (transport.snapshot(?close_operation).terminal_error != error.OK || transport.finish(?close_operation, error.OK, false))                                                                                             { ret 13; }
@@ -562,6 +572,24 @@ fun make_test_client(core: *client.Handshake) bool {
     ret client.init(core, ?open_configuration, pool.shared(), extra, 0);
 }
 
+# the lane a single-operation test drives, the write lane when both are live
+fun live_lane(value: *stream.Stream) *stream.Lane {
+    val state: transport.OperationState = transport.snapshot(?value.writing.operation).state;
+    if (state == 0 || state == transport.OPERATION_DESTROYED) {
+        val reading: transport.OperationState = transport.snapshot(?value.reading.operation).state;
+        if (reading != 0 && reading != transport.OPERATION_DESTROYED) { ret ?value.reading; }
+    }
+    ret ?value.writing;
+}
+
+fun live(value: *stream.Stream) *transport.Operation {
+    ret ?live_lane(value).operation;
+}
+
+fun settle(value: *stream.Stream) bool {
+    ret stream.destroy_operation(value, live(value).token);
+}
+
 fun make_open_stream(value: *stream.Stream, core: *client.Handshake,
     adapter: *transport.Transport) bool {
     ret make_leased_stream(value, core, adapter, pool.shared(), pool.shared_secret());
@@ -573,7 +601,7 @@ fun make_leased_stream(value: *stream.Stream, core: *client.Handshake,
     if (!make_test_client(core)) { ret false; }
     value.role                     = engine.CLIENT;
     value.client                   = core;
-    value.transport                = adapter;
+    value.lower.descriptor         = adapter[0];
     value.state                    = stream.OPEN;
     value.handshake_complete       = true;
     value.receive_record_plaintext = record.MAX_PLAINTEXT;
@@ -603,7 +631,7 @@ fun make_leased_stream(value: *stream.Stream, core: *client.Handshake,
         record.aes_128_gcm(), contracts.SecretBytes{data: ?key[0], len: 16},
         contracts.Bytes{data: ?iv[0], len: 12});
     ct.zeroize(?key[0], 16);
-    ret installed && read_installed;
+    ret installed && read_installed && transport.pin(?value.lower, ?value.lower.descriptor);
 }
 
 test "stream: accepted immediate terminals and callback reentry settle once" {
@@ -621,10 +649,10 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (!stream.write(?secure, ?scope,
         transport.Token{index: 30, generation: 1},
         ?application[0], 3, 0)) { ret 4; }
-    val canceled: transport.Snapshot = transport.snapshot(?secure.operation);
+    val canceled: transport.Snapshot = transport.snapshot(live(?secure));
     if (canceled.state != transport.OPERATION_TERMINAL ||
         canceled.terminal_error != error.CANCELLED || secure.state != stream.OPEN ||
-        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 5; }
+        !settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 5; }
 
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 6; }
     var failed: stream.Stream;
@@ -634,14 +662,14 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     if (!stream.write(?failed, ?scope,
         transport.Token{index: 30, generation: 2},
         ?application[0], 3, 0)) { ret 8; }
-    val synchronous: transport.Snapshot = transport.snapshot(?failed.operation);
+    val synchronous: transport.Snapshot = transport.snapshot(live(?failed));
     if (synchronous.state != transport.OPERATION_TERMINAL)  { ret 90; }
     if (synchronous.terminal_error != error.INTERNAL_ERROR) { ret 91; }
     if (failed.state != stream.FAILED)                      { ret 92; }
     if (!state.reentry_rejected)                            { ret 93; }
     if (!state.snapshot_rejected)                           { ret 94; }
     if (atomic.load(?failed.transition_owner) != 0)         { ret 95; }
-    if (!stream.destroy_operation(?failed))                 { ret 96; }
+    if (!settle(?failed))                                   { ret 96; }
     if (!stream.destroy(?failed))                           { ret 97; }
     if (!operation_ok(cancel.destroy(?scope)))              { ret 98; }
     reentrant_secure = nil;
@@ -662,10 +690,10 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
         atomic.load(?concurrent.transition_owner) != 0) { ret 14; }
     var completion: io_runtime.Completion;
     if (!runtime_ok(io_runtime.complete(?runtime,
-        concurrent.operation.lower_token, concurrent.wire_output_len,
+        live(?concurrent).lower_token, concurrent.wire_output_len,
         0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?concurrent, ?completion) ||
-        !stream.destroy_operation(?concurrent) || !stream.destroy(?concurrent) ||
+        !settle(?concurrent) || !stream.destroy(?concurrent) ||
         !operation_ok(cancel.destroy(?scope))) { ret 15; }
     reentrant_secure = nil;
 
@@ -673,20 +701,20 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
     var drifted: stream.Stream;
     if (!make_open_stream(?drifted, ?core_d, ?adapter)) { ret 17; }
     state.mutate_descriptor = true;
-    state.descriptor        = drifted.transport;
+    state.descriptor        = ?drifted.lower.descriptor;
     if (!stream.write(?drifted, ?scope,
         transport.Token{index: 30, generation: 3},
         ?application[0], 3, 0)) { ret 18; }
     if (!runtime_ok(io_runtime.complete(?runtime,
-        drifted.operation.lower_token, drifted.wire_output_len, 0, false)) ||
+        live(?drifted).lower_token, drifted.wire_output_len, 0, false)) ||
         !take_one(?runtime, ?completion) ||
         !stream.accept(?drifted, ?completion)) { ret 19; }
     val drifted_result: transport.Snapshot =
-        transport.snapshot(?drifted.operation);
+        transport.snapshot(live(?drifted));
     if (drifted_result.state != transport.OPERATION_TERMINAL ||
         drifted_result.terminal_error != error.INTERNAL_ERROR ||
-        drifted.operation.lower_buffer != nil || drifted.state != stream.FAILED ||
-        !stream.destroy_operation(?drifted) || !stream.destroy(?drifted) ||
+        live(?drifted).lower_buffer != nil || drifted.state != stream.FAILED ||
+        !settle(?drifted) || !stream.destroy(?drifted) ||
         !operation_ok(cancel.destroy(?scope))) { ret 20; }
     if (!runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 10; }
@@ -767,7 +795,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     if (stream.connect(?secure, ?core_b, core_storage, secrets, ?adapter,
         ?scope, transport.Token{index: 31, generation: 0}, 0)) { ret 31; }
     if (secure.state != stream.DESTROYED) { ret 32; }
-    if (secure.transport != nil)          { ret 33; }
+    if (secure.lower.owner != nil)        { ret 33; }
     if (secure.memory.source != nil || secure.client != nil ||
         secure.role != 0) { ret 34; }
     if (secure.wire_in.held || secure.wire_out.held || secure.opened.held ||
@@ -794,21 +822,21 @@ test "stream: partial write retains application ownership until the whole record
     if (!stream.write(?secure, ?scope, transport.Token{index: 10, generation: 1},
         ?application[0], 5, 44)) { ret 4; }
     val wire_length: usize = secure.wire_output_len;
-    if (wire_length <= 5 || secure.operation.application_buffer != ?application[0]) { ret 5; }
+    if (wire_length <= 5 || live(?secure).application_buffer != ?application[0]) { ret 5; }
     var completion: io_runtime.Completion;
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, 3, 0, false)) || !take_one(?runtime, ?completion) ||
+        live(?secure).lower_token, 3, 0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion)) { ret 6; }
-    if (transport.snapshot(?secure.operation).application_bytes != 0 ||
-        secure.operation.application_buffer != ?application[0]) { ret 7; }
+    if (transport.snapshot(live(?secure)).application_bytes != 0 ||
+        live(?secure).application_buffer != ?application[0]) { ret 7; }
     val remaining: usize = wire_length - 3;
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, remaining, 0, false)) ||
+        live(?secure).lower_token, remaining, 0, false)) ||
         !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 8; }
-    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    val finished: transport.Snapshot = transport.snapshot(live(?secure));
     if (finished.state != transport.OPERATION_TERMINAL || finished.application_bytes != 5 ||
         finished.terminal_error != error.OK || transport_state.writes != 2) { ret 9; }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope)) ||
+    if (!settle(?secure) || !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 10; }
     ret 0;
@@ -827,22 +855,22 @@ test "stream: write cancellation requires an abortive lower close" {
     var application: [3]u8 = [3]u8{1, 2, 3};
     if (!stream.write(?secure, ?scope, transport.Token{index: 11, generation: 1},
         ?application[0], 3, 45) || !transition_ok(cancel.cancel(?scope))) { ret 4; }
-    if (transport.snapshot(?secure.operation).state != transport.OPERATION_WAITING ||
-        secure.operation.application_buffer != ?application[0]) { ret 5; }
+    if (transport.snapshot(live(?secure)).state != transport.OPERATION_WAITING ||
+        live(?secure).application_buffer != ?application[0]) { ret 5; }
     var completion: io_runtime.Completion;
     if (!take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 6; }
-    if (transport.snapshot(?secure.operation).terminal_error != error.CANCELLED ||
-        secure.state != stream.FAILED || !stream.destroy_operation(?secure) ||
+    if (transport.snapshot(live(?secure)).terminal_error != error.CANCELLED ||
+        secure.state != stream.FAILED || !settle(?secure) ||
         !operation_ok(cancel.destroy(?scope))) { ret 7; }
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.close(?secure, ?scope,
         transport.Token{index: 11, generation: 2}, 46) ||
-        secure.pending_action != transport.TRANSPORT_ABORT) { ret 8; }
+        live_lane(?secure).pending_action != transport.TRANSPORT_ABORT) { ret 8; }
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, 0, 0, false)) || !take_one(?runtime, ?completion) ||
+        live(?secure).lower_token, 0, 0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion)) { ret 9; }
-    if (transport.snapshot(?secure.operation).terminal_error != error.OK ||
-        secure.state != stream.CLOSED || !stream.destroy_operation(?secure) ||
+    if (transport.snapshot(live(?secure)).terminal_error != error.OK ||
+        secure.state != stream.CLOSED || !settle(?secure) ||
         !stream.destroy(?secure) || !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 10; }
@@ -866,21 +894,21 @@ test "stream: zero-byte write completion makes sequence reuse impossible" {
     }
     var completion: io_runtime.Completion;
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, 0, 0, false)) ||
+        live(?secure).lower_token, 0, 0, false)) ||
         !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
         ret 5;
     }
-    if (transport.snapshot(?secure.operation).terminal_error != error.INTERNAL_ERROR ||
-        secure.state != stream.FAILED || !stream.destroy_operation(?secure) ||
+    if (transport.snapshot(live(?secure)).terminal_error != error.INTERNAL_ERROR ||
+        secure.state != stream.FAILED || !settle(?secure) ||
         stream.write(?secure, ?scope, transport.Token{index: 14, generation: 2},
         ?application[0], 3, 51) || !stream.close(?secure, ?scope,
         transport.Token{index: 14, generation: 3}, 52)) { ret 6; }
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, 0, 0, false)) ||
+        live(?secure).lower_token, 0, 0, false)) ||
         !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
         ret 7;
     }
-    if (secure.state != stream.CLOSED || !stream.destroy_operation(?secure) ||
+    if (secure.state != stream.CLOSED || !settle(?secure) ||
         !stream.destroy(?secure) || !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 8; }
@@ -901,27 +929,27 @@ test "stream: close notify is fully written before write-side shutdown" {
     if (transport_state.writes != 1 || transport_state.closes != 0) { ret 4; }
     var completion: io_runtime.Completion;
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, secure.wire_output_len, 0, false)) ||
+        live(?secure).lower_token, secure.wire_output_len, 0, false)) ||
         !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 5; }
-    if (transport_state.closes != 1 || secure.pending_action != transport.TRANSPORT_SHUTDOWN ||
+    if (transport_state.closes != 1 || live_lane(?secure).pending_action != transport.TRANSPORT_SHUTDOWN ||
         !secure.send_closed) { ret 6; }
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, 0, 0, false)) || !take_one(?runtime, ?completion) ||
+        live(?secure).lower_token, 0, 0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion)) { ret 7; }
-    if (transport.snapshot(?secure.operation).state != transport.OPERATION_TERMINAL ||
+    if (transport.snapshot(live(?secure)).state != transport.OPERATION_TERMINAL ||
         secure.state != stream.OPEN || !secure.send_closed ||
-        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
+        !settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 11; }
     if (!stream.close(?secure, ?scope,
         transport.Token{index: 12, generation: 2}, 49)) { ret 13; }
-    if (transport_state.writes != 1)                        { ret 14; }
-    if (transport_state.closes != 2)                        { ret 15; }
-    if (secure.pending_action != transport.TRANSPORT_CLOSE) { ret 16; }
+    if (transport_state.writes != 1)                                    { ret 14; }
+    if (transport_state.closes != 2)                                    { ret 15; }
+    if (live_lane(?secure).pending_action != transport.TRANSPORT_CLOSE) { ret 16; }
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, 0, 0, false)) ||
+        live(?secure).lower_token, 0, 0, false)) ||
         !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion) || secure.state != stream.CLOSED ||
-        !stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+        !settle(?secure) || !stream.destroy(?secure) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 12; }
@@ -973,9 +1001,9 @@ test "stream: encrypted records retain read ownership at every byte boundary" {
     }
     i = 0;
     for (i < sealed.written) {
-        secure.operation.lower_buffer[0] = wire[i];
+        live(?secure).lower_buffer[0] = wire[i];
         if (!runtime_ok(io_runtime.complete(?runtime,
-            secure.operation.lower_token, 1, 0,
+            live(?secure).lower_token, 1, 0,
             i + 1 == sealed.written))) { ret 7; }
         var completion: io_runtime.Completion;
         if (!take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) {
@@ -983,23 +1011,23 @@ test "stream: encrypted records retain read ownership at every byte boundary" {
         }
         i = i + 1;
     }
-    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    val finished: transport.Snapshot = transport.snapshot(live(?secure));
     record.destroy(?peer);
     if (finished.state != transport.OPERATION_TERMINAL) { ret 10; }
     if (finished.application_bytes != 5)                { ret 11; }
     if (application[0] != 'w' ||
         application[1] != 'o' || application[2] != 'r' || application[3] != 'l' ||
         application[4] != 'd') { ret 12; }
-    if (!stream.destroy_operation(?secure)) { ret 13; }
+    if (!settle(?secure)) { ret 13; }
     var after_eof: [1]u8;
     if (!stream.read(?secure, ?scope,
         transport.Token{index: 14, generation: 2}, ?after_eof[0], 1, 50)) {
         ret 16;
     }
-    val eof: transport.Snapshot = transport.snapshot(?secure.operation);
+    val eof: transport.Snapshot = transport.snapshot(live(?secure));
     if (eof.state != transport.OPERATION_TERMINAL ||
         eof.terminal_error != error.CLOSED || secure.state != stream.FAILED ||
-        !stream.destroy_operation(?secure)) { ret 17; }
+        !settle(?secure)) { ret 17; }
     if (!operation_ok(cancel.destroy(?scope))) { ret 14; }
     if (
         !runtime_closed(io_runtime.close(?runtime)) ||
@@ -1061,16 +1089,16 @@ test "stream: cancelling a read keeps the bytes the transport already settled" {
     val delivered: usize = 4;
     i = 0;
     for (i < delivered) {
-        secure.operation.lower_buffer[i] = wire[i];
-        i                                = i + 1;
+        live(?secure).lower_buffer[i] = wire[i];
+        i                             = i + 1;
     }
     if (!runtime_ok(io_runtime.complete(?runtime,
-        secure.operation.lower_token, delivered, 0, false))) { ret 7; }
+        live(?secure).lower_token, delivered, 0, false))) { ret 7; }
     if (!transition_ok(cancel.cancel(?scope))) { ret 8; }
     var completion: io_runtime.Completion;
     if (!take_one(?runtime, ?completion)
         || !stream.accept(?secure, ?completion)) { ret 9; }
-    val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
+    val cancelled: transport.Snapshot = transport.snapshot(live(?secure));
     if (cancelled.state != transport.OPERATION_TERMINAL
         || cancelled.terminal_error != error.CANCELLED
         || secure.state != stream.OPEN) { ret 10; }
@@ -1079,7 +1107,7 @@ test "stream: cancelling a read keeps the bytes the transport already settled" {
     if (secure.wire_input_len != delivered) { ret 11; }
 
     # and the record must still decode once the remainder arrives
-    if (!stream.destroy_operation(?secure)) { ret 12; }
+    if (!settle(?secure)) { ret 12; }
     var resumed: cancel.Scope;
     if (!operation_ok(cancel.make_root(?resumed, opt[time.Instant].none{}))) {
         ret 13;
@@ -1090,21 +1118,21 @@ test "stream: cancelling a read keeps the bytes the transport already settled" {
     }
     i = delivered;
     for (i < sealed.written) {
-        secure.operation.lower_buffer[0] = wire[i];
+        live(?secure).lower_buffer[0] = wire[i];
         if (!runtime_ok(io_runtime.complete(?runtime,
-            secure.operation.lower_token, 1, 0, false))) { ret 15; }
+            live(?secure).lower_token, 1, 0, false))) { ret 15; }
         var next: io_runtime.Completion;
         if (!take_one(?runtime, ?next) || !stream.accept(?secure, ?next)) {
             ret 16;
         }
         i = i + 1;
     }
-    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    val finished: transport.Snapshot = transport.snapshot(live(?secure));
     if (finished.state != transport.OPERATION_TERMINAL
         || finished.application_bytes != 5) { ret 17; }
     if (application[0] != 'h' || application[1] != 'e' || application[2] != 'l'
         || application[3] != 'l' || application[4] != 'o') { ret 18; }
-    if (!stream.destroy_operation(?secure) || !stream.destroy(?secure)) {
+    if (!settle(?secure) || !stream.destroy(?secure)) {
         ret 19;
     }
     if (!operation_ok(cancel.destroy(?resumed)) || !operation_ok(cancel.destroy(?scope))) { ret 20; }
@@ -1125,8 +1153,8 @@ fun parked_setup() bool {
 
 fun parked(secure: *stream.Stream, transport_state: *TestTransport,
     reads: usize, writes: usize) bool {
-    ret secure.pending_action == transport.TRANSPORT_WAIT &&
-        transport.snapshot(?secure.operation).state == transport.OPERATION_WAITING &&
+    ret live_lane(secure).pending_action == transport.TRANSPORT_WAIT &&
+        transport.snapshot(live(secure)).state == transport.OPERATION_WAITING &&
         transport_state.reads == reads && transport_state.writes == writes;
 }
 
@@ -1158,14 +1186,14 @@ test "stream: a write that waits for memory parks and resumes where it stopped" 
     if (!resumed(?runtime, ?secure))                                { ret 7; }
     if (transport_state.writes != 1 || secure.wire_output_len <= 3) { ret 8; }
     var completion: io_runtime.Completion;
-    if (!runtime_ok(io_runtime.complete(?runtime, secure.operation.lower_token,
+    if (!runtime_ok(io_runtime.complete(?runtime, live(?secure).lower_token,
         secure.wire_output_len, 0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion)) { ret 9; }
-    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    val finished: transport.Snapshot = transport.snapshot(live(?secure));
     if (finished.state != transport.OPERATION_TERMINAL ||
         finished.terminal_error != error.OK || finished.application_bytes != 3 ||
         secure.wire_out.held) { ret 10; }
-    if (!stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+    if (!settle(?secure) || !stream.destroy(?secure) ||
         pool.held(?parked_harness) != 0 || !pool.destroy(?parked_harness) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
@@ -1225,24 +1253,24 @@ test "stream: a read waits for memory to buffer and to open a record" {
     # and nothing it read is lost
     i = 0;
     for (i < sealed.written) {
-        secure.operation.lower_buffer[i] = wire[i];
-        i                                = i + 1;
+        live(?secure).lower_buffer[i] = wire[i];
+        i                             = i + 1;
     }
     pool.squeeze(?parked_squeeze);
     var completion: io_runtime.Completion;
-    if (!runtime_ok(io_runtime.complete(?runtime, secure.operation.lower_token,
+    if (!runtime_ok(io_runtime.complete(?runtime, live(?secure).lower_token,
         sealed.written, 0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion)) { ret 9; }
     if (!parked(?secure, ?transport_state, 1, 0) ||
         secure.wire_input_len != sealed.written || secure.wire_input_read != 0 ||
         secure.opened.held) { ret 10; }
     if (!resumed(?runtime, ?secure)) { ret 11; }
-    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    val finished: transport.Snapshot = transport.snapshot(live(?secure));
     if (finished.state != transport.OPERATION_TERMINAL ||
         finished.terminal_error != error.OK || finished.application_bytes != 5 ||
         application[0] != 'p' || application[4] != 's') { ret 12; }
     if (secure.wire_in.held || secure.opened.held) { ret 13; }
-    if (!stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+    if (!settle(?secure) || !stream.destroy(?secure) ||
         pool.held(?parked_harness) != 0 || !pool.destroy(?parked_harness) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
@@ -1268,14 +1296,14 @@ test "stream: cancelling an operation parked for memory settles it as cancelled"
     if (!transition_ok(cancel.cancel(?scope))) { ret 5; }
     var completion: io_runtime.Completion;
     if (!take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 6; }
-    val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
+    val cancelled: transport.Snapshot = transport.snapshot(live(?secure));
     if (cancelled.state != transport.OPERATION_TERMINAL ||
         cancelled.terminal_error != error.CANCELLED ||
-        cancelled.application_bytes != 0 || secure.pending_action != 0) { ret 7; }
+        cancelled.application_bytes != 0 || live_lane(?secure).pending_action != 0) { ret 7; }
     # nothing was sealed, so the stream is still usable, and a late resume is ignored
     if (secure.state != stream.OPEN || stream.resume(?secure) ||
         secure.wire_out.held || secure.sealing.held) { ret 8; }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 9; }
+    if (!settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 9; }
 
     # a read parked the same way ends the same way
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 10; }
@@ -1285,8 +1313,8 @@ test "stream: cancelling an operation parked for memory settles it as cancelled"
     if (!parked(?secure, ?transport_state, 0, 0))                                  { ret 17; }
     if (!transition_ok(cancel.cancel(?scope)) || !take_one(?runtime, ?completion)) { ret 18; }
     if (!stream.accept(?secure, ?completion))                                      { ret 11; }
-    if (transport.snapshot(?secure.operation).terminal_error != error.CANCELLED ||
-        secure.state != stream.OPEN || !stream.destroy_operation(?secure) ||
+    if (transport.snapshot(live(?secure)).terminal_error != error.CANCELLED ||
+        secure.state != stream.OPEN || !settle(?secure) ||
         !operation_ok(cancel.destroy(?scope))) { ret 12; }
 
     # once memory is back the stream writes as if nothing happened
@@ -1294,11 +1322,11 @@ test "stream: cancelling an operation parked for memory settles it as cancelled"
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.write(?secure, ?scope, transport.Token{index: 42, generation: 3},
         ?application[0], 3, 74) || transport_state.writes != 1) { ret 13; }
-    if (!runtime_ok(io_runtime.complete(?runtime, secure.operation.lower_token,
+    if (!runtime_ok(io_runtime.complete(?runtime, live(?secure).lower_token,
         secure.wire_output_len, 0, false)) || !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion) ||
-        transport.snapshot(?secure.operation).application_bytes != 3) { ret 14; }
-    if (!stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+        transport.snapshot(live(?secure)).application_bytes != 3) { ret 14; }
+    if (!settle(?secure) || !stream.destroy(?secure) ||
         pool.held(?parked_harness) != 0 || !pool.destroy(?parked_harness) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
@@ -1384,10 +1412,10 @@ test "stream: a cancelled completion's read bytes reach the record layer" {
     val delivered: usize = 6;
     var i:         usize = 0;
     for (i < delivered) {
-        secure.operation.lower_buffer[i] = wire[i];
-        i                                = i + 1;
+        live(?secure).lower_buffer[i] = wire[i];
+        i                             = i + 1;
     }
-    val token: io_runtime.Token = secure.operation.lower_token;
+    val token: io_runtime.Token = live(?secure).lower_token;
     if (!transition_ok(cancel.cancel(?scope)) ||
         !runtime_ok(io_runtime.complete_cancellation_transfer(?runtime, token, delivered, 0, false))) {
         ret 7;
@@ -1396,10 +1424,10 @@ test "stream: a cancelled completion's read bytes reach the record layer" {
     if (!take_one(?runtime, ?completion) ||
         !cancelled_with(?completion, io_error.CANCELLED, delivered)) { ret 8; }
     if (!stream.accept(?secure, ?completion)) { ret 9; }
-    val cancelled: transport.Snapshot = transport.snapshot(?secure.operation);
+    val cancelled: transport.Snapshot = transport.snapshot(live(?secure));
     if (cancelled.terminal_error != error.CANCELLED || cancelled.last_transport_bytes != delivered ||
         secure.state != stream.OPEN || secure.wire_input_len != delivered) { ret 10; }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 11; }
+    if (!settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 11; }
 
     # a completion that finished while the cancellation was underway rides on it
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
@@ -1408,10 +1436,10 @@ test "stream: a cancelled completion's read bytes reach the record layer" {
     val raced: usize = 5;
     i = 0;
     for (i < raced) {
-        secure.operation.lower_buffer[i] = wire[delivered + i];
-        i                                = i + 1;
+        live(?secure).lower_buffer[i] = wire[delivered + i];
+        i                             = i + 1;
     }
-    val raced_token: io_runtime.Token = secure.operation.lower_token;
+    val raced_token: io_runtime.Token = live(?secure).lower_token;
     if (!transition_ok(cancel.cancel(?scope)) ||
         !runtime_ok(io_runtime.complete(?runtime, raced_token, raced, 0, false)) ||
         !runtime_ok(io_runtime.complete_cancellation(?runtime, raced_token)) ||
@@ -1419,7 +1447,7 @@ test "stream: a cancelled completion's read bytes reach the record layer" {
         !cancelled_with(?completion, io_error.CANCELLED, raced) ||
         !stream.accept(?secure, ?completion)) { ret 13; }
     if (secure.wire_input_len != delivered + raced || secure.state != stream.OPEN ||
-        !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 14; }
+        !settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 14; }
 
     # the rest of the record arrives normally and the whole record decodes
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
@@ -1428,15 +1456,15 @@ test "stream: a cancelled completion's read bytes reach the record layer" {
     val rest: usize = sealed - delivered - raced;
     i = 0;
     for (i < rest) {
-        secure.operation.lower_buffer[i] = wire[delivered + raced + i];
-        i                                = i + 1;
+        live(?secure).lower_buffer[i] = wire[delivered + raced + i];
+        i                             = i + 1;
     }
-    if (!runtime_ok(io_runtime.complete(?runtime, secure.operation.lower_token, rest, 0, false)) ||
+    if (!runtime_ok(io_runtime.complete(?runtime, live(?secure).lower_token, rest, 0, false)) ||
         !take_one(?runtime, ?completion) || !stream.accept(?secure, ?completion)) { ret 16; }
-    val finished: transport.Snapshot = transport.snapshot(?secure.operation);
+    val finished: transport.Snapshot = transport.snapshot(live(?secure));
     if (finished.terminal_error != error.OK || finished.application_bytes != 5 ||
         application[0] != 'b' || application[4] != 's') { ret 17; }
-    if (!stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+    if (!settle(?secure) || !stream.destroy(?secure) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_ok(io_runtime.unregister_source(?runtime, state.source)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
@@ -1462,21 +1490,21 @@ test "stream: a timed-out completion's end of stream is kept" {
     var completion: io_runtime.Completion;
     if (!transition_ok(cancel.timeout(?scope)) ||
         !runtime_ok(io_runtime.complete_cancellation_transfer(?runtime,
-        secure.operation.lower_token, 0, 0, true)) ||
+        live(?secure).lower_token, 0, 0, true)) ||
         !take_one(?runtime, ?completion) ||
         !cancelled_with(?completion, io_error.TIMEOUT, 0) || !completion.end_of_stream ||
         !stream.accept(?secure, ?completion)) { ret 6; }
-    val timed_out: transport.Snapshot = transport.snapshot(?secure.operation);
+    val timed_out: transport.Snapshot = transport.snapshot(live(?secure));
     if (timed_out.terminal_error != error.TIMEOUT || !timed_out.last_end_of_stream ||
         !secure.lower_eof || secure.state != stream.OPEN) { ret 7; }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
+    if (!settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
     # the next read knows the peer is gone without another lower read
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.read(?secure, ?scope, transport.Token{index: 51, generation: 2},
         ?application[0], 5, 84)) { ret 9; }
-    if (transport.snapshot(?secure.operation).terminal_error != error.CLOSED ||
+    if (transport.snapshot(live(?secure)).terminal_error != error.CLOSED ||
         state.reads != 1) { ret 10; }
-    if (!stream.destroy_operation(?secure) || !stream.destroy(?secure) ||
+    if (!settle(?secure) || !stream.destroy(?secure) ||
         !operation_ok(cancel.destroy(?scope)) ||
         !runtime_ok(io_runtime.unregister_source(?runtime, state.source)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
@@ -1492,7 +1520,9 @@ test "stream: a cancelled completion's written bytes settle their record" {
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
-    if (!make_pending_source(?state)) { ret 2; }
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.pin(?provider, ?adapter)) { ret 90; }
+    if (!make_pending_source(?state))        { ret 2; }
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?core_a, ?adapter)) { ret 3; }
     var scope: cancel.Scope;
@@ -1504,14 +1534,14 @@ test "stream: a cancelled completion's written bytes settle their record" {
     var completion: io_runtime.Completion;
     if (!transition_ok(cancel.cancel(?scope)) ||
         !runtime_ok(io_runtime.complete_cancellation_transfer(?runtime,
-        secure.operation.lower_token, whole, 0, false)) ||
+        live(?secure).lower_token, whole, 0, false)) ||
         !take_one(?runtime, ?completion) ||
         !cancelled_with(?completion, io_error.CANCELLED, whole) ||
         !stream.accept(?secure, ?completion)) { ret 6; }
-    val sent: transport.Snapshot = transport.snapshot(?secure.operation);
+    val sent: transport.Snapshot = transport.snapshot(live(?secure));
     if (sent.terminal_error != error.CANCELLED || sent.application_bytes != 3 ||
         secure.state != stream.OPEN || secure.wire_output_len != 0) { ret 7; }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
+    if (!settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 8; }
 
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.write(?secure, ?scope, transport.Token{index: 52, generation: 2},
@@ -1519,13 +1549,13 @@ test "stream: a cancelled completion's written bytes settle their record" {
     val partial: usize = secure.wire_output_len - 1;
     if (!transition_ok(cancel.cancel(?scope)) ||
         !runtime_ok(io_runtime.complete_cancellation_transfer(?runtime,
-        secure.operation.lower_token, partial, 0, false)) ||
+        live(?secure).lower_token, partial, 0, false)) ||
         !take_one(?runtime, ?completion) ||
         !stream.accept(?secure, ?completion)) { ret 10; }
-    val cut: transport.Snapshot = transport.snapshot(?secure.operation);
+    val cut: transport.Snapshot = transport.snapshot(live(?secure));
     if (cut.terminal_error != error.CANCELLED || cut.application_bytes != 0 ||
         secure.state != stream.FAILED) { ret 11; }
-    if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 12; }
+    if (!settle(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 12; }
 
     # a transfer larger than the request is refused however the request ended
     var lower:   transport.Operation;
@@ -1534,7 +1564,7 @@ test "stream: a cancelled completion's written bytes settle their record" {
     if (!operation_ok(cancel.make_root(?bounded, opt[time.Instant].none{})) ||
         !transport.begin(?lower, transport.Token{index: 53, generation: 1},
         transport.APPLICATION_READ, ?bounded, ?buffer[0], 4, 0) ||
-        !transport.begin_action(?lower, ?adapter, transport.Action{kind: transport.TRANSPORT_READ,
+        !transport.begin_action(?lower, ?provider, transport.Action{kind: transport.TRANSPORT_READ,
         buffer: ?buffer[0], length: 4, context: 0}) ||
         !transition_ok(cancel.cancel(?bounded)) ||
         !runtime_ok(io_runtime.complete_cancellation_transfer(?runtime, lower.lower_token, 5, 0, false)) ||
