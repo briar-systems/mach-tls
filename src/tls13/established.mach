@@ -13,7 +13,6 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use tls.config;
 use tls.engine;
 use tls.error;
 use tls.handshake;
@@ -34,7 +33,6 @@ pub val TERMINAL:  State = 3;
 pub val DESTROYED: State = 4;
 
 pub val MAX_BYTES:     usize = 512;
-pub val NO_ALPN:       u8    = 255;
 val     MAX_QUEUED:    usize = 4;
 val     OUTPUT_BYTES:  usize = 8;
 val     PARTIAL_BYTES: usize = 8;
@@ -65,15 +63,16 @@ pub rec Seed {
     peer_offered_alpn:     bool;
     client_auth_requested: bool;
     quic:                  bool;
-    alpn_index:            u8;
-    receive_record_limit:  usize;
-    send_record_limit:     usize;
-    max_message_bytes:     usize;
-    max_ticket_bytes:      usize;
-    sessions:              *session.ClientStore;
-    verification_time:     i64;
-    client_config:         *config.ClientConfig;
-    server_config:         *config.ServerConfig;
+    retain_exporter:       bool;
+    # borrowed from the caller configuration, which outlives the connection
+    alpn:                 contracts.Bytes;
+    server_name:          contracts.Bytes;
+    receive_record_limit: usize;
+    send_record_limit:    usize;
+    max_message_bytes:    usize;
+    max_ticket_bytes:     usize;
+    sessions:             *session.ClientStore;
+    verification_time:    i64;
 }
 
 rec Pending {
@@ -86,7 +85,6 @@ pub rec Established {
     role:                  engine.Role;
     state:                 State;
     quic:                  bool;
-    alpn_index:            u8;
     retry_count:           u8;
     tickets_issued:        u8;
     authenticated:         bool;
@@ -125,8 +123,8 @@ pub rec Established {
     input_len:             usize;
     skip_remaining:        usize;
     sessions:              *session.ClientStore;
-    client_config:         *config.ClientConfig;
-    server_config:         *config.ServerConfig;
+    alpn:                  contracts.Bytes;
+    server_name:           contracts.Bytes;
 }
 
 fun result(status: engine.Status, failure: error.Error, consumed: usize,
@@ -223,8 +221,9 @@ fun clear_secrets(core: *Established) {
 # the empty value every record starts from
 pub fun empty() Established {
     var value: Established;
-    value.alpn_index    = NO_ALPN;
-    value.pending_alert = record.NO_ALERT;
+    value.alpn.data        = nil;
+    value.server_name.data = nil;
+    value.pending_alert    = record.NO_ALERT;
     ret value;
 }
 
@@ -236,8 +235,8 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     if (!owner_valid(core) || core.state != EMPTY || send == nil || receive == nil ||
         (seed.role != engine.CLIENT && seed.role != engine.SERVER) ||
         key_schedule.key_size(seed.suite) == 0 ||
-        (seed.role == engine.CLIENT && seed.client_config == nil) ||
-        (seed.role == engine.SERVER && seed.server_config == nil) ||
+        (seed.alpn.len != 0 && seed.alpn.data == nil) ||
+        (seed.server_name.len != 0 && seed.server_name.data == nil) ||
         !memory_range.valid(storage.input, storage.input_capacity) ||
         (storage.input == nil && storage.input_capacity != 0)) { ret false; }
     val owner: i64 = core.transition_owner;
@@ -245,7 +244,8 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     core.transition_owner      = owner;
     core.role                  = seed.role;
     core.quic                  = seed.quic;
-    core.alpn_index            = seed.alpn_index;
+    core.alpn                  = seed.alpn;
+    core.server_name           = seed.server_name;
     core.retry_count           = seed.retry_count;
     core.tickets_issued        = seed.tickets_issued;
     core.authenticated         = seed.authenticated;
@@ -260,16 +260,19 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     core.max_message_bytes     = seed.max_message_bytes;
     core.max_ticket_bytes      = seed.max_ticket_bytes;
     core.verification_time     = seed.verification_time;
-    core.client_config         = seed.client_config;
-    core.server_config         = seed.server_config;
     core.storage               = storage;
-    key_schedule.copy_secret(?core.send, send);
-    key_schedule.copy_secret(?core.receive, receive);
+    # quic never updates tls keys, so it keeps no application secret
+    if (!seed.quic) {
+        key_schedule.copy_secret(?core.send, send);
+        key_schedule.copy_secret(?core.receive, receive);
+    }
     if (seed.role == engine.CLIENT && seed.sessions != nil && resumption != nil) {
         core.sessions = seed.sessions;
         key_schedule.copy_secret(?core.resumption, resumption);
     }
-    if (exporter != nil) { key_schedule.copy_secret(?core.exporter, exporter); }
+    if (seed.retain_exporter && exporter != nil) {
+        key_schedule.copy_secret(?core.exporter, exporter);
+    }
     core.state = OPEN;
     ret true;
 }
@@ -371,12 +374,12 @@ fun retain_ticket(core: *Established, value: *codec.NewSessionTicket) {
     retained.lifetime_seconds = value.lifetime;
     retained.age_add          = value.age_add;
     retained.max_early_data   = 0;
-    val name: contracts.Bytes = core.client_config.server_name;
+    val name: contracts.Bytes = core.server_name;
     if (name.len <= session.MAX_SERVER_NAME) {
         copy_bytes(?retained.server_name[0], name.data, name.len);
         retained.server_name_len = name.len;
     }
-    val alpn: contracts.Bytes = selected_alpn(core);
+    val alpn: contracts.Bytes = core.alpn;
     if (alpn.len != 0 && alpn.len <= session.MAX_ALPN) {
         copy_bytes(?retained.alpn[0], alpn.data, alpn.len);
         retained.alpn_len = alpn.len;
@@ -705,21 +708,6 @@ pub fun destroy(core: *Established) bool {
     ret destroyed;
 }
 
-fun selected_alpn(core: *Established) contracts.Bytes {
-    var none: contracts.Bytes = contracts.Bytes{data: nil, len: 0};
-    if (core.alpn_index == NO_ALPN) { ret none; }
-    val index: usize = core.alpn_index::usize;
-    if (core.client_config != nil && index < core.client_config.alpn_len) {
-        val name: config.ProtocolName = core.client_config.alpn[index];
-        ret contracts.Bytes{data: name.data, len: name.len};
-    }
-    if (core.server_config != nil && index < core.server_config.alpn_len) {
-        val name: config.ProtocolName = core.server_config.alpn[index];
-        ret contracts.Bytes{data: name.data, len: name.len};
-    }
-    ret none;
-}
-
 # the negotiated facts. a server's peer name and either side's quic transport
 # parameters are only reported before finish
 pub fun snapshot(core: *Established) engine.Snapshot {
@@ -732,7 +720,7 @@ pub fun snapshot(core: *Established) engine.Snapshot {
     value.group                 = core.group;
     value.retry_count           = core.retry_count;
     value.authenticated         = core.authenticated;
-    value.selected_alpn         = selected_alpn(core);
+    value.selected_alpn         = core.alpn;
     value.peer_offered_alpn     = core.peer_offered_alpn;
     value.client_auth_requested = core.client_auth_requested;
     value.resumed               = core.resumed;
@@ -740,13 +728,11 @@ pub fun snapshot(core: *Established) engine.Snapshot {
     value.output_pending        = pending(core);
     value.event_active          = core.event_active;
     value.destroyed             = core.state == DESTROYED;
-    if (core.role == engine.CLIENT && core.client_config != nil) {
-        value.peer_name = core.client_config.server_name;
-    }
-    if (core.state == OPEN)     { value.status = engine.COMPLETE; }
-    or (core.state == TERMINAL) { value.status = engine.FAILED; }
-    or (core.state == CLOSING)  { value.status = engine.MORE; }
-    or                          { value.status = engine.CLOSED; }
+    if (core.role == engine.CLIENT) { value.peer_name = core.server_name; }
+    if (core.state == OPEN)         { value.status = engine.COMPLETE; }
+    or (core.state == TERMINAL)     { value.status = engine.FAILED; }
+    or (core.state == CLOSING)      { value.status = engine.MORE; }
+    or                              { value.status = engine.CLOSED; }
     leave(core);
     ret value;
 }
@@ -772,10 +758,7 @@ pub fun failure(core: *Established) error.Error {
     ret core.failure;
 }
 
-var test_client_config: config.ClientConfig;
-var test_server_config: config.ServerConfig;
-var test_protocols:     [2]config.ProtocolName;
-var test_input:         [512]u8;
+var test_input: [512]u8;
 
 fun test_secret(fill: u8) key_schedule.Secret {
     var value: key_schedule.Secret;
@@ -791,26 +774,18 @@ fun test_secret(fill: u8) key_schedule.Secret {
 }
 
 fun test_seed(role: engine.Role) Seed {
-    test_protocols[0]              = config.ProtocolName{data: "h2"::*u8, len: 2};
-    test_protocols[1]              = config.ProtocolName{data: "http/1.1"::*u8, len: 8};
-    test_client_config             = config.no_client_config();
-    test_client_config.alpn        = ?test_protocols[0];
-    test_client_config.alpn_len    = 2;
-    test_client_config.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
-    test_server_config             = config.no_server_config();
-    test_server_config.alpn        = ?test_protocols[0];
-    test_server_config.alpn_len    = 2;
     var seed: Seed;
     seed.role                 = role;
     seed.suite                = tls13.AES_128_GCM_SHA256;
     seed.group                = tls13.X25519;
-    seed.alpn_index           = 1;
+    seed.alpn                 = contracts.Bytes{data: "http/1.1"::*u8, len: 8};
     seed.receive_record_limit = record.MAX_PLAINTEXT;
     seed.send_record_limit    = record.MAX_PLAINTEXT;
     seed.max_message_bytes    = 16384;
     seed.max_ticket_bytes     = 256;
-    if (role == engine.CLIENT) { seed.client_config = ?test_client_config; }
-    or                         { seed.server_config = ?test_server_config; }
+    if (role == engine.CLIENT) {
+        seed.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+    }
     ret seed;
 }
 
