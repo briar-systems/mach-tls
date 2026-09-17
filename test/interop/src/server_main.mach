@@ -9,12 +9,12 @@ use std.filesystem;
 use io_error: std.io.error;
 use std.io.file;
 use io_runtime: std.io.runtime;
+use mem_secret: std.memory.secret;
 use std.net.ip;
 use std.net.tcp;
 use std.print;
 use std.runtime;
 use std.sync.cancel;
-use mem_secret: std.memory.secret;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -352,6 +352,7 @@ fun report(label: str, value: usize) {
 val HANDSHAKE_BYTES:   usize = 65536;
 val PEER_CERTIFICATES: usize = 8;
 val WIRE_BYTES:        usize = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+
 rec Connection {
     engine:            server.Server;
     secure:            stream.Stream;
@@ -362,12 +363,13 @@ rec Connection {
     wire_input:        [WIRE_BYTES]u8;
     wire_output:       [WIRE_BYTES]u8;
 }
+
 var cur:              *Connection;
 var option_footprint: bool;
 var footprint_base:   usize;
 
-val PAGE_SIZE:        usize = 4096;
-val IDLE_CALLS:       usize = 100000;
+val PAGE_SIZE:  usize = 4096;
+val IDLE_CALLS: usize = 100000;
 
 # resident pages of the whole process, from /proc/self/statm
 fun resident_pages() usize {
@@ -429,7 +431,7 @@ fun footprint(phase: str) {
 # the cost of the calls an idle established engine answers most
 fun idle_cost() {
     if (!option_footprint) { ret; }
-    var event: engine.Event;
+    var event:   engine.Event;
     val started: time.Clock = time.monotonic();
     var i:       usize      = 0;
     for (i < IDLE_CALLS) {
@@ -614,8 +616,8 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     # connection is torn down without attempting another record
     if (option_handshake_only && index + 1 < connection_count) {
         if (!stream.destroy(?cur.secure)) { ret 46; }
-        if (option_tls12)                    { tls12_connection.destroy(?legacy_engine); }
-        or                                   { server.destroy(?cur.engine); }
+        if (option_tls12)                 { tls12_connection.destroy(?legacy_engine); }
+        or                                { server.destroy(?cur.engine); }
         tcp.stream_close(?connection_socket);
         ret 0;
     }
@@ -997,7 +999,7 @@ fun main(argc: i64, argv: **u8) i64 {
             print.print("cannot allocate the connection\n");
             ret 9;
         }
-        val served: i64 = serve_one(index, ?allocator, trust, ?store);
+        val served:   i64                 = serve_one(index, ?allocator, trust, ?store);
         val released: err[io_error.Error] = mem_secret.deallocate_typed[Connection](cur, 1);
         if (sel released.err) { ret 9; }
         io_runtime.close(?connection_runtime);
