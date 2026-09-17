@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.6.0] - 2026-09-17
+
+### Breaking
+
+- The engines are renamed: `server.Server` is `server.Handshake`, `client.Client` is `client.Handshake`, and `tls12.connection.Connection` is `tls12.connection.Handshake` (#92).
+- A call that finds another call in progress on the same engine, established record or Stream is refused instead of made to wait. It returns `false`, or `FAILED` with `ILLEGAL_PARAMETER`. Each object has one owner at a time, and handing it to another thread is legal only once the current call has returned. See `doc/established.md` (#92).
+- The default limits are much smaller. Ten thousand concurrent handshakes need a few hundred MiB of storage instead of about 11 GiB (#92):
+
+  | limit | 0.5.2 | 0.6.0 |
+  | --- | ---: | ---: |
+  | `max_peer_handshake_bytes` | 1 MiB | 16 KiB |
+  | `max_client_hello_bytes` | 64 KiB | 16 KiB |
+  | `max_chain_bytes` | 512 KiB | 64 KiB |
+  | `max_certificate_bytes` (new) | none | 16 KiB |
+
+  To accept larger peers, set the field on `config.Limits` before `init`. Every limit can be raised to the protocol maximum:
+  - `max_peer_handshake_bytes` now bounds every incoming message except Certificate. Raise it for large extensions or large CertificateRequest authority lists.
+  - `max_chain_bytes` bounds a Certificate message through `config.certificate_message_bytes(limits)`. Raise it for long chains. A client's `Storage.input`, and a server's when it may require client authentication, must hold `certificate_message_bytes`.
+  - `max_certificate_bytes` bounds each chain entry, and a larger entry fails with `BAD_CERTIFICATE`. Raise it for certificates with very large SAN lists or keys.
+  - `max_client_hello_bytes` bounds the retained ClientHello. Raise it for clients that send large PSK or post-quantum key shares.
+- A server that requires client authentication from input too small for `certificate_message_bytes` fails the handshake with `RESOURCE_LIMIT` (#92).
+- The exporter master secret is no longer kept after the handshake. Set `retain_exporter` on the client or server configuration to keep `export_keying_material` working on an established connection (#92).
+- `stream.Storage` has a third region, `ticket_input`. A TLS 1.3 client with a session store must size it for `max_ticket_bytes` plus a handshake header, or tickets are skipped (#92).
+
+### Added
+
+- Established records: `tls13.established.Established` (464 bytes) and `tls12.established.Established` (88 bytes). When the last handshake event is accepted, the engine moves the application state into its embedded record and wipes or releases everything else. `server.finish`, `client.finish` and `tls12.connection.finish` move that record out and return the engine to its destroyed state, ready for `init` or a pool (#92).
+- `tls.stream` finishes its engine into its own established record when the completed handshake operation is destroyed. From then on it no longer borrows the engine (#92).
+- `config.certificate_message_bytes`, `config.Limits.max_certificate_bytes` and `retain_exporter` (#92).
+- Secret-level key schedule operations in `tls13.key_schedule` (#92).
+
+### Changed
+
+- An idle `next_event` costs one compare-and-swap, about 21 ns, down from 435 ns (#92).
+- An idle established TLS 1.3 connection in the footprint leg holds 6 resident pages, down from 9, and 15 after destroy, down from 18. The leg now bounds them at 8 and 17 (#92).
+- NewSessionTicket is accepted before or after `finish`. A client's ticket input is sized for a whole ticket message (#92).
+- The license is attributed to Briar Systems LLC (#93).
+
 ## [0.5.2] - 2026-09-17
 
 ### Changed
