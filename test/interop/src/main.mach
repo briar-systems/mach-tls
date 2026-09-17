@@ -229,7 +229,7 @@ var tls12_configuration: config.ClientConfig;
 var tls12_suites:        [6]tls13.CipherSuite;
 var tls12_signatures:    [7]tls13.SignatureScheme;
 var tls12_versions:      [1]u16;
-var legacy_engine:       tls12_connection.Connection;
+var legacy_engine:       tls12_connection.Handshake;
 var legacy_hello:        [16384]u8;
 var handshake_input:     [65536]u8;
 var handshake_output:    [65536]u8;

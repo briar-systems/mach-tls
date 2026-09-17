@@ -242,7 +242,7 @@ var tls12_configuration:       config.ServerConfig;
 var tls12_suites:              [6]tls13.CipherSuite;
 var tls12_signatures:          [5]tls13.SignatureScheme;
 var tls12_versions:            [2]u16;
-var legacy_engine:             tls12_connection.Connection;
+var legacy_engine:             tls12_connection.Handshake;
 var legacy_hello:              [16384]u8;
 var ticket_ring:               session.KeyRing;
 var replay_window:             session.ReplayWindow;

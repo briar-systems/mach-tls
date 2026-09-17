@@ -70,7 +70,7 @@ pub rec Stream {
     role:                     engine.Role;
     client:                   *client.Handshake;
     server:                   *server.Handshake;
-    legacy:                   *tls12_connection.Connection;
+    legacy:                   *tls12_connection.Handshake;
     operation:                transport.Operation;
     read_cipher:              record.Cipher;
     write_cipher:             record.Cipher;
@@ -975,7 +975,7 @@ fun operation_available(stream: *Stream) bool {
 
 fun init_inner(stream: *Stream, role: engine.Role,
     client_engine: *client.Handshake, server_engine: *server.Handshake,
-    legacy_engine: *tls12_connection.Connection, storage: Storage,
+    legacy_engine: *tls12_connection.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (stream_owner_data(stream) == nil ||
         (stream.state != 0 && stream.state != DESTROYED) ||
@@ -1061,7 +1061,7 @@ pub fun init_client(stream: *Stream, core: *client.Handshake, storage: Storage,
 }
 
 pub fun init_tls12_client(stream: *Stream,
-    core: *tls12_connection.Connection, storage: Storage,
+    core: *tls12_connection.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.TLS12_CLIENT, nil, nil, core,
@@ -1069,7 +1069,7 @@ pub fun init_tls12_client(stream: *Stream,
 }
 
 pub fun init_tls12_server(stream: *Stream,
-    core: *tls12_connection.Connection, storage: Storage,
+    core: *tls12_connection.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.TLS12_SERVER, nil, nil, core,
@@ -1246,7 +1246,7 @@ pub fun connect(stream: *Stream, core: *client.Handshake, storage: Storage,
 }
 
 # a tls 1.2 connection is driven by the same operations as a tls 1.3 one
-pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Connection,
+pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Handshake,
     storage: Storage, lower: *transport.Transport, scope: *cancel.Scope,
     token: transport.Token, verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1259,7 +1259,7 @@ pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Connection,
     ret leave(stream, true);
 }
 
-pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Connection,
+pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Handshake,
     storage: Storage, lower: *transport.Transport, scope: *cancel.Scope,
     token: transport.Token, verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }

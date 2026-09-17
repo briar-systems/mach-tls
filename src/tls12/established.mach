@@ -1,0 +1,341 @@
+# the tls 1.2 state an established connection needs, for both roles
+#
+# tls 1.2 has no post-handshake messages here and never renegotiates, and the
+# record keys already live in the stream's ciphers. what is left is close and
+# alert state, the record limits and the negotiated facts
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.engine;
+use tls.error;
+use tls.handshake;
+use tls.memory_range;
+use tls.record;
+use tls.tls12;
+use tls.tls13;
+use tls.transition;
+
+pub def State: u8;
+
+pub val EMPTY:     State = 0;
+pub val OPEN:      State = 1;
+pub val CLOSING:   State = 2;
+pub val TERMINAL:  State = 3;
+pub val DESTROYED: State = 4;
+
+pub val MAX_BYTES: usize = 256;
+
+# what a handshake knows when its handshake queue drains
+pub rec Seed {
+    role:                  engine.Role;
+    suite:                 u16;
+    group:                 tls13.NamedGroup;
+    authenticated:         bool;
+    peer_offered_alpn:     bool;
+    client_auth_requested: bool;
+    # borrowed from the caller's configuration, which outlives the connection
+    alpn:                 contracts.Bytes;
+    server_name:          contracts.Bytes;
+    receive_record_limit: usize;
+    send_record_limit:    usize;
+}
+
+pub rec Established {
+    role:                  engine.Role;
+    state:                 State;
+    authenticated:         bool;
+    peer_offered_alpn:     bool;
+    client_auth_requested: bool;
+    event_active:          bool;
+    alert_queued:          bool;
+    pending_alert:         record.AlertDescription;
+    failure:               error.Error;
+    suite:                 u16;
+    group:                 tls13.NamedGroup;
+    event_token:           u64;
+    event_generation:      u64;
+    transition_owner:      i64;
+    receive_record_limit:  usize;
+    send_record_limit:     usize;
+    alpn:                  contracts.Bytes;
+    server_name:           contracts.Bytes;
+}
+
+fun result(status: engine.Status, failure: error.Error, consumed: usize,
+    required: usize) engine.Result {
+    ret engine.result(status, failure, consumed, required);
+}
+
+fun owner_valid(core: *Established) bool {
+    if (core == nil) { ret false; }
+    val address: usize = (?core.state)::usize;
+    val offset:  usize = $offset_of(Established, state);
+    ret address >= offset && memory_range.valid((address - offset)::*u8,
+        $size_of(Established));
+}
+
+fun owner_overlaps(core: *Established, data: *u8, len: usize) bool {
+    val base: *u8 = ((?core.state)::usize - $offset_of(Established, state))::*u8;
+    ret memory_range.overlap(base, $size_of(Established), data, len);
+}
+
+fun enter(core: *Established) bool {
+    if (!owner_valid(core)) { ret false; }
+    ret transition.enter(?core.transition_owner, transition.current());
+}
+
+fun leave(core: *Established) {
+    transition.leave(?core.transition_owner);
+}
+
+fun live(core: *Established) bool {
+    ret core.state == OPEN || core.state == CLOSING;
+}
+
+fun fail(core: *Established, failure: error.Error,
+    alert: record.AlertDescription) engine.Result {
+    if (live(core)) {
+        core.failure       = failure;
+        core.pending_alert = alert;
+        core.alert_queued  = alert != record.NO_ALERT;
+        core.state         = TERMINAL;
+    }
+    ret result(engine.FAILED, failure, 0, 0);
+}
+
+pub fun empty() Established {
+    var value: Established;
+    value.alpn.data        = nil;
+    value.server_name.data = nil;
+    value.pending_alert    = record.NO_ALERT;
+    ret value;
+}
+
+pub fun begin(core: *Established, seed: Seed) bool {
+    if (!owner_valid(core) || core.state != EMPTY ||
+        (seed.role != engine.TLS12_CLIENT && seed.role != engine.TLS12_SERVER) ||
+        (seed.alpn.len != 0 && seed.alpn.data == nil) ||
+        (seed.server_name.len != 0 && seed.server_name.data == nil)) { ret false; }
+    val owner: i64 = core.transition_owner;
+    @core                      = empty();
+    core.transition_owner      = owner;
+    core.role                  = seed.role;
+    core.suite                 = seed.suite;
+    core.group                 = seed.group;
+    core.authenticated         = seed.authenticated;
+    core.peer_offered_alpn     = seed.peer_offered_alpn;
+    core.client_auth_requested = seed.client_auth_requested;
+    core.alpn                  = seed.alpn;
+    core.server_name           = seed.server_name;
+    core.receive_record_limit  = seed.receive_record_limit;
+    core.send_record_limit     = seed.send_record_limit;
+    core.state                 = OPEN;
+    ret true;
+}
+
+# move source into destination, leaving source empty. refused while an event
+# is active
+pub fun move(destination: *Established, source: *Established) bool {
+    if (!owner_valid(destination) || !owner_valid(source) ||
+        destination.state != EMPTY || !live(source) || source.event_active) {
+        ret false;
+    }
+    val owner: i64 = destination.transition_owner;
+    @destination                 = @source;
+    destination.transition_owner = owner;
+    wipe(source);
+    ret true;
+}
+
+pub fun wipe(core: *Established) {
+    if (core == nil) { ret; }
+    val owner: i64 = core.transition_owner;
+    @core                 = empty();
+    core.transition_owner = owner;
+}
+
+# any handshake message after establishment is refused, and a renegotiation
+# attempt says so
+pub fun ingest(core: *Established, level: engine.Level, data: *u8,
+    length: usize) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var progress: engine.Result = result(engine.MORE, error.OK, length,
+        handshake.HEADER_SIZE);
+    if (!live(core) || !memory_range.valid(data, length) ||
+        (length != 0 && data == nil) || owner_overlaps(core, data, length)) {
+        progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    or (core.alert_queued || core.event_active) {
+        progress = result(engine.BLOCKED, error.OK, 0, 0);
+    }
+    or (level != engine.APPLICATION) {
+        progress = fail(core, error.UNEXPECTED_MESSAGE, record.UNEXPECTED_MESSAGE_ALERT);
+    }
+    or (length != 0) {
+        var failure: error.Error = error.UNEXPECTED_MESSAGE;
+        if (data[0] == handshake.HELLO_REQUEST || data[0] == handshake.CLIENT_HELLO) {
+            failure = error.NO_RENEGOTIATION;
+        }
+        progress = fail(core, failure, engine.alert_for(failure));
+    }
+    leave(core);
+    ret progress;
+}
+
+pub fun poll(core: *Established) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var progress: engine.Result = result(engine.MORE, error.OK, 0, handshake.HEADER_SIZE);
+    if (!live(core))                            { progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    or (core.alert_queued || core.event_active) { progress = result(engine.BLOCKED, error.OK, 0, 0); }
+    leave(core);
+    ret progress;
+}
+
+pub fun next_event(core: *Established, output: *engine.Event) bool {
+    if (!enter(core)) { ret false; }
+    var available: bool = false;
+    if (output != nil && !core.event_active && core.alert_queued &&
+        memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) &&
+        !owner_overlaps(core, (?output.token)::*u8, $size_of(engine.Event))) {
+        var event: engine.Event = engine.empty_event();
+        event.token           = engine.next_generation(core.event_generation);
+        event.kind            = engine.ALERT;
+        event.suite           = core.suite;
+        event.alert           = core.pending_alert;
+        output[0]             = event;
+        core.event_generation = event.token;
+        core.event_token      = event.token;
+        core.event_active     = true;
+        available             = true;
+    }
+    leave(core);
+    ret available;
+}
+
+pub fun complete_event(core: *Established, token: u64, accepted: bool) bool {
+    if (!enter(core)) { ret false; }
+    var completed: bool = false;
+    if (core.event_active && token != 0 && token == core.event_token) {
+        core.event_active = false;
+        core.alert_queued = false;
+        if (!accepted) { fail(core, error.INTERNAL_ERROR, record.NO_ALERT); }
+        completed = true;
+    }
+    leave(core);
+    ret completed;
+}
+
+pub fun event_active(core: *Established) bool {
+    ret core != nil && core.event_active;
+}
+
+pub fun close(core: *Established,
+    description: record.AlertDescription) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var closed: engine.Result = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    if (core.state == OPEN && !core.alert_queued &&
+        record.valid_tls13_alert(description)) {
+        core.pending_alert = description;
+        core.alert_queued  = true;
+        if (description != record.USER_CANCELED_ALERT) { core.state = CLOSING; }
+        closed = result(engine.OK, error.OK, 0, 0);
+    }
+    leave(core);
+    ret closed;
+}
+
+pub fun destroy(core: *Established) bool {
+    if (!enter(core)) { ret false; }
+    val destroyed: bool = !core.event_active;
+    if (destroyed) {
+        wipe(core);
+        core.state = DESTROYED;
+    }
+    leave(core);
+    ret destroyed;
+}
+
+pub fun snapshot(core: *Established) engine.Snapshot {
+    var view: engine.Snapshot = engine.empty_snapshot();
+    if (!enter(core)) { ret view; }
+    view.role                  = core.role;
+    view.version               = tls12.VERSION;
+    view.error                 = core.failure;
+    view.suite                 = core.suite;
+    view.group                 = core.group;
+    view.authenticated         = core.authenticated;
+    view.selected_alpn         = core.alpn;
+    view.peer_offered_alpn     = core.peer_offered_alpn;
+    view.peer_name             = core.server_name;
+    view.client_auth_requested = core.client_auth_requested;
+    view.output_pending        = core.alert_queued;
+    view.event_active          = core.event_active;
+    view.destroyed             = core.state == DESTROYED;
+    if (core.state == OPEN)     { view.status = engine.COMPLETE; }
+    or (core.state == TERMINAL) { view.status = engine.FAILED; }
+    or (core.state == CLOSING)  { view.status = engine.MORE; }
+    or                          { view.status = engine.CLOSED; }
+    leave(core);
+    ret view;
+}
+
+pub fun receive_record_limit(core: *Established) usize {
+    if (!enter(core)) { ret 0; }
+    var limit: usize = 0;
+    if (live(core) || core.state == TERMINAL) { limit = core.receive_record_limit; }
+    leave(core);
+    ret limit;
+}
+
+pub fun send_record_limit(core: *Established) usize {
+    if (!enter(core)) { ret 0; }
+    var limit: usize = 0;
+    if (live(core) || core.state == TERMINAL) { limit = core.send_record_limit; }
+    leave(core);
+    ret limit;
+}
+
+test "tls12.established: the record fits its budget" {
+    if ($size_of(Established) > MAX_BYTES) { ret 1; }
+    ret 0;
+}
+
+test "tls12.established: renegotiation is refused with its own error" {
+    var seed: Seed;
+    seed.role                 = engine.TLS12_SERVER;
+    seed.suite                = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    seed.alpn                 = contracts.Bytes{data: "h2"::*u8, len: 2};
+    seed.receive_record_limit = record.MAX_PLAINTEXT;
+    seed.send_record_limit    = record.MAX_PLAINTEXT;
+    var core:  Established = empty();
+    var moved: Established = empty();
+    if (!begin(?core, seed) || !move(?moved, ?core) || core.state != EMPTY) { ret 1; }
+    if (snapshot(?moved).status != engine.COMPLETE ||
+        snapshot(?moved).selected_alpn.len != 2) { ret 2; }
+    var hello: [4]u8 = [4]u8{handshake.CLIENT_HELLO, 0, 0, 0};
+    if (ingest(?moved, engine.APPLICATION, ?hello[0], 4).status != engine.FAILED ||
+        snapshot(?moved).error != error.NO_RENEGOTIATION) { ret 3; }
+    var event: engine.Event;
+    if (!next_event(?moved, ?event) || event.kind != engine.ALERT ||
+        !complete_event(?moved, event.token, true)) { ret 4; }
+    if (next_event(?moved, ?event) || !destroy(?moved)) { ret 5; }
+    ret 0;
+}
+
+test "tls12.established: close queues exactly one alert" {
+    var seed: Seed;
+    seed.role  = engine.TLS12_CLIENT;
+    seed.suite = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
+    var core: Established = empty();
+    if (!begin(?core, seed)) { ret 1; }
+    if (close(?core, record.CLOSE_NOTIFY).status != engine.OK ||
+        close(?core, record.CLOSE_NOTIFY).status != engine.FAILED) { ret 2; }
+    var event: engine.Event;
+    if (!next_event(?core, ?event) || event.alert != record.CLOSE_NOTIFY ||
+        destroy(?core) || !complete_event(?core, event.token, true) ||
+        snapshot(?core).status != engine.MORE || !destroy(?core)) { ret 3; }
+    ret 0;
+}
