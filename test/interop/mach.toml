@@ -76,8 +76,3 @@ need = []
 
 [dep.tls]
 path = "../.."
-
-# crypto v0.13.0 pins std v5.0.0, so the std identity the library builds with is declared here too
-[dep.std]
-git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v5.0.1"
