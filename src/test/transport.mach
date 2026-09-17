@@ -31,6 +31,8 @@ use tls.record;
 use tls.stream;
 use tls.test.pool;
 use tls.tls13;
+use tls.tls13.established;
+use tls.tls13.key_schedule;
 use tls.transport;
 
 fun operation_ok(outcome: cancel.Operation) bool {
@@ -1576,5 +1578,385 @@ test "stream: a cancelled completion's written bytes settle their record" {
         !runtime_ok(io_runtime.unregister_source(?runtime, state.source)) ||
         !runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 15; }
+    ret 0;
+}
+
+fun fill_secret(secret: *key_schedule.Secret, base: u8) {
+    var i: usize = 0;
+    for (i < 32) {
+        val byte: u8 = base + i::u8;
+        secret.data[i] = byte;
+        i              = i + 1;
+    }
+    secret.len    = 32;
+    secret.active = true;
+}
+
+# an open stream over a finished core, which is what takes key updates
+fun make_finished_stream(value: *stream.Stream, core: *client.Handshake,
+    adapter: *transport.Transport, memory: buffer.Lease,
+    secrets: buffer.SecretLease) bool {
+    if (!make_leased_stream(value, core, adapter, memory, secrets)) { ret false; }
+    var send:    key_schedule.Secret;
+    var receive: key_schedule.Secret;
+    fill_secret(?send, 1);
+    fill_secret(?receive, 65);
+    var seed: established.Seed;
+    seed.role                 = engine.SERVER;
+    seed.suite                = tls13.AES_128_GCM_SHA256;
+    seed.group                = tls13.X25519;
+    seed.receive_record_limit = record.MAX_PLAINTEXT;
+    seed.send_record_limit    = record.MAX_PLAINTEXT;
+    seed.max_message_bytes    = 16384;
+    seed.max_ticket_bytes     = 256;
+    value.core13              = established.empty();
+    val begun: bool = established.begin(?value.core13, seed, ?send, ?receive, nil, nil,
+        buffer.no_lease());
+    ct.zeroize(?send.data[0], 48);
+    ct.zeroize(?receive.data[0], 48);
+    if (!begun) { ret false; }
+    value.role     = engine.SERVER;
+    value.client   = nil;
+    value.finished = true;
+    ret true;
+}
+
+# the peer seals with the key the test stream reads with
+fun make_peer(peer: *record.Cipher) bool {
+    var key: [16]^u8;
+    var iv:  [12]u8;
+    var i:   usize = 0;
+    for (i < 16) {
+        key[i] = (i + 1)::u8;
+        i      = i + 1;
+    }
+    i = 0;
+    for (i < 12) {
+        iv[i] = (0x80 + i)::u8;
+        i     = i + 1;
+    }
+    val installed: bool = record.install(peer, record.TLS13, record.aes_128_gcm(),
+        contracts.SecretBytes{data: ?key[0], len: 16},
+        contracts.Bytes{data: ?iv[0], len: 12});
+    ct.zeroize(?key[0], 16);
+    ret installed;
+}
+
+fun seal_peer(peer: *record.Cipher, kind: record.ContentType, clear: *^u8,
+    length: usize, wire: *u8) usize {
+    var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
+    val sealed:  record.Sealed = record.seal(peer, kind,
+        contracts.SecretBytes{data: clear, len: length}, 0,
+        contracts.SecretBuffer{data: ?scratch[0], capacity: record.MAX_INNER_PLAINTEXT},
+        contracts.Buffer{data: wire, capacity: record.HEADER_SIZE + record.MAX_CIPHERTEXT});
+    if (sealed.error != error.OK) { ret 0; }
+    ret sealed.written;
+}
+
+fun deliver(runtime: *io_runtime.Runtime, operation: *transport.Operation, wire: *u8,
+    length: usize) bool {
+    var i: usize = 0;
+    for (i < length) {
+        operation.lower_buffer[i] = wire[i];
+        i                         = i + 1;
+    }
+    ret runtime_ok(io_runtime.complete(runtime, operation.lower_token, length, 0, false));
+}
+
+fun step(runtime: *io_runtime.Runtime, secure: *stream.Stream) bool {
+    var completion: io_runtime.Completion;
+    ret take_one(runtime, ?completion) && stream.accept(secure, ?completion);
+}
+
+fun lane_ended(lane: *stream.Lane, failure: error.Error, bytes: usize) bool {
+    val value: transport.Snapshot = transport.snapshot(?lane.operation);
+    ret value.state == transport.OPERATION_TERMINAL && value.terminal_error == failure &&
+        value.application_bytes == bytes;
+}
+
+fun token(index: u32, generation: u32) transport.Token {
+    ret transport.Token{index: index, generation: generation};
+}
+
+test "stream: a read that finds memory first does not starve a parked write" {
+    var runtime: io_runtime.Runtime;
+    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    var writes: cancel.Scope;
+    var reads:  cancel.Scope;
+    if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
+        !operation_ok(cancel.make_root(?reads, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_leased_stream(?secure, ?core_a, ?adapter, pool.lease(?parked_harness),
+        pool.secret_lease(?parked_harness))) { ret 3; }
+    pool.squeeze(?parked_squeeze);
+    var output: [3]u8 = [3]u8{1, 2, 3};
+    var input:  [5]u8;
+    if (!stream.write(?secure, ?writes, token(60, 1), ?output[0], 3, 0) ||
+        !stream.read(?secure, ?reads, token(60, 2), ?input[0], 5, 0)) { ret 4; }
+    if (secure.writing.park != stream.PARK_MEMORY ||
+        secure.reading.park != stream.PARK_MEMORY || transport_state.reads != 0 ||
+        transport_state.writes != 0) { ret 5; }
+    pool.relax(?parked_squeeze);
+    if (!stream.resume(?secure)) { ret 6; }
+    # the read is woken first and stands aside, since the write holds the turn
+    if (!step(?runtime, ?secure)) { ret 7; }
+    if (secure.reading.park != stream.PARK_MEMORY || secure.wire_in.held ||
+        transport_state.reads != 0 || transport_state.writes != 0) { ret 8; }
+    if (!step(?runtime, ?secure))                                       { ret 9; }
+    if (transport_state.writes != 1 || secure.turn != stream.READ_LANE) { ret 10; }
+    # the write passed the turn and woke the read, which now takes its memory
+    if (!step(?runtime, ?secure) || transport_state.reads != 1 ||
+        secure.reading.park != stream.PARK_NONE) { ret 11; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.writing, error.OK, 3) ||
+        !stream.destroy_operation(?secure, token(60, 1))) { ret 12; }
+    if (!transition_ok(cancel.cancel(?reads)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.reading, error.CANCELLED, 0) ||
+        !stream.destroy_operation(?secure, token(60, 2)) || secure.state != stream.OPEN) {
+        ret 13;
+    }
+    if (!stream.destroy(?secure) || pool.held(?parked_harness) != 0 ||
+        !pool.destroy(?parked_harness) || !operation_ok(cancel.destroy(?writes)) ||
+        !operation_ok(cancel.destroy(?reads)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 14; }
+    ret 0;
+}
+
+test "stream: a write that went out in full counts its bytes when the read fails" {
+    var runtime: io_runtime.Runtime;
+    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    var peer:   record.Cipher;
+    if (!make_open_stream(?secure, ?core_a, ?adapter) || !make_peer(?peer)) { ret 3; }
+    var output: [3]u8 = [3]u8{1, 2, 3};
+    var input:  [5]u8;
+    if (!stream.write(?secure, ?scope, token(61, 1), ?output[0], 3, 0) ||
+        !stream.read(?secure, ?scope, token(61, 2), ?input[0], 5, 0) ||
+        transport_state.writes != 1 || transport_state.reads != 1) { ret 4; }
+    var clear:  [5]^u8 = [5]^u8{'f', 'o', 'r', 'g', 'e'};
+    var wire:   [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    val sealed: usize  = seal_peer(?peer, record.APPLICATION_DATA, ?clear[0], 5, ?wire[0]);
+    record.destroy(?peer);
+    if (sealed == 0) { ret 5; }
+    wire[sealed - 1] = wire[sealed - 1] ^ 1;
+    if (!deliver(?runtime, ?secure.reading.operation, ?wire[0], sealed) ||
+        !step(?runtime, ?secure)) { ret 6; }
+    if (!lane_ended(?secure.reading, error.BAD_RECORD_MAC, 0) ||
+        secure.state != stream.FAILED ||
+        transport.snapshot(?secure.writing.operation).state !=
+        transport.OPERATION_WAITING) { ret 7; }
+    # the record reached the peer, so its bytes count, and the write reports
+    # the failure that ended the stream
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.writing, error.BAD_RECORD_MAC, 3)) { ret 8; }
+    if (!stream.destroy_operation(?secure, token(61, 1)) ||
+        !stream.destroy_operation(?secure, token(61, 2)) ||
+        !stream.close(?secure, ?scope, token(61, 3), 0) ||
+        secure.writing.pending_action != transport.TRANSPORT_ABORT) { ret 9; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        0, 0, false)) || !step(?runtime, ?secure) || secure.state != stream.CLOSED ||
+        !stream.destroy_operation(?secure, token(61, 3)) || !stream.destroy(?secure) ||
+        !operation_ok(cancel.destroy(?scope)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 10; }
+    ret 0;
+}
+
+test "stream: a read in flight refuses close while half close and key update proceed" {
+    var runtime: io_runtime.Runtime;
+    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    var writes: cancel.Scope;
+    var reads:  cancel.Scope;
+    if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
+        !operation_ok(cancel.make_root(?reads, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_finished_stream(?secure, ?core_a, ?adapter, pool.shared(),
+        pool.shared_secret())) { ret 3; }
+    var input: [5]u8;
+    if (!stream.read(?secure, ?reads, token(62, 1), ?input[0], 5, 0) ||
+        transport_state.reads != 1) { ret 4; }
+    # a full close and an alert need both lanes and change nothing
+    if (stream.close(?secure, ?writes, token(62, 2), 0) ||
+        stream.alert(?secure, ?writes, token(62, 2), record.INTERNAL_ERROR_ALERT, 0)) { ret 5; }
+    if (secure.state != stream.OPEN || secure.send_closed || transport_state.writes != 0 ||
+        transport_state.closes != 0 ||
+        transport.snapshot(?secure.writing.operation).state != 0) { ret 6; }
+    # a key update and a half close need only the write lane
+    if (!stream.key_update(?secure, ?writes, token(62, 3), 0, 0) ||
+        transport_state.writes != 1) { ret 7; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.writing, error.OK, 0) ||
+        !stream.destroy_operation(?secure, token(62, 3))) { ret 8; }
+    if (!stream.half_close(?secure, ?writes, token(62, 4), 0) ||
+        transport_state.writes != 2) { ret 9; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        transport_state.closes != 1 ||
+        !runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        0, 0, false)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.writing, error.OK, 0) || !secure.send_closed ||
+        !stream.destroy_operation(?secure, token(62, 4))) { ret 10; }
+    if (transport.snapshot(?secure.reading.operation).state !=
+        transport.OPERATION_WAITING || transport_state.reads != 1) { ret 11; }
+    if (!transition_ok(cancel.cancel(?reads)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.reading, error.CANCELLED, 0) ||
+        !stream.destroy_operation(?secure, token(62, 1)) ||
+        secure.state != stream.OPEN) { ret 12; }
+    if (!stream.destroy(?secure) || !operation_ok(cancel.destroy(?writes)) ||
+        !operation_ok(cancel.destroy(?reads)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 13; }
+    ret 0;
+}
+
+test "stream: a peer close notify ends the read and leaves the write finishable" {
+    var runtime: io_runtime.Runtime;
+    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    var peer:   record.Cipher;
+    if (!make_open_stream(?secure, ?core_a, ?adapter) || !make_peer(?peer)) { ret 3; }
+    var output: [3]u8 = [3]u8{1, 2, 3};
+    var input:  [5]u8;
+    if (!stream.write(?secure, ?scope, token(63, 1), ?output[0], 3, 0) ||
+        !stream.read(?secure, ?scope, token(63, 2), ?input[0], 5, 0)) { ret 4; }
+    var clear:  [2]^u8 = [2]^u8{record.WARNING, record.CLOSE_NOTIFY};
+    var wire:   [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    val sealed: usize  = seal_peer(?peer, record.ALERT, ?clear[0], 2, ?wire[0]);
+    record.destroy(?peer);
+    if (sealed == 0 || !deliver(?runtime, ?secure.reading.operation, ?wire[0], sealed) ||
+        !step(?runtime, ?secure)) { ret 5; }
+    if (!lane_ended(?secure.reading, error.OK, 0) || !secure.peer_closed ||
+        secure.state != stream.OPEN) { ret 6; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.writing, error.OK, 3) || secure.state != stream.OPEN) { ret 7; }
+    if (!stream.destroy_operation(?secure, token(63, 1)) ||
+        !stream.destroy_operation(?secure, token(63, 2)) || !stream.destroy(?secure) ||
+        !operation_ok(cancel.destroy(?scope)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 8; }
+    ret 0;
+}
+
+test "stream: a failed stream closes over a read in flight and still accounts it" {
+    var runtime: io_runtime.Runtime;
+    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_open_stream(?secure, ?core_a, ?adapter)) { ret 3; }
+    var output: [3]u8 = [3]u8{1, 2, 3};
+    var input:  [5]u8;
+    if (!stream.read(?secure, ?scope, token(64, 1), ?input[0], 5, 0)) { ret 4; }
+    # sealing fails while the socket is healthy and the read is still in flight
+    secure.write_cipher.sequence = 0xffffffffffffffff;
+    if (!stream.write(?secure, ?scope, token(64, 2), ?output[0], 3, 0) ||
+        !lane_ended(?secure.writing, error.INTERNAL_ERROR, 0) ||
+        secure.state != stream.FAILED || transport_state.writes != 0 ||
+        transport.snapshot(?secure.reading.operation).state !=
+        transport.OPERATION_WAITING) { ret 5; }
+    if (!stream.destroy_operation(?secure, token(64, 2))) { ret 6; }
+    # only an abortive close is allowed, and it is what ends the read
+    if (stream.write(?secure, ?scope, token(64, 3), ?output[0], 3, 0) ||
+        !stream.close(?secure, ?scope, token(64, 3), 0) ||
+        secure.writing.pending_action != transport.TRANSPORT_ABORT ||
+        transport_state.closes != 1) { ret 7; }
+    var header: [4]u8 = [4]u8{record.APPLICATION_DATA, 3, 3, 0};
+    if (!deliver(?runtime, ?secure.reading.operation, ?header[0], 4) ||
+        !step(?runtime, ?secure)) { ret 8; }
+    if (!lane_ended(?secure.reading, error.INTERNAL_ERROR, 0) ||
+        secure.wire_input_len != 4) { ret 9; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        0, 0, false)) || !step(?runtime, ?secure) || secure.state != stream.CLOSED) {
+        ret 10;
+    }
+    if (!stream.destroy_operation(?secure, token(64, 1)) ||
+        !stream.destroy_operation(?secure, token(64, 3)) || !stream.destroy(?secure) ||
+        !operation_ok(cancel.destroy(?scope)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 11; }
+    ret 0;
+}
+
+test "stream: a read owing a record and a write short of memory do not deadlock" {
+    var runtime: io_runtime.Runtime;
+    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    var writes: cancel.Scope;
+    var reads:  cancel.Scope;
+    if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
+        !operation_ok(cancel.make_root(?reads, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    var peer:   record.Cipher;
+    if (!make_finished_stream(?secure, ?core_a, ?adapter, pool.lease(?parked_harness),
+        pool.secret_lease(?parked_harness)) || !make_peer(?peer)) { ret 3; }
+    var output: [3]u8 = [3]u8{1, 2, 3};
+    var input:  [5]u8;
+    if (!stream.write(?secure, ?writes, token(65, 1), ?output[0], 3, 0) ||
+        !stream.read(?secure, ?reads, token(65, 2), ?input[0], 5, 0)) { ret 4; }
+    # the peer asks for an update while the write's record is on the wire
+    var clear:  [5]^u8 = [5]^u8{24, 0, 0, 1, 1};
+    var wire:   [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+    val sealed: usize  = seal_peer(?peer, record.HANDSHAKE, ?clear[0], 5, ?wire[0]);
+    record.destroy(?peer);
+    if (sealed == 0 || !deliver(?runtime, ?secure.reading.operation, ?wire[0], sealed) ||
+        !step(?runtime, ?secure)) { ret 5; }
+    if (secure.reading.park != stream.PARK_PEER || !secure.core_event_sending ||
+        secure.sender != stream.WRITE_LANE) { ret 6; }
+    # the write's record lands, and the owed record then finds no memory
+    pool.squeeze(?parked_squeeze);
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure)) { ret 7; }
+    if (secure.writing.park != stream.PARK_MEMORY ||
+        transport.snapshot(?secure.writing.operation).application_bytes != 3) { ret 8; }
+    # the woken read tries the record too, and parks for memory beside the write
+    if (!step(?runtime, ?secure) || secure.reading.park != stream.PARK_MEMORY) { ret 9; }
+    pool.relax(?parked_squeeze);
+    if (!stream.resume(?secure) || !step(?runtime, ?secure) ||
+        !step(?runtime, ?secure)) { ret 10; }
+    # the write held the turn and sent the owed record exactly once
+    if (transport_state.writes != 2 || secure.sender != stream.WRITE_LANE ||
+        secure.turn != stream.READ_LANE) { ret 11; }
+    if (!step(?runtime, ?secure) || secure.reading.park != stream.PARK_PEER) { ret 12; }
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.writing, error.OK, 3) || secure.core_event_sending) { ret 13; }
+    # the read is woken once the record is out and goes back to reading
+    if (!step(?runtime, ?secure) || transport_state.reads != 2 ||
+        transport_state.writes != 2 || secure.state != stream.OPEN) { ret 14; }
+    if (!stream.destroy_operation(?secure, token(65, 1)) ||
+        !transition_ok(cancel.cancel(?reads)) || !step(?runtime, ?secure) ||
+        !lane_ended(?secure.reading, error.CANCELLED, 0) ||
+        !stream.destroy_operation(?secure, token(65, 2))) { ret 15; }
+    if (!stream.destroy(?secure) || pool.held(?parked_harness) != 0 ||
+        !pool.destroy(?parked_harness) || !operation_ok(cancel.destroy(?writes)) ||
+        !operation_ok(cancel.destroy(?reads)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 16; }
     ret 0;
 }
