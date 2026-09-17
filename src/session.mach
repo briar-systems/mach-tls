@@ -1216,6 +1216,70 @@ test "session: single use replay control admits one presentation" {
     ret 0;
 }
 
+test "session: a wall clock step moves neither rotation nor the key window" {
+    probe_counter = 1;
+    var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
+        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+    var ring: KeyRing;
+    if (!keyring_init(?ring, ?entropy, clock.at(1000, 50), 3600, 1800, 7200)) { ret 1; }
+    var state:  State = rotation_state(1000);
+    var ticket: [MAX_TICKET_BYTES]u8;
+    val length: usize = seal(?ring, ?state, clock.at(1000, 50), ?entropy,
+        contracts.Buffer{data: ?ticket[0], capacity: MAX_TICKET_BYTES});
+    if (length == 0) { ret 2; }
+    # the wall clock jumps a day ahead: the seal key is still inside its window
+    if (!keyring_rotate(?ring, ?entropy, clock.at(1000 + 86400, 60))) { ret 3; }
+    if (keyring_openable(?ring, mono(60 + 1800)) != 2 ||
+        keyring_openable(?ring, mono(60 + 1801)) != 1) { ret 4; }
+    # the wall clock steps back to the issue time: the retired key still closes
+    # on the monotonic deadline
+    var recovered: State;
+    if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: length},
+        clock.at(1000, 60 + 1800), ?recovered)) { ret 5; }
+    if (open(?ring, contracts.Bytes{data: ?ticket[0], len: length},
+        clock.at(1000, 60 + 1801), ?recovered)) { ret 6; }
+    # the lifetime is compared with the wall clock alone
+    if (!keyring_rotate(?ring, ?entropy, clock.at(999, 100))) { ret 7; }
+    state.issued_at = wall(1000);
+    val fresh: usize = seal(?ring, ?state, clock.at(999, 100), ?entropy,
+        contracts.Buffer{data: ?ticket[0], capacity: MAX_TICKET_BYTES});
+    if (fresh == 0) { ret 8; }
+    if (open(?ring, contracts.Bytes{data: ?ticket[0], len: fresh},
+        clock.at(1000 + 7201, 100), ?recovered)) { ret 9; }
+    if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: fresh},
+        clock.at(1000 + 7200, 100), ?recovered)) { ret 10; }
+    keyring_destroy(?ring);
+    state_destroy(?state);
+    state_destroy(?recovered);
+    ret 0;
+}
+
+test "session: a taken ticket carries its monotonic age in milliseconds" {
+    var store: ClientStore;
+    if (!client_store_init(?store)) { ret 1; }
+    var value: Ticket;
+    ticket_clear(?value);
+    value.identity_len     = 1;
+    value.identity[0]      = 7;
+    value.secret_len       = 32;
+    value.suite            = tls13.AES_128_GCM_SHA256;
+    value.received_at      = mono(1000);
+    value.lifetime_seconds = 3600;
+    value.server_name_len  = 15;
+    copy_bytes(?value.server_name[0], "api.example.com"::*u8, 15);
+    value.valid = true;
+    if (!client_store_save(?store, ?value)) { ret 2; }
+    var taken: Ticket;
+    if (!client_store_take(?store,
+        contracts.Bytes{data: "api.example.com"::*u8, len: 15},
+        time.Instant{sec: 1002, nsec: 500000000}, ?taken)) { ret 3; }
+    if (taken.age_milliseconds != 2500) { ret 4; }
+    ticket_destroy(?taken);
+    ticket_destroy(?value);
+    client_store_destroy(?store);
+    ret 0;
+}
+
 test "session: client ticket retention is bounded and freshest first" {
     var store: ClientStore;
     if (!client_store_init(?store)) { ret 1; }
