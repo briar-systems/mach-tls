@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0] - 2026-09-16
+
+### Changed
+
+- Dependencies: mach-std v4.0.1 and mach-crypto v0.11.0 (#77). Consumers now resolve std 4.0.1 or later, which requires mach 5.2.0 or later.
+- A transport refusal is built with `io.error.make`: an invalid submission reports kind `INVALID` with code 0 rather than a borrowed `EINVAL`. `transport.map_error` still classifies by kind, so the tls error a caller sees is unchanged.
+
 ## [0.4.1] - 2026-09-16
 
 ### Changed
