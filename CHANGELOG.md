@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.1] - 2026-09-17
+
+The bundled TCP adapter now closes correctly, and the interoperability matrix runs full-duplex traffic over it against OpenSSL and GnuTLS (#113).
+
+### Fixed
+
+- A stream closed through `transport.make_tcp` with `lifecycle.GRACEFUL` never settled its close and never released the socket. std's graceful stream close only shuts the write side down, and its completion was refused as the wrong kind. A graceful close now releases the socket, so the kernel sends what is queued and then a FIN (#113).
+- `lifecycle.ABORTIVE` and the adapter's abort were plain closes. They now set a zero linger first, so the peer sees a reset (#113).
+
+### Added
+
+- Full-duplex client legs in the interoperability matrix: over the bundled async TCP adapter, a 1 MiB write runs while reads run beside it, against OpenSSL (TLS 1.3 and 1.2) and GnuTLS (TLS 1.3). Each leg requires the echo to match and at least one read to settle while a lower write is in flight (#113).
+
 ## [0.8.0] - 2026-09-17
 
 Engines read wall and monotonic time from a caller clock source when they need it, and every in-process interval runs on the monotonic clock (#102). A stream carries one read and one write at once (#103).
