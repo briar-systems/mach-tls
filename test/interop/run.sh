@@ -260,12 +260,12 @@ client_leg_must_fail "1.2 client refuses a tls 1.3 only server" "--tls12" \
 
 echo
 echo "== per-connection footprint =="
-# resident pages of one established connection's region (engine, stream and
-# every buffer it still holds), read from /proc/self/pagemap. a finished
-# handshake returns to its pool with its buffers. the bounds are the v0.6.0
-# baseline plus two pages and tighten as #87 lands
-FOOTPRINT_IDLE_PAGES=8
-FOOTPRINT_DESTROYED_PAGES=17
+# resident pages of one established connection (stream, engine and the pages
+# its account's buffers cover), from /proc/self/pagemap and the account. a
+# finished handshake returns to its pool. the bounds are the v0.7.0 measurement
+# of one page plus two
+FOOTPRINT_IDLE_PAGES=3
+FOOTPRINT_DESTROYED_PAGES=3
 footprint_leg() {
   local connections=4
   $SERVER --footprint --connections $connections >"$WORK/footprint.log" 2>&1 &

@@ -60,20 +60,20 @@ ClientHello, `max_client_flight_bytes` the client authentication flight, and
 `max_server_flight_bytes` the generated EncryptedExtensions through Finished.
 `max_chain_bytes` applies to both the presented client chain and the served
 certificate chain. `server.storage_requirements` reports the exact ServerHello
-and flight output a configuration needs, so a caller sizes `Storage.output` from
-policy rather than by guessing. Every limit can be raised to the protocol
+and flight output a configuration needs, so a caller can shape its buffer
+classes from policy rather than by guessing. Every limit can be raised to the protocol
 maximum.
 
-`Storage.input` must hold `max_peer_handshake_bytes`. A listener that may serve
-a generation requiring client authentication also sizes it for
-`config.certificate_message_bytes`. A lease that requires client authentication
-from input too small for a chain fails the handshake with `RESOURCE_LIMIT`.
-
-`server.Storage` holds all variable-size handshake state and is caller-owned.
-The input, output, ClientHello retention, peer certificate array, and optional
-peer-extension regions must be representable and mutually disjoint, and none of
-them may overlap the engine record, the configuration, or the entropy callback
-context.
+`server.init` and `server.init_with_credential_selector` take a
+`buffer.Lease` on the connection's account (see [`memory.md`](memory.md)). The
+output is reserved at `start`, and the input, retained ClientHello and optional
+peer-extension buffers when a message needs them. The input grows only to the
+largest message received, at most `max_peer_handshake_bytes`, or
+`config.certificate_message_bytes` for a client's Certificate. Every buffer is
+returned when the handshake is finished or destroyed. `start`, `ingest` and
+`poll` return `WAITING` when memory is short, with nothing consumed. The peer
+certificate array is part of the engine record, and the lease records must not
+overlap the engine record, the configuration, or the entropy callback context.
 
 ## Handshake
 

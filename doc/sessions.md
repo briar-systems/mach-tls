@@ -73,7 +73,7 @@ presented more than once. Configuring `REPLAY_SINGLE_USE` requires both a
 window and a key ring; a configuration that names the policy without them is
 rejected.
 
-## Client ticket storage
+## Client ticket retention
 
 `session.ClientStore` retains at most `DEFAULT_MAX_TICKETS` tickets. Saving into
 a full store evicts the oldest. Taking a ticket selects the freshest unexpired
@@ -90,11 +90,10 @@ ticket, accepted or not, is wiped when the handshake completes.
 
 Tickets arrive after the handshake and are retained by the established core,
 which keeps the resumption master secret only when a store is configured. It
-assembles a ticket in caller storage: the handshake's input until `finish`, then
-the `established.Storage` passed to `client.finish` (for `tls.stream`,
-`stream.Storage.ticket_input`), sized for `max_ticket_bytes` plus a handshake
-header. A ticket nothing can retain, or has no room to assemble, is skipped
-without buffering its body.
+assembles a ticket in the handshake's input until `finish`, then in a chunk
+from the engine's lease, reserved before the ticket's bytes are taken (a
+shortage returns `WAITING` with nothing consumed) and returned once the ticket
+is saved. A ticket nothing can retain is skipped without buffering its body.
 
 ## Key updates
 
