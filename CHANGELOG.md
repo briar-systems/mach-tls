@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.1] - 2026-09-17
+
+### Changed
+
+- Dependencies: mach-crypto v0.12.0 (#83). X25519 key derivation takes 3.6x fewer instructions and Ed25519 signing 4.0x fewer, so every handshake does less key-share and certificate-signature work.
+
 ## [0.5.0] - 2026-09-16
 
 ### Changed
