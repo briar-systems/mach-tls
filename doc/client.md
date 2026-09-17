@@ -1,16 +1,20 @@
 # TLS 1.3 client ownership
 
-`tls.client` is the transport-independent TLS 1.3 handshake engine.
-`tls.stream` adds TLS records and a completion-driven ordered byte transport.
-The two layers share the same cryptographic state machine. QUIC consumes the
-first layer directly and does not make either package depend on the other.
+`client.Handshake` is the transport-independent TLS 1.3 handshake engine.
+When its handshake completes, it hands the connection to a small
+`tls13.established.Established` record, which `client.finish` moves out (see
+[`established.md`](established.md)). `tls.stream` adds TLS records and a
+completion-driven ordered byte transport. QUIC consumes the engine directly and
+does not make either package depend on the other.
 
 ## Configuration and bounds
 
 `client.init` snapshots the `config.ClientConfig`, entropy, trust-store, and
 optional identity descriptors. The arrays, certificate encodings, private key,
 ALPN bytes, and extension bytes reached through those descriptors remain
-immutable caller-owned borrows for the lifetime of the client. Mutation of an
+immutable caller-owned borrows for the lifetime of the connection, including the
+established record it finishes into, which borrows the server name and the
+selected ALPN bytes. Mutation of an
 outer descriptor after initialization cannot redirect a live handshake. The
 server name is an explicit bounded byte view, so validation and SNI encoding do
 not depend on a terminator scan. The configuration requires one TLS 1.3 version,
@@ -25,14 +29,24 @@ all mutable provider state. TLS rejects secret callback context so provider
 state cannot alias handshake keys or record plaintext through an address that
 ordinary ownership checks cannot inspect.
 
-The limits separate peer input from locally generated output. The
-`max_peer_handshake_bytes` bound includes the four-byte handshake header.
-`max_client_hello_bytes` and `max_client_flight_bytes` independently bound the
-largest configured ClientHello and client authentication flight. Initialization
-calculates exact output requirements from the configured names, extensions,
-chain, signature maximum, retry cookie, and key share. A large peer input policy
-therefore does not force equally large output or ClientHello storage.
-`max_chain_bytes` and `max_ticket_bytes` apply to their specific peer objects.
+The limits separate peer input from locally generated output:
+
+- `max_peer_handshake_bytes` (default 16 KiB) bounds every peer handshake
+  message except Certificate, including its four-byte header.
+- A Certificate message is bounded by `max_chain_bytes` (default 64 KiB), which
+  limits its entries together, plus its fixed framing
+  (`config.certificate_message_bytes`). `max_certificate_bytes` (default 16 KiB)
+  limits each entry.
+- `max_ticket_bytes` (default 16 KiB) bounds a NewSessionTicket's ticket.
+- `max_client_hello_bytes` and `max_client_flight_bytes` bound the largest
+  configured ClientHello and client authentication flight. Initialization
+  calculates exact output requirements from the configured names, extensions,
+  chain, signature maximum, retry cookie and key share, so a large peer input
+  policy does not force equally large output or ClientHello storage.
+
+Every limit can be raised to the protocol maximum. A deployment that must
+accept longer chains raises `max_chain_bytes`, and its input storage grows to
+match.
 
 `max_receive_record_plaintext` and `max_send_record_plaintext` are directional
 content limits. The receive limit is advertised with the RFC 8449
@@ -53,10 +67,12 @@ ClientHello retention, parsed certificate array, and optional peer-extension
 retention buffers are caller-owned. Every range must be representable and every
 mutable region must be disjoint. Configuration and extension input cannot
 overlap those regions. Every pointer range and array product is validated before
-the first nested descriptor is traversed or handshake state is published. A
-single handshake frame can use at most `limits.max_peer_handshake_bytes`,
-including its header. Consumed prefixes are compacted so the bound does not
-accidentally apply to the cumulative lifetime of a connection.
+the first nested descriptor is traversed or handshake state is published. The
+input must hold the largest message the limits allow: at least
+`max_peer_handshake_bytes` and `config.certificate_message_bytes(limits)`.
+Consumed prefixes are compacted so the bound does not accidentally apply to the
+cumulative lifetime of a connection. The storage is borrowed only by the
+handshake and is released at `finish`.
 
 `client.ExtraExtension.kind == 0` means that no opaque ClientHello extension is
 present. A nonzero kind is present even when its body is empty. If a peer
@@ -69,7 +85,8 @@ transport-parameters extension representable without a sentinel body.
 Call `client.init`, then `client.start`. Feed complete or fragmented handshake
 bytes with `client.ingest`. The level is `INITIAL` for ServerHello,
 `HANDSHAKE` for the encrypted handshake flight, and `APPLICATION` for legal
-post-handshake messages. `ingest` copies accepted input before returning. It
+post-handshake messages, which the established core handles once the handshake
+events have drained. `ingest` copies accepted input before returning. It
 reports the exact next byte requirement without publishing partial typed views.
 
 The client implements these state transitions:
@@ -88,7 +105,8 @@ The client implements these state transitions:
 6. Client authentication flight when requested, client Finished, application
    traffic-secret publication, authentication disposition, and handshake
    completion.
-7. Bounded NewSessionTicket validation and stream-only KeyUpdate processing.
+7. Handover to the established core, which validates bounded NewSessionTickets
+   and processes stream-only KeyUpdates.
 
 Wrong encryption levels, duplicate or misplaced extensions, a second retry,
 unsupported selections, illegal post-handshake messages, malformed certificates,
@@ -123,13 +141,19 @@ The event sequence can contain:
 - `ALERT` with the terminal TLS alert description
 
 Consumers must copy or install a traffic secret before accepting its event.
-The engine discards handshake keys only after the handshake-direction events are
-accepted and the application schedule is live. Destruction is rejected while an
-event is borrowed. Successful destruction wipes the ephemeral private key,
-transcript hash state, key schedule, and every owned traffic secret.
+When the last handshake event is accepted, the engine seeds the established
+core with the application traffic secrets and destroys its key schedule,
+transcript and offered PSK. From then on, `ingest`, `poll`, `next_event`,
+`complete_event`, `traffic_keys`, `close`, `request_key_update` and the
+snapshot are served by the core. `client.finish` moves the core out and
+releases the handshake. Destruction is rejected while an event is borrowed.
+Successful destruction wipes the ephemeral private key, transcript hash state,
+key schedule, the core and every owned traffic secret.
 
 Selected ALPN and peer parameters are copied out of the incremental input
-buffer. Their snapshot views remain stable until destruction. Certificate public
+buffer. Their snapshot views remain stable until `finish` or destruction. After
+`finish`, the selected ALPN is a view of the configured protocol name and peer
+parameters are no longer reported. Certificate public
 key material needed for CertificateVerify is also retained independently of the
 fragmented certificate input.
 
@@ -148,6 +172,11 @@ A QUIC connection adapter can implement its handshake protocol directly over
 - peer transport parameters use `ExtraExtension` and `PEER_PARAMETERS`.
 - early-data disposition, authentication, completion, and terminal alerts map
   without inference or fallback behavior.
+- at handshake confirmation (RFC 9001 section 4.1.2) the adapter takes the
+  snapshot and calls `client.finish`. A NewSessionTicket that arrives earlier
+  is served by the embedded core, and one that arrives later by the finished
+  core. Under QUIC the core keeps no application secret, since TLS KeyUpdate is
+  refused.
 
 TLS does not own QUIC offsets, retransmission, packet-number spaces, key discard
 timing, or CRYPTO reassembly. QUIC does not parse TLS records. The event token is
@@ -159,7 +188,9 @@ the only ownership acknowledgement between the two layers.
 its bounded callback context. The descriptor, runtime, context, application
 buffers, scopes, completions, and TLS storage are rejected when their public
 ranges overlap. Its caller-owned `stream.Storage` has disjoint public
-handshake and wire regions. The stream owns one internal secret-welded arena and
+wire regions and an optional ticket region. A client with a session store
+passes `ticket_input` sized for `max_ticket_bytes` plus a handshake header;
+without it, tickets are skipped. The stream owns one internal secret-welded arena and
 derives the incoming plaintext, outgoing content, and AEAD scratch subregions
 itself. Callers cannot supply a hostile secret subrange or overlap record
 plaintext with entropy or identity state. `connect` combines initialization and
@@ -171,6 +202,13 @@ must inspect the terminal snapshot and call `destroy_operation` before starting
 the next operation. Application buffers, cancellation scopes, completions, wire
 storage, and operation state have disjoint ownership while active.
 
+Destroying the completed handshake operation finishes the engine into the
+stream's own established core and releases the handshake object, whose
+snapshot then reports `destroyed`, so its owner can reuse it. Read
+`stream.negotiated` before that point for the peer name and peer parameters.
+Afterwards the snapshot comes from the core. A finish that cannot happen yet
+because an event is still borrowed is retried when the next operation starts.
+
 The internal secret arena is sized for the complete TLS plaintext envelope and
 partitioned from the configured `receive + 2 * send + 2` requirement. It holds
 one bounded incoming TLSInnerPlaintext region, one outgoing content region, and
@@ -181,9 +219,9 @@ TLS 1.3 inner content type, and AEAD tag.
 Submission callbacks run outside the operation lock. The operation enters an
 explicit submitting state first, so synchronous inspection cannot deadlock and
 cancellation cannot release a buffer before a returned lower token settles.
-Stream transitions use an atomic thread-owner gate. Concurrent callers serialize,
-while a callback that reenters on the owning thread is rejected without
-deadlock. A provider descriptor is pinned for every lower submission. If the
+Stream transitions use an entrant gate (see the ownership contract in
+[`established.md`](established.md)). A call that finds another call in
+progress, from another thread or from a reentering callback, is refused. A provider descriptor is pinned for every lower submission. If the
 live descriptor changes, the operation retains its lower ownership until the
 matching completion, validates that completion against the pinned provider
 state, then fails terminally. Completion fields are snapshotted before the
@@ -219,7 +257,8 @@ without close_notify is an unclean terminal failure.
 
 `stream.destroy` is rejected while a lower completion or client event still owns
 storage. It destroys terminal operation state, both record ciphers, and the
-client, then wipes the complete secret arena in one operation.
+established core, then wipes the complete secret arena in one operation. The
+handshake object stays with its owner.
 If `connect` initializes successfully but rejects the handshake before an
 application operation takes ownership, it rolls initialization back and clears
 every retained pointer. Once an operation is accepted, including immediate

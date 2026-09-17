@@ -111,14 +111,17 @@ mid-session, downgrade protection, and the protocol-correct rejection of each
 named failure.
 
 The footprint leg serves four TLS 1.3 connections with `--footprint`. Each
-connection lives in its own `std.memory.secret` region. The server reads
-`/proc/self/pagemap` and prints the resident pages of the region, the engine,
-the Stream's record region, and the wire and handshake buffers: once idle after
-the handshake, once after a request, and once after destroy. It also prints the
-cost of an idle `next_event`. The leg fails when the last connection's idle or
-destroyed region exceeds the bound in `run.sh`. The bounds are the v0.5.2
-baseline plus two pages, and they tighten as the per-connection memory work in
-#87 lands.
+connection's stream, engine and buffers are separate `std.memory.secret`
+allocations. Once the handshake operation is destroyed, the harness asserts
+that the stream finished its engine, then returns the engine and its handshake
+buffers to their pool. The server reads `/proc/self/pagemap` and prints the
+resident pages of the connection, the engine, the Stream's fixed state and
+record region, and the wire and handshake buffers: once idle after the
+handshake, once after a request, and once after destroy. It also prints the
+cost of an idle `next_event` on the established core. The leg fails when the
+last connection's idle or destroyed pages exceed the bound in `run.sh`. The
+bounds are the v0.6.0 baseline plus two pages, and they tighten as the
+per-connection memory work in #87 lands.
 
 ## Release evidence
 

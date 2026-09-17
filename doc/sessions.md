@@ -85,16 +85,28 @@ A client with a store offers one PSK: it initializes its key schedule from the
 ticket, writes `psk_key_exchange_modes` and a `pre_shared_key` extension last
 with a zeroed binder, then computes the real binder over the truncated encoding
 and patches it in. If the server does not select the PSK, the resumption
-schedule is destroyed and the handshake continues as a full one.
+schedule is destroyed and the handshake continues as a full one. The offered
+ticket, accepted or not, is wiped when the handshake completes.
+
+Tickets arrive after the handshake and are retained by the established core,
+which keeps the resumption master secret only when a store is configured. It
+assembles a ticket in caller storage: the handshake's input until `finish`, then
+the `established.Storage` passed to `client.finish` (for `tls.stream`,
+`stream.Storage.ticket_input`), sized for `max_ticket_bytes` plus a handshake
+header. A ticket nothing can retain, or has no room to assemble, is skipped
+without buffering its body.
 
 ## Key updates
 
-Either role may call `request_key_update`, and `stream.key_update` drives it as
-one operation: the KeyUpdate flight is written, the sending traffic secret
-advances, and the operation settles. A peer's KeyUpdate advances the receiving
-secret, and an update carrying `update_requested` is answered with one of our
-own. Read and write sequence numbers remain independent, so a rekey in one
-direction does not disturb the other.
+Either role's established core accepts `request_key_update`, and
+`stream.key_update` drives it as one operation: the KeyUpdate flight is written,
+the sending traffic secret advances, and the operation settles. A peer's
+KeyUpdate advances the receiving secret, and an update carrying
+`update_requested` is answered with one of our own. A KeyUpdate must be the last
+message in its record, so anything after it in the same ingest fails the
+connection. Read and write sequence numbers remain independent, so a rekey in
+one direction does not disturb the other. QUIC refuses TLS KeyUpdate, and under
+QUIC the core keeps no application secret.
 
 ## Early data
 

@@ -1,102 +1,76 @@
-# one entrant at a time for every engine and stream call
+# one entrant at a time for every engine, core and stream call
 #
-# the owner word is 0 when free, the holder's thread id when held, and the
-# negated id when held with sleepers waiting. only a leave that finds sleepers
-# enters the kernel, so an uncontended call costs no wake. a thread that slept
-# takes the word already marked, since others may still be waiting behind it
+# an object has one owner at a time. handing it to another thread is legal
+# once the current call has returned, but a call that finds another call in
+# progress, from any thread or from a callback on its own, is refused rather
+# than made to wait. entering is one uncontended compare-and-swap, with no
+# thread id and no kernel wait
 
 use std.sync.atomic;
 use std.sync.thread;
-use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 
-# false when owner is invalid or already holds the word, which refuses reentry
-pub fun enter(word: *i64, owner: i64) bool {
-    if (word == nil || owner <= 0) { ret false; }
-    var waited: bool = false;
-    for (true) {
-        val current: i64 = atomic.load(word);
-        if (current == owner || current == -owner) { ret false; }
-        if (current == 0) {
-            var free:    i64 = 0;
-            var desired: i64 = owner;
-            if (waited)                           { desired = -owner; }
-            if (atomic.cas(word, ?free, desired)) { ret true; }
-        }
-        or {
-            var sleeping: i64  = current;
-            var marked:   bool = current < 0;
-            if (!marked) {
-                var held: i64 = current;
-                sleeping = -current;
-                marked   = atomic.cas(word, ?held, sleeping);
-            }
-            if (marked) {
-                os.thread_wait(word, sleeping);
-                waited = true;
-            }
-        }
-    }
-    ret false;
+val FREE: i64 = 0;
+val HELD: i64 = 1;
+
+# false when the word is missing or already held
+pub fun enter(word: *i64) bool {
+    if (word == nil) { ret false; }
+    var free: i64 = FREE;
+    ret atomic.cas(word, ?free, HELD);
 }
 
 pub fun leave(word: *i64) {
-    if (atomic.exchange(word, 0) < 0) { os.thread_wake(word); }
+    atomic.store(word, FREE);
 }
 
-# whether owner holds the word, contended or not
-pub fun held_by(word: *i64, owner: i64) bool {
-    if (owner <= 0) { ret false; }
-    val current: i64 = atomic.load(word);
-    ret current == owner || current == -owner;
+# whether a call is in progress on the word
+pub fun held(word: *i64) bool {
+    ret word != nil && atomic.load(word) != FREE;
 }
 
-val CONTENDED_ROUNDS: usize = 20000;
+val HANDOFF_ROUNDS: usize = 20000;
 
-var contended_word:    i64;
-var contended_counter: usize;
+var handoff_word:    i64;
+var handoff_counter: usize;
 
-fun contend(context: *u8) {
-    val owner: i64   = os.thread_current_id();
-    var i:     usize = 0;
-    for (i < CONTENDED_ROUNDS) {
-        if (enter(?contended_word, owner)) {
-            contended_counter = contended_counter + 1;
-            leave(?contended_word);
+fun alternate(context: *u8) {
+    var i: usize = 0;
+    for (i < HANDOFF_ROUNDS) {
+        if (enter(?handoff_word)) {
+            handoff_counter = handoff_counter + 1;
+            leave(?handoff_word);
             i = i + 1;
         }
+        or { atomic.spin_hint(); }
     }
 }
 
-test "transition: reentry is refused and ownership is visible" {
-    var word:  i64 = 0;
-    val owner: i64 = os.thread_current_id();
-    if (!enter(?word, owner))   { ret 1; }
-    if (enter(?word, owner))    { ret 2; }
-    if (!held_by(?word, owner)) { ret 3; }
-    word = -owner;
-    if (!held_by(?word, owner)) { ret 4; }
-    if (enter(?word, owner))    { ret 5; }
+test "transition: a held word refuses every second entrant" {
+    var word: i64 = FREE;
+    if (!enter(?word) || !held(?word)) { ret 1; }
+    if (enter(?word))                  { ret 2; }
     leave(?word);
-    if (word != 0 || held_by(?word, owner))   { ret 6; }
-    if (enter(?word, 0) || enter(nil, owner)) { ret 7; }
+    if (held(?word) || !enter(?word)) { ret 3; }
+    leave(?word);
+    if (enter(nil) || held(nil)) { ret 4; }
     ret 0;
 }
 
-test "transition: contending threads each hold the word alone" {
-    contended_word    = 0;
-    contended_counter = 0;
+test "transition: two threads handing one word back and forth never overlap" {
+    handoff_word    = FREE;
+    handoff_counter = 0;
     var first:  thread.Thread;
     var second: thread.Thread;
-    thread.spawn_with(contend, nil, ?first);
-    thread.spawn_with(contend, nil, ?second);
+    thread.spawn_with(alternate, nil, ?first);
+    thread.spawn_with(alternate, nil, ?second);
     if (first.tid < 0 || second.tid < 0) { ret 1; }
     thread.join(?first);
     thread.join(?second);
-    if (contended_counter != CONTENDED_ROUNDS * 2) { ret 2; }
-    if (contended_word != 0)                       { ret 3; }
+    if (handoff_counter != HANDOFF_ROUNDS * 2) { ret 2; }
+    if (handoff_word != FREE)                  { ret 3; }
     ret 0;
 }

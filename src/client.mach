@@ -31,6 +31,7 @@ use tls.record;
 use tls.session;
 use tls.signature_scheme;
 use tls.tls13;
+use tls.tls13.established;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
 use tls.transition;
@@ -106,7 +107,7 @@ pub rec Storage {
     peer_parameters_capacity: usize;
 }
 
-pub rec Client {
+pub rec Handshake {
     config:                      *config.ClientConfig;
     configuration:               config.ClientConfig;
     entropy:                     secret.Entropy;
@@ -156,7 +157,6 @@ pub rec Client {
     authentication_pending:      bool;
     complete_pending:            bool;
     alert_pending:               bool;
-    update_send_after_output:    bool;
     event_active:                bool;
     event_generation:            u64;
     active_event:                engine.Event;
@@ -171,6 +171,9 @@ pub rec Client {
     offering_psk:                bool;
     psk_accepted:                bool;
     binder_transcript:           transcript.Transcript;
+    # the established core, seeded when the handshake queue drains
+    delegating: bool;
+    core:       established.Established;
 }
 
 fun result(status: Status, failure: error.Error, consumed: usize,
@@ -220,32 +223,32 @@ fun bytes_equal(first: contracts.Bytes, second: contracts.Bytes) bool {
     ret true;
 }
 
-fun client_owner_valid(client: *Client) bool {
+fun client_owner_valid(client: *Handshake) bool {
     if (client == nil) { ret false; }
     val address: usize = (?client.state)::usize;
-    val offset:  usize = $offset_of(Client, state);
+    val offset:  usize = $offset_of(Handshake, state);
     ret address >= offset && memory_range.valid((address - offset)::*u8,
-        $size_of(Client));
+        $size_of(Handshake));
 }
 
-fun client_owner_data(client: *Client) *u8 {
+fun client_owner_data(client: *Handshake) *u8 {
     if (!client_owner_valid(client)) { ret nil; }
-    ret ((?client.state)::usize - $offset_of(Client, state))::*u8;
+    ret ((?client.state)::usize - $offset_of(Handshake, state))::*u8;
 }
 
-fun client_owner_overlaps(client: *Client, data: *u8, len: usize) bool {
+fun client_owner_overlaps(client: *Handshake, data: *u8, len: usize) bool {
     if (!client_owner_valid(client) || !memory_range.valid(data, len)) {
         ret true;
     }
-    ret memory_range.overlap(client_owner_data(client), $size_of(Client), data, len);
+    ret memory_range.overlap(client_owner_data(client), $size_of(Handshake), data, len);
 }
 
-fun enter(client: *Client) bool {
+fun enter(client: *Handshake) bool {
     if (!client_owner_valid(client)) { ret false; }
-    ret transition.enter(?client.transition_owner, os.thread_current_id());
+    ret transition.enter(?client.transition_owner);
 }
 
-fun leave(client: *Client) {
+fun leave(client: *Handshake) {
     transition.leave(?client.transition_owner);
 }
 
@@ -490,7 +493,7 @@ fun borrowed_overlaps(value: *config.ClientConfig, extra: ExtraExtension,
     ret false;
 }
 
-pub fun aliases_borrowed(client: *Client, data: *u8, len: usize) bool {
+pub fun aliases_borrowed(client: *Handshake, data: *u8, len: usize) bool {
     if (!client_owner_valid(client) ||
         atomic.load(?client.transition_owner) != 0 ||
         client.config != ?client.configuration ||
@@ -501,7 +504,7 @@ pub fun aliases_borrowed(client: *Client, data: *u8, len: usize) bool {
         borrowed_overlaps(client.config, client.extra, data, len, true, true);
 }
 
-pub fun aliases_configuration(client: *Client, data: *u8, len: usize) bool {
+pub fun aliases_configuration(client: *Handshake, data: *u8, len: usize) bool {
     if (!client_owner_valid(client) ||
         atomic.load(?client.transition_owner) != 0 ||
         client.config != ?client.configuration ||
@@ -511,12 +514,12 @@ pub fun aliases_configuration(client: *Client, data: *u8, len: usize) bool {
     ret borrowed_overlaps(client.config, client.extra, data, len, false, true);
 }
 
-fun config_sources_disjoint(client: *Client, value: *config.ClientConfig,
+fun config_sources_disjoint(client: *Handshake, value: *config.ClientConfig,
     storage: *Storage, extra: ExtraExtension) bool {
     if (!client_owner_valid(client) ||
         borrowed_overlaps(value, extra, client_owner_data(client),
-        $size_of(Client), true, true) ||
-        storage_overlaps(storage, client_owner_data(client), $size_of(Client))) {
+        $size_of(Handshake), true, true) ||
+        storage_overlaps(storage, client_owner_data(client), $size_of(Handshake))) {
         ret false;
     }
     if (value.entropy_context_size != 0 &&
@@ -662,6 +665,7 @@ fun limits_equal(first: config.Limits, second: config.Limits) bool {
         first.max_client_flight_bytes == second.max_client_flight_bytes &&
         first.max_server_flight_bytes == second.max_server_flight_bytes &&
         first.max_chain_bytes == second.max_chain_bytes &&
+        first.max_certificate_bytes == second.max_certificate_bytes &&
         first.max_ticket_bytes == second.max_ticket_bytes;
 }
 
@@ -678,6 +682,7 @@ fun configuration_equal(first: config.ClientConfig,
         first.signature_len == second.signature_len &&
         first.client_identity == second.client_identity &&
         first.sessions == second.sessions &&
+        first.retain_exporter == second.retain_exporter &&
         first.entropy == second.entropy &&
         first.entropy_context_size == second.entropy_context_size &&
         limits_equal(first.limits, second.limits);
@@ -696,10 +701,9 @@ fun client_storage_equal(first: Storage, second: Storage) bool {
         first.peer_parameters_capacity == second.peer_parameters_capacity;
 }
 
-fun entropy_fill(client: *Client, output: *^u8, length: usize) bool {
-    val owner: i64 = os.thread_current_id();
-    if (!client_owner_valid(client) || owner <= 0 ||
-        !transition.held_by(?client.transition_owner, owner) ||
+fun entropy_fill(client: *Handshake, output: *^u8, length: usize) bool {
+    if (!client_owner_valid(client) ||
+        !transition.held(?client.transition_owner) ||
         client.config != ?client.configuration || !client.entropy.initialized ||
         client.entropy.fill_fn == nil || output == nil) { ret false; }
     val descriptor:              secret.Entropy          = client.entropy;
@@ -722,7 +726,7 @@ fun entropy_fill(client: *Client, output: *^u8, length: usize) bool {
     val expected_send_limit:     usize                   = client.send_record_plaintext;
     val status:                  i64                     = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val valid: bool = transition.held_by(?client.transition_owner, owner) &&
+    val valid: bool = transition.held(?client.transition_owner) &&
         client.config == expected_config && client.state == expected_state &&
         entropy_equal(client.entropy, descriptor) &&
         configuration_equal(client.configuration, expected_configuration) &&
@@ -768,7 +772,7 @@ fun entropy_fill(client: *Client, output: *^u8, length: usize) bool {
     ret true;
 }
 
-fun fill_entropy(client: *Client, output: *u8, length: usize) bool {
+fun fill_entropy(client: *Handshake, output: *u8, length: usize) bool {
     if (!client_owner_valid(client) || client.config == nil || output == nil) {
         ret false;
     }
@@ -786,7 +790,7 @@ fun fill_entropy(client: *Client, output: *u8, length: usize) bool {
     ret true;
 }
 
-fun fill_private(client: *Client) bool {
+fun fill_private(client: *Handshake) bool {
     if (!client_owner_valid(client) || client.config == nil) { ret false; }
     ct.zeroize(?client.private_key[0], 32);
     ret entropy_fill(client, ?client.private_key[0], 32);
@@ -829,8 +833,7 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         value.limits.max_client_flight_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_client_flight_bytes >
         handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
-        value.limits.max_chain_bytes == 0 ||
-        value.limits.max_chain_bytes > handshake.MAX_BODY_SIZE ||
+        !config.certificate_limits_valid(value.limits) ||
         value.limits.max_ticket_bytes == 0 ||
         value.limits.max_ticket_bytes > handshake.MAX_BODY_SIZE ||
         storage.input == nil ||
@@ -838,6 +841,7 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         storage.certificates == nil || storage.certificate_capacity == 0 ||
         storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.input_capacity < value.limits.max_peer_handshake_bytes ||
+        storage.input_capacity < config.certificate_message_bytes(value.limits) ||
         (extra.data.len != 0 && extra.data.data == nil) ||
         extra.data.len > 65531 || (extra.kind == 0 && extra.data.len != 0) ||
         (extra.kind != 0 && reserved_client_extension(extra.kind)) ||
@@ -910,7 +914,7 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
     ret true;
 }
 
-fun init_inner(client: *Client, configuration: *config.ClientConfig,
+fun init_inner(client: *Handshake, configuration: *config.ClientConfig,
     storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
     if (!client_owner_valid(client) ||
         (client.state != 0 && client.state != DESTROYED) ||
@@ -937,6 +941,8 @@ fun init_inner(client: *Client, configuration: *config.ClientConfig,
     client.peer_extension              = peer_extension;
     client.transcript                  = transcript.empty();
     client.state                       = EXPECT_SERVER_HELLO;
+    client.delegating                  = false;
+    client.core                        = established.empty();
     client.failure                     = error.OK;
     client.pending_alert               = record.NO_ALERT;
     client.input_len                   = 0;
@@ -965,7 +971,6 @@ fun init_inner(client: *Client, configuration: *config.ClientConfig,
     client.authentication_pending      = false;
     client.complete_pending            = false;
     client.alert_pending               = false;
-    client.update_send_after_output    = false;
     client.event_active                = false;
     client.receive_record_plaintext    =
         client.config.limits.max_receive_record_plaintext;
@@ -982,7 +987,7 @@ fun init_inner(client: *Client, configuration: *config.ClientConfig,
     ret true;
 }
 
-pub fun init(client: *Client, configuration: *config.ClientConfig,
+pub fun init(client: *Handshake, configuration: *config.ClientConfig,
     storage: Storage, extra: ExtraExtension, peer_extension: u16) bool {
     if (!enter(client)) { ret false; }
     val initialized: bool = init_inner(client, configuration, storage, extra,
@@ -999,7 +1004,7 @@ fun put_extension(output: *u8, offset: usize, kind: u16,
     ret offset + 4 + body.len;
 }
 
-fun configured_suite_value(client: *Client, suite: tls13.CipherSuite) bool {
+fun configured_suite_value(client: *Handshake, suite: tls13.CipherSuite) bool {
     var i: usize = 0;
     for (i < client.config.suite_len) {
         if (client.config.suites[i] == suite) { ret true; }
@@ -1008,7 +1013,7 @@ fun configured_suite_value(client: *Client, suite: tls13.CipherSuite) bool {
     ret false;
 }
 
-fun offered_group(client: *Client, group: tls13.NamedGroup) bool {
+fun offered_group(client: *Handshake, group: tls13.NamedGroup) bool {
     var i: usize = 0;
     for (i < client.config.group_len) {
         if (client.config.groups[i] == group) { ret true; }
@@ -1017,7 +1022,7 @@ fun offered_group(client: *Client, group: tls13.NamedGroup) bool {
     ret false;
 }
 
-fun derive_share(client: *Client, group: tls13.NamedGroup) bool {
+fun derive_share(client: *Handshake, group: tls13.NamedGroup) bool {
     var attempt: usize = 0;
     for (attempt < 16) {
         if (!fill_private(client)) { ret false; }
@@ -1043,7 +1048,7 @@ fun derive_share(client: *Client, group: tls13.NamedGroup) bool {
     ret false;
 }
 
-fun build_extensions(client: *Client, output: *u8, capacity: usize) usize {
+fun build_extensions(client: *Handshake, output: *u8, capacity: usize) usize {
     val name_len: usize = client.config.server_name.len;
     var required: usize = 4 + 2 + 1 + 2 + name_len;
     required = required + 4 + 2 + client.config.group_len * 2;
@@ -1170,7 +1175,7 @@ fun build_extensions(client: *Client, output: *u8, capacity: usize) usize {
 }
 
 # replace the placeholder binder in the encoded hello with the real one
-fun patch_binder(client: *Client, encoded_length: usize) error.Error {
+fun patch_binder(client: *Handshake, encoded_length: usize) error.Error {
     if (!client.offering_psk) { ret error.OK; }
     val size: usize = key_schedule.hash_size(client.schedule.algorithm);
     if (size == 0) { ret error.INTERNAL_ERROR; }
@@ -1223,7 +1228,7 @@ fun patch_binder(client: *Client, encoded_length: usize) error.Error {
     ret error.OK;
 }
 
-fun build_client_hello(client: *Client, after_retry: bool) error.Error {
+fun build_client_hello(client: *Handshake, after_retry: bool) error.Error {
     val extension_len: usize = build_extensions(client, client.storage.hello,
         client.storage.hello_capacity);
     if (extension_len == 0) { ret error.RESOURCE_LIMIT; }
@@ -1261,7 +1266,7 @@ fun build_client_hello(client: *Client, after_retry: bool) error.Error {
     ret error.OK;
 }
 
-fun fail(client: *Client, failure: error.Error,
+fun fail(client: *Handshake, failure: error.Error,
     alert: record.AlertDescription) engine.Result {
     if (client != nil && client.state != DESTROYED) {
         client.failure                     = failure;
@@ -1276,14 +1281,13 @@ fun fail(client: *Client, failure: error.Error,
         client.early_pending               = false;
         client.authentication_pending      = false;
         client.complete_pending            = false;
-        client.update_send_after_output    = false;
         client.alert_pending               = alert != record.NO_ALERT;
         client.state                       = TERMINAL;
     }
     ret result(FAILED, failure, 0, 0);
 }
 
-fun start_inner(client: *Client, verification_time: i64) engine.Result {
+fun start_inner(client: *Handshake, verification_time: i64) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state != EXPECT_SERVER_HELLO ||
         client.output_pending || client.hello_len != 0) {
@@ -1314,7 +1318,7 @@ fun start_inner(client: *Client, verification_time: i64) engine.Result {
     ret result(OK, error.OK, 0, client.output_len);
 }
 
-pub fun start(client: *Client, verification_time: i64) engine.Result {
+pub fun start(client: *Handshake, verification_time: i64) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
@@ -1323,7 +1327,7 @@ pub fun start(client: *Client, verification_time: i64) engine.Result {
     ret started;
 }
 
-fun restart_inner(client: *Client, reason: u8) engine.Result {
+fun restart_inner(client: *Handshake, reason: u8) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state != EXPECT_SERVER_HELLO ||
         client.server_hello_seen || client.event_active || client.hello_len == 0 ||
@@ -1341,7 +1345,7 @@ fun restart_inner(client: *Client, reason: u8) engine.Result {
     ret result(OK, error.OK, 0, client.output_len);
 }
 
-pub fun restart(client: *Client, reason: u8) engine.Result {
+pub fun restart(client: *Handshake, reason: u8) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
@@ -1350,7 +1354,7 @@ pub fun restart(client: *Client, reason: u8) engine.Result {
     ret restarted;
 }
 
-fun decode_own_hello(client: *Client, output: *codec.ClientHello) error.Error {
+fun decode_own_hello(client: *Handshake, output: *codec.ClientHello) error.Error {
     var message: handshake.Message;
     val parsed:  handshake.Progress = handshake.parse(client.storage.hello,
         client.hello_len,
@@ -1374,7 +1378,7 @@ fun selected_share(server: *codec.ServerHello, group: *tls13.NamedGroup,
     ret true;
 }
 
-fun shared_secret(client: *Client, peer: contracts.Bytes,
+fun shared_secret(client: *Handshake, peer: contracts.Bytes,
     output: *^u8) bool {
     var operation: contracts.Operation;
     if (client.group == tls13.X25519) {
@@ -1390,7 +1394,7 @@ fun shared_secret(client: *Client, peer: contracts.Bytes,
     ret operation.error == contracts.OK && operation.written == 32;
 }
 
-fun handle_retry(client: *Client, frame: contracts.Bytes,
+fun handle_retry(client: *Handshake, frame: contracts.Bytes,
     server: *codec.ServerHello, own: *codec.ClientHello) error.Error {
     if (client.retry_count != 0 || client.server_hello_seen) {
         ret error.UNEXPECTED_MESSAGE;
@@ -1432,7 +1436,7 @@ fun handle_retry(client: *Client, frame: contracts.Bytes,
     ret failure;
 }
 
-fun handle_server_hello(client: *Client, frame: contracts.Bytes,
+fun handle_server_hello(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var server:  codec.ServerHello;
     var failure: error.Error = codec.decode_server_hello(message, ?server);
@@ -1517,7 +1521,7 @@ fun alert_for(failure: error.Error) record.AlertDescription {
     ret engine.alert_for(failure);
 }
 
-fun alpn_offered(client: *Client, value: contracts.Bytes) bool {
+fun alpn_offered(client: *Handshake, value: contracts.Bytes) bool {
     var i: usize = 0;
     for (i < client.config.alpn_len) {
         if (client.config.alpn[i].len == value.len &&
@@ -1528,7 +1532,7 @@ fun alpn_offered(client: *Client, value: contracts.Bytes) bool {
     ret false;
 }
 
-fun handle_encrypted_extensions(client: *Client, frame: contracts.Bytes,
+fun handle_encrypted_extensions(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var encrypted: codec.EncryptedExtensions;
     var failure:   error.Error = codec.decode_encrypted_extensions(message, ?encrypted);
@@ -1611,7 +1615,7 @@ fun signature_requested(request: *codec.CertificateRequest,
     ret false;
 }
 
-fun configured_signature(client: *Client, scheme: tls13.SignatureScheme) bool {
+fun configured_signature(client: *Handshake, scheme: tls13.SignatureScheme) bool {
     var i: usize = 0;
     for (i < client.config.signature_len) {
         if (client.config.signatures[i] == scheme) { ret true; }
@@ -1620,7 +1624,7 @@ fun configured_signature(client: *Client, scheme: tls13.SignatureScheme) bool {
     ret false;
 }
 
-fun select_client_signature(client: *Client,
+fun select_client_signature(client: *Handshake,
     request: *codec.CertificateRequest) tls13.SignatureScheme {
     if (client.config.client_identity == nil ||
         client.config.client_identity.private_key == nil) { ret 0; }
@@ -1635,7 +1639,7 @@ fun select_client_signature(client: *Client,
     ret 0;
 }
 
-fun handle_certificate_request(client: *Client, frame: contracts.Bytes,
+fun handle_certificate_request(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var request: codec.CertificateRequest;
     var failure: error.Error = codec.decode_certificate_request(message, ?request);
@@ -1648,7 +1652,7 @@ fun handle_certificate_request(client: *Client, frame: contracts.Bytes,
     ret failure;
 }
 
-fun retain_peer_key(client: *Client) bool {
+fun retain_peer_key(client: *Handshake) bool {
     val first:  contracts.Bytes = client.peer_leaf.public_key.first;
     val second: contracts.Bytes = client.peer_leaf.public_key.second;
     if (first.data == nil || first.len == 0 || first.len > MAX_PUBLIC_KEY ||
@@ -1670,7 +1674,7 @@ fun retain_peer_key(client: *Client) bool {
     ret true;
 }
 
-fun handle_certificate(client: *Client, frame: contracts.Bytes,
+fun handle_certificate(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var certificate_message: codec.CertificateMessage;
     var failure:             error.Error = codec.decode_certificate(message, false,
@@ -1691,6 +1695,7 @@ fun handle_certificate(client: *Client, frame: contracts.Bytes,
         val status: extensions.NextStatus = codec.next_certificate(?iterator, ?entry);
         if (status == extensions.NEXT_DONE) { brk; }
         if (status != extensions.NEXT_ITEM || count >= client.storage.certificate_capacity ||
+            entry.certificate.len > client.config.limits.max_certificate_bytes ||
             entry.certificate.len > client.config.limits.max_chain_bytes - total) {
             ret error.BAD_CERTIFICATE;
         }
@@ -1721,7 +1726,7 @@ fun handle_certificate(client: *Client, frame: contracts.Bytes,
     ret failure;
 }
 
-fun certificate_verify_input(client: *Client, server: bool,
+fun certificate_verify_input(client: *Handshake, server: bool,
     output: *u8) error.Error {
     var hash:    [48]u8;
     val size:    usize       = key_schedule.hash_size(client.schedule.algorithm);
@@ -1746,7 +1751,7 @@ fun certificate_verify_input(client: *Client, server: bool,
     ret error.OK;
 }
 
-fun verify_peer_signature(client: *Client, value: *codec.CertificateVerify) error.Error {
+fun verify_peer_signature(client: *Handshake, value: *codec.CertificateVerify) error.Error {
     if (!configured_signature(client, value.scheme)) { ret error.ILLEGAL_PARAMETER; }
     var signed:  [MAX_SIGNED_CONTEXT]u8;
     var failure: error.Error = certificate_verify_input(client, true, ?signed[0]);
@@ -1765,7 +1770,7 @@ fun verify_peer_signature(client: *Client, value: *codec.CertificateVerify) erro
     ret error.OK;
 }
 
-fun handle_certificate_verify(client: *Client, frame: contracts.Bytes,
+fun handle_certificate_verify(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var value:   codec.CertificateVerify;
     var failure: error.Error = codec.decode_certificate_verify(message, ?value);
@@ -1778,7 +1783,7 @@ fun handle_certificate_verify(client: *Client, frame: contracts.Bytes,
     ret failure;
 }
 
-fun append_client_certificate(client: *Client, offset: usize) usize {
+fun append_client_certificate(client: *Handshake, offset: usize) usize {
     val identity:       *credentials.Identity = client.config.client_identity;
     var entries_length: usize                 = 0;
     if (identity != nil && client.client_auth_scheme != 0) {
@@ -1817,7 +1822,7 @@ fun append_client_certificate(client: *Client, offset: usize) usize {
     ret cursor;
 }
 
-fun sign_client(client: *Client, message: contracts.Bytes,
+fun sign_client(client: *Handshake, message: contracts.Bytes,
     output: contracts.Buffer) contracts.Operation {
     val private_key: *keys.PrivateKey = client.config.client_identity.private_key;
     if (private_key.algorithm == keys.ED25519 || private_key.algorithm == keys.P256) {
@@ -1869,7 +1874,7 @@ fun sign_client(client: *Client, message: contracts.Bytes,
     ret operation;
 }
 
-fun append_client_certificate_verify(client: *Client, offset: usize) usize {
+fun append_client_certificate_verify(client: *Handshake, offset: usize) usize {
     if (client.config.client_identity == nil || client.client_auth_scheme == 0) {
         ret offset;
     }
@@ -1902,7 +1907,7 @@ fun append_client_certificate_verify(client: *Client, offset: usize) usize {
     ret offset + encoded.produced;
 }
 
-fun append_client_finished(client: *Client, offset: usize) usize {
+fun append_client_finished(client: *Handshake, offset: usize) usize {
     var hash: [48]u8;
     val size: usize = key_schedule.hash_size(client.schedule.algorithm);
     if (transcript.snapshot(?client.transcript,
@@ -1927,7 +1932,7 @@ fun append_client_finished(client: *Client, offset: usize) usize {
     ret offset + encoded.produced;
 }
 
-fun build_client_flight(client: *Client) error.Error {
+fun build_client_flight(client: *Handshake) error.Error {
     var offset: usize = 0;
     if (client.client_auth_requested) {
         val certificate_end: usize = append_client_certificate(client, offset);
@@ -1973,7 +1978,7 @@ fun build_client_flight(client: *Client) error.Error {
     ret error.OK;
 }
 
-fun handle_finished(client: *Client, frame: contracts.Bytes,
+fun handle_finished(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var value:   codec.Finished;
     val size:    usize       = key_schedule.hash_size(client.schedule.algorithm);
@@ -2012,115 +2017,7 @@ fun handle_finished(client: *Client, frame: contracts.Bytes,
     ret error.OK;
 }
 
-fun handle_post_handshake(client: *Client, message: *handshake.Message) error.Error {
-    if (message.header.message_type == handshake.NEW_SESSION_TICKET) {
-        var ticket:  codec.NewSessionTicket;
-        val failure: error.Error = codec.decode_new_session_ticket(message, ?ticket);
-        if (failure != error.OK) { ret failure; }
-        if (ticket.ticket.len > client.config.limits.max_ticket_bytes) {
-            ret error.RESOURCE_LIMIT;
-        }
-        ret retain_ticket(client, ?ticket);
-    }
-    if (message.header.message_type == handshake.KEY_UPDATE) {
-        if (client.peer_extension == QUIC_TRANSPORT_PARAMETERS) {
-            ret error.UNEXPECTED_MESSAGE;
-        }
-        var update:  codec.KeyUpdate;
-        var failure: error.Error = codec.decode_key_update(message, ?update);
-        if (failure != error.OK) { ret failure; }
-        failure = key_schedule.update_traffic(?client.schedule,
-            ?client.schedule.server_application_traffic);
-        if (failure != error.OK) { ret failure; }
-        client.application_receive_pending = true;
-        if (update.request == codec.UPDATE_REQUESTED) {
-            val encoded: handshake.Progress = codec.encode_key_update(
-                codec.KeyUpdate{request: codec.UPDATE_NOT_REQUESTED},
-                contracts.Buffer{data: client.storage.output,
-                capacity: client.storage.output_capacity});
-            if (encoded.status != handshake.COMPLETE) { ret error.RESOURCE_LIMIT; }
-            client.output_len               = encoded.produced;
-            client.output_level             = APPLICATION;
-            client.output_pending           = true;
-            client.update_send_after_output = true;
-        }
-        ret error.OK;
-    }
-    ret error.UNEXPECTED_MESSAGE;
-}
-
-fun retain_ticket(client: *Client, value: *codec.NewSessionTicket) error.Error {
-    if (client.sessions == nil) { ret error.OK; }
-    if (value.ticket.len == 0 || value.ticket.len > session.MAX_TICKET_BYTES ||
-        value.lifetime == 0 ||
-        value.lifetime > session.MAX_TICKET_LIFETIME_SECONDS ||
-        value.nonce.len > 255) { ret error.OK; }
-    var retained: session.Ticket;
-    session.ticket_destroy(?retained);
-    val size: usize = key_schedule.hash_size(client.schedule.algorithm);
-    if (size == 0 || size > session.MAX_SECRET) { ret error.OK; }
-    if (key_schedule.resumption_psk(?client.schedule, value.nonce,
-        contracts.SecretBuffer{data: ?retained.secret[0],
-        capacity: session.MAX_SECRET}) != error.OK) {
-        session.ticket_destroy(?retained);
-        ret error.OK;
-    }
-    retained.secret_len = size;
-    copy_bytes(?retained.identity[0], value.ticket.data, value.ticket.len);
-    retained.identity_len     = value.ticket.len;
-    retained.suite            = client.suite;
-    retained.received_at      = client.verification_time;
-    retained.lifetime_seconds = value.lifetime;
-    retained.age_add          = value.age_add;
-    retained.max_early_data   = 0;
-    if (client.config.server_name.len <= session.MAX_SERVER_NAME) {
-        copy_bytes(?retained.server_name[0], client.config.server_name.data,
-            client.config.server_name.len);
-        retained.server_name_len = client.config.server_name.len;
-    }
-    if (client.selected_alpn.len != 0 &&
-        client.selected_alpn.len <= session.MAX_ALPN) {
-        copy_bytes(?retained.alpn[0], client.selected_alpn.data,
-            client.selected_alpn.len);
-        retained.alpn_len = client.selected_alpn.len;
-    }
-    retained.valid = true;
-    session.client_store_save(client.sessions, ?retained);
-    session.ticket_destroy(?retained);
-    ret error.OK;
-}
-
-fun request_key_update_inner(client: *Client, request: u8) engine.Result {
-    if (!client_owner_valid(client) || client.state != ESTABLISHED ||
-        client.output_pending || client.event_active ||
-        request > codec.UPDATE_REQUESTED) {
-        ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
-    }
-    val encoded: handshake.Progress = codec.encode_key_update(
-        codec.KeyUpdate{request: request},
-        contracts.Buffer{data: client.storage.output,
-        capacity: client.storage.output_capacity});
-    if (encoded.status != handshake.COMPLETE) {
-        ret result(FAILED, error.RESOURCE_LIMIT, 0, 0);
-    }
-    client.output_len               = encoded.produced;
-    client.output_level             = APPLICATION;
-    client.output_pending           = true;
-    client.update_send_after_output = true;
-    ret result(OK, error.OK, 0, client.output_len);
-}
-
-# ask the peer for a fresh send key, and optionally for one of its own
-pub fun request_key_update(client: *Client, request: u8) engine.Result {
-    if (!enter(client)) {
-        ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
-    }
-    val requested: engine.Result = request_key_update_inner(client, request);
-    leave(client);
-    ret requested;
-}
-
-fun process_frame(client: *Client, frame: contracts.Bytes,
+fun process_frame(client: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     if (client.state == EXPECT_SERVER_HELLO) {
         ret handle_server_hello(client, frame, message);
@@ -2146,11 +2043,19 @@ fun process_frame(client: *Client, frame: contracts.Bytes,
     if (client.state == EXPECT_FINISHED) {
         ret handle_finished(client, frame, message);
     }
-    if (client.state == ESTABLISHED) { ret handle_post_handshake(client, message); }
     ret error.UNEXPECTED_MESSAGE;
 }
 
-fun drive(client: *Client, level: Level) engine.Result {
+# the limit for the next buffered message, chosen by its type
+fun peer_limit(client: *Handshake) usize {
+    var message_type: handshake.MessageType = 0;
+    if (client.input_read < client.input_len) {
+        message_type = client.storage.input[client.input_read];
+    }
+    ret config.peer_message_limit(client.config.limits, message_type);
+}
+
+fun drive(client: *Handshake, level: Level) engine.Result {
     for (true) {
         if (client.output_pending || client.event_active) {
             ret result(BLOCKED, error.OK, 0, 0);
@@ -2163,7 +2068,7 @@ fun drive(client: *Client, level: Level) engine.Result {
         var message: handshake.Message;
         val parsed:  handshake.Progress = handshake.parse(
             ?client.storage.input[client.input_read], client.input_len - client.input_read,
-            client.config.limits.max_peer_handshake_bytes - handshake.HEADER_SIZE,
+            peer_limit(client) - handshake.HEADER_SIZE,
             ?message);
         if (parsed.status == handshake.NEED_INPUT) {
             ret result(MORE, error.OK, 0, parsed.required);
@@ -2188,7 +2093,7 @@ fun drive(client: *Client, level: Level) engine.Result {
     ret result(FAILED, error.INTERNAL_ERROR, 0, 0);
 }
 
-fun compact_input(client: *Client) {
+fun compact_input(client: *Handshake) {
     if (client.input_read == 0) { ret; }
     if (client.input_read == client.input_len) {
         client.input_read = 0;
@@ -2205,7 +2110,7 @@ fun compact_input(client: *Client) {
     client.input_len  = remaining;
 }
 
-fun ingest_inner(client: *Client, level: Level, data: *u8,
+fun ingest_inner(client: *Handshake, level: Level, data: *u8,
     length: usize) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || !valid_level(level) ||
@@ -2239,17 +2144,24 @@ fun ingest_inner(client: *Client, level: Level, data: *u8,
     ret progress;
 }
 
-pub fun ingest(client: *Client, level: Level, data: *u8,
+pub fun ingest(client: *Handshake, level: Level, data: *u8,
     length: usize) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: engine.Result = ingest_inner(client, level, data, length);
+    var progress: engine.Result;
+    if (client.delegating) {
+        if (client_owner_overlaps(client, data, length)) {
+            progress = result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+        }
+        or { progress = established.ingest(?client.core, level, data, length); }
+    }
+    or { progress = ingest_inner(client, level, data, length); }
     leave(client);
     ret progress;
 }
 
-fun poll_inner(client: *Client) engine.Result {
+fun poll_inner(client: *Handshake) engine.Result {
     if (!client_owner_valid(client) ||
         client.config == nil || client.state == DESTROYED ||
         client.state == TERMINAL) {
@@ -2261,16 +2173,18 @@ fun poll_inner(client: *Client) engine.Result {
     ret drive(client, level);
 }
 
-pub fun poll(client: *Client) engine.Result {
+pub fun poll(client: *Handshake) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: engine.Result = poll_inner(client);
+    var progress: engine.Result;
+    if (client.delegating) { progress = established.poll(?client.core); }
+    or                     { progress = poll_inner(client); }
     leave(client);
     ret progress;
 }
 
-fun pending(client: *Client) bool {
+fun pending(client: *Handshake) bool {
     ret client.output_pending || client.handshake_send_pending ||
         client.handshake_receive_pending || client.application_send_pending ||
         client.application_receive_pending || client.parameters_pending ||
@@ -2278,7 +2192,7 @@ fun pending(client: *Client) bool {
         client.complete_pending || client.alert_pending;
 }
 
-fun next_event_inner(client: *Client, output: *engine.Event) bool {
+fun next_event_inner(client: *Handshake, output: *engine.Event) bool {
     # nothing pending is answered before the borrowed descriptors are walked
     if (!client_owner_valid(client) || output == nil || client.event_active ||
         client.state == DESTROYED || !pending(client) ||
@@ -2362,22 +2276,91 @@ fun next_event_inner(client: *Client, output: *engine.Event) bool {
     ret true;
 }
 
-pub fun next_event(client: *Client, output: *engine.Event) bool {
+pub fun next_event(client: *Handshake, output: *engine.Event) bool {
     if (!enter(client)) { ret false; }
-    val available: bool = next_event_inner(client, output);
+    var available: bool = false;
+    if (client.delegating) {
+        available = output != nil && !client_owner_overlaps(client,
+            (?output.token)::*u8, $size_of(engine.Event)) &&
+            established.next_event(?client.core, output);
+    }
+    or { available = next_event_inner(client, output); }
     leave(client);
     ret available;
 }
 
-# once the last handshake event is accepted, nothing reads the handshake-only
-# secrets, the transcript or the offered psk again
-fun discard_completed(client: *Client) {
-    key_schedule.discard_handshake(?client.schedule);
-    transcript.destroy(?client.transcript);
-    session.ticket_destroy(?client.offered_ticket);
+# the configured protocol the handshake selected, borrowed from the caller
+fun configured_alpn(client: *Handshake) contracts.Bytes {
+    var i: usize = 0;
+    for (client.selected_alpn.len != 0 && i < client.config.alpn_len) {
+        val name: config.ProtocolName = client.config.alpn[i];
+        if (name.len == client.selected_alpn.len) {
+            var equal: bool  = true;
+            var at:    usize = 0;
+            for (at < name.len) {
+                if (name.data[at] != client.selected_alpn.data[at]) { equal = false; }
+                at = at + 1;
+            }
+            if (equal) { ret contracts.Bytes{data: name.data, len: name.len}; }
+        }
+        i = i + 1;
+    }
+    ret contracts.Bytes{data: nil, len: 0};
 }
 
-fun complete_event_inner(client: *Client, token: u64, accepted: bool) bool {
+# once the last handshake event is accepted the established core takes over:
+# it is seeded with the application secrets, and the schedule, transcript and
+# offered psk go with the handshake
+fun discard_completed(client: *Handshake) {
+    var seed: established.Seed;
+    seed.role                  = engine.CLIENT;
+    seed.suite                 = client.suite;
+    seed.group                 = client.group;
+    seed.retry_count           = client.retry_count;
+    seed.tickets_issued        = 0;
+    seed.authenticated         = client.authenticated;
+    seed.resumed               = client.psk_accepted;
+    seed.peer_offered_alpn     = false;
+    seed.client_auth_requested = client.client_auth_requested;
+    seed.quic                  = client.peer_extension == QUIC_TRANSPORT_PARAMETERS;
+    seed.retain_exporter       = client.config.retain_exporter;
+    seed.alpn                  = configured_alpn(client);
+    seed.server_name           = client.config.server_name;
+    seed.receive_record_limit  = client.receive_record_plaintext;
+    seed.send_record_limit     = client.send_record_plaintext;
+    seed.max_message_bytes     = client.config.limits.max_peer_handshake_bytes;
+    seed.max_ticket_bytes      = client.config.limits.max_ticket_bytes;
+    seed.sessions              = client.sessions;
+    seed.verification_time     = client.verification_time;
+    var resumption: *key_schedule.Secret = nil;
+    if (client.schedule.resumption_ready) {
+        resumption = ?client.schedule.resumption_master;
+    }
+    val seeded: bool = established.begin(?client.core, seed,
+        ?client.schedule.client_application_traffic,
+        ?client.schedule.server_application_traffic, resumption,
+        ?client.schedule.exporter_master, established.Storage{
+        input: client.storage.input, input_capacity: client.storage.input_capacity
+    });
+    key_schedule.destroy(?client.schedule);
+    transcript.destroy(?client.transcript);
+    session.ticket_destroy(?client.offered_ticket);
+    if (!seeded) {
+        fail(client, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+        ret;
+    }
+    client.delegating = true;
+    # bytes the server sent behind its finished belong to the core, which
+    # assembles them in this same storage from its start
+    if (client.input_read < client.input_len) {
+        established.feed(?client.core, ?client.storage.input[client.input_read],
+            client.input_len - client.input_read);
+    }
+    client.input_read = 0;
+    client.input_len  = 0;
+}
+
+fun complete_event_inner(client: *Handshake, token: u64, accepted: bool) bool {
     if (!client_owner_valid(client) ||
         !client.event_active || token == 0 ||
         token != client.active_event.token) { ret false; }
@@ -2392,16 +2375,6 @@ fun complete_event_inner(client: *Client, token: u64, accepted: bool) bool {
     if (kind == CRYPTO) {
         client.output_pending = false;
         client.output_len     = 0;
-        if (client.update_send_after_output) {
-            client.update_send_after_output = false;
-            if (key_schedule.update_traffic(?client.schedule,
-                ?client.schedule.client_application_traffic) != error.OK) {
-                fail(client, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
-            }
-            or {
-                client.application_send_pending = true;
-            }
-        }
     }
     or (kind == TRAFFIC_SECRET && level == HANDSHAKE && direction == SEND) {
         client.handshake_send_pending = false;
@@ -2430,8 +2403,7 @@ fun complete_event_inner(client: *Client, token: u64, accepted: bool) bool {
     or (kind == ALERT) {
         client.alert_pending = false;
     }
-    if (client.state == ESTABLISHED && !client.output_pending &&
-        !client.handshake_send_pending && !client.handshake_receive_pending &&
+    if (client.state == ESTABLISHED && !pending(client) &&
         client.schedule.stage == key_schedule.APPLICATION &&
         client.schedule.master_secret.active) {
         discard_completed(client);
@@ -2439,14 +2411,18 @@ fun complete_event_inner(client: *Client, token: u64, accepted: bool) bool {
     ret true;
 }
 
-pub fun complete_event(client: *Client, token: u64, accepted: bool) bool {
+pub fun complete_event(client: *Handshake, token: u64, accepted: bool) bool {
     if (!enter(client)) { ret false; }
-    val completed: bool = complete_event_inner(client, token, accepted);
+    var completed: bool = false;
+    if (client.delegating) {
+        completed = established.complete_event(?client.core, token, accepted);
+    }
+    or { completed = complete_event_inner(client, token, accepted); }
     leave(client);
     ret completed;
 }
 
-fun close_inner(client: *Client, description: record.AlertDescription) engine.Result {
+fun close_inner(client: *Handshake, description: record.AlertDescription) engine.Result {
     if (!client_owner_valid(client) ||
         client.state == DESTROYED || client.state == TERMINAL ||
         client.state == CLOSING || client.alert_pending ||
@@ -2461,18 +2437,22 @@ fun close_inner(client: *Client, description: record.AlertDescription) engine.Re
     ret result(OK, error.OK, 0, 0);
 }
 
-pub fun close(client: *Client, description: record.AlertDescription) engine.Result {
+pub fun close(client: *Handshake, description: record.AlertDescription) engine.Result {
     if (!enter(client)) {
         ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val closed: engine.Result = close_inner(client, description);
+    var closed: engine.Result;
+    if (client.delegating) { closed = established.close(?client.core, description); }
+    or                     { closed = close_inner(client, description); }
     leave(client);
     ret closed;
 }
 
-fun destroy_inner(client: *Client) bool {
-    if (!client_owner_valid(client) ||
-        client.event_active) { ret false; }
+fun destroy_inner(client: *Handshake) bool {
+    if (!client_owner_valid(client) || client.event_active ||
+        established.event_active(?client.core)) { ret false; }
+    established.wipe(?client.core);
+    client.delegating = false;
     ct.zeroize(?client.private_key[0], 32);
     transcript.destroy(?client.transcript);
     transcript.destroy(?client.binder_transcript);
@@ -2501,18 +2481,47 @@ fun destroy_inner(client: *Client) bool {
     # initialised on this record again starts from the declared zero state;
     # only the transition owner survives, since this thread still holds it
     val owner:   i64 = client.transition_owner;
-    var cleared: Client;
+    var cleared: Handshake;
     @client                 = cleared;
     client.transition_owner = owner;
     client.state            = DESTROYED;
     ret true;
 }
 
-pub fun destroy(client: *Client) bool {
+pub fun destroy(client: *Handshake) bool {
     if (!enter(client)) { ret false; }
     val destroyed: bool = destroy_inner(client);
     leave(client);
     ret destroyed;
+}
+
+# move the established connection into core and release the handshake, which
+# init may then reuse. refused, changing nothing, until the handshake queue
+# has drained and no event is active. a client with a session store passes
+# input storage for tickets; take the snapshot first, since the peer's quic
+# parameters are not kept past this call
+pub fun finish(client: *Handshake, core: *established.Established,
+    storage: established.Storage) contracts.Error {
+    if (!enter(client)) { ret contracts.INVALID_STATE; }
+    var finished: contracts.Error = contracts.INVALID_STATE;
+    if (client.delegating && !client.event_active && !pending(client) &&
+        established.move(core, ?client.core, storage)) {
+        destroy_inner(client);
+        finished = contracts.OK;
+    }
+    leave(client);
+    ret finished;
+}
+
+# a key update, served by the established core once the handshake has drained
+pub fun request_key_update(client: *Handshake, request: u8) engine.Result {
+    if (!enter(client)) { ret result(FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var requested: engine.Result = result(FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    if (client.delegating) {
+        requested = established.request_key_update(?client.core, request);
+    }
+    leave(client);
+    ret requested;
 }
 
 fun aead_for(suite: tls13.CipherSuite) record.Algorithm {
@@ -2524,7 +2533,7 @@ fun aead_for(suite: tls13.CipherSuite) record.Algorithm {
     ret 0;
 }
 
-fun secret_for(client: *Client, level: Level,
+fun secret_for(client: *Handshake, level: Level,
     direction: Direction) *key_schedule.Secret {
     if (level == HANDSHAKE && direction == SEND) {
         ret ?client.schedule.client_handshake_traffic;
@@ -2541,7 +2550,7 @@ fun secret_for(client: *Client, level: Level,
     ret nil;
 }
 
-fun traffic_keys_inner(client: *Client, event: *engine.Event,
+fun traffic_keys_inner(client: *Handshake, event: *engine.Event,
     key: contracts.SecretBuffer, iv: contracts.Buffer,
     key_length: *usize) bool {
     if (!client_owner_valid(client) || event == nil || key_length == nil ||
@@ -2559,16 +2568,20 @@ fun traffic_keys_inner(client: *Client, event: *engine.Event,
 }
 
 # derive the record keys for the borrowed traffic-secret event
-pub fun traffic_keys(client: *Client, event: *engine.Event,
+pub fun traffic_keys(client: *Handshake, event: *engine.Event,
     key: contracts.SecretBuffer, iv: contracts.Buffer,
     key_length: *usize) bool {
     if (!enter(client)) { ret false; }
-    val derived: bool = traffic_keys_inner(client, event, key, iv, key_length);
+    var derived: bool = false;
+    if (client.delegating) {
+        derived = established.traffic_keys(?client.core, event, key, iv, key_length);
+    }
+    or { derived = traffic_keys_inner(client, event, key, iv, key_length); }
     leave(client);
     ret derived;
 }
 
-fun snapshot_inner(client: *Client) engine.Snapshot {
+fun snapshot_inner(client: *Handshake) engine.Snapshot {
     var value: engine.Snapshot = engine.empty_snapshot();
     if (!client_owner_valid(client)) { ret value; }
     value.role      = engine.CLIENT;
@@ -2596,27 +2609,35 @@ fun snapshot_inner(client: *Client) engine.Snapshot {
     ret value;
 }
 
-pub fun snapshot(client: *Client) engine.Snapshot {
+pub fun snapshot(client: *Handshake) engine.Snapshot {
     if (!enter(client)) { ret engine.empty_snapshot(); }
-    val value: engine.Snapshot = snapshot_inner(client);
+    var value: engine.Snapshot;
+    if (client.delegating) {
+        # the server's parameters are the handshake's to report, until finish
+        value                 = established.snapshot(?client.core);
+        value.peer_parameters = client.peer_parameters;
+    }
+    or { value = snapshot_inner(client); }
     leave(client);
     ret value;
 }
 
-pub fun receive_record_limit(client: *Client) usize {
+pub fun receive_record_limit(client: *Handshake) usize {
     if (!enter(client)) { ret 0; }
     var limit: usize = 0;
-    if (client.config != nil && client.state != DESTROYED) {
+    if (client.delegating) { limit = established.receive_record_limit(?client.core); }
+    or (client.config != nil && client.state != DESTROYED) {
         limit = client.receive_record_plaintext;
     }
     leave(client);
     ret limit;
 }
 
-pub fun send_record_limit(client: *Client) usize {
+pub fun send_record_limit(client: *Handshake) usize {
     if (!enter(client)) { ret 0; }
     var limit: usize = 0;
-    if (client.config != nil && client.state != DESTROYED) {
+    if (client.delegating) { limit = established.send_record_limit(?client.core); }
+    or (client.config != nil && client.state != DESTROYED) {
         limit = client.send_record_plaintext;
     }
     leave(client);
@@ -2675,7 +2696,7 @@ test "client: destroy leaves no residue in any cleared record" {
 }
 
 test "client: configuration rejects unbounded and missing ownership" {
-    var client:        Client;
+    var client:        Handshake;
     var configuration: config.ClientConfig;
     var storage:       Storage;
     if (init(?client, ?configuration, storage, no_extra_extension(), 0)) { ret 1; }
@@ -2683,7 +2704,7 @@ test "client: configuration rejects unbounded and missing ownership" {
 }
 
 test "client: user canceled warning permits orderly close" {
-    var client: Client;
+    var client: Handshake;
     client.state = ESTABLISHED;
     if (close(?client, record.USER_CANCELED_ALERT).status != OK ||
         client.state != ESTABLISHED || !client.alert_pending ||
@@ -2740,9 +2761,9 @@ fun deterministic_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
-var reentry_client:         *Client;
+var reentry_client:         *Handshake;
 var reentry_rejections:     usize;
-var hostile_entropy_client: *Client;
+var hostile_entropy_client: *Handshake;
 var hostile_entropy_calls:  usize;
 
 fun reentrant_entropy(context: ptr, secret_context: *^u8,
@@ -2822,6 +2843,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     entropy.fill_fn                                   = reentrant_entropy;
     configuration.limits                              = config.production_limits();
     configuration.limits.max_peer_handshake_bytes     = 4096;
+    configuration.limits.max_chain_bytes              = 3072;
     configuration.limits.max_ticket_bytes             = 4096;
     configuration.limits.max_receive_record_plaintext = 1024;
     configuration.limits.max_send_record_plaintext    = 2048;
@@ -2877,13 +2899,13 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     };
     val oversized_extra: ExtraExtension = ExtraExtension{kind: 0xffa5,
         data: contracts.Bytes{data: ?oversized_extension[0], len: 65500}};
-    var oversized_client: Client;
+    var oversized_client: Handshake;
     if (init(?oversized_client, ?oversized_configuration,
         oversized_storage, oversized_extra, 0) ||
         oversized_client.state != 0) { ret 72; }
     var local_bound_configuration: config.ClientConfig = configuration;
     local_bound_configuration.limits.max_peer_handshake_bytes = 64;
-    var local_bound_client: Client;
+    var local_bound_client: Handshake;
     if (!init(?local_bound_client, ?local_bound_configuration, storage,
         no_extra_extension(), 0) ||
         start(?local_bound_client, 1787875200).status != OK ||
@@ -2898,7 +2920,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     hostile_descriptor.fill_fn = hostile_entropy;
     var hostile_configuration: config.ClientConfig = configuration;
     hostile_configuration.entropy = ?hostile_descriptor;
-    var hostile_client: Client;
+    var hostile_client: Handshake;
     hostile_entropy_client = ?hostile_client;
     hostile_entropy_calls  = 0;
     if (!init(?hostile_client, ?hostile_configuration, storage,
@@ -2919,7 +2941,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     }
     if (!destroy(?hostile_client)) { ret 78; }
     hostile_entropy_client = nil;
-    var value: Client;
+    var value: Handshake;
     reentry_client     = ?value;
     reentry_rejections = 0;
     if (configuration.entropy == nil || !configuration.entropy.initialized) { ret 21; }
@@ -3132,6 +3154,7 @@ test "client: event rejection has one terminal alert ownership path" {
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     configuration.limits.max_ticket_bytes         = 4096;
     val storage: Storage = Storage{
         input:           ?reject_input[0], input_capacity: 4096,
@@ -3141,7 +3164,7 @@ test "client: event rejection has one terminal alert ownership path" {
         peer_parameters: nil, peer_parameters_capacity: 0,
     };
     var empty_extra: ExtraExtension;
-    var value:       Client;
+    var value:       Handshake;
     if (!init(?value, ?configuration, storage, empty_extra, 0) ||
         start(?value, 1787875200).status != OK) { ret 1; }
     var event: engine.Event;
@@ -3190,6 +3213,7 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     configuration.limits.max_ticket_bytes         = 4096;
     val storage: Storage = Storage{
         input:           ?hostile_input[0], input_capacity: 4096,
@@ -3199,7 +3223,7 @@ test "client: wrong-level and out-of-state messages fail closed once" {
         peer_parameters: nil, peer_parameters_capacity: 0,
     };
     var empty_extra: ExtraExtension;
-    var value:       Client;
+    var value:       Handshake;
     if (!init(?value, ?configuration, storage, empty_extra, 0)) { ret 1; }
     if (start(?value, 1787875200).status != OK)                 { ret 4; }
     var event: engine.Event;
@@ -3320,6 +3344,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     configuration.limits.max_ticket_bytes         = 4096;
     var storage: Storage = Storage{
         input:           ?full_input[0], input_capacity: 4096,
@@ -3333,7 +3358,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
         kind: QUIC_TRANSPORT_PARAMETERS,
         data: contracts.Bytes{data: ?client_parameters[0], len: 2}
     };
-    var value: Client;
+    var value: Handshake;
     if (!init(?value, ?configuration, storage, client_extra,
         QUIC_TRANSPORT_PARAMETERS) ||
         start(?value, 1800000000).status != OK) { ret 2; }
@@ -3651,9 +3676,14 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
         if (!complete_event(?value, event.token, true)) { ret 33; }
     }
     if (!authentication_seen || !complete_seen || application_events != 2 ||
-        snapshot(?value).status != COMPLETE || !value.schedule.resumption_ready) {
+        snapshot(?value).status != COMPLETE) {
         ret 34;
     }
+    # the drained handshake handed over to the core, which under quic keeps no
+    # application secret since quic never updates tls keys
+    if (!value.delegating || value.schedule.master_secret.active ||
+        value.schedule.resumption_ready || value.core.send.active ||
+        value.core.receive.active || !value.core.quic) { ret 40; }
     transcript.destroy(?server_transcript);
     key_schedule.destroy(?server_schedule);
     if (!destroy(?value) || keys.destroy_private(?client_key) != contracts.OK) { ret 35; }

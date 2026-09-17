@@ -57,7 +57,7 @@ rec TestTransport {
     mutate_descriptor:    bool;
     mutate_completion:    bool;
     concurrent_reentry:   bool;
-    concurrent_blocked:   bool;
+    concurrent_refused:   bool;
     reentry_rejected:     bool;
     snapshot_rejected:    bool;
     accept_rejected:      bool;
@@ -123,17 +123,13 @@ fun test_submit(context: ptr, scope: *cancel.Scope, kind: io_runtime.Kind, buffe
     if (state.concurrent_reentry) {
         state.concurrent_reentry = false;
         thread.spawn_with(concurrent_destroy, state::*u8, ?state.worker);
+        # the other thread's call is refused at once while this one is inside
         if (state.worker.tid >= 0) {
-            for (atomic.load(?state.concurrent_entered) == 0) {
+            for (atomic.load(?state.concurrent_result) == 0) {
                 atomic.spin_hint();
             }
-            var i: usize = 0;
-            for (i < 1000) {
-                atomic.spin_hint();
-                i = i + 1;
-            }
-            state.concurrent_blocked =
-                atomic.load(?state.concurrent_result) == 0;
+            state.concurrent_refused =
+                atomic.load(?state.concurrent_result) == -1;
         }
     }
     if (state.mutate_descriptor) {
@@ -191,7 +187,7 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     state.mutate_descriptor    = false;
     state.mutate_completion    = false;
     state.concurrent_reentry   = false;
-    state.concurrent_blocked   = false;
+    state.concurrent_refused   = false;
     state.reentry_rejected     = false;
     state.snapshot_rejected    = false;
     state.accept_rejected      = false;
@@ -516,13 +512,13 @@ var open_signatures:       [1]tls13.SignatureScheme;
 var open_entropy:          secret.Entropy;
 var open_configuration:    config.ClientConfig;
 var open_identity:         credentials.Identity;
-var core_a:                client.Client;
-var core_b:                client.Client;
-var core_c:                client.Client;
-var core_d:                client.Client;
+var core_a:                client.Handshake;
+var core_b:                client.Handshake;
+var core_c:                client.Handshake;
+var core_d:                client.Handshake;
 
 # an open stream still borrows a real engine, so ownership queries stay honest
-fun make_test_client(core: *client.Client) bool {
+fun make_test_client(core: *client.Handshake) bool {
     client.destroy(core);
     open_entropy_counter = 1;
     open_entropy         = secret.Entropy{context: ?open_entropy_counter,
@@ -554,6 +550,7 @@ fun make_test_client(core: *client.Client) bool {
     open_configuration.entropy_context_size            = 1;
     open_configuration.limits                          = config.production_limits();
     open_configuration.limits.max_peer_handshake_bytes = 4096;
+    open_configuration.limits.max_chain_bytes          = 3072;
     var storage: client.Storage;
     storage.input                    = ?open_handshake_input[0];
     storage.input_capacity           = 4096;
@@ -572,7 +569,7 @@ fun make_test_client(core: *client.Client) bool {
     ret client.init(core, ?open_configuration, storage, extra, 0);
 }
 
-fun make_open_stream(value: *stream.Stream, core: *client.Client,
+fun make_open_stream(value: *stream.Stream, core: *client.Handshake,
     adapter: *transport.Transport, wire_input: *u8, wire_output: *u8) bool {
     if (!make_test_client(core)) { ret false; }
     value.role                         = engine.CLIENT;
@@ -664,7 +661,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
         transport.Token{index: 30, generation: 3},
         ?application[0], 3, 0) || state.worker.tid < 0) { ret 13; }
     thread.join(?state.worker);
-    if (!state.concurrent_blocked ||
+    if (!state.concurrent_refused ||
         atomic.load(?state.concurrent_result) != -1 ||
         atomic.load(?concurrent.transition_owner) != 0) { ret 14; }
     var completion: io_runtime.Completion;
@@ -746,6 +743,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     val core_storage: client.Storage = client.Storage{
         input:           ?connect_handshake_input[0], input_capacity: 4096,
         output:          ?connect_handshake_output[0], output_capacity: 4096,

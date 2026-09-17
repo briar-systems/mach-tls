@@ -1,0 +1,939 @@
+# the tls 1.3 state an established connection needs, for both roles
+#
+# a handshake seeds one of these when its handshake queue drains, serves
+# post-handshake calls through it, and moves it out in finish. it holds the
+# application traffic secrets, key-update and close state, a compact event
+# queue and the negotiated facts, and nothing a handshake reads: no
+# transcript, lease, peer certificate or handshake storage. borrowed arrays
+# are validated where they are seeded, so every call here is O(1) plus the
+# bytes it is given
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.engine;
+use tls.error;
+use tls.handshake;
+use tls.handshake.codec;
+use tls.memory_range;
+use tls.record;
+use tls.session;
+use tls.tls13;
+use tls.tls13.key_schedule;
+use tls.transition;
+
+pub def State: u8;
+
+pub val EMPTY:     State = 0;
+pub val OPEN:      State = 1;
+pub val CLOSING:   State = 2;
+pub val TERMINAL:  State = 3;
+pub val DESTROYED: State = 4;
+
+pub val MAX_BYTES:     usize = 512;
+val     MAX_QUEUED:    usize = 4;
+val     OUTPUT_BYTES:  usize = 8;
+val     PARTIAL_BYTES: usize = 8;
+val     SEND_SLOT:     usize = 0;
+val     RECEIVE_SLOT:  usize = 1;
+val     NO_SLOT:       u8    = 255;
+
+# caller storage for post-handshake messages larger than a key update. only a
+# client with a session store needs it, sized to hold a whole ticket message
+pub rec Storage {
+    input:          *u8;
+    input_capacity: usize;
+}
+
+pub fun no_storage() Storage {
+    ret Storage{input: nil, input_capacity: 0};
+}
+
+# what a handshake knows when its handshake queue drains
+pub rec Seed {
+    role:                  engine.Role;
+    suite:                 tls13.CipherSuite;
+    group:                 tls13.NamedGroup;
+    retry_count:           u8;
+    tickets_issued:        u8;
+    authenticated:         bool;
+    resumed:               bool;
+    peer_offered_alpn:     bool;
+    client_auth_requested: bool;
+    quic:                  bool;
+    retain_exporter:       bool;
+    # borrowed from the caller configuration, which outlives the connection
+    alpn:                 contracts.Bytes;
+    server_name:          contracts.Bytes;
+    receive_record_limit: usize;
+    send_record_limit:    usize;
+    max_message_bytes:    usize;
+    max_ticket_bytes:     usize;
+    sessions:             *session.ClientStore;
+    verification_time:    i64;
+}
+
+rec Pending {
+    kind:      engine.EventKind;
+    direction: engine.Direction;
+    alert:     record.AlertDescription;
+}
+
+pub rec Established {
+    role:                  engine.Role;
+    state:                 State;
+    quic:                  bool;
+    retry_count:           u8;
+    tickets_issued:        u8;
+    authenticated:         bool;
+    resumed:               bool;
+    peer_offered_alpn:     bool;
+    client_auth_requested: bool;
+    event_active:          bool;
+    pending_alert:         record.AlertDescription;
+    failure:               error.Error;
+    suite:                 tls13.CipherSuite;
+    group:                 tls13.NamedGroup;
+    algorithm:             key_schedule.HashAlgorithm;
+    queue_head:            u8;
+    queue_len:             u8;
+    output_len:            u8;
+    partial_len:           u8;
+    queue:                 [MAX_QUEUED]Pending;
+    output:                [OUTPUT_BYTES]u8;
+    partial:               [PARTIAL_BYTES]u8;
+    active_kind:           engine.EventKind;
+    active_direction:      engine.Direction;
+    send:                  key_schedule.Secret;
+    receive:               key_schedule.Secret;
+    resumption:            key_schedule.Secret;
+    exporter:              key_schedule.Secret;
+    event_token:           u64;
+    event_generation:      u64;
+    secret_generation:     [2]u64;
+    transition_owner:      i64;
+    verification_time:     i64;
+    receive_record_limit:  usize;
+    send_record_limit:     usize;
+    max_message_bytes:     usize;
+    max_ticket_bytes:      usize;
+    storage:               Storage;
+    input_len:             usize;
+    skip_remaining:        usize;
+    sessions:              *session.ClientStore;
+    alpn:                  contracts.Bytes;
+    server_name:           contracts.Bytes;
+}
+
+fun result(status: engine.Status, failure: error.Error, consumed: usize,
+    required: usize) engine.Result {
+    ret engine.result(status, failure, consumed, required);
+}
+
+fun owner_valid(core: *Established) bool {
+    if (core == nil) { ret false; }
+    val address: usize = (?core.state)::usize;
+    val offset:  usize = $offset_of(Established, state);
+    ret address >= offset && memory_range.valid((address - offset)::*u8,
+        $size_of(Established));
+}
+
+fun owner_data(core: *Established) *u8 {
+    ret ((?core.state)::usize - $offset_of(Established, state))::*u8;
+}
+
+fun owner_overlaps(core: *Established, data: *u8, len: usize) bool {
+    ret memory_range.overlap(owner_data(core), $size_of(Established), data, len);
+}
+
+fun enter(core: *Established) bool {
+    if (!owner_valid(core)) { ret false; }
+    ret transition.enter(?core.transition_owner);
+}
+
+fun leave(core: *Established) {
+    transition.leave(?core.transition_owner);
+}
+
+fun live(core: *Established) bool {
+    ret core.state == OPEN || core.state == CLOSING;
+}
+
+fun pending(core: *Established) bool {
+    ret core.queue_head < core.queue_len;
+}
+
+fun queue_clear(core: *Established) {
+    core.queue_head = 0;
+    core.queue_len  = 0;
+}
+
+fun queue_push(core: *Established, kind: engine.EventKind,
+    direction: engine.Direction, alert: record.AlertDescription) bool {
+    if (core.queue_len::usize >= MAX_QUEUED) { ret false; }
+    core.queue[core.queue_len] = Pending{kind: kind, direction: direction, alert: alert};
+    core.queue_len             = core.queue_len + 1;
+    ret true;
+}
+
+fun fail(core: *Established, failure: error.Error,
+    alert: record.AlertDescription) engine.Result {
+    if (core.state != DESTROYED && core.state != EMPTY) {
+        core.failure       = failure;
+        core.pending_alert = alert;
+        queue_clear(core);
+        core.output_len = 0;
+        if (alert != record.NO_ALERT) {
+            queue_push(core, engine.ALERT, 0, alert);
+        }
+        core.state = TERMINAL;
+    }
+    ret result(engine.FAILED, failure, 0, 0);
+}
+
+fun secret_at(core: *Established, direction: engine.Direction) *key_schedule.Secret {
+    if (direction == engine.SEND)    { ret ?core.send; }
+    if (direction == engine.RECEIVE) { ret ?core.receive; }
+    ret nil;
+}
+
+fun slot_for(direction: engine.Direction) usize {
+    if (direction == engine.SEND) { ret SEND_SLOT; }
+    ret RECEIVE_SLOT;
+}
+
+fun aead_for(suite: tls13.CipherSuite) record.Algorithm {
+    if (suite == tls13.AES_128_GCM_SHA256)       { ret record.AES_128_GCM; }
+    if (suite == tls13.AES_256_GCM_SHA384)       { ret record.AES_256_GCM; }
+    if (suite == tls13.CHACHA20_POLY1305_SHA256) { ret record.CHACHA20_POLY1305; }
+    ret 0;
+}
+
+fun clear_secrets(core: *Established) {
+    key_schedule.clear_secret(?core.send);
+    key_schedule.clear_secret(?core.receive);
+    key_schedule.clear_secret(?core.resumption);
+    key_schedule.clear_secret(?core.exporter);
+}
+
+# the empty value every record starts from
+pub fun empty() Established {
+    var value: Established;
+    value.alpn.data        = nil;
+    value.server_name.data = nil;
+    value.pending_alert    = record.NO_ALERT;
+    ret value;
+}
+
+# initialize core from a draining handshake. resumption and exporter may be nil,
+# and a client keeps a resumption secret only when it has a session store
+pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
+    receive: *key_schedule.Secret, resumption: *key_schedule.Secret,
+    exporter: *key_schedule.Secret, storage: Storage) bool {
+    if (!owner_valid(core) || core.state != EMPTY || send == nil || receive == nil ||
+        (seed.role != engine.CLIENT && seed.role != engine.SERVER) ||
+        key_schedule.key_size(seed.suite) == 0 ||
+        (seed.alpn.len != 0 && seed.alpn.data == nil) ||
+        (seed.server_name.len != 0 && seed.server_name.data == nil) ||
+        !memory_range.valid(storage.input, storage.input_capacity) ||
+        (storage.input == nil && storage.input_capacity != 0)) { ret false; }
+    val owner: i64 = core.transition_owner;
+    @core                      = empty();
+    core.transition_owner      = owner;
+    core.role                  = seed.role;
+    core.quic                  = seed.quic;
+    core.alpn                  = seed.alpn;
+    core.server_name           = seed.server_name;
+    core.retry_count           = seed.retry_count;
+    core.tickets_issued        = seed.tickets_issued;
+    core.authenticated         = seed.authenticated;
+    core.resumed               = seed.resumed;
+    core.peer_offered_alpn     = seed.peer_offered_alpn;
+    core.client_auth_requested = seed.client_auth_requested;
+    core.suite                 = seed.suite;
+    core.group                 = seed.group;
+    core.algorithm             = key_schedule.algorithm_for_suite(seed.suite);
+    core.receive_record_limit  = seed.receive_record_limit;
+    core.send_record_limit     = seed.send_record_limit;
+    core.max_message_bytes     = seed.max_message_bytes;
+    core.max_ticket_bytes      = seed.max_ticket_bytes;
+    core.verification_time     = seed.verification_time;
+    core.storage               = storage;
+    # quic never updates tls keys, so it keeps no application secret
+    if (!seed.quic) {
+        key_schedule.copy_secret(?core.send, send);
+        key_schedule.copy_secret(?core.receive, receive);
+    }
+    if (seed.role == engine.CLIENT && seed.sessions != nil && resumption != nil) {
+        core.sessions = seed.sessions;
+        key_schedule.copy_secret(?core.resumption, resumption);
+    }
+    if (seed.retain_exporter && exporter != nil) {
+        key_schedule.copy_secret(?core.exporter, exporter);
+    }
+    core.state = OPEN;
+    ret true;
+}
+
+# move source into destination, leaving source empty and wiped. a ticket half
+# assembled in source's storage is carried into the new storage
+pub fun move(destination: *Established, source: *Established,
+    storage: Storage) bool {
+    if (!owner_valid(destination) || !owner_valid(source) ||
+        destination.state != EMPTY || !live(source) || source.event_active ||
+        !memory_range.valid(storage.input, storage.input_capacity) ||
+        (storage.input == nil && storage.input_capacity != 0) ||
+        storage.input_capacity < source.input_len) { ret false; }
+    if (source.input_len != 0) {
+        copy_bytes(storage.input, source.storage.input, source.input_len);
+    }
+    val owner: i64 = destination.transition_owner;
+    @destination                 = @source;
+    destination.transition_owner = owner;
+    destination.storage          = storage;
+    wipe(source);
+    ret true;
+}
+
+# return core to empty, wiping every secret it held
+pub fun wipe(core: *Established) {
+    if (core == nil) { ret; }
+    clear_secrets(core);
+    val owner: i64 = core.transition_owner;
+    @core                 = empty();
+    core.transition_owner = owner;
+}
+
+fun key_update_bytes(core: *Established, request: u8) bool {
+    val encoded: handshake.Progress = codec.encode_key_update(
+        codec.KeyUpdate{request: request},
+        contracts.Buffer{data: ?core.output[0], capacity: OUTPUT_BYTES});
+    if (encoded.status != handshake.COMPLETE) { ret false; }
+    core.output_len = encoded.produced::u8;
+    ret true;
+}
+
+# queue our key update: the message goes out under the old key, then the new
+# send secret is published
+fun send_update(core: *Established, request: u8) error.Error {
+    if (!key_update_bytes(core, request)) { ret error.INTERNAL_ERROR; }
+    val failure: error.Error = key_schedule.secret_update(core.algorithm, ?core.send);
+    if (failure != error.OK) { ret failure; }
+    if (!queue_push(core, engine.CRYPTO, engine.SEND, record.NO_ALERT) ||
+        !queue_push(core, engine.TRAFFIC_SECRET, engine.SEND, record.NO_ALERT)) {
+        ret error.INTERNAL_ERROR;
+    }
+    ret error.OK;
+}
+
+fun handle_key_update(core: *Established, message: *handshake.Message) error.Error {
+    if (core.quic) { ret error.UNEXPECTED_MESSAGE; }
+    var update:  codec.KeyUpdate;
+    var failure: error.Error = codec.decode_key_update(message, ?update);
+    if (failure != error.OK) { ret failure; }
+    failure = key_schedule.secret_update(core.algorithm, ?core.receive);
+    if (failure != error.OK) { ret failure; }
+    if (!queue_push(core, engine.TRAFFIC_SECRET, engine.RECEIVE, record.NO_ALERT)) {
+        ret error.INTERNAL_ERROR;
+    }
+    if (update.request == codec.UPDATE_REQUESTED && core.state == OPEN) {
+        ret send_update(core, codec.UPDATE_NOT_REQUESTED);
+    }
+    ret error.OK;
+}
+
+fun copy_bytes(destination: *u8, source: *u8, length: usize) {
+    var i: usize = 0;
+    for (i < length) {
+        destination[i] = source[i];
+        i              = i + 1;
+    }
+}
+
+fun retain_ticket(core: *Established, value: *codec.NewSessionTicket) {
+    if (value.ticket.len == 0 || value.ticket.len > session.MAX_TICKET_BYTES ||
+        value.lifetime == 0 ||
+        value.lifetime > session.MAX_TICKET_LIFETIME_SECONDS ||
+        value.nonce.len > 255) { ret; }
+    val size: usize = key_schedule.hash_size(core.algorithm);
+    if (size == 0 || size > session.MAX_SECRET) { ret; }
+    var retained: session.Ticket;
+    session.ticket_destroy(?retained);
+    if (key_schedule.secret_resumption_psk(core.algorithm, ?core.resumption,
+        value.nonce, contracts.SecretBuffer{data: ?retained.secret[0],
+        capacity: session.MAX_SECRET}) != error.OK) {
+        session.ticket_destroy(?retained);
+        ret;
+    }
+    retained.secret_len = size;
+    copy_bytes(?retained.identity[0], value.ticket.data, value.ticket.len);
+    retained.identity_len     = value.ticket.len;
+    retained.suite            = core.suite;
+    retained.received_at      = core.verification_time;
+    retained.lifetime_seconds = value.lifetime;
+    retained.age_add          = value.age_add;
+    retained.max_early_data   = 0;
+    val name: contracts.Bytes = core.server_name;
+    if (name.len <= session.MAX_SERVER_NAME) {
+        copy_bytes(?retained.server_name[0], name.data, name.len);
+        retained.server_name_len = name.len;
+    }
+    val alpn: contracts.Bytes = core.alpn;
+    if (alpn.len != 0 && alpn.len <= session.MAX_ALPN) {
+        copy_bytes(?retained.alpn[0], alpn.data, alpn.len);
+        retained.alpn_len = alpn.len;
+    }
+    retained.valid = true;
+    session.client_store_save(core.sessions, ?retained);
+    session.ticket_destroy(?retained);
+}
+
+fun handle_ticket(core: *Established, message: *handshake.Message) error.Error {
+    var ticket:  codec.NewSessionTicket;
+    val failure: error.Error = codec.decode_new_session_ticket(message, ?ticket);
+    if (failure != error.OK)                       { ret failure; }
+    if (ticket.ticket.len > core.max_ticket_bytes) { ret error.RESOURCE_LIMIT; }
+    retain_ticket(core, ?ticket);
+    ret error.OK;
+}
+
+fun process(core: *Established, data: *u8, length: usize) error.Error {
+    var message: handshake.Message;
+    val parsed:  handshake.Progress = handshake.parse(data, length,
+        core.max_message_bytes - handshake.HEADER_SIZE, ?message);
+    if (parsed.status != handshake.COMPLETE || parsed.consumed != length) {
+        if (parsed.status == handshake.COMPLETE) { ret error.INTERNAL_ERROR; }
+        ret parsed.error;
+    }
+    if (message.header.message_type == handshake.KEY_UPDATE) {
+        ret handle_key_update(core, ?message);
+    }
+    if (message.header.message_type == handshake.NEW_SESSION_TICKET &&
+        core.role == engine.CLIENT) {
+        ret handle_ticket(core, ?message);
+    }
+    ret error.UNEXPECTED_MESSAGE;
+}
+
+fun header_type(core: *Established) handshake.MessageType {
+    ret core.partial[0];
+}
+
+fun header_length(core: *Established) usize {
+    ret (core.partial[1]::usize << 16) | (core.partial[2]::usize << 8) |
+        core.partial[3]::usize;
+}
+
+# consume post-handshake bytes; a key update must end its record, so nothing
+# may follow the message that produced events
+fun absorb(core: *Established, data: *u8, length: usize) error.Error {
+    var at: usize = 0;
+    for (at < length) {
+        if (pending(core)) { ret error.UNEXPECTED_MESSAGE; }
+        if (core.skip_remaining != 0) {
+            var skipped: usize = length - at;
+            if (skipped > core.skip_remaining) { skipped = core.skip_remaining; }
+            core.skip_remaining = core.skip_remaining - skipped;
+            at                  = at + skipped;
+        }
+        or (core.partial_len::usize < handshake.HEADER_SIZE) {
+            core.partial[core.partial_len] = data[at];
+            core.partial_len               = core.partial_len + 1;
+            at                             = at + 1;
+            if (core.partial_len::usize == handshake.HEADER_SIZE) {
+                val kind:  handshake.MessageType = header_type(core);
+                val total: usize                 = handshake.HEADER_SIZE + header_length(core);
+                if (total > core.max_message_bytes) { ret error.RESOURCE_LIMIT; }
+                if (kind == handshake.NEW_SESSION_TICKET && core.role == engine.CLIENT) {
+                    # a ticket nothing can retain, or has no room to assemble,
+                    # is skipped without buffering its body
+                    if (core.sessions == nil || total > core.storage.input_capacity) {
+                        core.skip_remaining = header_length(core);
+                        core.partial_len    = 0;
+                    }
+                    or {
+                        copy_bytes(core.storage.input, ?core.partial[0],
+                            handshake.HEADER_SIZE);
+                        core.input_len = handshake.HEADER_SIZE;
+                    }
+                }
+                or (kind != handshake.KEY_UPDATE || total > PARTIAL_BYTES) {
+                    ret error.UNEXPECTED_MESSAGE;
+                }
+            }
+        }
+        or (core.input_len != 0) {
+            val total:  usize = handshake.HEADER_SIZE + header_length(core);
+            var copied: usize = total - core.input_len;
+            if (copied > length - at) { copied = length - at; }
+            copy_bytes(?core.storage.input[core.input_len], ?data[at], copied);
+            core.input_len = core.input_len + copied;
+            at             = at + copied;
+        }
+        or {
+            val total: usize = handshake.HEADER_SIZE + header_length(core);
+            core.partial[core.partial_len] = data[at];
+            core.partial_len               = core.partial_len + 1;
+            at                             = at + 1;
+            if (core.partial_len::usize == total) {
+                val failure: error.Error = process(core, ?core.partial[0], total);
+                core.partial_len = 0;
+                if (failure != error.OK) { ret failure; }
+            }
+        }
+        if (core.input_len != 0 &&
+            core.input_len == handshake.HEADER_SIZE + header_length(core)) {
+            val failure: error.Error = process(core, core.storage.input, core.input_len);
+            core.input_len   = 0;
+            core.partial_len = 0;
+            if (failure != error.OK) { ret failure; }
+        }
+        if (core.partial_len::usize == handshake.HEADER_SIZE &&
+            header_length(core) == 0 && core.input_len == 0) {
+            val failure: error.Error = process(core, ?core.partial[0],
+                handshake.HEADER_SIZE);
+            core.partial_len = 0;
+            if (failure != error.OK) { ret failure; }
+        }
+    }
+    ret error.OK;
+}
+
+fun ingest_inner(core: *Established, level: engine.Level, data: *u8,
+    length: usize) engine.Result {
+    if (!live(core) || !memory_range.valid(data, length) ||
+        (length != 0 && data == nil) || owner_overlaps(core, data, length) ||
+        memory_range.overlap(core.storage.input, core.storage.input_capacity,
+        data, length)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (pending(core) || core.event_active) {
+        ret result(engine.BLOCKED, error.OK, 0, 0);
+    }
+    if (level != engine.APPLICATION) {
+        ret fail(core, error.UNEXPECTED_MESSAGE, record.UNEXPECTED_MESSAGE_ALERT);
+    }
+    val failure: error.Error = absorb(core, data, length);
+    if (failure != error.OK) {
+        ret fail(core, failure, engine.alert_for(failure));
+    }
+    if (pending(core)) { ret result(engine.OK, error.OK, length, 0); }
+    ret result(engine.MORE, error.OK, length, handshake.HEADER_SIZE);
+}
+
+# hand over post-handshake bytes a handshake had already buffered. data may lie
+# in the core's own storage, at or after the bytes it assembles there
+pub fun feed(core: *Established, data: *u8, length: usize) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var progress: engine.Result = result(engine.MORE, error.OK, length, 0);
+    if (!live(core) || (length != 0 && data == nil)) {
+        progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    or (length != 0) {
+        val failure: error.Error = absorb(core, data, length);
+        if (failure != error.OK) {
+            progress = fail(core, failure, engine.alert_for(failure));
+        }
+    }
+    leave(core);
+    ret progress;
+}
+
+pub fun ingest(core: *Established, level: engine.Level, data: *u8,
+    length: usize) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    val progress: engine.Result = ingest_inner(core, level, data, length);
+    leave(core);
+    ret progress;
+}
+
+pub fun poll(core: *Established) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    var progress: engine.Result = result(engine.MORE, error.OK, 0, handshake.HEADER_SIZE);
+    if (!live(core)) {
+        progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    or (pending(core) || core.event_active) {
+        progress = result(engine.BLOCKED, error.OK, 0, 0);
+    }
+    leave(core);
+    ret progress;
+}
+
+fun next_event_inner(core: *Established, output: *engine.Event) bool {
+    if (output == nil || core.event_active || core.state == DESTROYED ||
+        core.state == EMPTY || !pending(core) ||
+        !memory_range.valid((?output.token)::*u8, $size_of(engine.Event)) ||
+        owner_overlaps(core, (?output.token)::*u8, $size_of(engine.Event))) {
+        ret false;
+    }
+    val item:  Pending      = core.queue[core.queue_head];
+    var event: engine.Event = engine.empty_event();
+    event.token     = engine.next_generation(core.event_generation);
+    event.kind      = item.kind;
+    event.level     = engine.APPLICATION;
+    event.direction = item.direction;
+    event.suite     = core.suite;
+    event.aead      = aead_for(core.suite);
+    event.alert     = item.alert;
+    if (item.kind == engine.CRYPTO) {
+        event.data = contracts.Bytes{data: ?core.output[0], len: core.output_len::usize};
+    }
+    or (item.kind == engine.TRAFFIC_SECRET) {
+        val traffic: *key_schedule.Secret = secret_at(core, item.direction);
+        if (traffic == nil) { ret false; }
+        val slot: usize = slot_for(item.direction);
+        event.secret                 = key_schedule.bytes(traffic);
+        event.generation             = engine.next_generation(core.secret_generation[slot]);
+        core.secret_generation[slot] = event.generation;
+    }
+    output[0]             = event;
+    core.event_generation = event.token;
+    core.event_token      = event.token;
+    core.active_kind      = event.kind;
+    core.active_direction = event.direction;
+    core.event_active     = true;
+    ret true;
+}
+
+pub fun next_event(core: *Established, output: *engine.Event) bool {
+    if (!enter(core)) { ret false; }
+    val available: bool = next_event_inner(core, output);
+    leave(core);
+    ret available;
+}
+
+fun complete_event_inner(core: *Established, token: u64, accepted: bool) bool {
+    if (!core.event_active || token == 0 || token != core.event_token) { ret false; }
+    core.event_active = false;
+    if (!accepted) {
+        fail(core, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+        ret true;
+    }
+    if (core.active_kind == engine.CRYPTO) { core.output_len = 0; }
+    # quic never updates tls keys, so a delivered application secret is dropped
+    if (core.active_kind == engine.TRAFFIC_SECRET && core.quic) {
+        key_schedule.clear_secret(secret_at(core, core.active_direction));
+    }
+    core.queue_head = core.queue_head + 1;
+    if (core.queue_head >= core.queue_len) { queue_clear(core); }
+    ret true;
+}
+
+pub fun complete_event(core: *Established, token: u64, accepted: bool) bool {
+    if (!enter(core)) { ret false; }
+    val completed: bool = complete_event_inner(core, token, accepted);
+    leave(core);
+    ret completed;
+}
+
+pub fun event_active(core: *Established) bool {
+    ret core != nil && core.event_active;
+}
+
+fun traffic_keys_inner(core: *Established, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (event == nil || key_length == nil || !core.event_active ||
+        event.token != core.event_token ||
+        core.active_kind != engine.TRAFFIC_SECRET) { ret false; }
+    val traffic: *key_schedule.Secret = secret_at(core, core.active_direction);
+    if (traffic == nil ||
+        key_schedule.secret_traffic_key(core.algorithm, core.suite, traffic, key) !=
+        error.OK ||
+        key_schedule.secret_traffic_iv(core.algorithm, traffic, iv) != error.OK) {
+        ret false;
+    }
+    @key_length = key_schedule.key_size(core.suite);
+    ret true;
+}
+
+pub fun traffic_keys(core: *Established, event: *engine.Event,
+    key: contracts.SecretBuffer, iv: contracts.Buffer,
+    key_length: *usize) bool {
+    if (!enter(core)) { ret false; }
+    val derived: bool = traffic_keys_inner(core, event, key, iv, key_length);
+    leave(core);
+    ret derived;
+}
+
+fun request_key_update_inner(core: *Established, request: u8) engine.Result {
+    if (core.state != OPEN || core.quic || request > codec.UPDATE_REQUESTED) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (pending(core) || core.event_active) {
+        ret result(engine.BLOCKED, error.OK, 0, 0);
+    }
+    val failure: error.Error = send_update(core, request);
+    if (failure != error.OK) { ret fail(core, failure, engine.alert_for(failure)); }
+    ret result(engine.OK, error.OK, 0, 0);
+}
+
+# ask the peer for a fresh send key, and optionally for one of its own
+pub fun request_key_update(core: *Established, request: u8) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    val requested: engine.Result = request_key_update_inner(core, request);
+    leave(core);
+    ret requested;
+}
+
+fun close_inner(core: *Established,
+    description: record.AlertDescription) engine.Result {
+    if (core.state != OPEN || !record.valid_tls13_alert(description)) {
+        ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+    }
+    if (!queue_push(core, engine.ALERT, 0, description)) {
+        ret result(engine.FAILED, error.RESOURCE_LIMIT, 0, 0);
+    }
+    core.pending_alert = description;
+    if (description != record.USER_CANCELED_ALERT) { core.state = CLOSING; }
+    ret result(engine.OK, error.OK, 0, 0);
+}
+
+pub fun close(core: *Established,
+    description: record.AlertDescription) engine.Result {
+    if (!enter(core)) { ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
+    val closed: engine.Result = close_inner(core, description);
+    leave(core);
+    ret closed;
+}
+
+# keying material for an application that asked the configuration to retain
+# the exporter (rfc 8446 section 7.5)
+pub fun export_keying_material(core: *Established, label: contracts.Bytes,
+    context_hash: contracts.Bytes, output: contracts.SecretBuffer) error.Error {
+    if (!enter(core)) { ret error.ILLEGAL_PARAMETER; }
+    var exported: error.Error = error.ILLEGAL_PARAMETER;
+    if (live(core)) {
+        exported = key_schedule.secret_export(core.algorithm, ?core.exporter,
+            label, context_hash, output);
+    }
+    leave(core);
+    ret exported;
+}
+
+pub fun destroy(core: *Established) bool {
+    if (!enter(core)) { ret false; }
+    val destroyed: bool = !core.event_active;
+    if (destroyed) {
+        wipe(core);
+        core.state = DESTROYED;
+    }
+    leave(core);
+    ret destroyed;
+}
+
+# the negotiated facts. a server's peer name and either side's quic transport
+# parameters are only reported before finish
+pub fun snapshot(core: *Established) engine.Snapshot {
+    var value: engine.Snapshot = engine.empty_snapshot();
+    if (!enter(core)) { ret value; }
+    value.role                  = core.role;
+    value.version               = tls13.VERSION;
+    value.error                 = core.failure;
+    value.suite                 = core.suite;
+    value.group                 = core.group;
+    value.retry_count           = core.retry_count;
+    value.authenticated         = core.authenticated;
+    value.selected_alpn         = core.alpn;
+    value.peer_offered_alpn     = core.peer_offered_alpn;
+    value.client_auth_requested = core.client_auth_requested;
+    value.resumed               = core.resumed;
+    value.tickets_issued        = core.tickets_issued;
+    value.output_pending        = pending(core);
+    value.event_active          = core.event_active;
+    value.destroyed             = core.state == DESTROYED;
+    if (core.role == engine.CLIENT) { value.peer_name = core.server_name; }
+    if (core.state == OPEN)         { value.status = engine.COMPLETE; }
+    or (core.state == TERMINAL)     { value.status = engine.FAILED; }
+    or (core.state == CLOSING)      { value.status = engine.MORE; }
+    or                              { value.status = engine.CLOSED; }
+    leave(core);
+    ret value;
+}
+
+pub fun receive_record_limit(core: *Established) usize {
+    if (!enter(core)) { ret 0; }
+    var limit: usize = 0;
+    if (live(core) || core.state == TERMINAL) { limit = core.receive_record_limit; }
+    leave(core);
+    ret limit;
+}
+
+pub fun send_record_limit(core: *Established) usize {
+    if (!enter(core)) { ret 0; }
+    var limit: usize = 0;
+    if (live(core) || core.state == TERMINAL) { limit = core.send_record_limit; }
+    leave(core);
+    ret limit;
+}
+
+pub fun failure(core: *Established) error.Error {
+    if (core == nil) { ret error.ILLEGAL_PARAMETER; }
+    ret core.failure;
+}
+
+var test_input: [512]u8;
+
+fun test_secret(fill: u8) key_schedule.Secret {
+    var value: key_schedule.Secret;
+    var i:     usize = 0;
+    for (i < 32) {
+        val byte: u8 = fill + i::u8;
+        value.data[i] = byte;
+        i             = i + 1;
+    }
+    value.len    = 32;
+    value.active = true;
+    ret value;
+}
+
+fun test_seed(role: engine.Role) Seed {
+    var seed: Seed;
+    seed.role                 = role;
+    seed.suite                = tls13.AES_128_GCM_SHA256;
+    seed.group                = tls13.X25519;
+    seed.alpn                 = contracts.Bytes{data: "http/1.1"::*u8, len: 8};
+    seed.receive_record_limit = record.MAX_PLAINTEXT;
+    seed.send_record_limit    = record.MAX_PLAINTEXT;
+    seed.max_message_bytes    = 16384;
+    seed.max_ticket_bytes     = 256;
+    if (role == engine.CLIENT) {
+        seed.server_name = contracts.Bytes{data: "api.example.com"::*u8, len: 15};
+    }
+    ret seed;
+}
+
+fun drain(core: *Established, kinds: *engine.EventKind, capacity: usize) usize {
+    var count: usize = 0;
+    var event: engine.Event;
+    for (next_event(core, ?event)) {
+        if (count < capacity) { kinds[count] = event.kind; }
+        count = count + 1;
+        complete_event(core, event.token, true);
+    }
+    ret count;
+}
+
+test "established: the record fits its budget" {
+    if ($size_of(Established) > MAX_BYTES) { ret 1; }
+    ret 0;
+}
+
+test "established: a requested key update rekeys both directions once" {
+    var send:    key_schedule.Secret = test_secret(1);
+    var receive: key_schedule.Secret = test_secret(2);
+    var core:    Established         = empty();
+    if (!begin(?core, test_seed(engine.SERVER), ?send, ?receive, nil, nil,
+        no_storage())) { ret 1; }
+    if (snapshot(?core).status != engine.COMPLETE) { ret 2; }
+    if (snapshot(?core).selected_alpn.len != 8)    { ret 3; }
+    val before: u8 = core.receive.data[0]:>u8;
+    # a requested update split across two calls
+    var message: [5]u8 = [5]u8{handshake.KEY_UPDATE, 0, 0, 1, codec.UPDATE_REQUESTED};
+    if (ingest(?core, engine.APPLICATION, ?message[0], 2).status != engine.MORE) { ret 4; }
+    if (ingest(?core, engine.APPLICATION, ?message[2], 3).status != engine.OK)   { ret 5; }
+    if (core.receive.data[0]:>u8 == before)                                      { ret 6; }
+    var kinds: [4]engine.EventKind;
+    if (drain(?core, ?kinds[0], 4) != 3) { ret 7; }
+    if (kinds[0] != engine.TRAFFIC_SECRET || kinds[1] != engine.CRYPTO ||
+        kinds[2] != engine.TRAFFIC_SECRET) { ret 8; }
+    # nothing may follow a key update in its record
+    var twice: [10]u8 = [10]u8{handshake.KEY_UPDATE, 0, 0, 1, 0,
+        handshake.KEY_UPDATE, 0, 0, 1, 0};
+    if (ingest(?core, engine.APPLICATION, ?twice[0], 10).status != engine.FAILED) {
+        ret 9;
+    }
+    if (snapshot(?core).status != engine.FAILED)                    { ret 10; }
+    if (!destroy(?core) || core.send.active || core.receive.active) { ret 11; }
+    ret 0;
+}
+
+test "established: quic refuses key updates and drops delivered secrets" {
+    var send:    key_schedule.Secret = test_secret(3);
+    var receive: key_schedule.Secret = test_secret(4);
+    var core:    Established         = empty();
+    var seed:    Seed                = test_seed(engine.SERVER);
+    seed.quic = true;
+    if (!begin(?core, seed, ?send, ?receive, nil, nil, no_storage())) { ret 1; }
+    if (request_key_update(?core, codec.UPDATE_NOT_REQUESTED).status !=
+        engine.FAILED) { ret 2; }
+    var message: [5]u8 = [5]u8{handshake.KEY_UPDATE, 0, 0, 1, 0};
+    if (ingest(?core, engine.APPLICATION, ?message[0], 5).status != engine.FAILED) {
+        ret 3;
+    }
+    ret 0;
+}
+
+test "established: a client without a store skips tickets unbuffered" {
+    var send:    key_schedule.Secret = test_secret(5);
+    var receive: key_schedule.Secret = test_secret(6);
+    var core:    Established         = empty();
+    if (!begin(?core, test_seed(engine.CLIENT), ?send, ?receive, nil, nil,
+        no_storage())) { ret 1; }
+    var ticket: [16]u8 = [16]u8{handshake.NEW_SESSION_TICKET, 0, 0, 12,
+        0, 0, 0, 60, 0, 0, 0, 0, 0, 0, 0, 0};
+    val first:  engine.Result = ingest(?core, engine.APPLICATION, ?ticket[0], 9);
+    val second: engine.Result = ingest(?core, engine.APPLICATION, ?ticket[9], 7);
+    if (first.status != engine.MORE || second.status != engine.MORE) { ret 2; }
+    if (core.skip_remaining != 0 || core.partial_len != 0)           { ret 3; }
+    # a server never accepts a ticket
+    var server: Established = empty();
+    if (!begin(?server, test_seed(engine.SERVER), ?send, ?receive, nil, nil,
+        no_storage())) { ret 4; }
+    if (ingest(?server, engine.APPLICATION, ?ticket[0], 16).status != engine.FAILED) {
+        ret 5;
+    }
+    ret 0;
+}
+
+test "established: move carries the core and wipes the source" {
+    var send:    key_schedule.Secret = test_secret(7);
+    var receive: key_schedule.Secret = test_secret(8);
+    var source:  Established         = empty();
+    var target:  Established         = empty();
+    if (!begin(?source, test_seed(engine.SERVER), ?send, ?receive, nil, nil,
+        no_storage())) { ret 1; }
+    if (request_key_update(?source, codec.UPDATE_NOT_REQUESTED).status != engine.OK) {
+        ret 2;
+    }
+    var event: engine.Event;
+    if (!next_event(?source, ?event))                                         { ret 3; }
+    if (move(?target, ?source, no_storage()))                                 { ret 4; }
+    if (!complete_event(?source, event.token, true))                          { ret 5; }
+    if (!move(?target, ?source, no_storage()))                                { ret 6; }
+    if (source.state != EMPTY || source.send.active || source.receive.active) { ret 7; }
+    var kinds: [4]engine.EventKind;
+    if (drain(?target, ?kinds[0], 4) != 1 || kinds[0] != engine.TRAFFIC_SECRET) {
+        ret 8;
+    }
+    if (close(?target, record.CLOSE_NOTIFY).status != engine.OK)       { ret 9; }
+    if (drain(?target, ?kinds[0], 4) != 1 || kinds[0] != engine.ALERT) { ret 10; }
+    if (!destroy(?target))                                             { ret 11; }
+    ret 0;
+}
+
+test "established: a client with a store retains a split ticket" {
+    var send:       key_schedule.Secret = test_secret(9);
+    var receive:    key_schedule.Secret = test_secret(10);
+    var resumption: key_schedule.Secret = test_secret(11);
+    var store:      session.ClientStore;
+    if (!session.client_store_init(?store)) { ret 1; }
+    var seed: Seed = test_seed(engine.CLIENT);
+    seed.sessions = ?store;
+    var core: Established = empty();
+    if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
+        Storage{input: ?test_input[0], input_capacity: 512})) { ret 2; }
+    var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
+        0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
+    if (ingest(?core, engine.APPLICATION, ?ticket[0], 6).status != engine.MORE ||
+        ingest(?core, engine.APPLICATION, ?ticket[6], 16).status != engine.MORE) {
+        ret 3;
+    }
+    if (session.client_store_count(?store) != 1) { ret 4; }
+    session.client_store_destroy(?store);
+    if (!destroy(?core) || core.resumption.active) { ret 5; }
+    ret 0;
+}

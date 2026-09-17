@@ -6,6 +6,8 @@ use std.types.bool.bool;
 use std.types.size.usize;
 use tls.cert;
 use tls.cert.credentials;
+use tls.cert.verify;
+use tls.handshake;
 use tls.session;
 use tls.tls13;
 
@@ -23,12 +25,15 @@ pub rec ProtocolName {
 pub rec Limits {
     max_receive_record_plaintext: usize;
     max_send_record_plaintext:    usize;
-    max_peer_handshake_bytes:     usize;
-    max_client_hello_bytes:       usize;
-    max_client_flight_bytes:      usize;
-    max_server_flight_bytes:      usize;
-    max_chain_bytes:              usize;
-    max_ticket_bytes:             usize;
+    # every peer handshake message except certificate, header included
+    max_peer_handshake_bytes: usize;
+    max_client_hello_bytes:   usize;
+    max_client_flight_bytes:  usize;
+    max_server_flight_bytes:  usize;
+    # the certificate entries of one chain together, and each entry alone
+    max_chain_bytes:       usize;
+    max_certificate_bytes: usize;
+    max_ticket_bytes:      usize;
 }
 
 pub rec ClientConfig {
@@ -48,7 +53,9 @@ pub rec ClientConfig {
     entropy:              *secret.Entropy;
     entropy_context_size: usize;
     sessions:             *session.ClientStore;
-    limits:               Limits;
+    # keep the exporter master for export_keying_material (rfc 8446 section 7.5)
+    retain_exporter: bool;
+    limits:          Limits;
 }
 
 # client authentication policy belongs to the published credential generation,
@@ -72,7 +79,9 @@ pub rec ServerConfig {
     replay:                 *session.ReplayWindow;
     replay_policy:          session.ReplayPolicy;
     tickets_per_connection: u8;
-    limits:                 Limits;
+    # keep the exporter master for export_keying_material (rfc 8446 section 7.5)
+    retain_exporter: bool;
+    limits:          Limits;
 }
 
 # a value cleared by declaration rather than by an empty literal: a record
@@ -97,13 +106,39 @@ pub fun production_limits() Limits {
     var limits: Limits;
     limits.max_receive_record_plaintext = 16384;
     limits.max_send_record_plaintext    = 16384;
-    limits.max_peer_handshake_bytes     = 1048576;
-    limits.max_client_hello_bytes       = 65536;
+    limits.max_peer_handshake_bytes     = 16384;
+    limits.max_client_hello_bytes       = 16384;
     limits.max_client_flight_bytes      = 525312;
     limits.max_server_flight_bytes      = 525312;
-    limits.max_chain_bytes              = 524288;
+    limits.max_chain_bytes              = 65536;
+    limits.max_certificate_bytes        = 16384;
     limits.max_ticket_bytes             = 16384;
     ret limits;
+}
+
+# a certificate message carries its request context and its entries, whose
+# lengths max_chain_bytes bounds, plus the per-entry length a tls 1.2 chain adds
+val CERTIFICATE_MESSAGE_OVERHEAD: usize = handshake.HEADER_SIZE + 1 + 255 + 3 +
+    3 * verify.MAX_CHAIN_DEPTH;
+
+# the largest certificate message a peer may send under these limits
+pub fun certificate_message_bytes(limits: Limits) usize {
+    ret CERTIFICATE_MESSAGE_OVERHEAD + limits.max_chain_bytes;
+}
+
+# the largest peer message of this type, header included
+pub fun peer_message_limit(limits: Limits, message_type: handshake.MessageType) usize {
+    if (message_type == handshake.CERTIFICATE) { ret certificate_message_bytes(limits); }
+    ret limits.max_peer_handshake_bytes;
+}
+
+# the certificate limits are within the protocol. an entry is bounded by both
+# its own limit and what remains of the chain
+pub fun certificate_limits_valid(limits: Limits) bool {
+    ret limits.max_chain_bytes != 0 &&
+        limits.max_chain_bytes <= handshake.MAX_BODY_SIZE - CERTIFICATE_MESSAGE_OVERHEAD &&
+        limits.max_certificate_bytes != 0 &&
+        limits.max_certificate_bytes <= handshake.MAX_BODY_SIZE;
 }
 
 test "config: default limits are finite and protocol conforming" {
@@ -115,6 +150,10 @@ test "config: default limits are finite and protocol conforming" {
         limits.max_client_flight_bytes == 0 ||
         limits.max_server_flight_bytes == 0 ||
         limits.max_chain_bytes == 0) { ret 1; }
+    if (!certificate_limits_valid(limits) ||
+        certificate_message_bytes(limits) <= limits.max_chain_bytes) { ret 2; }
+    if (peer_message_limit(limits, handshake.CERTIFICATE) <= 65536 ||
+        peer_message_limit(limits, handshake.CLIENT_HELLO) != 16384) { ret 3; }
     ret 0;
 }
 

@@ -229,13 +229,15 @@ var tls12_configuration: config.ClientConfig;
 var tls12_suites:        [6]tls13.CipherSuite;
 var tls12_signatures:    [7]tls13.SignatureScheme;
 var tls12_versions:      [1]u16;
-var legacy_engine:       tls12_connection.Connection;
+var legacy_engine:       tls12_connection.Handshake;
 var legacy_hello:        [16384]u8;
 var handshake_input:     [65536]u8;
 var handshake_output:    [65536]u8;
 var hello_storage:       [65536]u8;
 var peer_certificates:   [8]cert.Certificate;
 var wire_input_storage:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var ticket_storage:      [16388]u8;
+var option_sessions:     bool;
 var wire_output_storage: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var dial_socket:         tcp.Stream;
 var dial_runtime:        io_runtime.Runtime;
@@ -319,11 +321,15 @@ fun dial_one(index: usize) i64 {
     storage.wire_input_capacity  = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output          = ?wire_output_storage[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+    if (option_sessions) {
+        storage.ticket_input          = ?ticket_storage[0];
+        storage.ticket_input_capacity = 16388;
+    }
 
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 4; }
     var secure:      stream.Stream;
-    var core:        client.Client;
+    var core:        client.Handshake;
     var empty_extra: client.ExtraExtension;
     empty_extra.kind      = 0;
     empty_extra.data.data = nil;
@@ -361,6 +367,8 @@ fun dial_one(index: usize) i64 {
     report("connection=", index);
     report("version=", negotiated.version::usize);
     report("suite=", negotiated.suite::usize);
+    # a client with a store must resume every connection after its first
+    if (option_sessions && index != 0 && !negotiated.resumed)                        { ret 44; }
     if (negotiated.resumed)                                                          { print.print("resumed=1\n"); }
     or                                                                               { print.print("resumed=0\n"); }
     if (!stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
@@ -488,7 +496,8 @@ fun main(argc: i64, argv: **u8) i64 {
             connections = parse_number(argv[argument]);
         }
         or (streq(current, "--sessions"::*u8)) {
-            use_sessions = true;
+            use_sessions    = true;
+            option_sessions = true;
         }
         or (streq(current, "--key-update"::*u8)) {
             option_key_update = true;
@@ -557,6 +566,7 @@ fun main(argc: i64, argv: **u8) i64 {
     dial_configuration.client_identity                 = ?client_identity;
     dial_configuration.entropy                         = ?entropy;
     dial_configuration.limits                          = config.production_limits();
+    dial_configuration.limits.max_chain_bytes          = 32768;
     dial_configuration.limits.max_peer_handshake_bytes = 65536;
 
     dial_configuration.sessions = nil;
@@ -598,6 +608,7 @@ fun main(argc: i64, argv: **u8) i64 {
     tls12_configuration.signature_len                   = 7;
     tls12_configuration.entropy                         = ?entropy;
     tls12_configuration.limits                          = config.production_limits();
+    tls12_configuration.limits.max_chain_bytes          = 32768;
     tls12_configuration.limits.max_peer_handshake_bytes = 65536;
     tls12_configuration.limits.max_chain_bytes          = 32768;
 
