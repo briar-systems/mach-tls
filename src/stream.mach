@@ -16,7 +16,6 @@ use tls.cert;
 use tls.cert.credentials;
 use tls.cert.x509;
 use tls.client;
-use tls.clock;
 use tls.config;
 use tls.engine;
 use tls.error;
