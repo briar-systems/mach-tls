@@ -14,6 +14,7 @@ use std.net.tcp;
 use std.print;
 use std.runtime;
 use std.sync.cancel;
+use mem_secret: std.memory.secret;
 use std.system.os;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -163,7 +164,7 @@ fun blocking_close(context: ptr, scope: *cancel.Scope,
 }
 
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
-    for (transport.snapshot(?secure_static.operation).state !=
+    for (transport.snapshot(?secure.operation).state !=
         transport.OPERATION_TERMINAL) {
         var completion: io_runtime.Completion;
         val polled:     res[usize, io_error.Error] = io_runtime.poll(owner,
@@ -216,12 +217,6 @@ var anchor_der:          [MAX_PEM]u8;
 var anchor_certificates: [4]cert.Certificate;
 var client_trust:        cert.TrustStore;
 
-var handshake_input:    [65536]u8;
-var handshake_output:   [65536]u8;
-var retained_hello:     [65536]u8;
-var peer_certificates:  [8]cert.Certificate;
-var wire_input:         [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var wire_output:        [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 var application_input:  [512]u8;
 var application_output: [64]u8;
 
@@ -249,8 +244,6 @@ var tls12_signatures:          [5]tls13.SignatureScheme;
 var tls12_versions:            [2]u16;
 var legacy_engine:             tls12_connection.Connection;
 var legacy_hello:              [16384]u8;
-var listener_engine_static:    server.Server;
-var secure_static:             stream.Stream;
 var ticket_ring:               session.KeyRing;
 var replay_window:             session.ReplayWindow;
 var listener_configuration:    config.ServerConfig;
@@ -354,6 +347,103 @@ fun report(label: str, value: usize) {
     print.print("\n");
 }
 
+# every connection owns one secret-welded region, the way a server holding
+# many connections allocates them, so its resident footprint can be measured
+val HANDSHAKE_BYTES:   usize = 65536;
+val PEER_CERTIFICATES: usize = 8;
+val WIRE_BYTES:        usize = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
+rec Connection {
+    engine:            server.Server;
+    secure:            stream.Stream;
+    handshake_input:   [HANDSHAKE_BYTES]u8;
+    handshake_output:  [HANDSHAKE_BYTES]u8;
+    hello:             [HANDSHAKE_BYTES]u8;
+    peer_certificates: [PEER_CERTIFICATES]cert.Certificate;
+    wire_input:        [WIRE_BYTES]u8;
+    wire_output:       [WIRE_BYTES]u8;
+}
+var cur:              *Connection;
+var option_footprint: bool;
+var footprint_base:   usize;
+
+val PAGE_SIZE:        usize = 4096;
+val IDLE_CALLS:       usize = 100000;
+
+# resident pages of the whole process, from /proc/self/statm
+fun resident_pages() usize {
+    var handle: usize = os.INVALID_HANDLE;
+    if (os.open(os.working_dir(), "/proc/self/statm", os.O_RDONLY, 0, ?handle) < 0) { ret 0; }
+    var text: [128]u8;
+    val n:    i64 = os.read(handle, ?text[0], 127);
+    os.close(handle);
+    if (n <= 0) { ret 0; }
+    var i: usize = 0;
+    for (i < n::usize && text[i] != ' ') { i = i + 1; }
+    i = i + 1;
+    var value: usize = 0;
+    for (i < n::usize && text[i] >= '0' && text[i] <= '9') {
+        value = value * 10 + (text[i] - '0')::usize;
+        i     = i + 1;
+    }
+    ret value;
+}
+
+# pages of [start, start + len) that are present, from /proc/self/pagemap
+fun present_pages(start: usize, len: usize) usize {
+    var handle: usize = os.INVALID_HANDLE;
+    if (len == 0 || os.open(os.working_dir(), "/proc/self/pagemap", os.O_RDONLY, 0,
+        ?handle) < 0) { ret 0; }
+    var count: usize = 0;
+    var page:  usize = start / PAGE_SIZE;
+    for (page <= (start + len - 1) / PAGE_SIZE) {
+        var entry: [8]u8;
+        if (os.seek(handle, (page * 8)::i64, 0) >= 0 &&
+            os.read(handle, ?entry[0], 8) == 8 && (entry[7] & 0x80) != 0) {
+            count = count + 1;
+        }
+        page = page + 1;
+    }
+    os.close(handle);
+    ret count;
+}
+
+fun footprint(phase: str) {
+    if (!option_footprint) { ret; }
+    val base:   usize = (?cur.handshake_input[0])::usize - $offset_of(Connection, handshake_input);
+    val secure: usize = base + $offset_of(Connection, secure);
+    print.print("footprint ");
+    print.print(phase);
+    print.print("\n");
+    report("  process_pages=", resident_pages() - footprint_base);
+    report("  region_pages=", present_pages(base, $size_of(Connection)));
+    report("  engine_pages=", present_pages(base + $offset_of(Connection, engine),
+        $size_of(server.Server)));
+    report("  stream_secret_pages=", present_pages(secure + $offset_of(stream.Stream, secret),
+        stream.SECRET_STORAGE_BYTES));
+    report("  wire_pages=", present_pages(base + $offset_of(Connection, wire_input),
+        WIRE_BYTES * 2));
+    report("  handshake_pages=", present_pages(base + $offset_of(Connection, handshake_input),
+        HANDSHAKE_BYTES * 3));
+}
+
+# the cost of the calls an idle established engine answers most
+fun idle_cost() {
+    if (!option_footprint) { ret; }
+    var event: engine.Event;
+    val started: time.Clock = time.monotonic();
+    var i:       usize      = 0;
+    for (i < IDLE_CALLS) {
+        if (server.next_event(?cur.engine, ?event)) { ret; }
+        i = i + 1;
+    }
+    val finished: time.Clock = time.monotonic();
+    if (sel started.err)  { ret; }
+    if (sel finished.err) { ret; }
+    val spent: i64 = (finished.ok.sec - started.ok.sec) * 1000000000 +
+        finished.ok.nsec - started.ok.nsec;
+    report("  idle_next_event_ns=", spent::usize / IDLE_CALLS);
+}
+
 fun serve_one(index: usize, allocator: *secret.Allocator,
     trust: *cert.TrustStore, store: *credentials.Store) i64 {
     blocking_state = BlockingTransport{runtime: ?connection_runtime,
@@ -367,16 +457,16 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         submit_abort:    blocking_close};
 
     var core_storage: server.Storage = server.Storage{
-        input:           ?handshake_input[0], input_capacity: 65536,
-        output:          ?handshake_output[0], output_capacity: 65536,
-        hello:           ?retained_hello[0], hello_capacity: 65536,
-        certificates:    ?peer_certificates[0], certificate_capacity: 8,
+        input:           ?cur.handshake_input[0], input_capacity: HANDSHAKE_BYTES,
+        output:          ?cur.handshake_output[0], output_capacity: HANDSHAKE_BYTES,
+        hello:           ?cur.hello[0], hello_capacity: HANDSHAKE_BYTES,
+        certificates:    ?cur.peer_certificates[0], certificate_capacity: PEER_CERTIFICATES,
         peer_parameters: nil, peer_parameters_capacity: 0
     };
     var storage: stream.Storage;
-    storage.wire_input           = ?wire_input[0];
+    storage.wire_input           = ?cur.wire_input[0];
     storage.wire_input_capacity  = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.wire_output          = ?wire_output[0];
+    storage.wire_output          = ?cur.wire_output[0];
     storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
 
     var empty_extra: server.ExtraExtension;
@@ -394,42 +484,46 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 11; }
     if (option_tls12) {
         val legacy_storage: tls12_connection.Storage =
-            tls12_connection.Storage{input: ?handshake_input[0],
-            input_capacity:  65536, output: ?handshake_output[0],
-            output_capacity: 65536, hello: ?legacy_hello[0],
+            tls12_connection.Storage{input: ?cur.handshake_input[0],
+            input_capacity:  65536, output: ?cur.handshake_output[0],
+            output_capacity: HANDSHAKE_BYTES, hello: ?legacy_hello[0],
             hello_capacity:  16384,
-            certificates:    ?peer_certificates[0], certificate_capacity: 8};
+            certificates:    ?cur.peer_certificates[0], certificate_capacity: PEER_CERTIFICATES};
         if (!tls12_connection.init_server(?legacy_engine, ?tls12_configuration,
             legacy_storage)) {
             print.print("cannot initialize the tls 1.2 server engine\n");
             ret 10;
         }
-        if (!stream.serve_tls12(?secure_static, ?legacy_engine, storage,
+        if (!stream.serve_tls12(?cur.secure, ?legacy_engine, storage,
             ?lower_transport, ?scope,
             transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
-            !settle(?secure_static, ?connection_runtime)) {
+            !settle(?cur.secure, ?connection_runtime)) {
             print.print("the handshake operation was not accepted\n");
             ret 12;
         }
     }
     or {
-        if (!server.init(?listener_engine_static, ?listener_configuration,
+        if (!server.init(?cur.engine, ?listener_configuration,
             core_storage, empty_extra, 0)) {
             report("hello required=", hello_required);
             report("flight required=", flight_required);
             print.print("cannot initialize the server engine\n");
             ret 10;
         }
-        if (!stream.serve(?secure_static, ?listener_engine_static, storage,
+        if (!stream.serve(?cur.secure, ?cur.engine, storage,
             ?lower_transport, ?scope,
             transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
-            !settle(?secure_static, ?connection_runtime)) {
+            !settle(?cur.secure, ?connection_runtime)) {
             print.print("the handshake operation was not accepted\n");
             ret 12;
         }
     }
-    val handshake:  transport.Snapshot = transport.snapshot(?secure_static.operation);
-    val negotiated: engine.Snapshot    = stream.negotiated(?secure_static);
+    if (!option_tls12) {
+        footprint("idle");
+        idle_cost();
+    }
+    val handshake:  transport.Snapshot = transport.snapshot(?cur.secure.operation);
+    val negotiated: engine.Snapshot    = stream.negotiated(?cur.secure);
 
     if (option_expect_failure) {
         if (handshake.terminal_error == error.OK) {
@@ -443,10 +537,10 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
             print.print("wrong alert\n");
             ret 14;
         }
-        stream.destroy_operation(?secure_static);
-        stream.destroy(?secure_static);
+        stream.destroy_operation(?cur.secure);
+        stream.destroy(?cur.secure);
         if (option_tls12) { tls12_connection.destroy(?legacy_engine); }
-        or                { server.destroy(?listener_engine_static); }
+        or                { server.destroy(?cur.engine); }
         ret 0;
     }
 
@@ -494,7 +588,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         print.print(?name_text[0]);
         print.print("\n");
     }
-    if (!stream.destroy_operation(?secure_static) || !operation_ok(cancel.destroy(?scope))) {
+    if (!stream.destroy_operation(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 23;
     }
 
@@ -508,8 +602,10 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
             trust, option_require_client_auth) != contracts.OK ||
             credentials.rotate(store, ?replacement, ?retired) != contracts.OK ||
             retired == nil) { ret 25; }
-        if (credentials.reclaimable(retired)) {
-            print.print("a retired generation was reclaimable while leased\n");
+        # a completed connection holds no lease, so the generation it was
+        # served from is reclaimable while it keeps serving
+        if (!credentials.reclaimable(retired)) {
+            print.print("an established connection still pins its generation\n");
             ret 26;
         }
     }
@@ -517,38 +613,39 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     # a peer that only measures the handshake has already gone away, so this
     # connection is torn down without attempting another record
     if (option_handshake_only && index + 1 < connection_count) {
-        if (!stream.destroy(?secure_static)) { ret 46; }
+        if (!stream.destroy(?cur.secure)) { ret 46; }
         if (option_tls12)                    { tls12_connection.destroy(?legacy_engine); }
-        or                                   { server.destroy(?listener_engine_static); }
+        or                                   { server.destroy(?cur.engine); }
         tcp.stream_close(?connection_socket);
         ret 0;
     }
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
-        !stream.read(?secure_static, ?scope,
+        !stream.read(?cur.secure, ?scope,
         transport.Token{index: 2, generation: 1},
         ?application_input[0], 512, 2) ||
-        !settle(?secure_static, ?connection_runtime)) { ret 30; }
-    val read: transport.Snapshot = transport.snapshot(?secure_static.operation);
+        !settle(?cur.secure, ?connection_runtime)) { ret 30; }
+    val read: transport.Snapshot = transport.snapshot(?cur.secure.operation);
     if (read.terminal_error != error.OK || read.application_bytes == 0) {
         report("read error=", read.terminal_error::usize);
         ret 31;
     }
     report("read=", read.application_bytes);
-    if (!stream.destroy_operation(?secure_static) || !operation_ok(cancel.destroy(?scope))) {
+    if (!option_tls12) { footprint("request"); }
+    if (!stream.destroy_operation(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 32;
     }
 
     if (option_key_update) {
         if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
-            !stream.key_update(?secure_static, ?scope,
+            !stream.key_update(?cur.secure, ?scope,
             transport.Token{index: 6, generation: 1}, 0, 6) ||
-            !settle(?secure_static, ?connection_runtime)) { ret 60; }
-        val updated: transport.Snapshot = transport.snapshot(?secure_static.operation);
+            !settle(?cur.secure, ?connection_runtime)) { ret 60; }
+        val updated: transport.Snapshot = transport.snapshot(?cur.secure.operation);
         if (updated.terminal_error != error.OK) {
             report("key update error=", updated.terminal_error::usize);
             ret 61;
         }
-        if (!stream.destroy_operation(?secure_static) || !operation_ok(cancel.destroy(?scope))) {
+        if (!stream.destroy_operation(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 62;
         }
         print.print("key-updated\n");
@@ -571,49 +668,50 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     application_output[14] = 'r';
     application_output[15] = '\n';
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
-        !stream.write(?secure_static, ?scope,
+        !stream.write(?cur.secure, ?scope,
         transport.Token{index: 3, generation: 1},
         ?application_output[0], 16, 3) ||
-        !settle(?secure_static, ?connection_runtime)) { ret 33; }
-    val written: transport.Snapshot = transport.snapshot(?secure_static.operation);
+        !settle(?cur.secure, ?connection_runtime)) { ret 33; }
+    val written: transport.Snapshot = transport.snapshot(?cur.secure.operation);
     if (written.terminal_error != error.OK || written.application_bytes != 16) {
         ret 34;
     }
-    if (!stream.destroy_operation(?secure_static) || !operation_ok(cancel.destroy(?scope))) {
+    if (!stream.destroy_operation(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 35;
     }
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
-        !stream.half_close(?secure_static, ?scope,
+        !stream.half_close(?cur.secure, ?scope,
         transport.Token{index: 4, generation: 1}, 4) ||
-        !settle(?secure_static, ?connection_runtime)) { ret 36; }
-    val half_closed: transport.Snapshot = transport.snapshot(?secure_static.operation);
-    if (half_closed.terminal_error != error.OK || !secure_static.send_closed ||
-        !stream.destroy_operation(?secure_static) || !operation_ok(cancel.destroy(?scope))) {
+        !settle(?cur.secure, ?connection_runtime)) { ret 36; }
+    val half_closed: transport.Snapshot = transport.snapshot(?cur.secure.operation);
+    if (half_closed.terminal_error != error.OK || !cur.secure.send_closed ||
+        !stream.destroy_operation(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
         ret 37;
     }
 
     if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
-        !stream.close(?secure_static, ?scope,
+        !stream.close(?cur.secure, ?scope,
         transport.Token{index: 5, generation: 1}, 5) ||
-        !settle(?secure_static, ?connection_runtime)) { ret 38; }
-    val closed: transport.Snapshot = transport.snapshot(?secure_static.operation);
-    if (closed.terminal_error != error.OK || !stream.destroy_operation(?secure_static) ||
-        !stream.destroy(?secure_static) || !operation_ok(cancel.destroy(?scope))) { ret 39; }
+        !settle(?cur.secure, ?connection_runtime)) { ret 38; }
+    val closed: transport.Snapshot = transport.snapshot(?cur.secure.operation);
+    if (closed.terminal_error != error.OK || !stream.destroy_operation(?cur.secure) ||
+        !stream.destroy(?cur.secure) || !operation_ok(cancel.destroy(?scope))) { ret 39; }
 
     if (option_tls12) {
         if (!tls12_connection.destroy(?legacy_engine)) { ret 40; }
     }
     or {
-        if (!server.destroy(?listener_engine_static)) { ret 40; }
+        if (!server.destroy(?cur.engine)) { ret 40; }
     }
     if (option_rotate) {
         if (!credentials.reclaimable(retired)) {
-            print.print("a retired generation stayed leased after destroy\n");
+            print.print("a retired generation was pinned again before destroy\n");
             ret 41;
         }
         print.print("rotated\n");
     }
+    if (!option_tls12) { footprint("destroyed"); }
     ret 0;
 }
 
@@ -630,6 +728,7 @@ fun main(argc: i64, argv: **u8) i64 {
     option_tickets             = 0;
     option_single_use          = false;
     option_handshake_only      = false;
+    option_footprint           = false;
     option_tls12               = false;
     option_dual_version        = false;
     var prefer_p256:     bool  = false;
@@ -665,6 +764,9 @@ fun main(argc: i64, argv: **u8) i64 {
         }
         or (streq(current, "--handshake-only"::*u8)) {
             option_handshake_only = true;
+        }
+        or (streq(current, "--footprint"::*u8)) {
+            option_footprint = true;
         }
         or (streq(current, "--tls12"::*u8)) {
             option_tls12 = true;
@@ -889,7 +991,15 @@ fun main(argc: i64, argv: **u8) i64 {
         connection_socket = accepted.ok;
         if (!runtime_ok(io_runtime.make(?connection_runtime,
             16))) { ret 9; }
+        footprint_base = resident_pages();
+        cur            = mem_secret.allocate_typed[Connection](1);
+        if (cur == nil) {
+            print.print("cannot allocate the connection\n");
+            ret 9;
+        }
         val served: i64 = serve_one(index, ?allocator, trust, ?store);
+        val released: err[io_error.Error] = mem_secret.deallocate_typed[Connection](cur, 1);
+        if (sel released.err) { ret 9; }
         io_runtime.close(?connection_runtime);
         io_runtime.destroy(?connection_runtime);
         if (served != 0) { ret served; }
