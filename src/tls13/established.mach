@@ -13,6 +13,7 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use tls.buffer;
 use tls.engine;
 use tls.error;
 use tls.handshake;
@@ -20,6 +21,7 @@ use tls.handshake.codec;
 use tls.memory_range;
 use tls.record;
 use tls.session;
+use tls.test.pool;
 use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.transition;
@@ -39,17 +41,6 @@ val     PARTIAL_BYTES: usize = 8;
 val     SEND_SLOT:     usize = 0;
 val     RECEIVE_SLOT:  usize = 1;
 val     NO_SLOT:       u8    = 255;
-
-# caller storage for post-handshake messages larger than a key update. only a
-# client with a session store needs it, sized to hold a whole ticket message
-pub rec Storage {
-    input:          *u8;
-    input_capacity: usize;
-}
-
-pub fun no_storage() Storage {
-    ret Storage{input: nil, input_capacity: 0};
-}
 
 # what a handshake knows when its handshake queue drains
 pub rec Seed {
@@ -119,12 +110,14 @@ pub rec Established {
     send_record_limit:     usize;
     max_message_bytes:     usize;
     max_ticket_bytes:      usize;
-    storage:               Storage;
-    input_len:             usize;
-    skip_remaining:        usize;
-    sessions:              *session.ClientStore;
-    alpn:                  contracts.Bytes;
-    server_name:           contracts.Bytes;
+    # a ticket being assembled, held only between its header and its last byte
+    memory:         buffer.Lease;
+    ticket:         buffer.Region;
+    input_len:      usize;
+    skip_remaining: usize;
+    sessions:       *session.ClientStore;
+    alpn:           contracts.Bytes;
+    server_name:    contracts.Bytes;
 }
 
 fun result(status: engine.Status, failure: error.Error, consumed: usize,
@@ -231,14 +224,14 @@ pub fun empty() Established {
 # and a client keeps a resumption secret only when it has a session store
 pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     receive: *key_schedule.Secret, resumption: *key_schedule.Secret,
-    exporter: *key_schedule.Secret, storage: Storage) bool {
+    exporter: *key_schedule.Secret, memory: buffer.Lease) bool {
     if (!owner_valid(core) || core.state != EMPTY || send == nil || receive == nil ||
         (seed.role != engine.CLIENT && seed.role != engine.SERVER) ||
         key_schedule.key_size(seed.suite) == 0 ||
         (seed.alpn.len != 0 && seed.alpn.data == nil) ||
         (seed.server_name.len != 0 && seed.server_name.data == nil) ||
-        !memory_range.valid(storage.input, storage.input_capacity) ||
-        (storage.input == nil && storage.input_capacity != 0)) { ret false; }
+        (seed.role == engine.CLIENT && seed.sessions != nil &&
+        !buffer.lease_valid(memory))) { ret false; }
     val owner: i64 = core.transition_owner;
     @core                      = empty();
     core.transition_owner      = owner;
@@ -260,7 +253,7 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
     core.max_message_bytes     = seed.max_message_bytes;
     core.max_ticket_bytes      = seed.max_ticket_bytes;
     core.verification_time     = seed.verification_time;
-    core.storage               = storage;
+    core.memory                = memory;
     # quic never updates tls keys, so it keeps no application secret
     if (!seed.quic) {
         key_schedule.copy_secret(?core.send, send);
@@ -278,21 +271,17 @@ pub fun begin(core: *Established, seed: Seed, send: *key_schedule.Secret,
 }
 
 # move source into destination, leaving source empty and wiped. a ticket half
-# assembled in source's storage is carried into the new storage
-pub fun move(destination: *Established, source: *Established,
-    storage: Storage) bool {
+# assembled goes with it, still charged to the same lease
+pub fun move(destination: *Established, source: *Established) bool {
     if (!owner_valid(destination) || !owner_valid(source) ||
-        destination.state != EMPTY || !live(source) || source.event_active ||
-        !memory_range.valid(storage.input, storage.input_capacity) ||
-        (storage.input == nil && storage.input_capacity != 0) ||
-        storage.input_capacity < source.input_len) { ret false; }
-    if (source.input_len != 0) {
-        copy_bytes(storage.input, source.storage.input, source.input_len);
+        destination.state != EMPTY || !live(source) || source.event_active) {
+        ret false;
     }
     val owner: i64 = destination.transition_owner;
     @destination                 = @source;
     destination.transition_owner = owner;
-    destination.storage          = storage;
+    clear_secrets(source);
+    source.ticket = buffer.empty();
     wipe(source);
     ret true;
 }
@@ -301,6 +290,7 @@ pub fun move(destination: *Established, source: *Established,
 pub fun wipe(core: *Established) {
     if (core == nil) { ret; }
     clear_secrets(core);
+    buffer.release(core.memory, ?core.ticket, core.ticket.chunk.bytes);
     val owner: i64 = core.transition_owner;
     @core                 = empty();
     core.transition_owner = owner;
@@ -426,6 +416,83 @@ fun header_length(core: *Established) usize {
         core.partial[3]::usize;
 }
 
+# the largest ticket message a client assembles
+fun ticket_limit(core: *Established) usize {
+    ret handshake.HEADER_SIZE + core.max_ticket_bytes;
+}
+
+# the ticket room absorb will need for data, found without changing anything.
+# a ticket is released once processed, so the largest one that starts here is
+# enough for all of them
+fun ticket_room(core: *Established, data: *u8, length: usize) usize {
+    if (core.role != engine.CLIENT || core.sessions == nil) { ret 0; }
+    var needed:  usize = 0;
+    var skip:    usize = core.skip_remaining;
+    var held:    usize = core.input_len;
+    var header:  [4]u8;
+    var partial: usize = core.partial_len::usize;
+    var i:       usize = 0;
+    for (i < partial && i < handshake.HEADER_SIZE) {
+        header[i] = core.partial[i];
+        i         = i + 1;
+    }
+    var at: usize = 0;
+    for (at < length) {
+        if (skip != 0) {
+            var skipped: usize = length - at;
+            if (skipped > skip) { skipped = skip; }
+            skip = skip - skipped;
+            at   = at + skipped;
+        }
+        or (partial < handshake.HEADER_SIZE) {
+            header[partial] = data[at];
+            partial         = partial + 1;
+            at              = at + 1;
+            if (partial == handshake.HEADER_SIZE) {
+                val body: usize = (header[1]::usize << 16) | (header[2]::usize << 8) |
+                    header[3]::usize;
+                val total: usize = handshake.HEADER_SIZE + body;
+                if (total > core.max_message_bytes || header[0] != handshake.NEW_SESSION_TICKET) {
+                    ret needed;
+                }
+                if (total > ticket_limit(core)) {
+                    skip    = body;
+                    partial = 0;
+                }
+                or {
+                    if (total > needed) { needed = total; }
+                    held = handshake.HEADER_SIZE;
+                    if (body == 0) {
+                        held    = 0;
+                        partial = 0;
+                    }
+                }
+            }
+        }
+        or {
+            val body: usize = (header[1]::usize << 16) | (header[2]::usize << 8) |
+                header[3]::usize;
+            val total:  usize = handshake.HEADER_SIZE + body;
+            var copied: usize = total - held;
+            if (copied > length - at) { copied = length - at; }
+            held = held + copied;
+            at   = at + copied;
+            if (held == total) {
+                held    = 0;
+                partial = 0;
+            }
+        }
+    }
+    ret needed;
+}
+
+# hold the room data's tickets need before any of it is absorbed
+fun reserve_tickets(core: *Established, data: *u8, length: usize) buffer.Outcome {
+    val needed: usize = ticket_room(core, data, length);
+    if (needed == 0) { ret buffer.HELD; }
+    ret buffer.reserve(core.memory, ?core.ticket, needed, core.input_len);
+}
+
 # consume post-handshake bytes; a key update must end its record, so nothing
 # may follow the message that produced events
 fun absorb(core: *Established, data: *u8, length: usize) error.Error {
@@ -449,12 +516,12 @@ fun absorb(core: *Established, data: *u8, length: usize) error.Error {
                 if (kind == handshake.NEW_SESSION_TICKET && core.role == engine.CLIENT) {
                     # a ticket nothing can retain, or has no room to assemble,
                     # is skipped without buffering its body
-                    if (core.sessions == nil || total > core.storage.input_capacity) {
+                    if (core.sessions == nil || total > ticket_limit(core)) {
                         core.skip_remaining = header_length(core);
                         core.partial_len    = 0;
                     }
                     or {
-                        copy_bytes(core.storage.input, ?core.partial[0],
+                        copy_bytes(core.ticket.chunk.data, ?core.partial[0],
                             handshake.HEADER_SIZE);
                         core.input_len = handshake.HEADER_SIZE;
                     }
@@ -468,7 +535,7 @@ fun absorb(core: *Established, data: *u8, length: usize) error.Error {
             val total:  usize = handshake.HEADER_SIZE + header_length(core);
             var copied: usize = total - core.input_len;
             if (copied > length - at) { copied = length - at; }
-            copy_bytes(?core.storage.input[core.input_len], ?data[at], copied);
+            copy_bytes(?core.ticket.chunk.data[core.input_len], ?data[at], copied);
             core.input_len = core.input_len + copied;
             at             = at + copied;
         }
@@ -485,9 +552,10 @@ fun absorb(core: *Established, data: *u8, length: usize) error.Error {
         }
         if (core.input_len != 0 &&
             core.input_len == handshake.HEADER_SIZE + header_length(core)) {
-            val failure: error.Error = process(core, core.storage.input, core.input_len);
+            val failure: error.Error = process(core, core.ticket.chunk.data, core.input_len);
             core.input_len   = 0;
             core.partial_len = 0;
+            buffer.release(core.memory, ?core.ticket, core.ticket.chunk.bytes);
             if (failure != error.OK) { ret failure; }
         }
         if (core.partial_len::usize == handshake.HEADER_SIZE &&
@@ -505,8 +573,8 @@ fun ingest_inner(core: *Established, level: engine.Level, data: *u8,
     length: usize) engine.Result {
     if (!live(core) || !memory_range.valid(data, length) ||
         (length != 0 && data == nil) || owner_overlaps(core, data, length) ||
-        memory_range.overlap(core.storage.input, core.storage.input_capacity,
-        data, length)) {
+        (core.ticket.held && memory_range.overlap(core.ticket.chunk.data,
+        core.ticket.chunk.bytes, data, length))) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     if (pending(core) || core.event_active) {
@@ -514,6 +582,11 @@ fun ingest_inner(core: *Established, level: engine.Level, data: *u8,
     }
     if (level != engine.APPLICATION) {
         ret fail(core, error.UNEXPECTED_MESSAGE, record.UNEXPECTED_MESSAGE_ALERT);
+    }
+    val room: buffer.Outcome = reserve_tickets(core, data, length);
+    if (room == buffer.WAIT) { ret result(engine.WAITING, error.OK, 0, 0); }
+    if (room == buffer.FAIL) {
+        ret fail(core, error.RESOURCE_LIMIT, record.INTERNAL_ERROR_ALERT);
     }
     val failure: error.Error = absorb(core, data, length);
     if (failure != error.OK) {
@@ -532,9 +605,16 @@ pub fun feed(core: *Established, data: *u8, length: usize) engine.Result {
         progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     or (length != 0) {
-        val failure: error.Error = absorb(core, data, length);
-        if (failure != error.OK) {
-            progress = fail(core, failure, engine.alert_for(failure));
+        val room: buffer.Outcome = reserve_tickets(core, data, length);
+        if (room == buffer.WAIT) { progress = result(engine.WAITING, error.OK, 0, 0); }
+        or (room == buffer.FAIL) {
+            progress = fail(core, error.RESOURCE_LIMIT, record.INTERNAL_ERROR_ALERT);
+        }
+        or {
+            val failure: error.Error = absorb(core, data, length);
+            if (failure != error.OK) {
+                progress = fail(core, failure, engine.alert_for(failure));
+            }
         }
     }
     leave(core);
@@ -775,8 +855,6 @@ pub fun failure(core: *Established) error.Error {
     ret core.failure;
 }
 
-var test_input: [512]u8;
-
 fun test_secret(fill: u8) key_schedule.Secret {
     var value: key_schedule.Secret;
     var i:     usize = 0;
@@ -827,7 +905,7 @@ test "established: a requested key update rekeys both directions once" {
     var receive: key_schedule.Secret = test_secret(2);
     var core:    Established         = empty();
     if (!begin(?core, test_seed(engine.SERVER), ?send, ?receive, nil, nil,
-        no_storage())) { ret 1; }
+        buffer.no_lease())) { ret 1; }
     if (snapshot(?core).status != engine.COMPLETE) { ret 2; }
     if (snapshot(?core).selected_alpn.len != 8)    { ret 3; }
     val before: u8 = core.receive.data[0]:>u8;
@@ -857,7 +935,7 @@ test "established: quic refuses key updates and drops delivered secrets" {
     var core:    Established         = empty();
     var seed:    Seed                = test_seed(engine.SERVER);
     seed.quic = true;
-    if (!begin(?core, seed, ?send, ?receive, nil, nil, no_storage())) { ret 1; }
+    if (!begin(?core, seed, ?send, ?receive, nil, nil, buffer.no_lease())) { ret 1; }
     if (request_key_update(?core, codec.UPDATE_NOT_REQUESTED).status !=
         engine.FAILED) { ret 2; }
     var message: [5]u8 = [5]u8{handshake.KEY_UPDATE, 0, 0, 1, 0};
@@ -872,7 +950,7 @@ test "established: a client without a store skips tickets unbuffered" {
     var receive: key_schedule.Secret = test_secret(6);
     var core:    Established         = empty();
     if (!begin(?core, test_seed(engine.CLIENT), ?send, ?receive, nil, nil,
-        no_storage())) { ret 1; }
+        buffer.no_lease())) { ret 1; }
     var ticket: [16]u8 = [16]u8{handshake.NEW_SESSION_TICKET, 0, 0, 12,
         0, 0, 0, 60, 0, 0, 0, 0, 0, 0, 0, 0};
     val first:  engine.Result = ingest(?core, engine.APPLICATION, ?ticket[0], 9);
@@ -882,7 +960,7 @@ test "established: a client without a store skips tickets unbuffered" {
     # a server never accepts a ticket
     var server: Established = empty();
     if (!begin(?server, test_seed(engine.SERVER), ?send, ?receive, nil, nil,
-        no_storage())) { ret 4; }
+        buffer.no_lease())) { ret 4; }
     if (ingest(?server, engine.APPLICATION, ?ticket[0], 16).status != engine.FAILED) {
         ret 5;
     }
@@ -895,15 +973,15 @@ test "established: move carries the core and wipes the source" {
     var source:  Established         = empty();
     var target:  Established         = empty();
     if (!begin(?source, test_seed(engine.SERVER), ?send, ?receive, nil, nil,
-        no_storage())) { ret 1; }
+        buffer.no_lease())) { ret 1; }
     if (request_key_update(?source, codec.UPDATE_NOT_REQUESTED).status != engine.OK) {
         ret 2;
     }
     var event: engine.Event;
     if (!next_event(?source, ?event))                                         { ret 3; }
-    if (move(?target, ?source, no_storage()))                                 { ret 4; }
+    if (move(?target, ?source))                                               { ret 4; }
     if (!complete_event(?source, event.token, true))                          { ret 5; }
-    if (!move(?target, ?source, no_storage()))                                { ret 6; }
+    if (!move(?target, ?source))                                              { ret 6; }
     if (source.state != EMPTY || source.send.active || source.receive.active) { ret 7; }
     var kinds: [4]engine.EventKind;
     if (drain(?target, ?kinds[0], 4) != 1 || kinds[0] != engine.TRAFFIC_SECRET) {
@@ -921,19 +999,53 @@ test "established: a client with a store retains a split ticket" {
     var resumption: key_schedule.Secret = test_secret(11);
     var store:      session.ClientStore;
     if (!session.client_store_init(?store)) { ret 1; }
+    var harness: pool.Harness;
+    if (!pool.make(?harness, 1 << 20, 1 << 20)) { ret 2; }
     var seed: Seed = test_seed(engine.CLIENT);
     seed.sessions = ?store;
     var core: Established = empty();
     if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
-        Storage{input: ?test_input[0], input_capacity: 512})) { ret 2; }
+        pool.lease(?harness))) { ret 3; }
     var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
         0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
     if (ingest(?core, engine.APPLICATION, ?ticket[0], 6).status != engine.MORE ||
+        pool.held(?harness) == 0 ||
         ingest(?core, engine.APPLICATION, ?ticket[6], 16).status != engine.MORE) {
-        ret 3;
+        ret 4;
     }
-    if (session.client_store_count(?store) != 1) { ret 4; }
+    if (session.client_store_count(?store) != 1 || pool.held(?harness) != 0) { ret 5; }
     session.client_store_destroy(?store);
-    if (!destroy(?core) || core.resumption.active) { ret 5; }
+    if (!destroy(?core) || core.resumption.active) { ret 6; }
+    if (!pool.destroy(?harness))                   { ret 7; }
+    ret 0;
+}
+
+test "established: a ticket waits for memory without consuming anything" {
+    var send:       key_schedule.Secret = test_secret(12);
+    var receive:    key_schedule.Secret = test_secret(13);
+    var resumption: key_schedule.Secret = test_secret(14);
+    var store:      session.ClientStore;
+    if (!session.client_store_init(?store)) { ret 1; }
+    var harness: pool.Harness;
+    if (!pool.make(?harness, 512, 1 << 20)) { ret 2; }
+    var hog: buffer.Region = buffer.empty();
+    if (buffer.reserve(pool.lease(?harness), ?hog, 512, 0) != buffer.HELD) { ret 3; }
+    var seed: Seed = test_seed(engine.CLIENT);
+    seed.sessions = ?store;
+    var core: Established = empty();
+    if (!begin(?core, seed, ?send, ?receive, ?resumption, nil,
+        pool.lease(?harness))) { ret 4; }
+    var ticket: [22]u8 = [22]u8{handshake.NEW_SESSION_TICKET, 0, 0, 18,
+        0, 0, 0, 60, 1, 2, 3, 4, 1, 7, 0, 4, 't', 'i', 'c', 'k', 0, 0};
+    val waited: engine.Result = ingest(?core, engine.APPLICATION, ?ticket[0], 22);
+    if (waited.status != engine.WAITING || waited.consumed != 0 ||
+        core.partial_len != 0 || core.input_len != 0 || core.ticket.held ||
+        session.client_store_count(?store) != 0) { ret 5; }
+    if (!buffer.release(pool.lease(?harness), ?hog, 0) || !pool.ready(?harness)) { ret 6; }
+    val retried: engine.Result = ingest(?core, engine.APPLICATION, ?ticket[0], 22);
+    if (retried.status != engine.MORE || retried.consumed != 22 ||
+        session.client_store_count(?store) != 1) { ret 7; }
+    session.client_store_destroy(?store);
+    if (!destroy(?core) || !pool.destroy(?harness)) { ret 8; }
     ret 0;
 }

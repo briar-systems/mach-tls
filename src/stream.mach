@@ -1464,13 +1464,10 @@ fun finish_engine(stream: *Stream) {
         finished = tls12_connection.finish(stream.legacy, ?stream.core12);
     }
     or (stream.role == engine.CLIENT) {
-        finished = client.finish(stream.client, ?stream.core13, established.Storage{
-            input:          stream.storage.ticket_input,
-            input_capacity: stream.storage.ticket_input_capacity
-        });
+        finished = client.finish(stream.client, ?stream.core13);
     }
     or {
-        finished = server.finish(stream.server, ?stream.core13, established.no_storage());
+        finished = server.finish(stream.server, ?stream.core13);
     }
     if (finished != contracts.OK) { ret; }
     stream.finished = true;
@@ -1549,10 +1546,6 @@ pub fun destroy(stream: *Stream) bool {
 # tls12.connection.Connection. No consumer needs to erase one today, and
 # mach-quic does not. If one ever must, that is the shape of laurel#27 and the
 # fix is an opaque handle rather than relaxing the weld.
-fun erase_client_storage(value: *client.Storage) ptr {
-    ret value::ptr;
-}
-
 fun erase_transport(value: *transport.Transport) ptr {
     ret value::ptr;
 }
@@ -1578,7 +1571,7 @@ fun erase_leaf(value: *x509.Certificate) ptr {
 }
 
 test "stream: the unwelded public types erase to the untyped ptr" {
-    if (erase_client_storage(nil) != nil || erase_transport(nil) != nil
+    if (erase_transport(nil) != nil
         || erase_operation(nil) != nil || erase_limits(nil) != nil) { ret 1; }
     if (erase_trust_store(nil) != nil || erase_certificate(nil) != nil
         || erase_leaf(nil) != nil) { ret 2; }

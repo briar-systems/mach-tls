@@ -39,12 +39,11 @@ pub rec SecretLease {
     lane:    u8;
 }
 
+# a held chunk's address is chunk.data and its size chunk.bytes
 pub rec Region {
-    chunk:    buffers.Chunk;
-    data:     *u8;
-    capacity: usize;
-    held:     bool;
-    flying:   bool;
+    chunk:  buffers.Chunk;
+    held:   bool;
+    flying: bool;
 }
 
 pub rec SecretRegion {
@@ -86,10 +85,10 @@ pub fun secret_lease_overlaps(lease: SecretLease, data: *u8, len: usize) bool {
 
 pub fun empty() Region {
     var value: Region;
-    value.data     = nil;
-    value.capacity = 0;
-    value.held     = false;
-    value.flying   = false;
+    value.chunk.data  = nil;
+    value.chunk.bytes = 0;
+    value.held        = false;
+    value.flying      = false;
     ret value;
 }
 
@@ -115,9 +114,17 @@ fun request(lease_lane: u8, bytes: usize, secret: bool) buffers.Request {
 # hold at least bytes in region, keeping its first keep bytes. a held region
 # that is already large enough is left alone; a refusal leaves it unchanged
 pub fun reserve(lease: Lease, region: *Region, bytes: usize, keep: usize) Outcome {
-    if (region == nil || keep > region.capacity || region.flying) { ret FAIL; }
-    if (region.held && region.capacity >= bytes) { ret HELD; }
-    if (bytes == 0)                              { ret HELD; }
+    ret reserve_from(lease, region, bytes, 0, keep);
+}
+
+# as reserve, but a new chunk starts with the keep bytes found at from, so a
+# growing buffer compacts in the same copy
+pub fun reserve_from(lease: Lease, region: *Region, bytes: usize, from: usize,
+    keep: usize) Outcome {
+    if (region == nil || region.flying || from > region.chunk.bytes ||
+        keep > region.chunk.bytes - from) { ret FAIL; }
+    if (region.held && region.chunk.bytes >= bytes) { ret HELD; }
+    if (bytes == 0)                                 { ret HELD; }
     val got: buffers.Acquired = buffers.source_acquire(lease.source, lease.account,
         request(lease.lane, bytes, false), true);
     var status: buffers.Status = got.status;
@@ -129,14 +136,12 @@ pub fun reserve(lease: Lease, region: *Region, bytes: usize, keep: usize) Outcom
     }
     var i: usize = 0;
     for (i < keep) {
-        data[i] = region.data[i];
+        data[i] = region.chunk.data[from + i];
         i       = i + 1;
     }
-    if (region.held) { release(lease, region, keep); }
-    region.chunk    = got.chunk;
-    region.data     = data;
-    region.capacity = got.chunk.bytes;
-    region.held     = true;
+    if (region.held) { release(lease, region, from + keep); }
+    region.chunk = got.chunk;
+    region.held  = true;
     ret HELD;
 }
 
@@ -145,11 +150,11 @@ pub fun release(lease: Lease, region: *Region, used: usize) bool {
     if (region == nil || !region.held) { ret true; }
     if (region.flying)                 { ret false; }
     var wipe: usize = used;
-    if (wipe > region.capacity) { wipe = region.capacity; }
+    if (wipe > region.chunk.bytes) { wipe = region.chunk.bytes; }
     var i: usize = 0;
     for (i < wipe) {
-        region.data[i] = 0;
-        i              = i + 1;
+        region.chunk.data[i] = 0;
+        i                    = i + 1;
     }
     val reason: buffers.Reason = buffers.source_release(lease.source, lease.account,
         region.chunk);

@@ -83,6 +83,29 @@ pub fun destroy(harness: *Harness) bool {
     ret buffers.destroy(?harness.pool);
 }
 
+# each test runs in its own process, so one pool per process serves it
+var shared_harness: Harness;
+
+# a lease on a roomy process-wide pool, made on first use
+pub fun shared() buffer.Lease {
+    if (!shared_harness.made && !make(?shared_harness, 1 << 28, 1 << 27)) {
+        ret buffer.no_lease();
+    }
+    ret lease(?shared_harness);
+}
+
+pub fun shared_secret() buffer.SecretLease {
+    if (!shared_harness.made && !make(?shared_harness, 1 << 28, 1 << 27)) {
+        ret buffer.no_secret_lease();
+    }
+    ret secret_lease(?shared_harness);
+}
+
+# bytes the shared account holds now
+pub fun shared_held() usize {
+    ret shared_harness.account.held;
+}
+
 fun erase_lease(value: *buffer.Lease) ptr {
     ret value::ptr;
 }
@@ -102,14 +125,14 @@ test "buffer: a region grows by copy and returns everything it held" {
     val plain:  buffer.Lease  = lease(?harness);
     var region: buffer.Region = buffer.empty();
     if (buffer.reserve(plain, ?region, 100, 0) != buffer.HELD ||
-        region.capacity != 512 || held(?harness) != 512) { ret 2; }
-    region.data[0]  = 7;
-    region.data[99] = 9;
+        region.chunk.bytes != 512 || held(?harness) != 512) { ret 2; }
+    region.chunk.data[0]  = 7;
+    region.chunk.data[99] = 9;
     if (buffer.reserve(plain, ?region, 300, 100) != buffer.HELD ||
-        region.capacity != 512) { ret 3; }
+        region.chunk.bytes != 512) { ret 3; }
     if (buffer.reserve(plain, ?region, 5000, 100) != buffer.HELD ||
-        region.capacity != 17408 || held(?harness) != 17408 ||
-        region.data[0] != 7 || region.data[99] != 9) { ret 4; }
+        region.chunk.bytes != 17408 || held(?harness) != 17408 ||
+        region.chunk.data[0] != 7 || region.chunk.data[99] != 9) { ret 4; }
     if (!buffer.fly(plain, ?region) || buffer.release(plain, ?region, 100) ||
         buffer.reserve(plain, ?region, 20000, 0) != buffer.FAIL) { ret 5; }
     if (!buffer.land(plain, ?region) || !buffer.release(plain, ?region, 100) ||
@@ -127,8 +150,8 @@ test "buffer: exhaustion waits unchanged and a budget overrun fails" {
     if (buffer.reserve(plain, ?first, 4000, 0) != buffer.HELD) { ret 2; }
     if (buffer.reserve(plain, ?other, 100, 0) != buffer.WAIT ||
         other.held || ready(?harness)) { ret 3; }
-    if (!buffer.release(plain, ?first, 0) || !ready(?harness)) { ret 4; }
-    if (buffer.reserve(plain, ?other, 100, 0) != buffer.HELD) { ret 5; }
+    if (!buffer.release(plain, ?first, 0) || !ready(?harness))   { ret 4; }
+    if (buffer.reserve(plain, ?other, 100, 0) != buffer.HELD)    { ret 5; }
     if (!buffer.release(plain, ?other, 0) || !destroy(?harness)) { ret 6; }
     var tight: Harness;
     if (!make(?tight, 1 << 20, 1024)) { ret 7; }
@@ -145,11 +168,11 @@ test "buffer: a secret region keeps its prefix and is wiped on release" {
     val secret: buffer.SecretLease  = secret_lease(?harness);
     var region: buffer.SecretRegion = buffer.secret_empty();
     if (buffer.secret_reserve(secret, ?region, 10, 0) != buffer.HELD ||
-        region.capacity != 512) { ret 2; }
+        region.chunk.bytes != 512) { ret 2; }
     region.data[3] = 0x5a;
     val first: *^u8 = region.data;
     if (buffer.secret_reserve(secret, ?region, 1000, 10) != buffer.HELD ||
-        region.capacity != 4096 || region.data[3]:>u8 != 0x5a) { ret 3; }
+        region.chunk.bytes != 4096 || region.data[3]:>u8 != 0x5a) { ret 3; }
     if (first[3]:>u8 != 0) { ret 4; }
     if (!buffer.secret_release(secret, ?region) || region.held ||
         held(?harness) != 0 || !destroy(?harness)) { ret 5; }

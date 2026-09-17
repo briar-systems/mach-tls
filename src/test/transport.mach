@@ -18,6 +18,7 @@ use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
+use tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.client;
@@ -27,6 +28,7 @@ use tls.error;
 use tls.memory_range;
 use tls.record;
 use tls.stream;
+use tls.test.pool;
 use tls.tls13;
 use tls.transport;
 
@@ -468,26 +470,22 @@ test "transport: timeout resolves an idle operation once" {
     ret 0;
 }
 
-var write_wire_input:         [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var write_wire_output:        [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var cancel_wire_input:        [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var cancel_wire_output:       [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var zero_wire_input:          [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var zero_wire_output:         [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var close_wire_input:         [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var close_wire_output:        [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var fragment_wire_input:      [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var fragment_wire_output:     [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var preserve_wire_input:      [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var preserve_wire_output:     [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var terminal_wire_input:      [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var terminal_wire_output:     [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var connect_handshake_input:  [4096]u8;
-var connect_handshake_output: [4096]u8;
-var connect_handshake_hello:  [4096]u8;
-var connect_certificates:     [1]cert.Certificate;
-var connect_wire_input:       [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var connect_wire_output:      [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var write_wire_input:     [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var write_wire_output:    [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var cancel_wire_input:    [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var cancel_wire_output:   [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var zero_wire_input:      [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var zero_wire_output:     [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var close_wire_input:     [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var close_wire_output:    [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var fragment_wire_input:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var fragment_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var preserve_wire_input:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var preserve_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var terminal_wire_input:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var terminal_wire_output: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var connect_wire_input:   [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var connect_wire_output:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
 
 fun test_entropy(context: ptr, secret_context: *^u8,
     output: *^u8, length: usize) i64 {
@@ -502,25 +500,21 @@ fun test_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
-var open_handshake_input:  [4096]u8;
-var open_handshake_output: [4096]u8;
-var open_handshake_hello:  [4096]u8;
-var open_certificates:     [1]cert.Certificate;
-var open_entropy_counter:  u8;
-var open_anchor:           cert.Certificate;
-var open_trust:            cert.TrustStore;
-var open_protocols:        [1]config.ProtocolName;
-var open_versions:         [1]u16;
-var open_suites:           [1]tls13.CipherSuite;
-var open_groups:           [1]tls13.NamedGroup;
-var open_signatures:       [1]tls13.SignatureScheme;
-var open_entropy:          secret.Entropy;
-var open_configuration:    config.ClientConfig;
-var open_identity:         credentials.Identity;
-var core_a:                client.Handshake;
-var core_b:                client.Handshake;
-var core_c:                client.Handshake;
-var core_d:                client.Handshake;
+var open_entropy_counter: u8;
+var open_anchor:          cert.Certificate;
+var open_trust:           cert.TrustStore;
+var open_protocols:       [1]config.ProtocolName;
+var open_versions:        [1]u16;
+var open_suites:          [1]tls13.CipherSuite;
+var open_groups:          [1]tls13.NamedGroup;
+var open_signatures:      [1]tls13.SignatureScheme;
+var open_entropy:         secret.Entropy;
+var open_configuration:   config.ClientConfig;
+var open_identity:        credentials.Identity;
+var core_a:               client.Handshake;
+var core_b:               client.Handshake;
+var core_c:               client.Handshake;
+var core_d:               client.Handshake;
 
 # an open stream still borrows a real engine, so ownership queries stay honest
 fun make_test_client(core: *client.Handshake) bool {
@@ -556,22 +550,11 @@ fun make_test_client(core: *client.Handshake) bool {
     open_configuration.limits                          = config.production_limits();
     open_configuration.limits.max_peer_handshake_bytes = 4096;
     open_configuration.limits.max_chain_bytes          = 3072;
-    var storage: client.Storage;
-    storage.input                    = ?open_handshake_input[0];
-    storage.input_capacity           = 4096;
-    storage.output                   = ?open_handshake_output[0];
-    storage.output_capacity          = 4096;
-    storage.hello                    = ?open_handshake_hello[0];
-    storage.hello_capacity           = 4096;
-    storage.certificates             = ?open_certificates[0];
-    storage.certificate_capacity     = 1;
-    storage.peer_parameters          = nil;
-    storage.peer_parameters_capacity = 0;
     var extra: client.ExtraExtension;
     extra.kind      = 0;
     extra.data.data = nil;
     extra.data.len  = 0;
-    ret client.init(core, ?open_configuration, storage, extra, 0);
+    ret client.init(core, ?open_configuration, pool.shared(), extra, 0);
 }
 
 fun make_open_stream(value: *stream.Stream, core: *client.Handshake,
@@ -749,14 +732,8 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
     configuration.limits.max_chain_bytes          = 3072;
-    val core_storage: client.Storage = client.Storage{
-        input:           ?connect_handshake_input[0], input_capacity: 4096,
-        output:          ?connect_handshake_output[0], output_capacity: 4096,
-        hello:           ?connect_handshake_hello[0], hello_capacity: 4096,
-        certificates:    ?connect_certificates[0], certificate_capacity: 1,
-        peer_parameters: nil, peer_parameters_capacity: 0
-    };
-    var storage: stream.Storage;
+    val core_storage: buffer.Lease = pool.shared();
+    var storage:      stream.Storage;
     storage.wire_input           = ?connect_wire_input[0];
     storage.wire_input_capacity  = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
     storage.wire_output          = ?connect_wire_output[0];
