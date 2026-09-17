@@ -455,7 +455,8 @@ mach build test/interop
 `mach dep pull` alone keeps a copy taken earlier.
 
 The footprint leg serves four TLS 1.3 connections with `--footprint` and bounds
-the resident pages of the last connection's region, idle and after destroy (see
+the resident pages of the last connection, its stream, engine and held buffers,
+idle and after destroy (see
 [`../../doc/validation.md`](../../doc/validation.md)):
 
 ```sh

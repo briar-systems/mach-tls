@@ -29,6 +29,7 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls13.transcript` owns SHA-256 and SHA-384 transcript lifecycle and retry rewrites.
 - `tls.tls13.key_schedule` implements the complete TLS 1.3 HKDF schedule and traffic derivation.
 - `tls.tls13.established` holds what an established TLS 1.3 connection keeps, for both roles: application secrets, key updates, tickets, and close state.
+- `tls.buffer` borrows every variable-size buffer from the caller's `std.memory.buffers` sources, one account per connection (see [`doc/memory.md`](doc/memory.md)).
 - `tls.transition` is the entrant gate every engine, core, and stream call passes.
 - `tls.state` defines client and server connection state.
 - `tls.session` implements ticket keys and rotation, sealed session state, bounded replay control, and bounded client ticket storage.

@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.7.0] - 2026-09-17
+
+An idle established TLS 1.3 connection now takes 1 resident page and holds no buffer, down from 6 pages. Every variable-size buffer comes from the caller's `std.memory.buffers` pool when it is needed and goes back when it is not (#98).
+
+### Breaking
+
+- Requires mach-std v5.0.1 and mach-crypto v0.13.1 (#98).
+- Handshake engines, established records and the Stream take their memory from the caller's buffer pool. `client.Storage`, `server.Storage`, `tls12.connection.Storage` and `stream.Storage` are removed, and so is the Stream's inline secret region and `stream.SECRET_STORAGE_BYTES` (#98):
+  - `client.init`, `server.init`, `server.init_with_credential_selector`, `tls12.connection.init_client` and `init_server` take a `buffer.Lease`.
+  - `stream.init_client`, `init_server`, `init_tls12_client`, `init_tls12_server`, `connect`, `connect_tls12`, `serve` and `serve_tls12` take a `buffer.Lease` and a `buffer.SecretLease` on the same account.
+  - `client.finish`, `server.finish` and `tls12.connection.finish` take no storage.
+  - The caller opens one account per connection and closes it after the connection is destroyed. tls never opens an account. See `doc/memory.md`.
+- A call short of memory returns the new `engine.WAITING`, with nothing consumed and nothing changed. The caller repeats it once the pool reports the account ready. A budget or misuse refusal fails the connection with `RESOURCE_LIMIT` (#98).
+- A Stream operation short of memory parks instead of failing. Call `stream.resume` when the pool reports the account ready. A parked operation still settles as `CANCELLED` or `TIMEOUT` through `stream.accept` (#98).
+- Behaviour change: an application write that is cancelled or times out between records, for example while parked for memory, now leaves the stream `OPEN`. Before 0.7.0 any cancelled or timed-out write failed the stream. A write cancelled with a sealed record partly unsent still fails it (#98).
+
+### Added
+
+- `tls.buffer`: `Lease`, `SecretLease`, and the reservation outcomes (`HELD`, `WAIT`, `FAIL`) over `std.memory.buffers` sources (#98).
+- `engine.WAITING`, `stream.resume`, `stream.READ_START` and `transport.TRANSPORT_WAIT` (#98).
+- `doc/memory.md`: the lease contract, the recommended class shape, waiting for memory, and the footprint (#98).
+
+### Changed
+
+- The Stream reads with a 512-byte buffer and grows it only to what a record header announces. Before encryption starts, a record header asking for more than the plaintext limit is refused at once (#98).
+- Handshake input grows only to the largest message actually received (#98).
+- The footprint leg serves each connection from its own pool account, requires every chunk back before the account closes, and bounds a connection at 3 pages idle and after destroy (#98).
+- Tests and the interoperability harness use `Instant` deadlines and clocks (#98).
+
 ## [0.6.0] - 2026-09-17
 
 ### Breaking

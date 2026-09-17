@@ -35,7 +35,7 @@ The TLS 1.3 established record holds:
 - the negotiated facts
 - borrowed views of the configured server name and the selected ALPN name
 
-It holds no transcript, credential lease, peer certificate, handshake storage or
+It holds no transcript, credential lease, peer certificate, handshake buffer or
 configuration copy. No call on it re-validates borrowed arrays, so an idle call
 is O(1).
 
@@ -55,13 +55,14 @@ From then on the engine serves `ingest`, `poll`, `next_event`,
 `complete_event`, `traffic_keys`, `close`, `request_key_update` and the record
 limits from the core.
 
-`finish(handshake, *Established, storage)` (TLS 1.2 takes no storage) moves the
-core out:
+`finish(handshake, *Established)` moves the core out:
 
 - It refuses with `INVALID_STATE`, changing nothing, until the handoff has
   happened, the handshake queue is drained and no event is borrowed.
-- On success the core carries any queued post-handshake events and any
-  half-assembled ticket, and the handshake engine returns to its destroyed
+- A client refuses while it still holds post-handshake bytes that waited for
+  memory. Retry once its account is ready.
+- On success the core carries any queued post-handshake events, any
+  half-assembled ticket and the engine's lease, and the handshake engine returns to its destroyed
   state, ready for `init` again or for a pool.
 
 Take the snapshot before `finish`. The handshake reports the peer's server name
@@ -81,9 +82,8 @@ is still borrowed at that moment, the finish is retried when the next operation
 starts. `stream.negotiated` reports the handshake's view until then, and the
 established record's view afterwards.
 
-A TLS 1.3 client with a session store passes `stream.Storage.ticket_input`,
-sized for `max_ticket_bytes` plus a handshake header. Without it, tickets are
-skipped.
+A TLS 1.3 client with a session store assembles tickets in a chunk from the
+engine's lease, reserved when a ticket arrives and returned once it is saved.
 
 ### QUIC
 
@@ -114,26 +114,15 @@ Every engine, established record and stream has exactly one owner at a time.
 
 ## Memory
 
-Measured by the footprint leg of the interoperability matrix (see
-[`validation.md`](validation.md)). The harness serves each connection from its
-own `std.memory.secret` allocations, returns a finished handshake and its
-buffers to their pool, and reads `/proc/self/pagemap`.
+An idle established TLS 1.3 connection is one resident page, the Stream
+record, and holds no buffer. The lease contract, waiting for memory and the
+measurements are in [`memory.md`](memory.md).
 
-| state of one established TLS 1.3 connection | resident pages |
-| --- | ---: |
-| idle, after the handshake | 6 |
-| after one request | 6 |
-| after `stream.destroy` | 15 |
-
-What remains in an idle connection is the stream's fixed state (1,240 bytes,
-including both established records), its inline record region, and the two wire
-buffers. The on-demand buffer work in #87 removes the last two.
-
-A handshake in progress costs one pooled engine plus its storage, sized by the
-limits:
+A handshake in progress costs one pooled engine plus the buffers its messages
+need, bounded by the limits:
 
 - `max_peer_handshake_bytes` and `max_client_hello_bytes` default to 16 KiB
-- `max_chain_bytes` defaults to 64 KiB, and a client's input must hold
+- `max_chain_bytes` defaults to 64 KiB, and a Certificate message is bounded by
   `config.certificate_message_bytes`
 - `max_certificate_bytes` defaults to 16 KiB per entry
 

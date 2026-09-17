@@ -9,6 +9,12 @@ completion-based transport, and the same ownership rules. A completed handshake
 hands the connection to a `tls.tls12.established` record, and
 `tls12.connection.finish` moves it out (see [`established.md`](established.md)).
 
+`init_client` and `init_server` take a `buffer.Lease` on the connection's
+account. The handshake input, output and retained ClientHello are chunks from
+it, returned when the handshake hands over, and `start`, `ingest` and `poll`
+return `WAITING` when memory is short, with nothing consumed (see
+[`memory.md`](memory.md)).
+
 ## Modules
 
 - `tls.tls12` holds the registry values and the per-suite properties: PRF hash,

@@ -42,11 +42,11 @@ The limits separate peer input from locally generated output:
   configured ClientHello and client authentication flight. Initialization
   calculates exact output requirements from the configured names, extensions,
   chain, signature maximum, retry cookie and key share, so a large peer input
-  policy does not force equally large output or ClientHello storage.
+  policy does not force equally large output or ClientHello buffers.
 
 Every limit can be raised to the protocol maximum. A deployment that must
-accept longer chains raises `max_chain_bytes`, and its input storage grows to
-match.
+accept longer chains raises `max_chain_bytes`, and the input buffer grows to
+match when such a chain arrives.
 
 `max_receive_record_plaintext` and `max_send_record_plaintext` are directional
 content limits. The receive limit is advertised with the RFC 8449
@@ -62,22 +62,20 @@ destroyed. A CertificateRequest with no compatible signature scheme produces an
 empty Certificate message as required by RFC 8446. A compatible request sends
 Certificate, CertificateVerify, and Finished under one exact transcript.
 
-`client.Storage` holds all variable-size handshake state. The input, output,
-ClientHello retention, parsed certificate array, and optional peer-extension
-retention buffers are caller-owned. Every range must be representable and every
-mutable region must be disjoint. Configuration and extension input cannot
-overlap those regions. Every pointer range and array product is validated before
-the first nested descriptor is traversed or handshake state is published. The
-input must hold the largest message the limits allow: at least
-`max_peer_handshake_bytes` and `config.certificate_message_bytes(limits)`.
-Consumed prefixes are compacted so the bound does not accidentally apply to the
-cumulative lifetime of a connection. The storage is borrowed only by the
-handshake and is released at `finish`.
+`client.init` takes a `buffer.Lease` on the connection's account (see
+[`memory.md`](memory.md)). The input, output, retained ClientHello and optional
+peer-extension buffers are chunks from it, reserved when a message needs them
+and returned once it is processed, so the input grows only to the largest
+message actually received, at most `max_peer_handshake_bytes` or
+`config.certificate_message_bytes(limits)`. Consumed prefixes are compacted so
+the bound does not apply to the cumulative lifetime of a connection. The parsed
+certificate array is part of the engine record. `start`, `ingest` and `poll`
+return `WAITING` when memory is short, with nothing consumed.
 
 `client.ExtraExtension.kind == 0` means that no opaque ClientHello extension is
 present. A nonzero kind is present even when its body is empty. If a peer
 extension is requested, its kind must match the offered extra extension and the
-caller must provide `Storage.peer_parameters`. This makes an empty QUIC
+its body is retained in a chunk from the lease. This makes an empty QUIC
 transport-parameters extension representable without a sentinel body.
 
 ## Incremental handshake
@@ -186,21 +184,22 @@ the only ownership acknowledgement between the two layers.
 
 `tls.stream` snapshots a valid `tls.transport.Transport` descriptor and retains
 its bounded callback context. The descriptor, runtime, context, application
-buffers, scopes, completions, and TLS storage are rejected when their public
-ranges overlap. Its caller-owned `stream.Storage` has disjoint public
-wire regions and an optional ticket region. A client with a session store
-passes `ticket_input` sized for `max_ticket_bytes` plus a handshake header;
-without it, tickets are skipped. The stream owns one internal secret-welded arena and
-derives the incoming plaintext, outgoing content, and AEAD scratch subregions
-itself. Callers cannot supply a hostile secret subrange or overlap record
-plaintext with entropy or identity state. `connect` combines initialization and
-handshake. Separate
-`handshake`, `read`, `write`, `alert`, `half_close`, and `close` operations are
-also available. Every operation retains its application token, cancellation
-scope, deadline, and application buffer through terminal resolution. The caller
-must inspect the terminal snapshot and call `destroy_operation` before starting
-the next operation. Application buffers, cancellation scopes, completions, wire
-storage, and operation state have disjoint ownership while active.
+buffers, scopes, completions, and the lease records are rejected when their
+public ranges overlap. `init_*`, `connect*` and `serve*` take a `buffer.Lease`
+and a `buffer.SecretLease` on the connection's one account. The Stream reads
+into a wire buffer that starts at `stream.READ_START` and grows to what a
+record header announces, seals and opens records in secret chunks held only
+for that record, and returns every buffer when an operation ends. `connect`
+combines initialization and handshake. Separate `handshake`, `read`, `write`,
+`alert`, `half_close`, and `close` operations are also available. Every
+operation retains its application token, cancellation scope, deadline, and
+application buffer through terminal resolution. The caller must inspect the
+terminal snapshot and call `destroy_operation` before starting the next
+operation.
+
+An operation that must wait for memory parks until `stream.resume`, and
+settles through `stream.accept` like any other. The contract is in
+[`memory.md`](memory.md).
 
 Destroying the completed handshake operation finishes the engine into the
 stream's own established core and releases the handshake object, whose
@@ -208,13 +207,6 @@ snapshot then reports `destroyed`, so its owner can reuse it. Read
 `stream.negotiated` before that point for the peer name and peer parameters.
 Afterwards the snapshot comes from the core. A finish that cannot happen yet
 because an event is still borrowed is retried when the next operation starts.
-
-The internal secret arena is sized for the complete TLS plaintext envelope and
-partitioned from the configured `receive + 2 * send + 2` requirement. It holds
-one bounded incoming TLSInnerPlaintext region, one outgoing content region, and
-one outgoing TLSInnerPlaintext scratch region. The public input and output wire buffers scale to
-`receive + 22` and `send + 22` bytes respectively, covering the record header,
-TLS 1.3 inner content type, and AEAD tag.
 
 Submission callbacks run outside the operation lock. The operation enters an
 explicit submitting state first, so synchronous inspection cannot deadlock and
@@ -237,14 +229,16 @@ plaintext limit and advance application ownership only after the complete record
 has settled.
 
 A cancelled or timed-out read retains safely reusable record input. Bytes the
-transport had already settled into wire storage are accounted for before the
+transport had already settled into the wire buffer are accounted for before the
 operation resolves, so cancelling a read is a control-flow decision and never a
 data-loss one: the record layer sees every byte that came off the lower
 transport, and the following record still decodes. A caller that pre-empts a
 read to make room for a write may therefore do so at any point without
-corrupting the stream. A cancelled,
-timed-out, zero-progress, or failed write makes the stream `FAILED`, since a
-partially published ciphertext record cannot be retried or skipped. After the
+corrupting the stream. A write cancelled or timed out with a sealed record
+partly unsent, or a zero-progress or failed write, makes the stream `FAILED`,
+since a partially published ciphertext record cannot be retried or skipped. A
+write that ends between records, including one parked for memory, leaves the
+stream `OPEN`. After the
 terminal operation is destroyed, `close` on a failed stream submits the distinct
 abortive lower-close callback without attempting another TLS record.
 
@@ -256,9 +250,9 @@ before the configured lower close. A fatal local alert moves the stream to
 without close_notify is an unclean terminal failure.
 
 `stream.destroy` is rejected while a lower completion or client event still owns
-storage. It destroys terminal operation state, both record ciphers, and the
-established core, then wipes the complete secret arena in one operation. The
-handshake object stays with its owner.
+a buffer. It returns every buffer to the lease, wiping what it held, and
+destroys terminal operation state, both record ciphers, and the established
+core. The handshake object stays with its owner.
 If `connect` initializes successfully but rejects the handshake before an
 application operation takes ownership, it rolls initialization back and clears
 every retained pointer. Once an operation is accepted, including immediate
