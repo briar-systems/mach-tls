@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.8.0] - 2026-09-17
+
+Engines read wall and monotonic time from a caller clock source when they need it, and every in-process interval runs on the monotonic clock (#102). A stream carries one read and one write at once (#103).
+
+### Breaking
+
+- Time comes from a clock source (#102):
+  - `config.ClientConfig.clock` and `config.ServerConfig.clock` are required. They name a caller-owned `clock.Source`, shared across connections. `clock.system()` reads the process clocks, and `clock.frozen` answers with a moment the caller controls. `read_fn` must not call into tls, must not block, and must be safe under the entrant gate.
+  - `client.start`, `server.start` and `tls12.connection.start` take no time.
+  - `stream.handshake`, `connect`, `connect_tls12`, `serve` and `serve_tls12` drop their time argument.
+  - `verify.Options.now` is a `time.Time`.
+  - Session: `keyring_init`, `keyring_rotate`, `seal` and `open` take `clock.Moment`. `keyring_openable` and `client_store_take` take `time.Instant`. `replay_admit` takes `time.Time`. `State.issued_at` is a `time.Time`, `Ticket.received_at` is a `time.Instant`, and `Ticket` gains `age_milliseconds`.
+  - A clock read that fails during a handshake fails it with `internal_error`. When a ticket arrives, a failed read drops that ticket and counts it in the new `engine.Snapshot.ticket_clock_failures`.
+- A stream carries one read and one write at once (#103):
+  - The lower transport must accept a read and a write submitted concurrently. The bundled TCP adapter does.
+  - `stream.destroy_operation(stream, token)` takes the token of the operation to release.
+  - `stream.Snapshot.operation` is replaced by `read` and `write`, and the snapshot gains `failure`.
+  - `Stream.operation`, `pending_action`, `transport` and `lower_transport` are replaced by `reading`, `writing` and `lower`.
+  - The handshake, `alert` and `close` are refused while a read is outstanding. `half_close` and `key_update` need only the write lane.
+  - A lane that fails the stream leaves the other lane's lower action in flight. That action is accounted when it completes, then resolves with the stream's failure. A `FAILED` stream must be closed, and `close` on it is allowed while a read is outstanding. See `doc/client.md`.
+  - `transport.begin_action` takes a `*transport.Provider` from `transport.pin`. `Operation.provider` is a `*Provider`, and `Operation.provider_owner` is removed.
+
+### Fixed
+
+- A resuming client sent `obfuscated_ticket_age = 0`. It now sends the ticket's age in milliseconds, measured on the monotonic clock from receipt, plus `age_add`, modulo 2^32 (RFC 8446 4.2.11) (#102).
+- Ticket-key rotation and overlap followed the wall clock, so a wall-clock step could rotate keys early or stretch the overlap. They now run on the monotonic clock (#102).
+
+### Changed
+
+- `stream.Stream` is 1,864 bytes, up from 1,704. An idle connection is still one resident page (#103).
+- `transport.Operation` is 208 bytes, down from 280 (#103).
+
 ## [0.7.1] - 2026-09-17
 
 A cancelled, timed-out or failed completion now keeps the transfer it reports. From mach-std 5.3.0 on, every backend reports that transfer (#104).
