@@ -1,11 +1,13 @@
 # TLS 1.2 ownership
 
-`tls.tls12.connection` is the TLS 1.2 handshake engine. It implements both
+`tls12.connection.Handshake` is the TLS 1.2 handshake engine. It implements both
 roles in one module because the two share their secrets, their transcript, and
 their record structure and differ only in the order of their state machine.
 It publishes the same `tls.engine` contract as the TLS 1.3 engines, so
 `tls.stream` drives a TLS 1.2 connection with the same operations, the same
-completion-based transport, and the same ownership rules.
+completion-based transport, and the same ownership rules. A completed handshake
+hands the connection to a `tls.tls12.established` record, and
+`tls12.connection.finish` moves it out (see [`established.md`](established.md)).
 
 ## Modules
 
@@ -16,6 +18,11 @@ completion-based transport, and the same ownership rules.
 - `tls.tls12.messages` provides borrowed typed views and transactional encoders
   for the TLS 1.2 handshake messages.
 - `tls.tls12.connection` is the engine.
+- `tls.tls12.established` is what an established connection keeps: close and
+  alert state, the record limits and the negotiated facts. The record keys
+  already live in the stream's ciphers, so it holds no secret, and the PRF
+  secrets, transcript and credential lease go with the handshake once both
+  traffic secrets are delivered.
 
 `tls.handshake` frames both versions but keeps their message sets apart:
 `parse_version` and `serialize_version` accept the TLS 1.2 set only when asked
@@ -101,9 +108,10 @@ configuration whose versions do not include TLS 1.2.
 
 Renegotiation is refused, always. Both roles send an empty
 `renegotiation_info` and reject a non-empty one on an initial handshake. Once
-established, a HelloRequest or a second ClientHello fails the connection with
-`error.NO_RENEGOTIATION`, signalled on the wire as `unexpected_message` because
-the connection is terminal rather than merely declining.
+established, any handshake byte fails the connection at its first byte: a
+HelloRequest or a second ClientHello with `error.NO_RENEGOTIATION`, signalled on
+the wire as `unexpected_message` because the connection is terminal rather than
+merely declining, and any other message with `UNEXPECTED_MESSAGE`.
 
 ## Not implemented
 

@@ -28,6 +28,7 @@ use tls.memory_range;
 use tls.record;
 use tls.signature_scheme;
 use tls.tls12;
+use tls12_established: tls.tls12.established;
 use tls.tls12.messages;
 use tls.tls12.prf;
 use tls.tls13;
@@ -84,7 +85,7 @@ rec Pending {
     alert:        record.AlertDescription;
 }
 
-pub rec Connection {
+pub rec Handshake {
     role:                     engine.Role;
     client_config:            *config.ClientConfig;
     client_configuration:     config.ClientConfig;
@@ -142,6 +143,9 @@ pub rec Connection {
     transition_owner:         i64;
     receive_record_plaintext: usize;
     send_record_plaintext:    usize;
+    # the established core, seeded when the handshake queue drains
+    delegating: bool;
+    core:       tls12_established.Established;
 }
 
 fun result(status: engine.Status, failure: error.Error, consumed: usize,
@@ -166,30 +170,30 @@ fun copy_bytes(destination: *u8, source: *u8, length: usize) {
     }
 }
 
-fun owner_valid(value: *Connection) bool {
+fun owner_valid(value: *Handshake) bool {
     if (value == nil) { ret false; }
     val address: usize = (?value.state)::usize;
-    val offset:  usize = $offset_of(Connection, state);
+    val offset:  usize = $offset_of(Handshake, state);
     ret address >= offset && memory_range.valid((address - offset)::*u8,
-        $size_of(Connection));
+        $size_of(Handshake));
 }
 
-fun owner_data(value: *Connection) *u8 {
+fun owner_data(value: *Handshake) *u8 {
     if (!owner_valid(value)) { ret nil; }
-    ret ((?value.state)::usize - $offset_of(Connection, state))::*u8;
+    ret ((?value.state)::usize - $offset_of(Handshake, state))::*u8;
 }
 
-fun owner_overlaps(value: *Connection, data: *u8, len: usize) bool {
+fun owner_overlaps(value: *Handshake, data: *u8, len: usize) bool {
     if (!owner_valid(value) || !memory_range.valid(data, len)) { ret true; }
-    ret memory_range.overlap(owner_data(value), $size_of(Connection), data, len);
+    ret memory_range.overlap(owner_data(value), $size_of(Handshake), data, len);
 }
 
-fun enter(value: *Connection) bool {
+fun enter(value: *Handshake) bool {
     if (!owner_valid(value)) { ret false; }
-    ret transition.enter(?value.transition_owner, os.thread_current_id());
+    ret transition.enter(?value.transition_owner);
 }
 
-fun leave(value: *Connection) {
+fun leave(value: *Handshake) {
     transition.leave(?value.transition_owner);
 }
 
@@ -248,7 +252,7 @@ fun storage_overlaps(storage: *Storage, data: *u8, len: usize) bool {
         certificate_bytes);
 }
 
-fun borrowed_overlaps(value: *Connection, data: *u8, len: usize) bool {
+fun borrowed_overlaps(value: *Handshake, data: *u8, len: usize) bool {
     if (!owner_valid(value) || !memory_range.valid(data, len)) { ret true; }
     if (value.role == engine.TLS12_CLIENT) {
         val configuration: *config.ClientConfig = value.client_config;
@@ -335,7 +339,7 @@ fun borrowed_overlaps(value: *Connection, data: *u8, len: usize) bool {
     ret false;
 }
 
-pub fun aliases_borrowed(value: *Connection, data: *u8, len: usize) bool {
+pub fun aliases_borrowed(value: *Handshake, data: *u8, len: usize) bool {
     if (!owner_valid(value) || atomic.load(?value.transition_owner) != 0 ||
         value.state == 0 || value.state >= DESTROYED) { ret true; }
     ret owner_overlaps(value, data, len) ||
@@ -343,7 +347,7 @@ pub fun aliases_borrowed(value: *Connection, data: *u8, len: usize) bool {
         borrowed_overlaps(value, data, len);
 }
 
-pub fun aliases_configuration(value: *Connection, data: *u8,
+pub fun aliases_configuration(value: *Handshake, data: *u8,
     len: usize) bool {
     if (!owner_valid(value) || atomic.load(?value.transition_owner) != 0 ||
         value.state == 0 || value.state >= DESTROYED) { ret true; }
@@ -368,7 +372,13 @@ fun offers_tls12(versions: *u16, version_len: usize) bool {
     ret false;
 }
 
-fun limits_valid(limits: config.Limits, storage: *Storage) bool {
+# a role that receives a certificate chain assembles it in input
+fun limits_valid(limits: config.Limits, storage: *Storage, receives_chain: bool) bool {
+    var input_required: usize = limits.max_peer_handshake_bytes;
+    if (receives_chain &&
+        config.certificate_message_bytes(limits) > input_required) {
+        input_required = config.certificate_message_bytes(limits);
+    }
     ret limits.max_receive_record_plaintext >= 63 &&
         limits.max_receive_record_plaintext <= record.MAX_PLAINTEXT &&
         limits.max_send_record_plaintext != 0 &&
@@ -376,9 +386,8 @@ fun limits_valid(limits: config.Limits, storage: *Storage) bool {
         limits.max_peer_handshake_bytes > handshake.HEADER_SIZE &&
         limits.max_peer_handshake_bytes <=
         handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE &&
-        limits.max_chain_bytes != 0 &&
-        limits.max_chain_bytes <= handshake.MAX_BODY_SIZE &&
-        storage.input_capacity >= limits.max_peer_handshake_bytes;
+        config.certificate_limits_valid(limits) &&
+        storage.input_capacity >= input_required;
 }
 
 pub fun client_config_valid(value: *config.ClientConfig,
@@ -404,7 +413,7 @@ pub fun client_config_valid(value: *config.ClientConfig,
         storage.certificates == nil || storage.certificate_capacity == 0 ||
         storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.hello == nil || storage.hello_capacity < 2048 ||
-        !limits_valid(value.limits, storage)) { ret false; }
+        !limits_valid(value.limits, storage, true)) { ret false; }
     var i: usize = 0;
     for (i < value.suite_len) {
         if (!tls12.valid_suite(value.suites[i])) { ret false; }
@@ -457,7 +466,7 @@ pub fun server_config_valid(value: *config.ServerConfig,
         storage.certificates == nil || storage.certificate_capacity == 0 ||
         storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.hello == nil || storage.hello_capacity < 2048 ||
-        !limits_valid(value.limits, storage) ||
+        !limits_valid(value.limits, storage, false) ||
         storage.output_capacity < 4096 + value.limits.max_chain_bytes) {
         ret false;
     }
@@ -486,7 +495,9 @@ pub fun server_config_valid(value: *config.ServerConfig,
     ret true;
 }
 
-fun reset(value: *Connection, storage: Storage) {
+fun reset(value: *Handshake, storage: Storage) {
+    value.delegating              = false;
+    value.core                    = tls12_established.empty();
     value.storage                 = storage;
     value.transcript              = transcript.empty();
     value.secrets                 = prf.empty();
@@ -524,14 +535,14 @@ fun reset(value: *Connection, storage: Storage) {
     ct.zeroize(?value.private_key[0], 32);
 }
 
-pub fun init_client(value: *Connection, configuration: *config.ClientConfig,
+pub fun init_client(value: *Handshake, configuration: *config.ClientConfig,
     storage: Storage) bool {
     if (!enter(value)) { ret false; }
     if ((value.state != 0 && value.state != DESTROYED) ||
         !client_config_valid(configuration, ?storage) ||
         borrowed_overlaps_config(configuration, nil, owner_data(value),
-        $size_of(Connection)) ||
-        storage_overlaps(?storage, owner_data(value), $size_of(Connection))) {
+        $size_of(Handshake)) ||
+        storage_overlaps(?storage, owner_data(value), $size_of(Handshake))) {
         leave(value);
         ret false;
     }
@@ -577,14 +588,14 @@ fun borrowed_overlaps_config(client: *config.ClientConfig,
     ret true;
 }
 
-pub fun init_server(value: *Connection, configuration: *config.ServerConfig,
+pub fun init_server(value: *Handshake, configuration: *config.ServerConfig,
     storage: Storage) bool {
     if (!enter(value)) { ret false; }
     if ((value.state != 0 && value.state != DESTROYED) ||
         !server_config_valid(configuration, ?storage) ||
         borrowed_overlaps_config(nil, configuration, owner_data(value),
-        $size_of(Connection)) ||
-        storage_overlaps(?storage, owner_data(value), $size_of(Connection))) {
+        $size_of(Handshake)) ||
+        storage_overlaps(?storage, owner_data(value), $size_of(Handshake))) {
         leave(value);
         ret false;
     }
@@ -604,51 +615,51 @@ pub fun init_server(value: *Connection, configuration: *config.ServerConfig,
     ret true;
 }
 
-fun limits(value: *Connection) config.Limits {
+fun limits(value: *Handshake) config.Limits {
     if (value.role == engine.TLS12_CLIENT) {
         ret value.client_configuration.limits;
     }
     ret value.server_configuration.limits;
 }
 
-fun queue_clear(value: *Connection) {
+fun queue_clear(value: *Handshake) {
     value.queue_head = 0;
     value.queue_len  = 0;
 }
 
-fun pending(value: *Connection) bool {
+fun pending(value: *Handshake) bool {
     ret value.queue_head < value.queue_len;
 }
 
-fun queue_push(value: *Connection, item: Pending) bool {
+fun queue_push(value: *Handshake, item: Pending) bool {
     if (value.queue_len >= MAX_QUEUED_EVENTS) { ret false; }
     value.queue[value.queue_len] = item;
     value.queue_len              = value.queue_len + 1;
     ret true;
 }
 
-fun queue_crypto(value: *Connection, level: engine.Level, offset: usize,
+fun queue_crypto(value: *Handshake, level: engine.Level, offset: usize,
     length: usize) bool {
     ret queue_push(value, Pending{kind: engine.CRYPTO, level: level,
         direction: engine.SEND, secret_index: NO_SECRET, offset: offset,
         length:    length, disposition: 0, alert: record.NO_ALERT});
 }
 
-fun queue_secret(value: *Connection, direction: engine.Direction,
+fun queue_secret(value: *Handshake, direction: engine.Direction,
     index: usize) bool {
     ret queue_push(value, Pending{kind: engine.TRAFFIC_SECRET,
         level:  engine.APPLICATION, direction: direction, secret_index: index,
         offset: 0, length: 0, disposition: 0, alert: record.NO_ALERT});
 }
 
-fun queue_simple(value: *Connection, kind: engine.EventKind,
+fun queue_simple(value: *Handshake, kind: engine.EventKind,
     disposition: u8) bool {
     ret queue_push(value, Pending{kind: kind, level: engine.APPLICATION,
         direction:   0, secret_index: NO_SECRET, offset: 0, length: 0,
         disposition: disposition, alert: record.NO_ALERT});
 }
 
-fun release_lease(value: *Connection) {
+fun release_lease(value: *Handshake) {
     if (value.lease_held) {
         credentials.release(?value.lease);
         value.lease_held = false;
@@ -656,7 +667,7 @@ fun release_lease(value: *Connection) {
     value.lease = credentials.empty_lease();
 }
 
-fun fail(value: *Connection, failure: error.Error,
+fun fail(value: *Handshake, failure: error.Error,
     alert: record.AlertDescription) engine.Result {
     if (value != nil && value.state != DESTROYED) {
         value.failure       = failure;
@@ -673,10 +684,9 @@ fun fail(value: *Connection, failure: error.Error,
     ret result(engine.FAILED, failure, 0, 0);
 }
 
-fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
-    val owner: i64 = os.thread_current_id();
-    if (!owner_valid(value) || owner <= 0 ||
-        !transition.held_by(?value.transition_owner, owner) ||
+fun entropy_fill(value: *Handshake, output: *^u8, length: usize) bool {
+    if (!owner_valid(value) ||
+        !transition.held(?value.transition_owner) ||
         !value.entropy.initialized || value.entropy.fill_fn == nil ||
         output == nil) { ret false; }
     val descriptor:       secret.Entropy = value.entropy;
@@ -686,7 +696,7 @@ fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
     val expected_queue:   usize          = value.queue_len;
     val status:           i64            = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val stable: bool = transition.held_by(?value.transition_owner, owner) &&
+    val stable: bool = transition.held(?value.transition_owner) &&
         value.state == expected_state &&
         value.storage.input == expected_storage.input &&
         value.storage.output == expected_storage.output &&
@@ -708,7 +718,7 @@ fun entropy_fill(value: *Connection, output: *^u8, length: usize) bool {
     ret true;
 }
 
-fun fill_public(value: *Connection, output: *u8, length: usize) bool {
+fun fill_public(value: *Handshake, output: *u8, length: usize) bool {
     var temporary: [MAX_POINT]^u8;
     if (length > MAX_POINT || !entropy_fill(value, ?temporary[0], length)) {
         ct.zeroize(?temporary[0], MAX_POINT);
@@ -723,7 +733,7 @@ fun fill_public(value: *Connection, output: *u8, length: usize) bool {
     ret true;
 }
 
-fun derive_share(value: *Connection, curve: tls13.NamedGroup) bool {
+fun derive_share(value: *Handshake, curve: tls13.NamedGroup) bool {
     var attempt: usize = 0;
     for (attempt < 16) {
         ct.zeroize(?value.private_key[0], 32);
@@ -752,7 +762,7 @@ fun derive_share(value: *Connection, curve: tls13.NamedGroup) bool {
     ret false;
 }
 
-fun shared_secret(value: *Connection, output: *^u8) bool {
+fun shared_secret(value: *Handshake, output: *^u8) bool {
     val peer: contracts.Bytes = contracts.Bytes{data: ?value.peer_public[0],
         len: value.peer_public_len};
     var operation: contracts.Operation;
@@ -769,17 +779,17 @@ fun shared_secret(value: *Connection, output: *^u8) bool {
     ret operation.error == contracts.OK && operation.written == 32;
 }
 
-fun absorb(value: *Connection, data: *u8, length: usize) error.Error {
+fun absorb(value: *Handshake, data: *u8, length: usize) error.Error {
     ret transcript.update(?value.transcript,
         contracts.Bytes{data: data, len: length});
 }
 
-fun transcript_hash(value: *Connection, output: *u8) error.Error {
+fun transcript_hash(value: *Handshake, output: *u8) error.Error {
     ret transcript.snapshot(?value.transcript,
         contracts.Buffer{data: output, capacity: 48});
 }
 
-fun hash_size(value: *Connection) usize {
+fun hash_size(value: *Handshake) usize {
     ret key_schedule.hash_size(tls12.suite_hash(value.suite));
 }
 
@@ -787,7 +797,7 @@ fun scheme_matches_key(scheme: u16, algorithm: keys.Algorithm) bool {
     ret signature_scheme.can_sign(scheme, algorithm);
 }
 
-fun retain_peer_key(value: *Connection) bool {
+fun retain_peer_key(value: *Handshake) bool {
     val first:  contracts.Bytes = value.peer_leaf.public_key.first;
     val second: contracts.Bytes = value.peer_leaf.public_key.second;
     if (first.data == nil || first.len == 0 || first.len > MAX_PUBLIC_KEY ||
@@ -810,7 +820,7 @@ fun retain_peer_key(value: *Connection) bool {
     ret true;
 }
 
-fun verify_peer_signature(value: *Connection, scheme: u16,
+fun verify_peer_signature(value: *Handshake, scheme: u16,
     message: contracts.Bytes, signature_bytes: contracts.Bytes) error.Error {
     if (!value.peer_leaf_present) { ret error.BAD_CERTIFICATE; }
     val status: contracts.Error = signature_scheme.verify(scheme,
@@ -820,7 +830,7 @@ fun verify_peer_signature(value: *Connection, scheme: u16,
     ret error.OK;
 }
 
-fun sign_message(value: *Connection, private_key: *keys.PrivateKey,
+fun sign_message(value: *Handshake, private_key: *keys.PrivateKey,
     scheme: u16, message: contracts.Bytes,
     output: contracts.Buffer) contracts.Operation {
     if (private_key == nil) {
@@ -887,7 +897,7 @@ fun put_extension(output: *u8, offset: usize, kind: u16,
     ret offset + 4 + body.len;
 }
 
-fun build_client_extensions(value: *Connection, output: *u8,
+fun build_client_extensions(value: *Handshake, output: *u8,
     capacity: usize) usize {
     val configuration: *config.ClientConfig = value.client_config;
     var offset:        usize                = 0;
@@ -953,7 +963,7 @@ fun build_client_extensions(value: *Connection, output: *u8,
     ret offset;
 }
 
-fun build_client_hello(value: *Connection) error.Error {
+fun build_client_hello(value: *Handshake) error.Error {
     val configuration:   *config.ClientConfig = value.client_config;
     var extension_bytes: [1024]u8;
     val extension_len:   usize                = build_client_extensions(value,
@@ -1002,7 +1012,7 @@ fun build_client_hello(value: *Connection) error.Error {
     ret error.OK;
 }
 
-fun start_inner(value: *Connection, verification_time: i64) engine.Result {
+fun start_inner(value: *Handshake, verification_time: i64) engine.Result {
     if (!owner_valid(value) ||
         (value.state != C_EXPECT_SERVER_HELLO &&
         value.state != S_EXPECT_CLIENT_HELLO) || pending(value)) {
@@ -1034,7 +1044,7 @@ fun start_inner(value: *Connection, verification_time: i64) engine.Result {
     ret result(engine.OK, error.OK, 0, 0);
 }
 
-pub fun start(value: *Connection, verification_time: i64) engine.Result {
+pub fun start(value: *Handshake, verification_time: i64) engine.Result {
     if (!enter(value)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
@@ -1075,7 +1085,7 @@ fun requires_extended_master_secret(list: extensions.List) bool {
     ret extensions.contains(list, extensions.EXTENDED_MASTER_SECRET);
 }
 
-fun configured_signature(value: *Connection, scheme: u16) bool {
+fun configured_signature(value: *Handshake, scheme: u16) bool {
     var signatures: *tls13.SignatureScheme = nil;
     var count:      usize                  = 0;
     if (value.role == engine.TLS12_CLIENT) {
@@ -1094,7 +1104,7 @@ fun configured_signature(value: *Connection, scheme: u16) bool {
     ret false;
 }
 
-fun configured_group(value: *Connection, curve: u16) bool {
+fun configured_group(value: *Handshake, curve: u16) bool {
     var groups: *tls13.NamedGroup = nil;
     var count:  usize             = 0;
     if (value.role == engine.TLS12_CLIENT) {
@@ -1113,7 +1123,7 @@ fun configured_group(value: *Connection, curve: u16) bool {
     ret false;
 }
 
-fun record_alpn(value: *Connection, list: extensions.List) error.Error {
+fun record_alpn(value: *Handshake, list: extensions.List) error.Error {
     var item: extensions.Extension;
     if (!extensions.find(list, extensions.APPLICATION_LAYER_PROTOCOL, ?item)) {
         ret error.NO_APPLICATION_PROTOCOL;
@@ -1149,7 +1159,7 @@ fun record_alpn(value: *Connection, list: extensions.List) error.Error {
     ret error.NO_APPLICATION_PROTOCOL;
 }
 
-fun downgrade_marked(value: *Connection, random: contracts.Bytes) bool {
+fun downgrade_marked(value: *Handshake, random: contracts.Bytes) bool {
     if (random.len != 32) { ret false; }
     var matched_tls12: bool  = true;
     var matched_tls11: bool  = true;
@@ -1166,7 +1176,7 @@ fun downgrade_marked(value: *Connection, random: contracts.Bytes) bool {
     ret matched_tls12 || matched_tls11;
 }
 
-fun handle_server_hello(value: *Connection, frame: contracts.Bytes,
+fun handle_server_hello(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var hello:   messages.ServerHello;
     var failure: error.Error = messages.decode_server_hello(message, ?hello);
@@ -1212,7 +1222,7 @@ fun handle_server_hello(value: *Connection, frame: contracts.Bytes,
     ret error.OK;
 }
 
-fun verify_peer_chain(value: *Connection, entries: contracts.Bytes,
+fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
     count: usize, purpose: verify.Purpose,
     identity: contracts.Bytes) error.Error {
     if (count == 0 || count > value.storage.certificate_capacity ||
@@ -1234,6 +1244,7 @@ fun verify_peer_chain(value: *Connection, entries: contracts.Bytes,
         if (status == extensions.NEXT_DONE) { brk; }
         if (status != extensions.NEXT_ITEM ||
             index >= value.storage.certificate_capacity ||
+            entry.len > limits(value).max_certificate_bytes ||
             entry.len > limits(value).max_chain_bytes - total) {
             ret error.BAD_CERTIFICATE;
         }
@@ -1266,7 +1277,7 @@ fun verify_peer_chain(value: *Connection, entries: contracts.Bytes,
     ret error.OK;
 }
 
-fun handle_server_certificate(value: *Connection, frame: contracts.Bytes,
+fun handle_server_certificate(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var certificate: messages.CertificateMessage;
     var failure:     error.Error = messages.decode_certificate(message,
@@ -1280,7 +1291,7 @@ fun handle_server_certificate(value: *Connection, frame: contracts.Bytes,
     ret failure;
 }
 
-fun handle_server_key_exchange(value: *Connection, frame: contracts.Bytes,
+fun handle_server_key_exchange(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var exchange: messages.ServerKeyExchange;
     var failure:  error.Error = messages.decode_server_key_exchange(message,
@@ -1325,7 +1336,7 @@ fun handle_server_key_exchange(value: *Connection, frame: contracts.Bytes,
     ret failure;
 }
 
-fun handle_certificate_request(value: *Connection, frame: contracts.Bytes,
+fun handle_certificate_request(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var request: messages.CertificateRequest;
     val failure: error.Error = messages.decode_certificate_request(message,
@@ -1335,7 +1346,7 @@ fun handle_certificate_request(value: *Connection, frame: contracts.Bytes,
     ret absorb(value, frame.data, frame.len);
 }
 
-fun build_client_flight(value: *Connection) error.Error {
+fun build_client_flight(value: *Handshake) error.Error {
     var offset: usize = 0;
     if (value.client_auth_requested) {
         # tls 1.2 client authentication is not offered, so the empty
@@ -1420,7 +1431,7 @@ fun build_client_flight(value: *Connection) error.Error {
     ret error.OK;
 }
 
-fun handle_server_hello_done(value: *Connection, frame: contracts.Bytes,
+fun handle_server_hello_done(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     val failure: error.Error = messages.decode_server_hello_done(message);
     if (failure != error.OK) { ret failure; }
@@ -1429,7 +1440,7 @@ fun handle_server_hello_done(value: *Connection, frame: contracts.Bytes,
     ret build_client_flight(value);
 }
 
-fun handle_peer_finished(value: *Connection, frame: contracts.Bytes,
+fun handle_peer_finished(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var finished: messages.Finished;
     var failure:  error.Error = messages.decode_finished(message, ?finished);
@@ -1450,7 +1461,7 @@ fun handle_peer_finished(value: *Connection, frame: contracts.Bytes,
     ret absorb(value, frame.data, frame.len);
 }
 
-fun retain_server_name(value: *Connection, hello: *messages.ClientHello) bool {
+fun retain_server_name(value: *Handshake, hello: *messages.ClientHello) bool {
     value.server_name = contracts.Bytes{data: nil, len: 0};
     var item: extensions.Extension;
     if (!extensions.find(hello.extensions, extensions.SERVER_NAME, ?item) ||
@@ -1465,7 +1476,7 @@ fun retain_server_name(value: *Connection, hello: *messages.ClientHello) bool {
     ret true;
 }
 
-fun select_server_alpn(value: *Connection,
+fun select_server_alpn(value: *Handshake,
     hello: *messages.ClientHello) error.Error {
     val configuration: *config.ServerConfig = value.server_config;
     var item:          extensions.Extension;
@@ -1510,7 +1521,7 @@ fun select_server_alpn(value: *Connection,
     ret error.OK;
 }
 
-fun build_server_extensions(value: *Connection, output: *u8,
+fun build_server_extensions(value: *Handshake, output: *u8,
     capacity: usize) usize {
     var offset: usize = 0;
     if (capacity < 512) { ret 0; }
@@ -1540,7 +1551,7 @@ fun build_server_extensions(value: *Connection, output: *u8,
     ret offset;
 }
 
-fun append_server_certificate(value: *Connection, offset: usize) usize {
+fun append_server_certificate(value: *Handshake, offset: usize) usize {
     val identity: *credentials.Identity = value.lease.identity;
     if (identity == nil || identity.chain.len == 0) { ret 0; }
     var entries: [16384]u8;
@@ -1566,7 +1577,7 @@ fun append_server_certificate(value: *Connection, offset: usize) usize {
     ret offset + encoded_message.produced;
 }
 
-fun append_server_key_exchange(value: *Connection, offset: usize) usize {
+fun append_server_key_exchange(value: *Handshake, offset: usize) usize {
     var params: [4 + MAX_POINT]u8;
     params[0] = messages.NAMED_CURVE;
     write_u16(?params[0], 1, value.curve);
@@ -1610,7 +1621,7 @@ fun append_server_key_exchange(value: *Connection, offset: usize) usize {
     ret offset + encoded.produced;
 }
 
-fun handle_client_hello(value: *Connection, frame: contracts.Bytes,
+fun handle_client_hello(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var hello:   messages.ClientHello;
     var failure: error.Error = messages.decode_client_hello(message, ?hello);
@@ -1746,7 +1757,7 @@ fun handle_client_hello(value: *Connection, frame: contracts.Bytes,
     ret error.OK;
 }
 
-fun handle_client_key_exchange(value: *Connection, frame: contracts.Bytes,
+fun handle_client_key_exchange(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     var exchange: messages.ClientKeyExchange;
     var failure:  error.Error = messages.decode_client_key_exchange(message,
@@ -1788,7 +1799,7 @@ fun handle_client_key_exchange(value: *Connection, frame: contracts.Bytes,
     ret error.OK;
 }
 
-fun build_server_finished(value: *Connection) error.Error {
+fun build_server_finished(value: *Handshake) error.Error {
     value.output_used = 0;
     var hash:    [48]u8;
     var failure: error.Error = transcript_hash(value, ?hash[0]);
@@ -1820,7 +1831,7 @@ fun build_server_finished(value: *Connection) error.Error {
     ret error.OK;
 }
 
-fun process_frame(value: *Connection, frame: contracts.Bytes,
+fun process_frame(value: *Handshake, frame: contracts.Bytes,
     message: *handshake.Message) error.Error {
     val kind: handshake.MessageType = message.header.message_type;
     if (value.state == C_EXPECT_SERVER_HELLO) {
@@ -1891,7 +1902,16 @@ fun process_frame(value: *Connection, frame: contracts.Bytes,
     ret error.UNEXPECTED_MESSAGE;
 }
 
-fun drive(value: *Connection) engine.Result {
+# the limit for the next buffered message, chosen by its type
+fun peer_limit(value: *Handshake) usize {
+    var message_type: handshake.MessageType = 0;
+    if (value.input_read < value.input_len) {
+        message_type = value.storage.input[value.input_read];
+    }
+    ret config.peer_message_limit(limits(value), message_type);
+}
+
+fun drive(value: *Handshake) engine.Result {
     for (true) {
         if (pending(value) || value.event_active) {
             ret result(engine.BLOCKED, error.OK, 0, 0);
@@ -1905,8 +1925,7 @@ fun drive(value: *Connection) engine.Result {
         val parsed:  handshake.Progress = handshake.parse_version(
             ?value.storage.input[value.input_read],
             value.input_len - value.input_read,
-            limits(value).max_peer_handshake_bytes - handshake.HEADER_SIZE,
-            true, ?message);
+            peer_limit(value) - handshake.HEADER_SIZE, true, ?message);
         if (parsed.status == handshake.NEED_INPUT) {
             ret result(engine.MORE, error.OK, 0, parsed.required);
         }
@@ -1926,7 +1945,7 @@ fun drive(value: *Connection) engine.Result {
     ret result(engine.FAILED, error.INTERNAL_ERROR, 0, 0);
 }
 
-fun compact_input(value: *Connection) {
+fun compact_input(value: *Handshake) {
     if (value.input_read == 0) { ret; }
     if (value.input_read == value.input_len) {
         value.input_read = 0;
@@ -1943,7 +1962,7 @@ fun compact_input(value: *Connection) {
     value.input_len  = left;
 }
 
-fun ingest_inner(value: *Connection, level: engine.Level, data: *u8,
+fun ingest_inner(value: *Handshake, level: engine.Level, data: *u8,
     length: usize) engine.Result {
     if (!owner_valid(value) || value.state == 0 ||
         !engine.valid_level(level) || value.state == DESTROYED ||
@@ -1969,29 +1988,37 @@ fun ingest_inner(value: *Connection, level: engine.Level, data: *u8,
     ret progress;
 }
 
-pub fun ingest(value: *Connection, level: engine.Level, data: *u8,
+pub fun ingest(value: *Handshake, level: engine.Level, data: *u8,
     length: usize) engine.Result {
     if (!enter(value)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val progress: engine.Result = ingest_inner(value, level, data, length);
+    var progress: engine.Result;
+    if (value.delegating) {
+        if (owner_overlaps(value, data, length)) {
+            progress = result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
+        }
+        or { progress = tls12_established.ingest(?value.core, level, data, length); }
+    }
+    or { progress = ingest_inner(value, level, data, length); }
     leave(value);
     ret progress;
 }
 
-pub fun poll(value: *Connection) engine.Result {
+pub fun poll(value: *Handshake) engine.Result {
     if (!enter(value)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     var progress: engine.Result = result(engine.FAILED,
         error.ILLEGAL_PARAMETER, 0, 0);
-    if (owner_valid(value) && value.state != 0 && value.state != DESTROYED &&
+    if (value.delegating) { progress = tls12_established.poll(?value.core); }
+    or (owner_valid(value) && value.state != 0 && value.state != DESTROYED &&
         value.state != TERMINAL) { progress = drive(value); }
     leave(value);
     ret progress;
 }
 
-fun next_event_inner(value: *Connection, output: *engine.Event) bool {
+fun next_event_inner(value: *Handshake, output: *engine.Event) bool {
     # nothing pending is answered before the borrowed descriptors are walked
     if (!owner_valid(value) || output == nil || value.event_active ||
         value.state == DESTROYED || !pending(value) ||
@@ -2033,14 +2060,80 @@ fun next_event_inner(value: *Connection, output: *engine.Event) bool {
     ret true;
 }
 
-pub fun next_event(value: *Connection, output: *engine.Event) bool {
+pub fun next_event(value: *Handshake, output: *engine.Event) bool {
     if (!enter(value)) { ret false; }
-    val available: bool = next_event_inner(value, output);
+    var available: bool = false;
+    if (value.delegating) {
+        available = output != nil && !owner_overlaps(value, (?output.token)::*u8,
+            $size_of(engine.Event)) && tls12_established.next_event(?value.core, output);
+    }
+    or { available = next_event_inner(value, output); }
     leave(value);
     ret available;
 }
 
-fun complete_event_inner(value: *Connection, token: u64,
+# the configured protocol the handshake selected, borrowed from the caller
+fun configured_alpn(value: *Handshake) contracts.Bytes {
+    var names: *config.ProtocolName = value.server_configuration.alpn;
+    var count: usize                = value.server_configuration.alpn_len;
+    if (value.role == engine.TLS12_CLIENT) {
+        names = value.client_configuration.alpn;
+        count = value.client_configuration.alpn_len;
+    }
+    var i: usize = 0;
+    for (value.selected_alpn.len != 0 && i < count) {
+        if (names[i].len == value.selected_alpn.len) {
+            var equal: bool  = true;
+            var at:    usize = 0;
+            for (at < names[i].len) {
+                if (names[i].data[at] != value.selected_alpn.data[at]) { equal = false; }
+                at = at + 1;
+            }
+            if (equal) { ret contracts.Bytes{data: names[i].data, len: names[i].len}; }
+        }
+        i = i + 1;
+    }
+    ret contracts.Bytes{data: nil, len: 0};
+}
+
+# both traffic secrets have been taken once the established queue drains, and
+# tls 1.2 never derives another, so the core takes over and the secrets,
+# transcript and credential lease go with the handshake
+fun hand_over(value: *Handshake) {
+    var seed: tls12_established.Seed;
+    seed.role                  = value.role;
+    seed.suite                 = value.suite;
+    seed.group                 = value.curve;
+    seed.authenticated         = value.authenticated;
+    seed.peer_offered_alpn     = value.peer_offered_alpn;
+    seed.client_auth_requested = value.client_auth_requested;
+    seed.alpn                  = configured_alpn(value);
+    seed.server_name.data      = nil;
+    seed.server_name.len       = 0;
+    if (value.role == engine.TLS12_CLIENT) {
+        seed.server_name = value.client_configuration.server_name;
+    }
+    seed.receive_record_limit = value.receive_record_plaintext;
+    seed.send_record_limit    = value.send_record_plaintext;
+    val seeded: bool = tls12_established.begin(?value.core, seed);
+    transcript.destroy(?value.transcript);
+    prf.destroy(?value.secrets);
+    release_lease(value);
+    if (!seeded) {
+        fail(value, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
+        ret;
+    }
+    value.delegating = true;
+    # anything the peer sent behind its finished is a handshake message
+    if (value.input_read < value.input_len) {
+        tls12_established.ingest(?value.core, engine.APPLICATION,
+            ?value.storage.input[value.input_read], 1);
+    }
+    value.input_read = 0;
+    value.input_len  = 0;
+}
+
+fun complete_event_inner(value: *Handshake, token: u64,
     accepted: bool) bool {
     if (!owner_valid(value) || !value.event_active || token == 0 ||
         token != value.active_event.token) { ret false; }
@@ -2054,24 +2147,24 @@ fun complete_event_inner(value: *Connection, token: u64,
         queue_clear(value);
         value.output_used = 0;
     }
-    # both traffic secrets have been taken once the established queue drains,
-    # and tls 1.2 never derives another
-    if (value.state == ESTABLISHED && !pending(value) && value.secrets.keys_ready) {
-        transcript.destroy(?value.transcript);
-        prf.destroy(?value.secrets);
-        release_lease(value);
+    if (value.state == ESTABLISHED && !pending(value) && !value.delegating) {
+        hand_over(value);
     }
     ret true;
 }
 
-pub fun complete_event(value: *Connection, token: u64, accepted: bool) bool {
+pub fun complete_event(value: *Handshake, token: u64, accepted: bool) bool {
     if (!enter(value)) { ret false; }
-    val completed: bool = complete_event_inner(value, token, accepted);
+    var completed: bool = false;
+    if (value.delegating) {
+        completed = tls12_established.complete_event(?value.core, token, accepted);
+    }
+    or { completed = complete_event_inner(value, token, accepted); }
     leave(value);
     ret completed;
 }
 
-fun traffic_keys_inner(value: *Connection, event: *engine.Event,
+fun traffic_keys_inner(value: *Handshake, event: *engine.Event,
     key: contracts.SecretBuffer, iv: contracts.Buffer,
     key_length: *usize) bool {
     if (!owner_valid(value) || event == nil || key_length == nil ||
@@ -2100,23 +2193,25 @@ fun traffic_keys_inner(value: *Connection, event: *engine.Event,
     ret true;
 }
 
-pub fun traffic_keys(value: *Connection, event: *engine.Event,
+pub fun traffic_keys(value: *Handshake, event: *engine.Event,
     key: contracts.SecretBuffer, iv: contracts.Buffer,
     key_length: *usize) bool {
     if (!enter(value)) { ret false; }
-    val derived: bool = traffic_keys_inner(value, event, key, iv, key_length);
+    val derived: bool = !value.delegating &&
+        traffic_keys_inner(value, event, key, iv, key_length);
     leave(value);
     ret derived;
 }
 
-pub fun close(value: *Connection,
+pub fun close(value: *Handshake,
     description: record.AlertDescription) engine.Result {
     if (!enter(value)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
     var closed: engine.Result = result(engine.FAILED, error.ILLEGAL_PARAMETER,
         0, 0);
-    if (owner_valid(value) && value.state != 0 && value.state != DESTROYED &&
+    if (value.delegating) { closed = tls12_established.close(?value.core, description); }
+    or (owner_valid(value) && value.state != 0 && value.state != DESTROYED &&
         value.state != TERMINAL && value.state != CLOSING &&
         record.valid_tls13_alert(description)) {
         var duplicate: bool  = false;
@@ -2139,10 +2234,12 @@ pub fun close(value: *Connection,
     ret closed;
 }
 
-pub fun destroy(value: *Connection) bool {
-    if (!enter(value)) { ret false; }
+fun destroy_inner(value: *Handshake) bool {
     var destroyed: bool = false;
-    if (owner_valid(value) && !value.event_active) {
+    if (owner_valid(value) && !value.event_active &&
+        !tls12_established.event_active(?value.core)) {
+        tls12_established.wipe(?value.core);
+        value.delegating = false;
         ct.zeroize(?value.private_key[0], 32);
         transcript.destroy(?value.transcript);
         prf.destroy(?value.secrets);
@@ -2189,14 +2286,25 @@ pub fun destroy(value: *Connection) bool {
         value.state       = DESTROYED;
         destroyed         = true;
     }
+    ret destroyed;
+}
+
+pub fun destroy(value: *Handshake) bool {
+    if (!enter(value)) { ret false; }
+    val destroyed: bool = destroy_inner(value);
     leave(value);
     ret destroyed;
 }
 
-pub fun snapshot(value: *Connection) engine.Snapshot {
+pub fun snapshot(value: *Handshake) engine.Snapshot {
     if (!enter(value)) { ret engine.empty_snapshot(); }
     var view: engine.Snapshot = engine.empty_snapshot();
-    if (owner_valid(value)) {
+    if (value.delegating) {
+        # a server's peer name is the handshake's to report, until finish
+        view           = tls12_established.snapshot(?value.core);
+        view.peer_name = value.server_name;
+    }
+    or (owner_valid(value)) {
         view.role                  = value.role;
         view.version               = tls12.VERSION;
         view.error                 = value.failure;
@@ -2219,32 +2327,50 @@ pub fun snapshot(value: *Connection) engine.Snapshot {
     ret view;
 }
 
-pub fun receive_record_limit(value: *Connection) usize {
+pub fun receive_record_limit(value: *Handshake) usize {
     if (!enter(value)) { ret 0; }
     var limit: usize = 0;
-    if (owner_valid(value) && value.state != 0 && value.state != DESTROYED) {
+    if (value.delegating) { limit = tls12_established.receive_record_limit(?value.core); }
+    or (owner_valid(value) && value.state != 0 && value.state != DESTROYED) {
         limit = value.receive_record_plaintext;
     }
     leave(value);
     ret limit;
 }
 
-pub fun send_record_limit(value: *Connection) usize {
+pub fun send_record_limit(value: *Handshake) usize {
     if (!enter(value)) { ret 0; }
     var limit: usize = 0;
-    if (owner_valid(value) && value.state != 0 && value.state != DESTROYED) {
+    if (value.delegating) { limit = tls12_established.send_record_limit(?value.core); }
+    or (owner_valid(value) && value.state != 0 && value.state != DESTROYED) {
         limit = value.send_record_plaintext;
     }
     leave(value);
     ret limit;
 }
 
-pub fun downgrade_signalled(value: *Connection) bool {
+# move the established connection into core and release the handshake, which
+# init may then reuse. refused, changing nothing, until the handshake queue
+# has drained and no event is active. take the snapshot first: a server's
+# peer name is not kept past this call
+pub fun finish(value: *Handshake, core: *tls12_established.Established) contracts.Error {
+    if (!enter(value)) { ret contracts.INVALID_STATE; }
+    var finished: contracts.Error = contracts.INVALID_STATE;
+    if (value.delegating && !value.event_active && !pending(value) &&
+        tls12_established.move(core, ?value.core)) {
+        destroy_inner(value);
+        finished = contracts.OK;
+    }
+    leave(value);
+    ret finished;
+}
+
+pub fun downgrade_signalled(value: *Handshake) bool {
     ret value != nil && value.downgrade_signalled;
 }
 
 test "tls12.connection: an unconfigured connection accepts nothing" {
-    var value:   Connection;
+    var value:   Handshake;
     var storage: Storage;
     var client:  config.ClientConfig;
     var server:  config.ServerConfig;
@@ -2466,7 +2592,7 @@ fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
 var captured_key:     [4][prf.MAX_KEY]^u8;
 var captured_key_len: [4]usize;
 
-fun capture_keys(source: *Connection, event: *engine.Event, dialer: bool) bool {
+fun capture_keys(source: *Handshake, event: *engine.Event, dialer: bool) bool {
     var slot: usize = 0;
     if (!dialer)                           { slot = 2; }
     if (event.direction == engine.RECEIVE) { slot = slot + 1; }
@@ -2478,7 +2604,7 @@ fun capture_keys(source: *Connection, event: *engine.Event, dialer: bool) bool {
         ?captured_key_len[slot]);
 }
 
-fun drain_events(source: *Connection, into_listener: bool) i64 {
+fun drain_events(source: *Handshake, into_listener: bool) i64 {
     var event: engine.Event;
     for (next_event(source, ?event)) {
         var stored: bool = true;
@@ -2506,7 +2632,7 @@ fun drain_events(source: *Connection, into_listener: bool) i64 {
 
 # a target that already has queued events refuses more input, so its queue is
 # drained between segments exactly as the stream would
-fun deliver(target: *Connection, into_listener: bool, buffer: *u8,
+fun deliver(target: *Handshake, into_listener: bool, buffer: *u8,
     levels: *engine.Level, offsets: *usize, lengths: *usize, count: *usize,
     used: *usize) i64 {
     val total:  usize = @count;
@@ -2540,7 +2666,7 @@ fun deliver(target: *Connection, into_listener: bool, buffer: *u8,
     ret failed;
 }
 
-fun exchange(local: *Connection, peer: *Connection) i64 {
+fun exchange(local: *Handshake, peer: *Handshake) i64 {
     to_listener_count = 0;
     to_listener_used  = 0;
     to_dialer_count   = 0;
@@ -2595,8 +2721,8 @@ fun loopback_storage_server() Storage {
 test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(false, ?owner)) { ret 1; }
-    var dialer:   Connection;
-    var listener: Connection;
+    var dialer:   Handshake;
+    var listener: Handshake;
     if (!init_client(?dialer, ?loopback_client_config,
         loopback_storage_client())) { ret 2; }
     if (!init_server(?listener, ?loopback_server_config,
@@ -2643,6 +2769,24 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
             listener.secrets.master[i]:>u8 != 0) { ret 29; }
         i = i + 1;
     }
+    # both roles finish into cores, and the released handshakes are reusable
+    var dialer_core:   tls12_established.Established = tls12_established.empty();
+    var listener_core: tls12_established.Established = tls12_established.empty();
+    if (!dialer.delegating || !listener.delegating) { ret 30; }
+    if (snapshot(?listener).peer_name.len != 15)    { ret 31; }
+    if (finish(?dialer, ?dialer_core) != contracts.OK ||
+        finish(?listener, ?listener_core) != contracts.OK ||
+        dialer.state != DESTROYED || listener.state != DESTROYED) { ret 32; }
+    if (tls12_established.snapshot(?listener_core).peer_name.len != 0 ||
+        tls12_established.snapshot(?dialer_core).peer_name.len != 15 ||
+        tls12_established.snapshot(?dialer_core).selected_alpn.len != 2) { ret 33; }
+    if (!tls12_established.destroy(?dialer_core) ||
+        !tls12_established.destroy(?listener_core)) { ret 34; }
+    if (!init_client(?dialer, ?loopback_client_config, loopback_storage_client()) ||
+        !init_server(?listener, ?loopback_server_config, loopback_storage_server()) ||
+        start(?listener, 1800000000).status != engine.OK ||
+        start(?dialer, 1800000000).status != engine.OK ||
+        exchange(?dialer, ?listener) != 0) { ret 35; }
     # renegotiation is refused by both roles once established
     var request: [4]u8 = [4]u8{handshake.HELLO_REQUEST, 0, 0, 0};
     if (ingest(?dialer, engine.APPLICATION, ?request[0], 4).status !=
@@ -2661,8 +2805,8 @@ test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
     # the listener also speaks tls 1.3, so it marks the 1.2 negotiation and
     # refuses the deliberate fallback the client signals
     loopback_client_versions[0] = tls13.VERSION;
-    var dialer:   Connection;
-    var listener: Connection;
+    var dialer:   Handshake;
+    var listener: Handshake;
     if (init_client(?dialer, ?loopback_client_config,
         loopback_storage_client())) { ret 2; }
     var both: [2]u16 = [2]u16{tls13.VERSION, tls12.VERSION};
@@ -2688,8 +2832,8 @@ test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
     loopback_client_versions[0]        = tls12.VERSION;
     loopback_server_config.versions    = ?both[0];
     loopback_server_config.version_len = 2;
-    var plain_dialer:     Connection;
-    var marking_listener: Connection;
+    var plain_dialer:     Handshake;
+    var marking_listener: Handshake;
     if (!init_client(?plain_dialer, ?loopback_client_config,
         loopback_storage_client()) ||
         !init_server(?marking_listener, ?loopback_server_config,
@@ -2730,7 +2874,7 @@ fun mutation_storage() Storage {
 
 # every outcome of one mutated hello must be a complete, bounded state
 fun feed_mutation(length: usize) i64 {
-    var listener: Connection;
+    var listener: Handshake;
     if (!init_server(?listener, ?loopback_server_config, mutation_storage()) ||
         start(?listener, 1800000000).status != engine.OK) { ret 1; }
     val fed: engine.Result = ingest(?listener, engine.INITIAL,
@@ -2771,7 +2915,7 @@ fun feed_mutation(length: usize) i64 {
 test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(false, ?owner)) { ret 1; }
-    var dialer: Connection;
+    var dialer: Handshake;
     if (!init_client(?dialer, ?loopback_client_config,
         loopback_storage_client()) ||
         start(?dialer, 1800000000).status != engine.OK) { ret 2; }
@@ -2802,7 +2946,7 @@ test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
     }
 
     # a hello at the wrong level or in the wrong state fails closed
-    var wrong: Connection;
+    var wrong: Handshake;
     if (!init_server(?wrong, ?loopback_server_config, mutation_storage()) ||
         start(?wrong, 1800000000).status != engine.OK) { ret 6; }
     i = 0;

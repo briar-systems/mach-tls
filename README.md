@@ -12,6 +12,7 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls12.prf` implements the TLS 1.2 pseudorandom function and its secrets.
 - `tls.tls12.messages` provides borrowed views and encoders for TLS 1.2 messages.
 - `tls.tls12.connection` implements the TLS 1.2 handshake for both roles.
+- `tls.tls12.established` holds what an established TLS 1.2 connection keeps.
 - `tls.config` defines bounded client and server configuration.
 - `tls.cert` defines borrowed certificate, chain, and trust store contracts.
 - `tls.cert.x509` parses strict borrowed X.509 certificate views.
@@ -27,11 +28,13 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.handshake.negotiation` selects suites, groups, signatures, and ALPN by server policy.
 - `tls.tls13.transcript` owns SHA-256 and SHA-384 transcript lifecycle and retry rewrites.
 - `tls.tls13.key_schedule` implements the complete TLS 1.3 HKDF schedule and traffic derivation.
+- `tls.tls13.established` holds what an established TLS 1.3 connection keeps, for both roles: application secrets, key updates, tickets, and close state.
+- `tls.transition` is the entrant gate every engine, core, and stream call passes.
 - `tls.state` defines client and server connection state.
 - `tls.session` implements ticket keys and rotation, sealed session state, bounded replay control, and bounded client ticket storage.
-- `tls.client` implements the incremental TLS 1.3 client handshake.
+- `tls.client` implements the incremental TLS 1.3 client handshake (`client.Handshake`).
 - `tls.server` implements the incremental TLS 1.3 server handshake and
-  credential selection.
+  credential selection (`server.Handshake`).
 - `tls.stream` implements a completion-driven TLS 1.3 secure byte stream for
   either role.
 
@@ -56,7 +59,7 @@ TLS 1.2 is implemented for both roles over the same engine contract, the same re
 
 Session resumption is implemented for both roles. A server seals sessions under a rotating ticket key with an exact retirement overlap, verifies PSK binders on a separate transcript, and can require a ticket to be single-use. A client retains tickets in a bounded store and offers one PSK per connection. Either role can initiate a post-handshake key update. Early data is not implemented and is never offered. The contract is in [`doc/sessions.md`](doc/sessions.md).
 
-`tls.engine` defines the one handshake-engine contract both roles implement, so `tls.stream` drives either over the same records and the same transport. A stream borrows a caller-owned engine and never destroys it. `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contracts and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md) and [`doc/server.md`](doc/server.md).
+`tls.engine` defines the one handshake-engine contract both roles implement, so `tls.stream` drives either over the same records and the same transport. A stream borrows a caller-owned engine and never destroys it. Once the handshake completes, the stream finishes the engine into its own small established core and releases the engine to its owner, so an idle established connection holds no handshake state. The split, `finish`, the ownership contract, and the per-connection memory figures are in [`doc/established.md`](doc/established.md). `tls.stream` adds incremental record I/O, partial completion handling, read, write, half-close, alert, graceful close, and abortive failure cleanup. The exact ownership contracts and the record-free QUIC adapter surface are documented in [`doc/client.md`](doc/client.md) and [`doc/server.md`](doc/server.md).
 
 ## Certificates and credentials
 
@@ -138,6 +141,7 @@ mach dep pull .
 mach build .
 mach test .
 mach dep pull test/interop
+mach dep update test/interop tls
 mach build test/interop
 ```
 

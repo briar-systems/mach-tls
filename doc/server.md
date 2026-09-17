@@ -1,9 +1,11 @@
 # TLS 1.3 server ownership
 
-`tls.server` is the transport-independent TLS 1.3 server handshake engine.
-It publishes the same event contract as `tls.client`, defined once in
-`tls.engine`, so `tls.stream` drives either role over the same records and the
-same completion-based transport.
+`server.Handshake` is the transport-independent TLS 1.3 server handshake
+engine. It publishes the same event contract as `client.Handshake`, defined once
+in `tls.engine`, so `tls.stream` drives either role over the same records and
+the same completion-based transport. A completed handshake hands the connection
+to a `tls13.established.Established` record, which `server.finish` moves out
+(see [`established.md`](established.md)).
 
 ## The engine contract
 
@@ -19,11 +21,14 @@ Every role implements the same operations:
 - `close` queues one terminal alert
 - `snapshot` reports negotiated parameters and status
 - `aliases_borrowed` and `aliases_configuration` answer ownership queries
+- `finish` moves a drained established connection out of the engine
 
 An engine is caller-owned. `tls.stream` borrows one through `init_client`,
-`init_server`, `connect`, or `serve`, and never destroys it. The engine must
-outlive the stream, and `stream.destroy` leaves it untouched so the owner can
-inspect the negotiated result and then destroy it.
+`init_server`, `connect`, or `serve`, and never destroys it. When the stream's
+completed handshake operation is destroyed, the stream finishes the engine into
+its own established core and stops borrowing it. The engine's snapshot then
+reports `destroyed`, and its owner may `init` it again for another connection or
+return it to a pool.
 
 Engines carry secret state, so the language forbids erasing them to an untyped
 pointer. The stream therefore holds one typed pointer per role and dispatches
@@ -38,20 +43,31 @@ signature arrays remain immutable caller-owned borrows for the lifetime of the
 engine. The configuration requires one TLS 1.3 version, one to three cipher
 suites, one or two groups, one to five signature schemes, an initialized
 credential store, an operating-system or application entropy source, and
-explicit finite limits.
+explicit finite limits. The configuration outlives the connection: an
+established record borrows the selected ALPN name from it.
 
 Client authentication policy is not part of the listener configuration. It
 belongs to the published credential generation, together with the trust store it
 is checked against, so one rotation changes both at once and a connection cannot
 observe a policy that never existed.
 
-`max_peer_handshake_bytes` bounds one incoming frame including its header.
-`max_client_hello_bytes` bounds the retained ClientHello, `max_client_flight_bytes`
-the client authentication flight, and `max_server_flight_bytes` the generated
-EncryptedExtensions through Finished. `max_chain_bytes` applies to both the
-presented client chain and the served certificate chain. `server.storage_requirements`
-reports the exact ServerHello and flight output a configuration needs, so a
-caller sizes `Storage.output` from policy rather than by guessing.
+`max_peer_handshake_bytes` (default 16 KiB) bounds every incoming message except
+Certificate, including its header. A client Certificate is bounded by
+`config.certificate_message_bytes(limits)`, which follows `max_chain_bytes`
+(default 64 KiB). Each of its entries is bounded by `max_certificate_bytes`
+(default 16 KiB). `max_client_hello_bytes` (default 16 KiB) bounds the retained
+ClientHello, `max_client_flight_bytes` the client authentication flight, and
+`max_server_flight_bytes` the generated EncryptedExtensions through Finished.
+`max_chain_bytes` applies to both the presented client chain and the served
+certificate chain. `server.storage_requirements` reports the exact ServerHello
+and flight output a configuration needs, so a caller sizes `Storage.output` from
+policy rather than by guessing. Every limit can be raised to the protocol
+maximum.
+
+`Storage.input` must hold `max_peer_handshake_bytes`. A listener that may serve
+a generation requiring client authentication also sizes it for
+`config.certificate_message_bytes`. A lease that requires client authentication
+from input too small for a chain fails the handshake with `RESOURCE_LIMIT`.
 
 `server.Storage` holds all variable-size handshake state and is caller-owned.
 The input, output, ClientHello retention, peer certificate array, and optional
@@ -93,7 +109,10 @@ HelloRetryRequest sentinel. `ingest` at `INITIAL` accepts the ClientHello.
 8. The client flight is verified: an optional certificate path for client
    authentication, its CertificateVerify, and Finished. The client application
    traffic secret, the authentication disposition, and completion follow.
-9. Post-handshake KeyUpdate is processed and answered.
+9. Once every event is accepted, the established core takes the application
+   traffic secrets. The key schedule, transcript, resumed PSK and credential
+   lease go with the handshake. Post-handshake KeyUpdate is processed and
+   answered by the core.
 
 Events are published from one bounded ordered queue, so interleaved flights and
 secret transitions have one explicit order rather than an inferred one. The
@@ -150,15 +169,17 @@ bounded work. A terminal engine accepts no further peer input.
 | client authentication required, none presented | `CERTIFICATE_REQUIRED` | `certificate_required` |
 | client chain fails path validation | `BAD_CERTIFICATE` / `UNKNOWN_CA` | matching certificate alert |
 | declared body above the configured bound | `RESOURCE_LIMIT` | `internal_error` |
+| client chain entry above `max_certificate_bytes` | `BAD_CERTIFICATE` | `bad_certificate` |
 
 A ClientHello may fragment at every byte. Each incomplete prefix reports the
 exact next requirement, publishes no event, and changes no handshake state.
 
 ## Validation
 
-Unit coverage drives the server against `tls.client` in process through a
+Unit coverage drives the server against `client.Handshake` in process through a
 complete authenticated handshake and compares both application traffic secrets
-byte for byte. A malformed-hello corpus asserts the exact error and alert for
+byte for byte. It finishes both engines into established cores, rekeys between
+the cores, and reuses the released handshakes for a second connection. A malformed-hello corpus asserts the exact error and alert for
 every row of the table above, that every truncation prefix reports a requirement
 without publishing state, and that a terminal engine refuses further input.
 

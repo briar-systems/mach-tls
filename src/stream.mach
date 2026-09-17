@@ -20,8 +20,10 @@ use tls.error;
 use tls.memory_range;
 use tls.record;
 use tls.server;
-use tls12_connection: tls.tls12.connection;
+use tls12_connection:  tls.tls12.connection;
+use tls12_established: tls.tls12.established;
 use tls.tls13;
+use tls.tls13.established;
 use tls.tls13.key_schedule;
 use tls.transition;
 use tls.transport;
@@ -50,6 +52,11 @@ pub rec Storage {
     wire_input_capacity:  usize;
     wire_output:          *u8;
     wire_output_capacity: usize;
+    # a tls 1.3 client with a session store assembles tickets here, sized to
+    # the configured max_ticket_bytes plus a handshake header; without it a
+    # ticket is skipped
+    ticket_input:          *u8;
+    ticket_input_capacity: usize;
 }
 
 pub rec Snapshot {
@@ -64,13 +71,18 @@ pub rec Snapshot {
 # one operation is active at a time, while read and write cipher sequences remain independent
 # exactly one engine pointer is set; both are caller-owned and outlive the stream
 pub rec Stream {
-    transport:                *transport.Transport;
-    lower_transport:          transport.Transport;
-    storage:                  Storage;
-    role:                     engine.Role;
-    client:                   *client.Client;
-    server:                   *server.Server;
-    legacy:                   *tls12_connection.Connection;
+    transport:       *transport.Transport;
+    lower_transport: transport.Transport;
+    storage:         Storage;
+    role:            engine.Role;
+    client:          *client.Handshake;
+    server:          *server.Handshake;
+    legacy:          *tls12_connection.Handshake;
+    # once the handshake operation is destroyed the engine is finished into
+    # one of these and the handshake object is released to its owner
+    finished:                 bool;
+    core13:                   established.Established;
+    core12:                   tls12_established.Established;
     operation:                transport.Operation;
     read_cipher:              record.Cipher;
     write_cipher:             record.Cipher;
@@ -106,7 +118,7 @@ pub rec Stream {
     send_record_plaintext:    usize;
 }
 
-val REGION_COUNT: usize = 2;
+val REGION_COUNT: usize = 3;
 
 rec Region {
     data: *u8;
@@ -117,6 +129,7 @@ fun storage_regions(value: *Storage, output: *Region) bool {
     if (value == nil || output == nil) { ret false; }
     output[0] = Region{data: value.wire_input, len: value.wire_input_capacity};
     output[1] = Region{data: value.wire_output, len: value.wire_output_capacity};
+    output[2] = Region{data: value.ticket_input, len: value.ticket_input_capacity};
     var i: usize = 0;
     for (i < REGION_COUNT) {
         if (!memory_range.valid(output[i].data, output[i].len)) { ret false; }
@@ -198,6 +211,7 @@ fun storage_valid(value: *Storage, lower: *transport.Transport) bool {
 
 fun engine_bound(stream: *Stream) bool {
     if (stream == nil)                { ret false; }
+    if (stream.finished)              { ret true; }
     if (stream.role == engine.CLIENT) { ret stream.client != nil; }
     if (stream.role == engine.SERVER) { ret stream.server != nil; }
     if (engine.is_tls12(stream.role)) { ret stream.legacy != nil; }
@@ -206,6 +220,8 @@ fun engine_bound(stream: *Stream) bool {
 
 fun engine_aliases_borrowed(stream: *Stream, data: *u8, len: usize) bool {
     if (!engine_bound(stream)) { ret true; }
+    # a finished core borrows nothing a caller buffer could alias
+    if (stream.finished) { ret false; }
     if (stream.role == engine.CLIENT) {
         ret client.aliases_borrowed(stream.client, data, len);
     }
@@ -215,6 +231,7 @@ fun engine_aliases_borrowed(stream: *Stream, data: *u8, len: usize) bool {
 
 fun engine_aliases_configuration(stream: *Stream, data: *u8, len: usize) bool {
     if (!engine_bound(stream)) { ret true; }
+    if (stream.finished)       { ret false; }
     if (stream.role == engine.CLIENT) {
         ret client.aliases_configuration(stream.client, data, len);
     }
@@ -226,6 +243,7 @@ fun engine_start(stream: *Stream, verification_time: i64) engine.Result {
     if (!engine_bound(stream)) {
         ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
+    if (stream.finished) { ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
     if (stream.role == engine.CLIENT) {
         ret client.start(stream.client, verification_time);
     }
@@ -238,6 +256,10 @@ fun engine_ingest(stream: *Stream, level: engine.Level, data: *u8,
     if (!engine_bound(stream)) {
         ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.ingest(?stream.core12, level, data, length);
+    }
+    if (stream.finished) { ret established.ingest(?stream.core13, level, data, length); }
     if (stream.role == engine.CLIENT) {
         ret client.ingest(stream.client, level, data, length);
     }
@@ -249,6 +271,10 @@ fun engine_poll(stream: *Stream) engine.Result {
     if (!engine_bound(stream)) {
         ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.poll(?stream.core12);
+    }
+    if (stream.finished)              { ret established.poll(?stream.core13); }
     if (stream.role == engine.CLIENT) { ret client.poll(stream.client); }
     if (engine.is_tls12(stream.role)) { ret tls12_connection.poll(stream.legacy); }
     ret server.poll(stream.server);
@@ -256,6 +282,10 @@ fun engine_poll(stream: *Stream) engine.Result {
 
 fun engine_next_event(stream: *Stream, output: *engine.Event) bool {
     if (!engine_bound(stream)) { ret false; }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.next_event(?stream.core12, output);
+    }
+    if (stream.finished) { ret established.next_event(?stream.core13, output); }
     if (stream.role == engine.CLIENT) {
         ret client.next_event(stream.client, output);
     }
@@ -265,6 +295,10 @@ fun engine_next_event(stream: *Stream, output: *engine.Event) bool {
 
 fun engine_complete_event(stream: *Stream, token: u64, accepted: bool) bool {
     if (!engine_bound(stream)) { ret false; }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.complete_event(?stream.core12, token, accepted);
+    }
+    if (stream.finished) { ret established.complete_event(?stream.core13, token, accepted); }
     if (stream.role == engine.CLIENT) {
         ret client.complete_event(stream.client, token, accepted);
     }
@@ -275,7 +309,11 @@ fun engine_complete_event(stream: *Stream, token: u64, accepted: bool) bool {
 fun engine_traffic_keys(stream: *Stream, event: *engine.Event,
     key: contracts.SecretBuffer, iv: contracts.Buffer,
     key_length: *usize) bool {
-    if (!engine_bound(stream)) { ret false; }
+    if (!engine_bound(stream))                           { ret false; }
+    if (stream.finished && engine.is_tls12(stream.role)) { ret false; }
+    if (stream.finished) {
+        ret established.traffic_keys(?stream.core13, event, key, iv, key_length);
+    }
     if (stream.role == engine.CLIENT) {
         ret client.traffic_keys(stream.client, event, key, iv, key_length);
     }
@@ -287,15 +325,18 @@ fun engine_request_key_update(stream: *Stream, request: u8) engine.Result {
     if (!engine_bound(stream)) {
         ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    if (stream.role == engine.CLIENT) {
-        ret client.request_key_update(stream.client, request);
+    if (!stream.finished || engine.is_tls12(stream.role)) {
+        ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    if (engine.is_tls12(stream.role)) { ret engine.result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0); }
-    ret server.request_key_update(stream.server, request);
+    ret established.request_key_update(?stream.core13, request);
 }
 
 fun engine_snapshot(stream: *Stream) engine.Snapshot {
-    if (!engine_bound(stream))        { ret engine.empty_snapshot(); }
+    if (!engine_bound(stream)) { ret engine.empty_snapshot(); }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.snapshot(?stream.core12);
+    }
+    if (stream.finished)              { ret established.snapshot(?stream.core13); }
     if (stream.role == engine.CLIENT) { ret client.snapshot(stream.client); }
     if (engine.is_tls12(stream.role)) { ret tls12_connection.snapshot(stream.legacy); }
     ret server.snapshot(stream.server);
@@ -303,6 +344,10 @@ fun engine_snapshot(stream: *Stream) engine.Snapshot {
 
 fun engine_receive_limit(stream: *Stream) usize {
     if (!engine_bound(stream)) { ret 0; }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.receive_record_limit(?stream.core12);
+    }
+    if (stream.finished) { ret established.receive_record_limit(?stream.core13); }
     if (stream.role == engine.CLIENT) {
         ret client.receive_record_limit(stream.client);
     }
@@ -312,6 +357,10 @@ fun engine_receive_limit(stream: *Stream) usize {
 
 fun engine_send_limit(stream: *Stream) usize {
     if (!engine_bound(stream)) { ret 0; }
+    if (stream.finished && engine.is_tls12(stream.role)) {
+        ret tls12_established.send_record_limit(?stream.core12);
+    }
+    if (stream.finished) { ret established.send_record_limit(?stream.core13); }
     if (stream.role == engine.CLIENT) {
         ret client.send_record_limit(stream.client);
     }
@@ -959,7 +1008,7 @@ fun drive_owned(stream: *Stream) bool {
 
 fun enter(stream: *Stream) bool {
     if (stream_owner_data(stream) == nil) { ret false; }
-    ret transition.enter(?stream.transition_owner, os.thread_current_id());
+    ret transition.enter(?stream.transition_owner);
 }
 
 fun leave(stream: *Stream, accepted: bool) bool {
@@ -967,15 +1016,19 @@ fun leave(stream: *Stream, accepted: bool) bool {
     ret accepted;
 }
 
+# every operation after the handshake starts from a finished engine; a finish
+# the handshake operation's destruction could not make yet is retried here
 fun operation_available(stream: *Stream) bool {
     if (stream == nil) { ret false; }
-    val state: transport.OperationState = transport.snapshot(?stream.operation).state;
-    ret state == 0 || state == transport.OPERATION_DESTROYED;
+    val state:     transport.OperationState = transport.snapshot(?stream.operation).state;
+    val available: bool                     = state == 0 || state == transport.OPERATION_DESTROYED;
+    if (available) { finish_engine(stream); }
+    ret available;
 }
 
 fun init_inner(stream: *Stream, role: engine.Role,
-    client_engine: *client.Client, server_engine: *server.Server,
-    legacy_engine: *tls12_connection.Connection, storage: Storage,
+    client_engine: *client.Handshake, server_engine: *server.Handshake,
+    legacy_engine: *tls12_connection.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (stream_owner_data(stream) == nil ||
         (stream.state != 0 && stream.state != DESTROYED) ||
@@ -994,10 +1047,13 @@ fun init_inner(stream: *Stream, role: engine.Role,
         storage_overlaps(?storage, stream_owner_data(stream), $size_of(Stream)) ||
         transport.state_overlaps(lower, stream_owner_data(stream),
         $size_of(Stream))) { ret false; }
-    stream.role   = role;
-    stream.client = client_engine;
-    stream.server = server_engine;
-    stream.legacy = legacy_engine;
+    stream.finished = false;
+    stream.core13   = established.empty();
+    stream.core12   = tls12_established.empty();
+    stream.role     = role;
+    stream.client   = client_engine;
+    stream.server   = server_engine;
+    stream.legacy   = legacy_engine;
     val ready: engine.Snapshot = engine_snapshot(stream);
     if (!engine_bound(stream) || ready.role != role || ready.destroyed ||
         ready.status != engine.MORE || ready.event_active ||
@@ -1053,7 +1109,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
 }
 
 # the caller initializes and owns the engine; the stream only borrows it
-pub fun init_client(stream: *Stream, core: *client.Client, storage: Storage,
+pub fun init_client(stream: *Stream, core: *client.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.CLIENT, core, nil, nil, storage,
@@ -1061,7 +1117,7 @@ pub fun init_client(stream: *Stream, core: *client.Client, storage: Storage,
 }
 
 pub fun init_tls12_client(stream: *Stream,
-    core: *tls12_connection.Connection, storage: Storage,
+    core: *tls12_connection.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.TLS12_CLIENT, nil, nil, core,
@@ -1069,14 +1125,14 @@ pub fun init_tls12_client(stream: *Stream,
 }
 
 pub fun init_tls12_server(stream: *Stream,
-    core: *tls12_connection.Connection, storage: Storage,
+    core: *tls12_connection.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.TLS12_SERVER, nil, nil, core,
         storage, lower));
 }
 
-pub fun init_server(stream: *Stream, core: *server.Server, storage: Storage,
+pub fun init_server(stream: *Stream, core: *server.Handshake, storage: Storage,
     lower: *transport.Transport) bool {
     if (!enter(stream)) { ret false; }
     ret leave(stream, init_inner(stream, engine.SERVER, nil, core, nil, storage,
@@ -1231,7 +1287,7 @@ pub fun key_update(stream: *Stream, scope: *cancel.Scope,
     ret leave(stream, key_update_inner(stream, scope, token, request, context));
 }
 
-pub fun connect(stream: *Stream, core: *client.Client, storage: Storage,
+pub fun connect(stream: *Stream, core: *client.Handshake, storage: Storage,
     lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1246,7 +1302,7 @@ pub fun connect(stream: *Stream, core: *client.Client, storage: Storage,
 }
 
 # a tls 1.2 connection is driven by the same operations as a tls 1.3 one
-pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Connection,
+pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Handshake,
     storage: Storage, lower: *transport.Transport, scope: *cancel.Scope,
     token: transport.Token, verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1259,7 +1315,7 @@ pub fun connect_tls12(stream: *Stream, core: *tls12_connection.Connection,
     ret leave(stream, true);
 }
 
-pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Connection,
+pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Handshake,
     storage: Storage, lower: *transport.Transport, scope: *cancel.Scope,
     token: transport.Token, verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1272,7 +1328,7 @@ pub fun serve_tls12(stream: *Stream, core: *tls12_connection.Connection,
     ret leave(stream, true);
 }
 
-pub fun serve(stream: *Stream, core: *server.Server, storage: Storage,
+pub fun serve(stream: *Stream, core: *server.Handshake, storage: Storage,
     lower: *transport.Transport, scope: *cancel.Scope, token: transport.Token,
     verification_time: i64, context: usize) bool {
     if (!enter(stream)) { ret false; }
@@ -1399,6 +1455,30 @@ pub fun snapshot(stream: *Stream) Snapshot {
     ret value;
 }
 
+# a completed handshake is finished into the stream's own core, which drops
+# every handshake-only byte and releases the handshake object to its owner
+fun finish_engine(stream: *Stream) {
+    if (stream.finished || !stream.handshake_complete || !engine_bound(stream)) { ret; }
+    var finished: contracts.Error = contracts.INVALID_STATE;
+    if (engine.is_tls12(stream.role)) {
+        finished = tls12_connection.finish(stream.legacy, ?stream.core12);
+    }
+    or (stream.role == engine.CLIENT) {
+        finished = client.finish(stream.client, ?stream.core13, established.Storage{
+            input:          stream.storage.ticket_input,
+            input_capacity: stream.storage.ticket_input_capacity
+        });
+    }
+    or {
+        finished = server.finish(stream.server, ?stream.core13, established.no_storage());
+    }
+    if (finished != contracts.OK) { ret; }
+    stream.finished = true;
+    stream.client   = nil;
+    stream.server   = nil;
+    stream.legacy   = nil;
+}
+
 fun destroy_operation_inner(stream: *Stream) bool {
     val current: transport.Snapshot = transport.snapshot(?stream.operation);
     if (current.state == transport.OPERATION_SUBMITTING ||
@@ -1407,7 +1487,9 @@ fun destroy_operation_inner(stream: *Stream) bool {
         ret false;
     }
     settle_terminal(stream);
-    ret transport.destroy_operation(?stream.operation);
+    if (!transport.destroy_operation(?stream.operation)) { ret false; }
+    finish_engine(stream);
+    ret true;
 }
 
 pub fun destroy_operation(stream: *Stream) bool {
@@ -1429,20 +1511,25 @@ fun destroy_inner(stream: *Stream) bool {
     record.destroy(?stream.read_cipher);
     record.destroy(?stream.write_cipher);
     ct.zeroize(?stream.secret[0], SECRET_STORAGE_BYTES);
-    stream.role                         = 0;
-    stream.client                       = nil;
-    stream.server                       = nil;
-    stream.legacy                       = nil;
-    stream.transport                    = nil;
-    stream.lower_transport              = transport.no_transport();
-    stream.storage.wire_input           = nil;
-    stream.storage.wire_input_capacity  = 0;
-    stream.storage.wire_output          = nil;
-    stream.storage.wire_output_capacity = 0;
-    stream.plaintext                    = nil;
-    stream.content                      = nil;
-    stream.scratch                      = nil;
-    stream.state                        = DESTROYED;
+    established.wipe(?stream.core13);
+    tls12_established.wipe(?stream.core12);
+    stream.finished                      = false;
+    stream.role                          = 0;
+    stream.client                        = nil;
+    stream.server                        = nil;
+    stream.legacy                        = nil;
+    stream.transport                     = nil;
+    stream.lower_transport               = transport.no_transport();
+    stream.storage.wire_input            = nil;
+    stream.storage.wire_input_capacity   = 0;
+    stream.storage.wire_output           = nil;
+    stream.storage.wire_output_capacity  = 0;
+    stream.storage.ticket_input          = nil;
+    stream.storage.ticket_input_capacity = 0;
+    stream.plaintext                     = nil;
+    stream.content                       = nil;
+    stream.scratch                       = nil;
+    stream.state                         = DESTROYED;
     ret true;
 }
 
@@ -1457,7 +1544,7 @@ pub fun destroy(stream: *Stream) bool {
 # of them fails here rather than in a consumer.
 #
 # Eight public types deliberately cannot erase, because key material lives
-# inline in them: client.Client, server.Server, Stream, config.ClientConfig,
+# inline in them: client.Handshake, server.Handshake, Stream, config.ClientConfig,
 # config.ServerConfig, credentials.Identity, engine.Event and
 # tls12.connection.Connection. No consumer needs to erase one today, and
 # mach-quic does not. If one ever must, that is the shape of laurel#27 and the
@@ -1502,8 +1589,8 @@ test "stream: an unbound or uninitialized engine cannot take ownership" {
     var stream:   Stream;
     var storage:  Storage;
     var lower:    transport.Transport;
-    var core:     client.Client;
-    var listener: server.Server;
+    var core:     client.Handshake;
+    var listener: server.Handshake;
     if (init_client(?stream, nil, storage, ?lower) ||
         init_server(?stream, nil, storage, ?lower)) { ret 1; }
     if (init_client(?stream, ?core, storage, ?lower))     { ret 2; }
