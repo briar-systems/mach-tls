@@ -777,14 +777,15 @@ fun process_record(stream: *Stream) bool {
         ret handled;
     }
     if (content_type == record.HANDSHAKE) {
-        var revealed: [record.MAX_INNER_PLAINTEXT]u8;
+        # a handshake message is revealed over its own consumed ciphertext, which
+        # is always longer than the plaintext it carried
         if (protected) {
             var i: usize = 0;
             for (i < content_length) {
-                revealed[i] = stream.plaintext[i]:>u8;
-                i           = i + 1;
+                input[i] = stream.plaintext[i]:>u8;
+                i        = i + 1;
             }
-            content = ?revealed[0];
+            content = input;
         }
         var level: engine.Level = engine.INITIAL;
         if (protected)                 { level = engine.HANDSHAKE; }
@@ -795,8 +796,8 @@ fun process_record(stream: *Stream) bool {
             ct.zeroize(stream.plaintext, content_length);
             var i: usize = 0;
             for (i < content_length) {
-                revealed[i] = 0;
-                i           = i + 1;
+                input[i] = 0;
+                i        = i + 1;
             }
         }
         if (progress.status == engine.FAILED) {
