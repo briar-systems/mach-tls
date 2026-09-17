@@ -554,6 +554,7 @@ fun make_test_client(core: *client.Handshake) bool {
     open_configuration.entropy_context_size            = 1;
     open_configuration.limits                          = config.production_limits();
     open_configuration.limits.max_peer_handshake_bytes = 4096;
+    open_configuration.limits.max_chain_bytes          = 3072;
     var storage: client.Storage;
     storage.input                    = ?open_handshake_input[0];
     storage.input_capacity           = 4096;
@@ -746,6 +747,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     val core_storage: client.Storage = client.Storage{
         input:           ?connect_handshake_input[0], input_capacity: 4096,
         output:          ?connect_handshake_output[0], output_capacity: 4096,

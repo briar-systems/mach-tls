@@ -566,6 +566,7 @@ fun main(argc: i64, argv: **u8) i64 {
     dial_configuration.client_identity                 = ?client_identity;
     dial_configuration.entropy                         = ?entropy;
     dial_configuration.limits                          = config.production_limits();
+    dial_configuration.limits.max_chain_bytes          = 32768;
     dial_configuration.limits.max_peer_handshake_bytes = 65536;
 
     dial_configuration.sessions = nil;
@@ -607,6 +608,7 @@ fun main(argc: i64, argv: **u8) i64 {
     tls12_configuration.signature_len                   = 7;
     tls12_configuration.entropy                         = ?entropy;
     tls12_configuration.limits                          = config.production_limits();
+    tls12_configuration.limits.max_chain_bytes          = 32768;
     tls12_configuration.limits.max_peer_handshake_bytes = 65536;
     tls12_configuration.limits.max_chain_bytes          = 32768;
 

@@ -665,6 +665,7 @@ fun limits_equal(first: config.Limits, second: config.Limits) bool {
         first.max_client_flight_bytes == second.max_client_flight_bytes &&
         first.max_server_flight_bytes == second.max_server_flight_bytes &&
         first.max_chain_bytes == second.max_chain_bytes &&
+        first.max_certificate_bytes == second.max_certificate_bytes &&
         first.max_ticket_bytes == second.max_ticket_bytes;
 }
 
@@ -833,8 +834,7 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         value.limits.max_client_flight_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_client_flight_bytes >
         handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
-        value.limits.max_chain_bytes == 0 ||
-        value.limits.max_chain_bytes > handshake.MAX_BODY_SIZE ||
+        !config.certificate_limits_valid(value.limits) ||
         value.limits.max_ticket_bytes == 0 ||
         value.limits.max_ticket_bytes > handshake.MAX_BODY_SIZE ||
         storage.input == nil ||
@@ -842,6 +842,7 @@ fun config_valid(value: *config.ClientConfig, storage: *Storage,
         storage.certificates == nil || storage.certificate_capacity == 0 ||
         storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.input_capacity < value.limits.max_peer_handshake_bytes ||
+        storage.input_capacity < config.certificate_message_bytes(value.limits) ||
         (extra.data.len != 0 && extra.data.data == nil) ||
         extra.data.len > 65531 || (extra.kind == 0 && extra.data.len != 0) ||
         (extra.kind != 0 && reserved_client_extension(extra.kind)) ||
@@ -1695,6 +1696,7 @@ fun handle_certificate(client: *Handshake, frame: contracts.Bytes,
         val status: extensions.NextStatus = codec.next_certificate(?iterator, ?entry);
         if (status == extensions.NEXT_DONE) { brk; }
         if (status != extensions.NEXT_ITEM || count >= client.storage.certificate_capacity ||
+            entry.certificate.len > client.config.limits.max_certificate_bytes ||
             entry.certificate.len > client.config.limits.max_chain_bytes - total) {
             ret error.BAD_CERTIFICATE;
         }
@@ -2045,6 +2047,15 @@ fun process_frame(client: *Handshake, frame: contracts.Bytes,
     ret error.UNEXPECTED_MESSAGE;
 }
 
+# the limit for the next buffered message, chosen by its type
+fun peer_limit(client: *Handshake) usize {
+    var message_type: handshake.MessageType = 0;
+    if (client.input_read < client.input_len) {
+        message_type = client.storage.input[client.input_read];
+    }
+    ret config.peer_message_limit(client.config.limits, message_type);
+}
+
 fun drive(client: *Handshake, level: Level) engine.Result {
     for (true) {
         if (client.output_pending || client.event_active) {
@@ -2058,7 +2069,7 @@ fun drive(client: *Handshake, level: Level) engine.Result {
         var message: handshake.Message;
         val parsed:  handshake.Progress = handshake.parse(
             ?client.storage.input[client.input_read], client.input_len - client.input_read,
-            client.config.limits.max_peer_handshake_bytes - handshake.HEADER_SIZE,
+            peer_limit(client) - handshake.HEADER_SIZE,
             ?message);
         if (parsed.status == handshake.NEED_INPUT) {
             ret result(MORE, error.OK, 0, parsed.required);
@@ -2833,6 +2844,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     entropy.fill_fn                                   = reentrant_entropy;
     configuration.limits                              = config.production_limits();
     configuration.limits.max_peer_handshake_bytes     = 4096;
+    configuration.limits.max_chain_bytes              = 3072;
     configuration.limits.max_ticket_bytes             = 4096;
     configuration.limits.max_receive_record_plaintext = 1024;
     configuration.limits.max_send_record_plaintext    = 2048;
@@ -3143,6 +3155,7 @@ test "client: event rejection has one terminal alert ownership path" {
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     configuration.limits.max_ticket_bytes         = 4096;
     val storage: Storage = Storage{
         input:           ?reject_input[0], input_capacity: 4096,
@@ -3201,6 +3214,7 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     configuration.limits.max_ticket_bytes         = 4096;
     val storage: Storage = Storage{
         input:           ?hostile_input[0], input_capacity: 4096,
@@ -3331,6 +3345,7 @@ test "client: complete authenticated rfc 8446 flight has exact traffic transitio
     configuration.entropy_context_size            = 1;
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
+    configuration.limits.max_chain_bytes          = 3072;
     configuration.limits.max_ticket_bytes         = 4096;
     var storage: Storage = Storage{
         input:           ?full_input[0], input_capacity: 4096,

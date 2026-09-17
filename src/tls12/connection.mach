@@ -372,7 +372,13 @@ fun offers_tls12(versions: *u16, version_len: usize) bool {
     ret false;
 }
 
-fun limits_valid(limits: config.Limits, storage: *Storage) bool {
+# a role that receives a certificate chain assembles it in input
+fun limits_valid(limits: config.Limits, storage: *Storage, receives_chain: bool) bool {
+    var input_required: usize = limits.max_peer_handshake_bytes;
+    if (receives_chain &&
+        config.certificate_message_bytes(limits) > input_required) {
+        input_required = config.certificate_message_bytes(limits);
+    }
     ret limits.max_receive_record_plaintext >= 63 &&
         limits.max_receive_record_plaintext <= record.MAX_PLAINTEXT &&
         limits.max_send_record_plaintext != 0 &&
@@ -380,9 +386,8 @@ fun limits_valid(limits: config.Limits, storage: *Storage) bool {
         limits.max_peer_handshake_bytes > handshake.HEADER_SIZE &&
         limits.max_peer_handshake_bytes <=
         handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE &&
-        limits.max_chain_bytes != 0 &&
-        limits.max_chain_bytes <= handshake.MAX_BODY_SIZE &&
-        storage.input_capacity >= limits.max_peer_handshake_bytes;
+        config.certificate_limits_valid(limits) &&
+        storage.input_capacity >= input_required;
 }
 
 pub fun client_config_valid(value: *config.ClientConfig,
@@ -408,7 +413,7 @@ pub fun client_config_valid(value: *config.ClientConfig,
         storage.certificates == nil || storage.certificate_capacity == 0 ||
         storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.hello == nil || storage.hello_capacity < 2048 ||
-        !limits_valid(value.limits, storage)) { ret false; }
+        !limits_valid(value.limits, storage, true)) { ret false; }
     var i: usize = 0;
     for (i < value.suite_len) {
         if (!tls12.valid_suite(value.suites[i])) { ret false; }
@@ -461,7 +466,7 @@ pub fun server_config_valid(value: *config.ServerConfig,
         storage.certificates == nil || storage.certificate_capacity == 0 ||
         storage.certificate_capacity > verify.MAX_CHAIN_DEPTH ||
         storage.hello == nil || storage.hello_capacity < 2048 ||
-        !limits_valid(value.limits, storage) ||
+        !limits_valid(value.limits, storage, false) ||
         storage.output_capacity < 4096 + value.limits.max_chain_bytes) {
         ret false;
     }
@@ -1240,6 +1245,7 @@ fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
         if (status == extensions.NEXT_DONE) { brk; }
         if (status != extensions.NEXT_ITEM ||
             index >= value.storage.certificate_capacity ||
+            entry.len > limits(value).max_certificate_bytes ||
             entry.len > limits(value).max_chain_bytes - total) {
             ret error.BAD_CERTIFICATE;
         }
@@ -1897,6 +1903,15 @@ fun process_frame(value: *Handshake, frame: contracts.Bytes,
     ret error.UNEXPECTED_MESSAGE;
 }
 
+# the limit for the next buffered message, chosen by its type
+fun peer_limit(value: *Handshake) usize {
+    var message_type: handshake.MessageType = 0;
+    if (value.input_read < value.input_len) {
+        message_type = value.storage.input[value.input_read];
+    }
+    ret config.peer_message_limit(limits(value), message_type);
+}
+
 fun drive(value: *Handshake) engine.Result {
     for (true) {
         if (pending(value) || value.event_active) {
@@ -1911,8 +1926,7 @@ fun drive(value: *Handshake) engine.Result {
         val parsed:  handshake.Progress = handshake.parse_version(
             ?value.storage.input[value.input_read],
             value.input_len - value.input_read,
-            limits(value).max_peer_handshake_bytes - handshake.HEADER_SIZE,
-            true, ?message);
+            peer_limit(value) - handshake.HEADER_SIZE, true, ?message);
         if (parsed.status == handshake.NEED_INPUT) {
             ret result(engine.MORE, error.OK, 0, parsed.required);
         }

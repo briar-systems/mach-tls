@@ -588,6 +588,7 @@ fun limits_equal(first: config.Limits, second: config.Limits) bool {
         first.max_client_flight_bytes == second.max_client_flight_bytes &&
         first.max_server_flight_bytes == second.max_server_flight_bytes &&
         first.max_chain_bytes == second.max_chain_bytes &&
+        first.max_certificate_bytes == second.max_certificate_bytes &&
         first.max_ticket_bytes == second.max_ticket_bytes;
 }
 
@@ -766,8 +767,7 @@ pub fun config_valid(value: *config.ServerConfig, storage: *Storage,
         value.limits.max_server_flight_bytes <= handshake.HEADER_SIZE ||
         value.limits.max_server_flight_bytes >
         handshake.MAX_BODY_SIZE + handshake.HEADER_SIZE ||
-        value.limits.max_chain_bytes == 0 ||
-        value.limits.max_chain_bytes > handshake.MAX_BODY_SIZE ||
+        !config.certificate_limits_valid(value.limits) ||
         value.limits.max_ticket_bytes == 0 ||
         value.limits.max_ticket_bytes > handshake.MAX_BODY_SIZE ||
         storage.input == nil || storage.output == nil || storage.hello == nil ||
@@ -1533,6 +1533,12 @@ fun acquire_credentials(server: *Handshake, requested: contracts.Bytes,
     if (server.client_auth_required && server.client_trust == nil) {
         ret error.INTERNAL_ERROR;
     }
+    # a client chain is assembled in input, which a listener sizes for the
+    # generations it may serve
+    if (server.client_auth_required && server.storage.input_capacity <
+        config.certificate_message_bytes(server.config.limits)) {
+        ret error.RESOURCE_LIMIT;
+    }
     ret error.OK;
 }
 
@@ -2154,6 +2160,7 @@ fun handle_client_certificate(server: *Handshake, frame: contracts.Bytes,
         if (status == extensions.NEXT_DONE) { brk; }
         if (status != extensions.NEXT_ITEM ||
             count >= server.storage.certificate_capacity ||
+            entry.certificate.len > server.config.limits.max_certificate_bytes ||
             entry.certificate.len >
             server.config.limits.max_chain_bytes - total) {
             ret error.BAD_CERTIFICATE;
@@ -2405,6 +2412,15 @@ fun process_frame(server: *Handshake, frame: contracts.Bytes,
     ret error.UNEXPECTED_MESSAGE;
 }
 
+# the limit for the next buffered message, chosen by its type
+fun peer_limit(server: *Handshake) usize {
+    var message_type: handshake.MessageType = 0;
+    if (server.input_read < server.input_len) {
+        message_type = server.storage.input[server.input_read];
+    }
+    ret config.peer_message_limit(server.config.limits, message_type);
+}
+
 fun drive(server: *Handshake) engine.Result {
     for (true) {
         if (pending(server) || server.event_active) {
@@ -2419,7 +2435,7 @@ fun drive(server: *Handshake) engine.Result {
         val parsed:  handshake.Progress = handshake.parse(
             ?server.storage.input[server.input_read],
             server.input_len - server.input_read,
-            server.config.limits.max_peer_handshake_bytes - handshake.HEADER_SIZE,
+            peer_limit(server) - handshake.HEADER_SIZE,
             ?message);
         if (parsed.status == handshake.NEED_INPUT) {
             ret result(engine.MORE, error.OK, 0, parsed.required);
@@ -3289,6 +3305,7 @@ test "server: a complete tls 1.3 handshake authenticates the mach client" {
     dialer.entropy_context_size            = 1;
     dialer.limits                          = config.production_limits();
     dialer.limits.max_peer_handshake_bytes = 8192;
+    dialer.limits.max_chain_bytes          = 7168;
     var client_storage: client.Storage = client.Storage{
         input:           ?loopback_client_input[0], input_capacity: 8192,
         output:          ?loopback_client_output[0], output_capacity: 8192,
@@ -3475,6 +3492,7 @@ test "server: quic transport parameters reach the caller as an event" {
     dialer.entropy_context_size            = 1;
     dialer.limits                          = config.production_limits();
     dialer.limits.max_peer_handshake_bytes = 8192;
+    dialer.limits.max_chain_bytes          = 7168;
     var client_storage: client.Storage = client.Storage{
         input:                    ?loopback_client_input[0], input_capacity: 8192,
         output:                   ?loopback_client_output[0], output_capacity: 8192,
@@ -4026,6 +4044,7 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     resume_dialer.limits                          = config.production_limits();
     resume_dialer.limits.max_peer_handshake_bytes = 16384;
     resume_dialer.limits.max_client_hello_bytes   = 16384;
+    resume_dialer.limits.max_chain_bytes          = 12288;
     ret true;
 }
 
@@ -4293,6 +4312,37 @@ test "finish: established cores carry the connection and the handshakes are reus
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
     if (keys.destroy_private(?resume_key) != contracts.OK) { ret 18; }
+    ret 0;
+}
+
+test "limits: a client sizes input for chains and refuses an oversized entry" {
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, 1800000000)) {
+        ret 1;
+    }
+    var listener_engine: Handshake;
+    var dialer_engine:   client.Handshake;
+    # the default chain limit needs more input than this client lends
+    resume_dialer.limits.max_chain_bytes = config.production_limits().max_chain_bytes;
+    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) != 2) { ret 2; }
+    if (!destroy(?listener_engine))                                        { ret 3; }
+    # an entry above its own limit fails the handshake even inside the chain limit
+    resume_dialer.limits.max_chain_bytes       = 12288;
+    resume_dialer.limits.max_certificate_bytes = 64;
+    if (resume_connect(?listener_engine, ?dialer_engine, 1800000000) == 0) { ret 4; }
+    if (client.snapshot(?dialer_engine).error != error.BAD_CERTIFICATE)    { ret 5; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine))     { ret 6; }
+    resume_dialer.limits.max_certificate_bytes = 16384;
+    val served: i64 = resume_connect(?listener_engine, ?dialer_engine, 1800000000);
+    if (served != 0)                                                   { ret 10 + served::i32; }
+    if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 7; }
+
+    var retired: *credentials.Generation = nil;
+    credentials.retire_store(?resume_store_credentials, ?retired);
+    session.keyring_destroy(?resume_ring);
+    session.replay_destroy(?resume_window);
+    session.client_store_destroy(?resume_store);
+    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 8; }
     ret 0;
 }
 
