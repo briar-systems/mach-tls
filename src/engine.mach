@@ -36,6 +36,10 @@ pub val BLOCKED:  Status = 3;
 pub val COMPLETE: Status = 4;
 pub val FAILED:   Status = 5;
 pub val CLOSED:   Status = 6;
+# the buffer source is out of shared memory. nothing was consumed and nothing
+# changed; the source has registered the caller's account, and the caller
+# repeats the same call once the source reports that account ready
+pub val WAITING: Status = 7;
 
 pub def Role: u8;
 pub val CLIENT:       Role = 1;

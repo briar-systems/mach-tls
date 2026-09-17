@@ -16,9 +16,11 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.char.char;
 use std.types.error.err;
+use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
+use tls.buffer;
 use tls.cert;
 use tls.cert.credentials;
 use tls.cert.load;
@@ -30,6 +32,7 @@ use tls.memory_range;
 use tls.record;
 use tls.session;
 use tls.stream;
+use tls.test.pool;
 use tls.tls12;
 use tls12_connection: tls.tls12.connection;
 use tls.tls13;
@@ -209,9 +212,13 @@ fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
     ret true;
 }
 
+# an operation parked for memory is resumed once the connection's account is ready
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
     for (transport.snapshot(?secure.operation).state !=
         transport.OPERATION_TERMINAL) {
+        if (secure.pending_action == transport.TRANSPORT_WAIT) {
+            if (!pool.ready(?dial_memory) || !stream.resume(secure)) { ret false; }
+        }
         var completion: io_runtime.Completion;
         val polled:     res[usize, io_error.Error] = io_runtime.poll(owner,
             ?completion, 1);
@@ -230,15 +237,8 @@ var tls12_suites:        [6]tls13.CipherSuite;
 var tls12_signatures:    [7]tls13.SignatureScheme;
 var tls12_versions:      [1]u16;
 var legacy_engine:       tls12_connection.Handshake;
-var legacy_hello:        [16384]u8;
-var handshake_input:     [65536]u8;
-var handshake_output:    [65536]u8;
-var hello_storage:       [65536]u8;
-var peer_certificates:   [8]cert.Certificate;
-var wire_input_storage:  [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
-var ticket_storage:      [16388]u8;
 var option_sessions:     bool;
-var wire_output_storage: [record.HEADER_SIZE + record.MAX_CIPHERTEXT]u8;
+var dial_memory:         pool.Harness;
 var dial_socket:         tcp.Stream;
 var dial_runtime:        io_runtime.Runtime;
 var dial_blocking:       BlockingTransport;
@@ -309,25 +309,13 @@ fun dial_one(index: usize) i64 {
         submit_shutdown: blocking_shutdown, submit_close: blocking_close,
         submit_abort:    blocking_close};
 
-    var core_storage: client.Storage = client.Storage{
-        input:           ?handshake_input[0], input_capacity: 65536,
-        output:          ?handshake_output[0], output_capacity: 65536,
-        hello:           ?hello_storage[0], hello_capacity: 65536,
-        certificates:    ?peer_certificates[0], certificate_capacity: 8,
-        peer_parameters: nil, peer_parameters_capacity: 0
-    };
-    var storage: stream.Storage;
-    storage.wire_input           = ?wire_input_storage[0];
-    storage.wire_input_capacity  = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    storage.wire_output          = ?wire_output_storage[0];
-    storage.wire_output_capacity = record.HEADER_SIZE + record.MAX_CIPHERTEXT;
-    if (option_sessions) {
-        storage.ticket_input          = ?ticket_storage[0];
-        storage.ticket_input_capacity = 16388;
-    }
+    # one account per connection, on a pool of the recommended class shape
+    if (!pool.make(?dial_memory, 1 << 24, 1 << 22)) { ret 3; }
+    val memory:  buffer.Lease       = pool.lease(?dial_memory);
+    val secrets: buffer.SecretLease = pool.secret_lease(?dial_memory);
 
     var scope: cancel.Scope;
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0}))) { ret 4; }
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
     var secure:      stream.Stream;
     var core:        client.Handshake;
     var empty_extra: client.ExtraExtension;
@@ -335,23 +323,17 @@ fun dial_one(index: usize) i64 {
     empty_extra.data.data = nil;
     empty_extra.data.len  = 0;
     if (option_tls12) {
-        val legacy_storage: tls12_connection.Storage =
-            tls12_connection.Storage{input: ?handshake_input[0],
-            input_capacity:  65536, output: ?handshake_output[0],
-            output_capacity: 65536, hello: ?legacy_hello[0],
-            hello_capacity:  16384,
-            certificates:    ?peer_certificates[0], certificate_capacity: 8};
         if (!tls12_connection.init_client(?legacy_engine, ?tls12_configuration,
-            legacy_storage)) { ret 10; }
-        if (!stream.connect_tls12(?secure, ?legacy_engine, storage,
+            memory)) { ret 10; }
+        if (!stream.connect_tls12(?secure, ?legacy_engine, memory, secrets,
             ?dial_lower, ?scope,
             transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
     or {
-        if (!client.init(?core, ?dial_configuration, core_storage,
+        if (!client.init(?core, ?dial_configuration, memory,
             empty_extra, 0)) { ret 10; }
-        if (!stream.connect(?secure, ?core, storage, ?dial_lower, ?scope,
+        if (!stream.connect(?secure, ?core, memory, secrets, ?dial_lower, ?scope,
             transport.Token{index: 1, generation: 1}, 1800000000, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
@@ -375,7 +357,7 @@ fun dial_one(index: usize) i64 {
 
     var application_input: [64]u8;
     if (index == 0) {
-        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+        if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
             !transition_ok(cancel.cancel(?scope)) ||
             !stream.read(?secure, ?scope,
             transport.Token{index: 2, generation: 1},
@@ -385,7 +367,7 @@ fun dial_one(index: usize) i64 {
             !stream.destroy_operation(?secure) || !operation_ok(cancel.destroy(?scope))) {
             ret 45;
         }
-        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+        if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
             !transition_ok(cancel.timeout(?scope)) ||
             !stream.read(?secure, ?scope,
             transport.Token{index: 2, generation: 2},
@@ -398,7 +380,7 @@ fun dial_one(index: usize) i64 {
     }
 
     if (option_key_update) {
-        if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+        if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
             !stream.key_update(?secure, ?scope,
             transport.Token{index: 7, generation: 1}, 0, 7) ||
             !settle(?secure, ?dial_runtime)) { ret 60; }
@@ -417,7 +399,7 @@ fun dial_one(index: usize) i64 {
         'm', 'a', 'c', 'h', '-', 't', 'l', 's', ' ', 'i', 'n', 't', 'e', 'r',
         '\n', 0
     };
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.write(?secure, ?scope,
         transport.Token{index: 3, generation: 1},
         ?application_output[0], 15, 4) ||
@@ -428,7 +410,7 @@ fun dial_one(index: usize) i64 {
         ret 49;
     }
 
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.read(?secure, ?scope,
         transport.Token{index: 4, generation: 1},
         ?application_input[0], 64, 5) ||
@@ -439,7 +421,7 @@ fun dial_one(index: usize) i64 {
         ret 51;
     }
 
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.half_close(?secure, ?scope,
         transport.Token{index: 5, generation: 1}, 6) ||
         !settle(?secure, ?dial_runtime)) { ret 52; }
@@ -449,7 +431,7 @@ fun dial_one(index: usize) i64 {
         ret 53;
     }
 
-    if (!operation_ok(cancel.make_root(?scope, false, time.Time{sec: 0, nsec: 0})) ||
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.close(?secure, ?scope,
         transport.Token{index: 6, generation: 1}, 7) ||
         !settle(?secure, ?dial_runtime)) { ret 7; }
@@ -467,6 +449,8 @@ fun dial_one(index: usize) i64 {
     or {
         if (!client.destroy(?core)) { ret 9; }
     }
+    # every chunk the connection held is back before its account closes
+    if (pool.held(?dial_memory) != 0 || !pool.destroy(?dial_memory)) { ret 12; }
     ret 0;
 }
 
