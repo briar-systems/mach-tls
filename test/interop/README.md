@@ -352,6 +352,22 @@ keys. A peer that mishandles the update fails the leg.
 # client: --key-update, driven by openssl s_server above
 ```
 
+## Full duplex
+
+The client harness accepts `--duplex`. It then connects through the bundled
+`transport.make_tcp` adapter over `std.net.async` instead of the blocking test
+transport, and after the regular exchange it writes 1 MiB in one operation
+while reads run beside it. The peer echoes as it reads, so a client that could
+not read until its write finished would stall once both socket buffers filled.
+The leg requires every echoed byte to match, and requires at least one read to
+settle while the write still had a lower write in flight. It then half-closes
+and closes through the adapter's graceful close.
+
+```sh
+# client: --duplex, and --tls12 --duplex, driven by openssl s_server -rev above
+# client: --duplex, driven by gnutls-serv --echo above
+```
+
 ## Qualification for the session revision
 
 Against OpenSSL 3.6.3 and GnuTLS 3.8.13 on linux-x86_64: nineteen
