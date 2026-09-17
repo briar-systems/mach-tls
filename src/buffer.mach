@@ -1,0 +1,216 @@
+# buffers borrowed from the caller's std.memory.buffers sources
+#
+# a connection owns exactly one account. the caller opens it, hands it to tls
+# in a lease, and closes it after the connection is destroyed; tls only charges
+# it, on the lease's lane, and never opens an account of its own. a wake-up
+# reported for that account's handle may come from tls or from the caller's
+# own chunks, and the caller retries whatever call it had pending.
+#
+# a region is one held chunk with the bytes a component still needs from it.
+# a refusal is budget or misuse, which fails the connection, or exhausted or
+# memory, which the source registers for a wake-up and the caller retries.
+
+use std.crypto.ct;
+use std.memory.buffers;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.memory_range;
+
+# what an acquisition did
+pub def Outcome: u8;
+
+pub val HELD: Outcome = 1;
+pub val WAIT: Outcome = 2;
+pub val FAIL: Outcome = 3;
+
+# a plain source and the caller's account, borrowed for the connection
+pub rec Lease {
+    source:  *buffers.Source;
+    account: *buffers.Account;
+    lane:    u8;
+}
+
+# a secret source and the same account, borrowed for the connection
+pub rec SecretLease {
+    source:  *buffers.SecretSource;
+    account: *buffers.Account;
+    lane:    u8;
+}
+
+pub rec Region {
+    chunk:    buffers.Chunk;
+    data:     *u8;
+    capacity: usize;
+    held:     bool;
+    flying:   bool;
+}
+
+pub rec SecretRegion {
+    chunk:    buffers.Chunk;
+    data:     *^u8;
+    capacity: usize;
+    held:     bool;
+}
+
+pub fun no_lease() Lease {
+    ret Lease{source: nil, account: nil, lane: 0};
+}
+
+pub fun no_secret_lease() SecretLease {
+    ret SecretLease{source: nil, account: nil, lane: 0};
+}
+
+pub fun lease_valid(lease: Lease) bool {
+    ret lease.source != nil && lease.account != nil &&
+        memory_range.valid(lease.source::*u8, $size_of(buffers.Source)) &&
+        memory_range.valid(lease.account::*u8, $size_of(buffers.Account));
+}
+
+pub fun secret_lease_valid(lease: SecretLease) bool {
+    ret lease.source != nil && lease.account != nil &&
+        memory_range.valid(lease.account::*u8, $size_of(buffers.Account));
+}
+
+# whether a caller range overlaps the lease's source or account records
+pub fun lease_overlaps(lease: Lease, data: *u8, len: usize) bool {
+    ret memory_range.overlap(lease.source::*u8, $size_of(buffers.Source), data, len) ||
+        memory_range.overlap(lease.account::*u8, $size_of(buffers.Account), data, len);
+}
+
+# a welded source has no plain range, so only its account is checked
+pub fun secret_lease_overlaps(lease: SecretLease, data: *u8, len: usize) bool {
+    ret memory_range.overlap(lease.account::*u8, $size_of(buffers.Account), data, len);
+}
+
+pub fun empty() Region {
+    var value: Region;
+    value.data     = nil;
+    value.capacity = 0;
+    value.held     = false;
+    value.flying   = false;
+    ret value;
+}
+
+pub fun secret_empty() SecretRegion {
+    var value: SecretRegion;
+    value.data     = nil;
+    value.capacity = 0;
+    value.held     = false;
+    ret value;
+}
+
+fun refused(reason: buffers.Reason) Outcome {
+    var kind: buffers.Reason = reason;
+    if (sel kind.exhausted) { ret WAIT; }
+    if (sel kind.memory)    { ret WAIT; }
+    ret FAIL;
+}
+
+fun request(lease_lane: u8, bytes: usize, secret: bool) buffers.Request {
+    ret buffers.Request{bytes: bytes, align: 0, lane: lease_lane, secret: secret};
+}
+
+# hold at least bytes in region, keeping its first keep bytes. a held region
+# that is already large enough is left alone; a refusal leaves it unchanged
+pub fun reserve(lease: Lease, region: *Region, bytes: usize, keep: usize) Outcome {
+    if (region == nil || keep > region.capacity || region.flying) { ret FAIL; }
+    if (region.held && region.capacity >= bytes) { ret HELD; }
+    if (bytes == 0)                              { ret HELD; }
+    val got: buffers.Acquired = buffers.source_acquire(lease.source, lease.account,
+        request(lease.lane, bytes, false), true);
+    var status: buffers.Status = got.status;
+    if (!(sel status.ok)) { ret refused(got.reason); }
+    val data: *u8 = got.chunk.data;
+    if (data == nil || got.chunk.bytes < bytes) {
+        buffers.source_release(lease.source, lease.account, got.chunk);
+        ret FAIL;
+    }
+    var i: usize = 0;
+    for (i < keep) {
+        data[i] = region.data[i];
+        i       = i + 1;
+    }
+    if (region.held) { release(lease, region, keep); }
+    region.chunk    = got.chunk;
+    region.data     = data;
+    region.capacity = got.chunk.bytes;
+    region.held     = true;
+    ret HELD;
+}
+
+# return region to its source after zeroing the used bytes
+pub fun release(lease: Lease, region: *Region, used: usize) bool {
+    if (region == nil || !region.held) { ret true; }
+    if (region.flying)                 { ret false; }
+    var wipe: usize = used;
+    if (wipe > region.capacity) { wipe = region.capacity; }
+    var i: usize = 0;
+    for (i < wipe) {
+        region.data[i] = 0;
+        i              = i + 1;
+    }
+    val reason: buffers.Reason = buffers.source_release(lease.source, lease.account,
+        region.chunk);
+    var kind: buffers.Reason = reason;
+    if (!(sel kind.none)) { ret false; }
+    @region = empty();
+    ret true;
+}
+
+# mark a held region as handed to an in-flight operation, or settled from one
+pub fun fly(lease: Lease, region: *Region) bool {
+    if (region == nil || !region.held || region.flying) { ret false; }
+    var kind: buffers.Reason = buffers.source_retain(lease.source, region.chunk.ref);
+    if (!(sel kind.none)) { ret false; }
+    region.flying = true;
+    ret true;
+}
+
+pub fun land(lease: Lease, region: *Region) bool {
+    if (region == nil || !region.flying) { ret false; }
+    var kind: buffers.Reason = buffers.source_settle(lease.source, region.chunk.ref);
+    if (!(sel kind.none)) { ret false; }
+    region.flying = false;
+    ret true;
+}
+
+# hold at least bytes of secret memory, keeping its first keep bytes
+pub fun secret_reserve(lease: SecretLease, region: *SecretRegion, bytes: usize,
+    keep: usize) Outcome {
+    if (region == nil || keep > region.capacity) { ret FAIL; }
+    if (region.held && region.capacity >= bytes) { ret HELD; }
+    if (bytes == 0)                              { ret HELD; }
+    val got: buffers.Acquired = buffers.secret_source_acquire(lease.source,
+        lease.account, request(lease.lane, bytes, true), true);
+    var status: buffers.Status = got.status;
+    if (!(sel status.ok)) { ret refused(got.reason); }
+    val data: *^u8 = buffers.secret_source_view(lease.source, got.chunk);
+    if (data == nil || got.chunk.bytes < bytes) {
+        buffers.secret_source_release(lease.source, lease.account, got.chunk);
+        ret FAIL;
+    }
+    var i: usize = 0;
+    for (i < keep) {
+        data[i] = region.data[i];
+        i       = i + 1;
+    }
+    if (region.held) { secret_release(lease, region); }
+    region.chunk    = got.chunk;
+    region.data     = data;
+    region.capacity = got.chunk.bytes;
+    region.held     = true;
+    ret HELD;
+}
+
+# the source wipes a secret chunk in full on release
+pub fun secret_release(lease: SecretLease, region: *SecretRegion) bool {
+    if (region == nil || !region.held) { ret true; }
+    ct.zeroize(region.data, region.capacity);
+    var kind: buffers.Reason = buffers.secret_source_release(lease.source,
+        lease.account, region.chunk);
+    if (!(sel kind.none)) { ret false; }
+    @region = secret_empty();
+    ret true;
+}

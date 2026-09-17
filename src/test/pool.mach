@@ -1,0 +1,157 @@
+# a buffers pool and one connection account for tests
+
+use A: std.allocator;
+use std.allocator.page;
+use std.memory.buffers;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+use tls.buffer;
+
+pub val CLASS_COUNT: usize = 6;
+
+pub rec Harness {
+    backing: A.Allocator;
+    classes: [CLASS_COUNT]buffers.ClassConfig;
+    pool:    buffers.Pool;
+    plain:   buffers.Source;
+    secret:  buffers.SecretSource;
+    account: buffers.Account;
+    budgets: [2]usize;
+    made:    bool;
+}
+
+# the class shape the documentation recommends: 512 B, 4 KiB and one record,
+# each plain and secret
+pub fun make(harness: *Harness, global: usize, budget: usize) bool {
+    var made: err[A.Error] = page.make(?harness.backing);
+    if (sel made.err) { ret false; }
+    val sizes: [3]usize = [3]usize{512, 4096, 17408};
+    var i:     usize    = 0;
+    for (i < CLASS_COUNT) {
+        harness.classes[i] = buffers.ClassConfig{size: sizes[i % 3], align: 0,
+            secret: i >= 3, high_water: 4};
+        i = i + 1;
+    }
+    var config: buffers.Config;
+    config.classes       = ?harness.classes[0];
+    config.class_count   = CLASS_COUNT;
+    config.lanes         = 2;
+    config.global_budget = global;
+    config.initial_slots = 8;
+    if (!buffers.make(?harness.pool, config, ?harness.backing)) { ret false; }
+    harness.plain      = buffers.source(?harness.pool);
+    harness.secret     = buffers.secret_source(?harness.pool);
+    harness.budgets[0] = budget;
+    harness.budgets[1] = budget;
+    var opened: buffers.Reason = buffers.open_account(?harness.pool, ?harness.account,
+        1, ?harness.budgets[0], 0);
+    if (!(sel opened.none)) {
+        buffers.destroy(?harness.pool);
+        ret false;
+    }
+    harness.made = true;
+    ret true;
+}
+
+pub fun lease(harness: *Harness) buffer.Lease {
+    ret buffer.Lease{source: ?harness.plain, account: ?harness.account, lane: 0};
+}
+
+pub fun secret_lease(harness: *Harness) buffer.SecretLease {
+    ret buffer.SecretLease{source: ?harness.secret, account: ?harness.account, lane: 0};
+}
+
+# bytes the account holds now
+pub fun held(harness: *Harness) usize {
+    ret harness.account.held;
+}
+
+pub fun ready(harness: *Harness) bool {
+    var handle: u64 = 0;
+    ret buffers.ready(?harness.pool, ?handle, 1) == 1 && handle == 1;
+}
+
+# false when the account still holds a chunk
+pub fun destroy(harness: *Harness) bool {
+    if (!harness.made) { ret true; }
+    var closed: buffers.Reason = buffers.close_account(?harness.pool, ?harness.account);
+    if (!(sel closed.none)) { ret false; }
+    harness.made = false;
+    ret buffers.destroy(?harness.pool);
+}
+
+fun erase_lease(value: *buffer.Lease) ptr {
+    ret value::ptr;
+}
+
+fun erase_region(value: *buffer.Region) ptr {
+    ret value::ptr;
+}
+
+test "buffer: the plain lease and region erase to the untyped ptr" {
+    if (erase_lease(nil) != nil || erase_region(nil) != nil) { ret 1; }
+    ret 0;
+}
+
+test "buffer: a region grows by copy and returns everything it held" {
+    var harness: Harness;
+    if (!make(?harness, 1 << 20, 1 << 20)) { ret 1; }
+    val plain:  buffer.Lease  = lease(?harness);
+    var region: buffer.Region = buffer.empty();
+    if (buffer.reserve(plain, ?region, 100, 0) != buffer.HELD ||
+        region.capacity != 512 || held(?harness) != 512) { ret 2; }
+    region.data[0]  = 7;
+    region.data[99] = 9;
+    if (buffer.reserve(plain, ?region, 300, 100) != buffer.HELD ||
+        region.capacity != 512) { ret 3; }
+    if (buffer.reserve(plain, ?region, 5000, 100) != buffer.HELD ||
+        region.capacity != 17408 || held(?harness) != 17408 ||
+        region.data[0] != 7 || region.data[99] != 9) { ret 4; }
+    if (!buffer.fly(plain, ?region) || buffer.release(plain, ?region, 100) ||
+        buffer.reserve(plain, ?region, 20000, 0) != buffer.FAIL) { ret 5; }
+    if (!buffer.land(plain, ?region) || !buffer.release(plain, ?region, 100) ||
+        region.held || held(?harness) != 0) { ret 6; }
+    if (!destroy(?harness)) { ret 7; }
+    ret 0;
+}
+
+test "buffer: exhaustion waits unchanged and a budget overrun fails" {
+    var harness: Harness;
+    if (!make(?harness, 4096, 1 << 20)) { ret 1; }
+    val plain: buffer.Lease  = lease(?harness);
+    var first: buffer.Region = buffer.empty();
+    var other: buffer.Region = buffer.empty();
+    if (buffer.reserve(plain, ?first, 4000, 0) != buffer.HELD) { ret 2; }
+    if (buffer.reserve(plain, ?other, 100, 0) != buffer.WAIT ||
+        other.held || ready(?harness)) { ret 3; }
+    if (!buffer.release(plain, ?first, 0) || !ready(?harness)) { ret 4; }
+    if (buffer.reserve(plain, ?other, 100, 0) != buffer.HELD) { ret 5; }
+    if (!buffer.release(plain, ?other, 0) || !destroy(?harness)) { ret 6; }
+    var tight: Harness;
+    if (!make(?tight, 1 << 20, 1024)) { ret 7; }
+    var region: buffer.Region = buffer.empty();
+    if (buffer.reserve(lease(?tight), ?region, 2000, 0) != buffer.FAIL ||
+        region.held || ready(?tight)) { ret 8; }
+    if (!destroy(?tight)) { ret 9; }
+    ret 0;
+}
+
+test "buffer: a secret region keeps its prefix and is wiped on release" {
+    var harness: Harness;
+    if (!make(?harness, 1 << 20, 1 << 20)) { ret 1; }
+    val secret: buffer.SecretLease  = secret_lease(?harness);
+    var region: buffer.SecretRegion = buffer.secret_empty();
+    if (buffer.secret_reserve(secret, ?region, 10, 0) != buffer.HELD ||
+        region.capacity != 512) { ret 2; }
+    region.data[3] = 0x5a;
+    val first: *^u8 = region.data;
+    if (buffer.secret_reserve(secret, ?region, 1000, 10) != buffer.HELD ||
+        region.capacity != 4096 || region.data[3]:>u8 != 0x5a) { ret 3; }
+    if (first[3]:>u8 != 0) { ret 4; }
+    if (!buffer.secret_release(secret, ?region) || region.held ||
+        held(?harness) != 0 || !destroy(?harness)) { ret 5; }
+    ret 0;
+}
