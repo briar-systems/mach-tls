@@ -4,6 +4,7 @@ use crypto.contracts;
 use crypto.encoding.der;
 use crypto.encoding.keys;
 use crypto.signature;
+use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -22,9 +23,10 @@ pub val SERVER_AUTH: Purpose = 1;
 pub val CLIENT_AUTH: Purpose = 2;
 
 pub rec Options {
-    identity:             contracts.Bytes;
-    purpose:              Purpose;
-    now:                  i64;
+    identity: contracts.Bytes;
+    purpose:  Purpose;
+    # wall clock: certificate validity is stated in real time
+    now:                  time.Time;
     max_depth:            usize;
     max_signature_checks: usize;
 }
@@ -139,8 +141,9 @@ fun eku_allowed(value: *x509.Certificate, purpose: Purpose) bool {
     ret false;
 }
 
-fun valid_time(value: *x509.Certificate, now: i64) bool {
-    ret value != nil && now >= value.not_before && now <= value.not_after;
+fun valid_time(value: *x509.Certificate, now: time.Time) bool {
+    val seconds: i64 = time.time_unix_sec(now);
+    ret value != nil && seconds >= value.not_before && seconds <= value.not_after;
 }
 
 fun ip_like(identity: contracts.Bytes) bool {
@@ -590,7 +593,7 @@ test "cert.verify: construct and validate an ed25519 server path" {
     var options:   Options         = Options{
         identity:             contracts.Bytes{data: "api.example.com"::*u8, len: 15},
         purpose:              SERVER_AUTH,
-        now:                  1800000000,
+        now:                  time.unix(1800000000, 0),
         max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
@@ -650,7 +653,7 @@ test "cert.verify: validate an openssl p-384 sha-384 server path" {
     var options: Options = Options{
         identity:             contracts.Bytes{data: "p384.example.com"::*u8, len: 16},
         purpose:              SERVER_AUTH,
-        now:                  1800000000,
+        now:                  time.unix(1800000000, 0),
         max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
@@ -700,7 +703,7 @@ test "cert.verify: validate rsa pkcs1 and pss server paths" {
     var options: Options = Options{
         identity:             contracts.Bytes{data: "rsa.example.com"::*u8, len: 15},
         purpose:              SERVER_AUTH,
-        now:                  1800000000,
+        now:                  time.unix(1800000000, 0),
         max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };
@@ -735,7 +738,7 @@ test "cert.verify: enforce constrained intermediate paths" {
     var options:   Options          = Options{
         identity:             contracts.Bytes{data: "api.example.com"::*u8, len: 15},
         purpose:              SERVER_AUTH,
-        now:                  1800000000,
+        now:                  time.unix(1800000000, 0),
         max_depth:            MAX_CHAIN_DEPTH,
         max_signature_checks: MAX_SIGNATURE_CHECKS,
     };

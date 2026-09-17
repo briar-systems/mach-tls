@@ -3,6 +3,7 @@
 use std.runtime;
 
 fwd tls.error;
+fwd tls.clock;
 fwd tls.tls12;
 fwd tls.tls12.prf;
 fwd tls.tls12.messages;

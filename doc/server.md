@@ -13,7 +13,8 @@ to a `tls13.established.Established` record, which `server.finish` moves out
 `Event` and `Snapshot` records, and the one map from protocol failure to alert.
 Every role implements the same operations:
 
-- `start` arms the engine and fixes the certificate verification time
+- `start` arms the engine. Times come from the configuration's `clock.Source`
+  when they are needed (see [`sessions.md`](sessions.md#two-clocks))
 - `ingest` accepts complete or fragmented handshake bytes at one level
 - `poll` advances the engine without new peer input
 - `next_event` publishes one borrowed event; `complete_event` releases it
@@ -42,8 +43,8 @@ its bounded arrays. The credential store, ALPN names, version, suite, group, and
 signature arrays remain immutable caller-owned borrows for the lifetime of the
 engine. The configuration requires one TLS 1.3 version, one to three cipher
 suites, one or two groups, one to five signature schemes, an initialized
-credential store, an operating-system or application entropy source, and
-explicit finite limits. The configuration outlives the connection: an
+credential store, an operating-system or application entropy source, a clock
+source, and explicit finite limits. The configuration outlives the connection: an
 established record borrows the selected ALPN name from it.
 
 Client authentication policy is not part of the listener configuration. It
