@@ -21,8 +21,9 @@ not depend on a terminator scan. The configuration requires one TLS 1.3 version,
 one to three supported cipher
 suites, one or two supported groups, one to five supported signature schemes,
 at least one ALPN name, a bounded trust store, an operating-system or
-application entropy source, and explicit finite limits. SNI is required and is
-always authenticated against the leaf certificate subject alternative name.
+application entropy source, a clock source, and explicit finite limits. SNI is
+required and is always authenticated against the leaf certificate subject
+alternative name.
 An application entropy source declares the exact size of its public callback
 context with `entropy_context_size`. The context is retained and must contain
 all mutable provider state. TLS rejects secret callback context so provider

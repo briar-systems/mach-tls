@@ -111,7 +111,6 @@ pub rec Handshake {
     suite:                    u16;
     curve:                    tls13.NamedGroup;
     signature_scheme:         u16;
-    at:                       clock.Moment;
     input_len:                usize;
     input_read:               usize;
     output_used:              usize;
@@ -231,6 +230,22 @@ fun buffers_overlap(value: *Handshake, data: *u8, len: usize) bool {
         buffer.lease_overlaps(value.memory, data, len);
 }
 
+fun configured_clock(value: *Handshake) *clock.Source {
+    if (value.role == engine.TLS12_CLIENT) {
+        if (value.client_config == nil) { ret nil; }
+        ret value.client_config.clock;
+    }
+    if (value.server_config == nil) { ret nil; }
+    ret value.server_config.clock;
+}
+
+fun clock_overlaps(source: *clock.Source, data: *u8, len: usize) bool {
+    ret !clock.source_valid(source) ||
+        memory_range.overlap(data, len, source::*u8, $size_of(clock.Source)) ||
+        memory_range.overlap(data, len, source.context::*u8,
+        source.context_size);
+}
+
 fun borrowed_overlaps(value: *Handshake, data: *u8, len: usize) bool {
     if (!owner_valid(value) || !memory_range.valid(data, len)) { ret true; }
     if (value.role == engine.TLS12_CLIENT) {
@@ -268,7 +283,8 @@ fun borrowed_overlaps(value: *Handshake, data: *u8, len: usize) bool {
             anchor_bytes) ||
             memory_range.overlap(data, len,
             configuration.entropy.context::*u8,
-            configuration.entropy_context_size)) { ret true; }
+            configuration.entropy_context_size) ||
+            clock_overlaps(configuration.clock, data, len)) { ret true; }
         var i: usize = 0;
         for (i < configuration.alpn_len) {
             if (memory_range.overlap(data, len, configuration.alpn[i].data,
@@ -308,7 +324,8 @@ fun borrowed_overlaps(value: *Handshake, data: *u8, len: usize) bool {
         memory_range.overlap(data, len, configuration.signatures::*u8,
         signature_bytes) ||
         memory_range.overlap(data, len, configuration.entropy.context::*u8,
-        configuration.entropy_context_size)) { ret true; }
+        configuration.entropy_context_size) ||
+        clock_overlaps(configuration.clock, data, len)) { ret true; }
     var i: usize = 0;
     for (i < configuration.alpn_len) {
         if (memory_range.overlap(data, len, configuration.alpn[i].data,
@@ -386,6 +403,7 @@ fun client_output_requirement(value: *config.ClientConfig, output: *usize) bool 
 pub fun client_config_valid(value: *config.ClientConfig) bool {
     var output: usize = 0;
     if (value == nil || !client_output_requirement(value, ?output) ||
+        !clock.source_valid(value.clock) ||
         value.entropy == nil || !value.entropy.initialized ||
         value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
@@ -436,7 +454,7 @@ pub fun client_config_valid(value: *config.ClientConfig) bool {
 }
 
 pub fun server_config_valid(value: *config.ServerConfig) bool {
-    if (value == nil ||
+    if (value == nil || !clock.source_valid(value.clock) ||
         value.entropy == nil || !value.entropy.initialized ||
         value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
@@ -1007,7 +1025,7 @@ fun build_client_hello(value: *Handshake) error.Error {
     ret error.OK;
 }
 
-fun start_inner(value: *Handshake, at: clock.Moment) engine.Result {
+fun start_inner(value: *Handshake) engine.Result {
     if (!owner_valid(value) ||
         (value.state != C_EXPECT_SERVER_HELLO &&
         value.state != S_EXPECT_CLIENT_HELLO) || pending(value)) {
@@ -1021,7 +1039,6 @@ fun start_inner(value: *Handshake, at: clock.Moment) engine.Result {
             ?value.buffers.hello, HELLO_BYTES, 0));
         if (hello.status != engine.OK) { ret hello; }
     }
-    value.at = at;
     if (value.role == engine.TLS12_SERVER) {
         if (!fill_public(value, ?value.server_random[0], 32)) {
             ret fail(value, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
@@ -1047,11 +1064,11 @@ fun start_inner(value: *Handshake, at: clock.Moment) engine.Result {
     ret result(engine.OK, error.OK, 0, 0);
 }
 
-pub fun start(value: *Handshake, at: clock.Moment) engine.Result {
+pub fun start(value: *Handshake) engine.Result {
     if (!enter(value)) {
         ret result(engine.FAILED, error.ILLEGAL_PARAMETER, 0, 0);
     }
-    val started: engine.Result = start_inner(value, at);
+    val started: engine.Result = start_inner(value);
     leave(value);
     ret started;
 }
@@ -1260,10 +1277,12 @@ fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
     val chain: cert.Chain = cert.Chain{
         certificates: ?value.certificates[0], len: index
     };
+    var now: clock.Moment;
+    if (!clock.read(configured_clock(value), ?now)) { ret error.INTERNAL_ERROR; }
     var options: verify.Options;
     options.identity             = identity;
     options.purpose              = purpose;
-    options.now                  = value.at.wall;
+    options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
     var trust: *cert.TrustStore = ?value.trust;
@@ -2405,13 +2424,32 @@ pub fun downgrade_signalled(value: *Handshake) bool {
     ret value != nil && value.downgrade_signalled;
 }
 
+var test_moment: clock.Moment;
+var test_clock:  clock.Source;
+
+# every test configuration reads this frozen clock, set by the helper below
+fun test_source() *clock.Source {
+    if (test_clock.read_fn == nil) { set_test_time(1800000000); }
+    ret ?test_clock;
+}
+
+fun set_test_time(seconds: i64) {
+    test_moment = clock.at(seconds, seconds);
+    test_clock  = clock.frozen(?test_moment);
+}
+
+fun start_at(value: *Handshake, seconds: i64) engine.Result {
+    set_test_time(seconds);
+    ret start(value);
+}
+
 test "tls12.connection: an unconfigured connection accepts nothing" {
     var value:  Handshake;
     var client: config.ClientConfig;
     var server: config.ServerConfig;
-    if (init_client(?value, ?client, pool.shared()))           { ret 1; }
-    if (init_server(?value, ?server, pool.shared()))           { ret 2; }
-    if (start(?value, clock.at(0, 0)).status != engine.FAILED) { ret 3; }
+    if (init_client(?value, ?client, pool.shared())) { ret 1; }
+    if (init_server(?value, ?server, pool.shared())) { ret 2; }
+    if (start_at(?value, 0).status != engine.FAILED) { ret 3; }
     if (ingest(?value, engine.INITIAL, nil, 0).status != engine.FAILED) {
         ret 4;
     }
@@ -2551,6 +2589,7 @@ fun loopback_configure(versions_include_tls13: bool,
     loopback_client_config.signature_len                   = 1;
     loopback_client_config.entropy                         = ?loopback_client_entropy;
     loopback_client_config.entropy_context_size            = 1;
+    loopback_client_config.clock                           = test_source();
     loopback_client_config.limits                          = config.production_limits();
     loopback_client_config.limits.max_peer_handshake_bytes = 16384;
     loopback_client_config.limits.max_chain_bytes          = 8192;
@@ -2572,6 +2611,7 @@ fun loopback_configure(versions_include_tls13: bool,
     loopback_server_config.signature_len                   = 1;
     loopback_server_config.entropy                         = ?loopback_server_entropy;
     loopback_server_config.entropy_context_size            = 1;
+    loopback_server_config.clock                           = test_source();
     loopback_server_config.limits                          = config.production_limits();
     loopback_server_config.limits.max_peer_handshake_bytes = 16384;
     loopback_server_config.limits.max_chain_bytes          = 8192;
@@ -2679,7 +2719,7 @@ fun pressed(target: *Handshake, starting: bool, level: engine.Level, data: *u8,
     var outcome: engine.Result;
     var round:   usize = 0;
     for (round < 2) {
-        if (starting)                         { outcome = start(target, clock.at(1800000000, 1800000000)); }
+        if (starting)                         { outcome = start_at(target, 1800000000); }
         or                                    { outcome = ingest(target, level, data, length); }
         if (outcome.status != engine.WAITING) { brk; }
         pressure_waits = pressure_waits + 1;
@@ -2776,8 +2816,8 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
         pool.shared())) { ret 2; }
     if (!init_server(?listener, ?loopback_server_config,
         pool.shared())) { ret 3; }
-    if (start(?listener, clock.at(1800000000, 1800000000)).status != engine.OK ||
-        start(?dialer, clock.at(1800000000, 1800000000)).status != engine.OK) { ret 4; }
+    if (start_at(?listener, 1800000000).status != engine.OK ||
+        start_at(?dialer, 1800000000).status != engine.OK) { ret 4; }
     val exchanged: i64 = exchange(?dialer, ?listener);
     if (exchanged != 0) { ret 10 + exchanged::i32; }
     val client_view: engine.Snapshot = snapshot(?dialer);
@@ -2833,8 +2873,8 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
         !tls12_established.destroy(?listener_core)) { ret 34; }
     if (!init_client(?dialer, ?loopback_client_config, pool.shared()) ||
         !init_server(?listener, ?loopback_server_config, pool.shared()) ||
-        start(?listener, clock.at(1800000000, 1800000000)).status != engine.OK ||
-        start(?dialer, clock.at(1800000000, 1800000000)).status != engine.OK ||
+        start_at(?listener, 1800000000).status != engine.OK ||
+        start_at(?dialer, 1800000000).status != engine.OK ||
         exchange(?dialer, ?listener) != 0) { ret 35; }
     # renegotiation is refused by both roles once established
     var request: [4]u8 = [4]u8{handshake.HELLO_REQUEST, 0, 0, 0};
@@ -2855,8 +2895,8 @@ test "tls12.connection: a handshake that waits for memory matches one that never
     var listener: Handshake;
     if (!init_client(?dialer, ?loopback_client_config, pool.shared()) ||
         !init_server(?listener, ?loopback_server_config, pool.shared()) ||
-        start(?listener, clock.at(1800000000, 1800000000)).status != engine.OK ||
-        start(?dialer, clock.at(1800000000, 1800000000)).status != engine.OK ||
+        start_at(?listener, 1800000000).status != engine.OK ||
+        start_at(?dialer, 1800000000).status != engine.OK ||
         exchange(?dialer, ?listener) != 0) { ret 2; }
     var calm: [4][prf.MAX_KEY]u8;
     var slot: usize = 0;
@@ -2925,8 +2965,8 @@ test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
         pool.shared())) { ret 3; }
     if (!init_server(?listener, ?loopback_server_config,
         pool.shared())) { ret 4; }
-    if (start(?listener, clock.at(1800000000, 1800000000)).status != engine.OK ||
-        start(?dialer, clock.at(1800000000, 1800000000)).status != engine.OK) { ret 5; }
+    if (start_at(?listener, 1800000000).status != engine.OK ||
+        start_at(?dialer, 1800000000).status != engine.OK) { ret 5; }
     val exchanged: i64 = exchange(?dialer, ?listener);
     if (exchanged == 0) { ret 6; }
     # the listener refuses the fallback signal before anything else happens
@@ -2945,8 +2985,8 @@ test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
         pool.shared()) ||
         !init_server(?marking_listener, ?loopback_server_config,
         pool.shared())) { ret 9; }
-    if (start(?marking_listener, clock.at(1800000000, 1800000000)).status != engine.OK ||
-        start(?plain_dialer, clock.at(1800000000, 1800000000)).status != engine.OK) { ret 10; }
+    if (start_at(?marking_listener, 1800000000).status != engine.OK ||
+        start_at(?plain_dialer, 1800000000).status != engine.OK) { ret 10; }
     # the listener wrote the downgrade sentinel into its random
     var i: usize = 0;
     for (i < 8) {
@@ -2972,7 +3012,7 @@ var mutation_case: [validation.MAX_CORPUS]u8;
 fun feed_mutation(length: usize) i64 {
     var listener: Handshake;
     if (!init_server(?listener, ?loopback_server_config, pool.shared()) ||
-        start(?listener, clock.at(1800000000, 1800000000)).status != engine.OK) { ret 1; }
+        start_at(?listener, 1800000000).status != engine.OK) { ret 1; }
     val fed: engine.Result = ingest(?listener, engine.INITIAL,
         ?mutation_case[0], length);
     var outcome: i64 = 0;
@@ -3015,7 +3055,7 @@ test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
     var dialer: Handshake;
     if (!init_client(?dialer, ?loopback_client_config,
         pool.shared()) ||
-        start(?dialer, clock.at(1800000000, 1800000000)).status != engine.OK) { ret 2; }
+        start_at(?dialer, 1800000000).status != engine.OK) { ret 2; }
     val length: usize = dialer.hello_len;
     if (length == 0 || length > validation.MAX_CORPUS) { ret 3; }
     var seed_bytes: [2048]u8;
@@ -3045,7 +3085,7 @@ test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
     # a hello at the wrong level or in the wrong state fails closed
     var wrong: Handshake;
     if (!init_server(?wrong, ?loopback_server_config, pool.shared()) ||
-        start(?wrong, clock.at(1800000000, 1800000000)).status != engine.OK) { ret 6; }
+        start_at(?wrong, 1800000000).status != engine.OK) { ret 6; }
     i = 0;
     for (i < length) {
         mutation_case[i] = seed_bytes[i];

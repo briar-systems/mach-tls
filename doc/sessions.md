@@ -7,9 +7,13 @@ explicitly bounded.
 
 ## Two clocks
 
-Every engine's `start` takes a `clock.Moment`, which carries two separate
-readings taken by the caller: `wall`, a `time.Time`, and `monotonic`, a
-`time.Instant`. `clock.now` reads both. The rule for which one a value uses:
+Every client and server configuration names a `clock.Source`, a caller-owned
+clock shared by all the connections that use it. An engine reads it at the
+moment a time is needed, and each read returns one `clock.Moment` that holds two
+separate readings: `wall`, a `time.Time`, and `monotonic`, a `time.Instant`.
+`clock.system()` reads the process clocks. `clock.frozen` answers with a moment
+the caller controls, for tests and replayed traces. The rule for which reading a
+value uses:
 
 - A value only ever compared with other readings from this process is an
   interval and uses `monotonic`: the ticket-key seal and open deadlines, and a
@@ -23,6 +27,24 @@ compared with the other field of another. A wall-clock step therefore moves
 neither key rotation nor a retired key's overlap, and a ticket's lifetime still
 follows real time.
 
+The engines read the source when a server seals a batch of tickets, when it
+opens an offered ticket, when either side verifies a certificate chain, when a
+client takes a ticket to offer, and when a client receives a ticket. Each read
+comes before any state changes. A failed read during the handshake fails it
+with `internal_error`. A failed read when a ticket arrives drops that ticket,
+leaves the connection open, and counts it in the snapshot's
+`ticket_clock_failures`.
+
+`read_fn` runs inside a tls call, with that connection's entrant gate held. It
+must not call into tls or block, and it must be safe to call from any thread
+that drives a connection. A source must stay unchanged while any connection
+names it. Its `context_size` bounds the bytes `context` names, and tls keeps
+them apart from its own memory as it does an entropy context.
+
+Callers that drive the lower layers directly still pass explicit times.
+`verify.Options.now` is a `time.Time`, the key ring functions take a
+`clock.Moment`, and the client store takes a `time.Instant`.
+
 ## Ticket keys and rotation
 
 A server seals sessions under one ticket key at a time. `session.KeyRing` holds
@@ -35,8 +57,9 @@ time it was minted.
 - `overlap_seconds`: how long a retired key stays usable for opening
 - `ticket_lifetime_seconds`: the lifetime written into each issued ticket
 
-The ring is caller-owned and outlives connections, so its moments must come
-from the same monotonic clock as every engine's `start` that uses it.
+The ring is caller-owned and outlives connections, so the moments passed to
+`keyring_init` and `keyring_rotate` must come from the same source as the
+configurations that use it.
 
 `keyring_rotate` mints a replacement and retires the current key exactly: the
 retired key stops sealing immediately and stops opening `overlap_seconds` later,
@@ -117,10 +140,8 @@ offered ticket, accepted or not, is wiped when the handshake completes.
 
 Tickets arrive after the handshake and are retained by the established core,
 which keeps the resumption master secret only when a store is configured. The
-core reads no clock, so it stamps a ticket's receipt instant with the monotonic
-reading its handshake started at. A ticket that arrives late in a long
-connection therefore reports an age that is too large and expires early, never
-late. It assembles a ticket in the handshake's input until `finish`, then in a
+core reads the client's clock source as each ticket arrives, so a ticket's age
+runs from its receipt, however late in the connection that is. It assembles a ticket in the handshake's input until `finish`, then in a
 chunk from the engine's lease, reserved before the ticket's bytes are taken (a
 shortage returns `WAITING` with nothing consumed) and returned once the ticket
 is saved. A ticket nothing can retain is skipped without buffering its body.
@@ -149,12 +170,16 @@ encryption level carried through `tls.stream`, which this package does not have.
 
 Unit coverage seals and opens tickets across rotation boundaries, asserts the
 overlap is exact on both sides, steps the wall clock without moving rotation,
-checks a taken ticket's age and the obfuscated age a client sends, rejects
-tampered tickets and expired ones, admits a replayed value exactly once, bounds
-the client store and its eviction order, resumes a real handshake between
-`tls.client` and `tls.server` with matching application secrets, refuses a
-second presentation of one ticket under a single-use policy, and drives
-thirty-two key updates in each direction while the two sides stay in step.
+checks a taken ticket's age and the obfuscated age a client sends, measures a
+ticket's age from its receipt, counts a ticket dropped for an unreadable clock,
+fails a handshake whose clock cannot be read with nothing changed in the ring,
+store or replay window, repeats a full handshake and a resumption byte for byte
+under a frozen clock, rejects tampered tickets and expired ones, admits a
+replayed value exactly once, bounds the client store and its eviction order,
+resumes a real handshake between `tls.client` and `tls.server` with matching
+application secrets, refuses a second presentation of one ticket under a
+single-use policy, and drives thirty-two key updates in each direction while the
+two sides stay in step.
 
 The external harness resumes against OpenSSL and GnuTLS in both directions and
 performs key updates mid-session against both. See

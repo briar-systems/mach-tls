@@ -221,6 +221,20 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     adapter.submit_abort    = test_close;
 }
 
+var test_moment: clock.Moment;
+var test_clock:  clock.Source;
+
+# every test configuration reads this frozen clock, set by the helper below
+fun test_source() *clock.Source {
+    if (test_clock.read_fn == nil) { set_test_time(1800000000); }
+    ret ?test_clock;
+}
+
+fun set_test_time(seconds: i64) {
+    test_moment = clock.at(seconds, seconds);
+    test_clock  = clock.frozen(?test_moment);
+}
+
 test "transport: submission callbacks run outside the operation lock" {
     var runtime: io_runtime.Runtime;
     if (!runtime_ok(io_runtime.make(?runtime, 4))) { ret 1; }
@@ -537,6 +551,7 @@ fun make_test_client(core: *client.Handshake) bool {
     open_configuration.signature_len                   = 1;
     open_configuration.entropy                         = ?open_entropy;
     open_configuration.entropy_context_size            = 1;
+    open_configuration.clock                           = test_source();
     open_configuration.limits                          = config.production_limits();
     open_configuration.limits.max_peer_handshake_bytes = 4096;
     open_configuration.limits.max_chain_bytes          = 3072;
@@ -721,6 +736,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     configuration.signature_len                   = 1;
     configuration.entropy                         = ?entropy_source;
     configuration.entropy_context_size            = 1;
+    configuration.clock                           = test_source();
     configuration.limits                          = config.production_limits();
     configuration.limits.max_peer_handshake_bytes = 4096;
     configuration.limits.max_chain_bytes          = 3072;
@@ -749,7 +765,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
     if (!client.init(?core_b, ?configuration, core_storage,
         client.ExtraExtension{}, 0)) { ret 30; }
     if (stream.connect(?secure, ?core_b, core_storage, secrets, ?adapter,
-        ?scope, transport.Token{index: 31, generation: 0}, clock.at(0, 0), 0)) { ret 31; }
+        ?scope, transport.Token{index: 31, generation: 0}, 0)) { ret 31; }
     if (secure.state != stream.DESTROYED) { ret 32; }
     if (secure.transport != nil)          { ret 33; }
     if (secure.memory.source != nil || secure.client != nil ||

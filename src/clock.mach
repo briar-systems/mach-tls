@@ -1,22 +1,57 @@
-# the two timebases tls reads, taken together
+# the two timebases tls reads, and where it reads them from
 #
 # a value only ever compared with other readings taken in this process is an
 # interval and lives on `monotonic`: the ticket-key rotation schedule and a
 # client's ticket age. a value that must be compared with something from
 # outside the process lives on `wall`: certificate validity, a ticket's issue
 # time and lifetime, and the replay window's expiry.
+#
+# an engine reads its configured `Source` at the point a time is used, so a
+# value is always measured when it happens rather than when the handshake began
 
 use std.chrono.time;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.size.usize;
+use tls.memory_range;
 
-# both clocks read at one point by the caller. the two fields are separate
-# readings, not one: neither is ever derived from the other, and no field of
-# one moment is compared with the other field of another
+# both clocks read at one point. the two fields are separate readings, not one:
+# neither is ever derived from the other, and no field of one moment is
+# compared with the other field of another
 pub rec Moment {
     wall:      time.Time;
     monotonic: time.Instant;
+}
+
+# fills a moment from the source's context, or returns false when it cannot
+pub def ReadFun: fun(ptr, *Moment) bool;
+
+# a caller-owned clock shared by every connection that names it, unchanged
+# while any of them is live. `context_size` bounds the bytes `context` names,
+# zero exactly when `context` is nil, so tls can keep them apart from its own.
+# tls calls `read_fn` from inside its own calls, with the object's entrant gate held, so
+# `read_fn` must not call into tls, must not block, and must be safe to call
+# from any thread that drives a connection. a false return fails the handshake
+# that asked, or drops the ticket that asked (see `established.Snapshot`)
+pub rec Source {
+    context:      ptr;
+    context_size: usize;
+    read_fn:      ReadFun;
+}
+
+# the descriptor and its context are addressable and consistent
+pub fun source_valid(source: *Source) bool {
+    ret source != nil &&
+        memory_range.valid(source::*u8, $size_of(Source)) &&
+        source.read_fn != nil &&
+        (source.context == nil) == (source.context_size == 0) &&
+        memory_range.valid(source.context::*u8, source.context_size);
+}
+
+pub fun read(source: *Source, output: *Moment) bool {
+    if (source == nil || source.read_fn == nil || output == nil) { ret false; }
+    ret source.read_fn(source.context, output);
 }
 
 # the moment now, or false when either clock cannot be read
@@ -29,6 +64,28 @@ pub fun now(output: *Moment) bool {
     output.wall      = wall.ok;
     output.monotonic = monotonic.ok;
     ret true;
+}
+
+fun system_read(context: ptr, output: *Moment) bool {
+    ret now(output);
+}
+
+# the process clocks
+pub fun system() Source {
+    ret Source{context: nil, context_size: 0, read_fn: system_read};
+}
+
+fun frozen_read(context: ptr, output: *Moment) bool {
+    if (context == nil) { ret false; }
+    @output = @(context::*Moment);
+    ret true;
+}
+
+# a source that answers with `value` until the caller changes it, for tests and
+# replayed traces. `value` must outlive every connection that reads it
+pub fun frozen(value: *Moment) Source {
+    ret Source{context: value::ptr, context_size: $size_of(Moment),
+        read_fn: frozen_read};
 }
 
 # a moment built from explicit readings, for tests and replayed traces

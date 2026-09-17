@@ -216,11 +216,14 @@ fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
 # the fixtures are valid for a fixed window, so the wall reading is pinned to a
 # time inside it. the monotonic reading is the process clock, so ticket ages
 # are real
-fun harness_moment(output: *clock.Moment) bool {
+fun harness_read(context: ptr, output: *clock.Moment) bool {
     if (!clock.now(output)) { ret false; }
     output.wall = time.unix(1800000000, 0);
     ret true;
 }
+
+var harness_clock: clock.Source = clock.Source{context: nil, context_size: 0,
+    read_fn: harness_read};
 
 # an operation parked for memory is resumed once the connection's account is ready
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
@@ -326,8 +329,6 @@ fun dial_one(index: usize) i64 {
 
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 4; }
-    var moment: clock.Moment;
-    if (!harness_moment(?moment)) { ret 6; }
     var secure:      stream.Stream;
     var core:        client.Handshake;
     var empty_extra: client.ExtraExtension;
@@ -339,14 +340,14 @@ fun dial_one(index: usize) i64 {
             memory)) { ret 10; }
         if (!stream.connect_tls12(?secure, ?legacy_engine, memory, secrets,
             ?dial_lower, ?scope,
-            transport.Token{index: 1, generation: 1}, moment, 1) ||
+            transport.Token{index: 1, generation: 1}, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
     or {
         if (!client.init(?core, ?dial_configuration, memory,
             empty_extra, 0)) { ret 10; }
         if (!stream.connect(?secure, ?core, memory, secrets, ?dial_lower, ?scope,
-            transport.Token{index: 1, generation: 1}, moment, 1) ||
+            transport.Token{index: 1, generation: 1}, 1) ||
             !settle(?secure, ?dial_runtime)) { ret 5; }
     }
     val handshake:  transport.Snapshot = transport.snapshot(?secure.operation);
@@ -561,6 +562,7 @@ fun main(argc: i64, argv: **u8) i64 {
     dial_configuration.signature_len                   = 5;
     dial_configuration.client_identity                 = ?client_identity;
     dial_configuration.entropy                         = ?entropy;
+    dial_configuration.clock                           = ?harness_clock;
     dial_configuration.limits                          = config.production_limits();
     dial_configuration.limits.max_chain_bytes          = 32768;
     dial_configuration.limits.max_peer_handshake_bytes = 65536;
@@ -603,6 +605,7 @@ fun main(argc: i64, argv: **u8) i64 {
     tls12_configuration.signatures                      = ?tls12_signatures[0];
     tls12_configuration.signature_len                   = 7;
     tls12_configuration.entropy                         = ?entropy;
+    tls12_configuration.clock                           = ?harness_clock;
     tls12_configuration.limits                          = config.production_limits();
     tls12_configuration.limits.max_chain_bytes          = 32768;
     tls12_configuration.limits.max_peer_handshake_bytes = 65536;
