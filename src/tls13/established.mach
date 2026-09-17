@@ -447,15 +447,13 @@ fun absorb(core: *Established, data: *u8, length: usize) error.Error {
                 val total: usize                 = handshake.HEADER_SIZE + header_length(core);
                 if (total > core.max_message_bytes) { ret error.RESOURCE_LIMIT; }
                 if (kind == handshake.NEW_SESSION_TICKET && core.role == engine.CLIENT) {
-                    if (core.sessions == nil) {
-                        # nothing retains a ticket, so its body is never buffered
+                    # a ticket nothing can retain, or has no room to assemble,
+                    # is skipped without buffering its body
+                    if (core.sessions == nil || total > core.storage.input_capacity) {
                         core.skip_remaining = header_length(core);
                         core.partial_len    = 0;
                     }
                     or {
-                        if (total > core.storage.input_capacity) {
-                            ret error.RESOURCE_LIMIT;
-                        }
                         copy_bytes(core.storage.input, ?core.partial[0],
                             handshake.HEADER_SIZE);
                         core.input_len = handshake.HEADER_SIZE;
