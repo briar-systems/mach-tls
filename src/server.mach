@@ -4173,28 +4173,17 @@ test "session: a ticket resumes one connection and a key update rekeys it" {
 # every engine call below first finds the pool empty. a call that must wait
 # changes nothing, and after a wake its retry proceeds
 var pressure:       pool.Harness;
-var hogs:           [1024]buffer.Region;
-var hog_count:      usize;
+var squeezed:       pool.Squeeze;
 var pressure_waits: usize;
 var pressure_fault: i64;
 
 fun hog() {
-    for (hog_count < 1024) {
-        hogs[hog_count] = buffer.empty();
-        if (buffer.reserve(pool.lease(?pressure), ?hogs[hog_count], 512, 0) != buffer.HELD) {
-            brk;
-        }
-        hog_count = hog_count + 1;
-    }
+    squeezed.harness = ?pressure;
+    pool.squeeze(?squeezed);
 }
 
 fun unhog() {
-    for (hog_count > 0) {
-        hog_count = hog_count - 1;
-        buffer.release(pool.lease(?pressure), ?hogs[hog_count], 0);
-    }
-    var handle: [4]u64;
-    buffers.ready(?pressure.pool, ?handle[0], 4);
+    pool.relax(?squeezed);
 }
 
 rec Marks {
