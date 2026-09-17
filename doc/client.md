@@ -228,19 +228,32 @@ byte. Outgoing handshake flights and application writes split at the TLS
 plaintext limit and advance application ownership only after the complete record
 has settled.
 
-A cancelled or timed-out read retains safely reusable record input. Bytes the
-transport had already settled into the wire buffer are accounted for before the
-operation resolves, so cancelling a read is a control-flow decision and never a
-data-loss one: the record layer sees every byte that came off the lower
-transport, and the following record still decodes. A caller that pre-empts a
-read to make room for a write may therefore do so at any point without
-corrupting the stream. A write cancelled or timed out with a sealed record
-partly unsent, or a zero-progress or failed write, makes the stream `FAILED`,
-since a partially published ciphertext record cannot be retried or skipped. A
-write that ends between records, including one parked for memory, leaves the
-stream `OPEN`. After the
-terminal operation is destroyed, `close` on a failed stream submits the distinct
-abortive lower-close callback without attempting another TLS record.
+A cancelled, timed-out or failed completion still reports the transfer that
+finished before it, and the stream accounts for that transfer before the
+operation resolves. This needs mach-std 5.3.0 or later, which reports it on
+every backend.
+
+- **Read.** A cancelled read keeps every byte and the end of stream the lower
+  transport reported, and the following record still decodes. Cancelling a
+  read is a control-flow decision and never a data-loss one, so a caller that
+  pre-empts a read to make room for a write may do so at any point.
+- **Write that finished its record.** A cancelled write whose transfer
+  completed its record settles that record. Its application bytes count, and
+  the stream stays `OPEN`.
+- **Write that fails the stream.** The stream becomes `FAILED` for a write
+  cancelled with a sealed record partly unsent, a zero-progress write, or a
+  failed write, since a partially published ciphertext record cannot be
+  retried or skipped.
+- **Write between records.** A write that ends between records, including one
+  parked for memory, leaves the stream `OPEN`.
+
+After the terminal operation is destroyed, `close` on a failed stream submits
+the distinct abortive lower-close callback without attempting another TLS
+record.
+
+A lower transport must report in a cancelled completion the bytes its request
+already moved. A transfer larger than the request is refused as
+`INTERNAL_ERROR`, however the request ended.
 
 `half_close` writes close_notify completely, shuts down only the lower write
 side, and keeps reads available. A later `close` submits the lower close without

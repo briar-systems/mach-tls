@@ -626,6 +626,12 @@ fun provider_state_overlaps(descriptor: *Transport, data: *u8,
         descriptor.aliases_state(descriptor.context, data, len);
 }
 
+# reads and writes move at most what was submitted; every other action moves nothing
+fun transfer_fits(kind: ActionKind, length: usize, completion: *io_runtime.Completion) bool {
+    if (kind == TRANSPORT_READ || kind == TRANSPORT_WRITE) { ret completion.bytes <= length; }
+    ret completion.bytes == 0 && !completion.end_of_stream;
+}
+
 pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
     if (operation == nil || completion == nil ||
         !memory_range.valid(completion::*u8, $size_of(io_runtime.Completion)) ||
@@ -655,31 +661,31 @@ pub fun accept(operation: *Operation, completion: *io_runtime.Completion) bool {
         memory_range.valid(provider_owner::*u8, $size_of(Transport)) &&
         descriptor_equal(?provider, provider_owner);
     val provider_drifted: bool = operation.provider_drifted || !provider_stable;
-    operation.state                = OPERATION_OPEN;
-    operation.lower_kind           = 0;
-    operation.lower_buffer         = nil;
-    operation.lower_length         = 0;
-    operation.provider             = no_transport();
-    operation.provider_owner       = nil;
-    operation.provider_drifted     = false;
-    operation.last_transport_bytes = settled.bytes;
-    operation.last_end_of_stream   = settled.end_of_stream;
-    if (operation.cancellation_requested) {
-        terminal_locked(operation, operation.cancellation_error, false, true);
+    operation.state            = OPERATION_OPEN;
+    operation.lower_kind       = 0;
+    operation.lower_buffer     = nil;
+    operation.lower_length     = 0;
+    operation.provider         = no_transport();
+    operation.provider_owner   = nil;
+    operation.provider_drifted = false;
+    # a cancelled, timed-out or failed completion still reports the transfer
+    # that finished before it, and that transfer is as real as a successful one
+    val transfer_valid: bool = !aliases_provider && completion_stable && !provider_drifted &&
+        transfer_fits(lower_kind, lower_length, ?settled);
+    operation.last_transport_bytes = 0;
+    operation.last_end_of_stream   = false;
+    if (transfer_valid) {
+        operation.last_transport_bytes = settled.bytes;
+        operation.last_end_of_stream   = settled.end_of_stream;
     }
-    or (aliases_provider || !completion_stable || provider_drifted) {
-        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+    if (!transfer_valid) {
+        terminal_locked(operation, error.INTERNAL_ERROR, false, operation.cancellation_requested);
+    }
+    or (operation.cancellation_requested) {
+        terminal_locked(operation, operation.cancellation_error, settled.end_of_stream, true);
     }
     or (settled.has_error) {
-        terminal_locked(operation, map_error(settled.error), false, false);
-    }
-    or ((lower_kind == TRANSPORT_READ || lower_kind == TRANSPORT_WRITE) && settled.bytes > lower_length) {
-        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
-    }
-    or ((lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN ||
-        lower_kind == TRANSPORT_ABORT || lower_kind == TRANSPORT_WAIT) &&
-        (settled.bytes != 0 || settled.end_of_stream)) {
-        terminal_locked(operation, error.INTERNAL_ERROR, false, false);
+        terminal_locked(operation, map_error(settled.error), settled.end_of_stream, false);
     }
     or (lower_kind == TRANSPORT_CLOSE || lower_kind == TRANSPORT_SHUTDOWN ||
         lower_kind == TRANSPORT_ABORT) {
@@ -705,10 +711,11 @@ pub fun wake(operation: *Operation) bool {
     ret !(sel completed.err);
 }
 
+# the owner may also count the transfer of the completion that ended the operation
 pub fun advance(operation: *Operation, bytes: usize) bool {
     if (operation == nil) { ret false; }
     mutex.lock(?operation.lock);
-    if (operation.state != OPERATION_OPEN || bytes > operation.application_length - operation.application_bytes) {
+    if ((operation.state != OPERATION_OPEN && operation.state != OPERATION_TERMINAL) || bytes > operation.application_length - operation.application_bytes) {
         mutex.unlock(?operation.lock);
         ret false;
     }
