@@ -4,6 +4,7 @@ use io_error: std.io.error;
 use std.io.lifecycle;
 use io_runtime: std.io.runtime;
 use net_async:  std.net.async;
+use socket_api: std.net.socket;
 use std.net.tcp;
 use std.sync.cancel;
 use std.sync.mutex;
@@ -230,6 +231,10 @@ pub fun abort(
     ret descriptor.submit_abort(descriptor.context, scope, context);
 }
 
+# close_mode says how a stream's close releases the socket. GRACEFUL closes it
+# after the kernel sends what is queued and a FIN. ABORTIVE resets it, dropping
+# anything unsent. an abort always resets. std's own GRACEFUL stream close only
+# shuts the write side down and keeps the socket, which is half_close here
 pub rec TcpAdapter {
     driver:     *net_async.Driver;
     stream:     *tcp.Stream;
@@ -263,9 +268,22 @@ fun tcp_write(context: ptr, scope: *cancel.Scope, buffer: *u8, length: usize, to
     ret net_async.submit_write(adapter.driver, scope, adapter.stream, buffer, length, token_context);
 }
 
+# std's ABORTIVE stream close is the one that releases the socket. a reset is a
+# zero linger set first, which a socket the peer already reset may refuse
+fun release_stream(adapter: *TcpAdapter, scope: *cancel.Scope, reset: bool,
+    token_context: usize) res[io_runtime.Token, io_error.Error] {
+    if (reset) {
+        socket_api.set_linger(adapter.stream.handle,
+            socket_api.Linger{enabled: true, seconds: 0});
+    }
+    ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream,
+        lifecycle.ABORTIVE, token_context);
+}
+
 fun tcp_close(context: ptr, scope: *cancel.Scope, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
-    ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream, adapter.close_mode, token_context);
+    ret release_stream(adapter, scope, adapter.close_mode == lifecycle.ABORTIVE,
+        token_context);
 }
 
 fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) res[io_runtime.Token, io_error.Error] {
@@ -276,8 +294,7 @@ fun tcp_shutdown(context: ptr, scope: *cancel.Scope, token_context: usize) res[i
 
 fun tcp_abort(context: ptr, scope: *cancel.Scope, token_context: usize) res[io_runtime.Token, io_error.Error] {
     val adapter: *TcpAdapter = context::*TcpAdapter;
-    ret net_async.submit_stream_close(adapter.driver, scope, adapter.stream,
-        lifecycle.ABORTIVE, token_context);
+    ret release_stream(adapter, scope, true, token_context);
 }
 
 pub fun make_tcp(

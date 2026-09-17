@@ -81,6 +81,10 @@ delivered one byte at a time, close_notify fully written before a write-side
 shutdown, callback reentry, concurrent entry, and a provider descriptor that
 mutates under an operation.
 
+It also closes a loopback socket through the bundled TCP adapter in each close
+mode and checks what the peer reads: a clean end of stream for a graceful close,
+and a reset for an abortive one.
+
 The interop client harness additionally performs a pre-cancelled read and a
 pre-timed-out read against a live peer and requires the exact terminal error.
 
@@ -108,7 +112,8 @@ including HelloRetryRequest, credential types, SNI exact, wildcard, and default
 selection, ALPN, client authentication, session resumption, ticket reuse under
 both replay policies, credential rotation during a live connection, key updates
 mid-session, downgrade protection, and the protocol-correct rejection of each
-named failure.
+named failure. The client also runs a full-duplex exchange over the bundled
+async TCP adapter, for both versions.
 
 The footprint leg serves four TLS 1.3 connections with `--footprint`. Each
 connection's stream and engine are separate `std.memory.secret` allocations,
