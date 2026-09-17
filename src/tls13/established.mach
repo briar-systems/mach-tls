@@ -150,7 +150,7 @@ fun owner_overlaps(core: *Established, data: *u8, len: usize) bool {
 
 fun enter(core: *Established) bool {
     if (!owner_valid(core)) { ret false; }
-    ret transition.enter(?core.transition_owner, transition.current());
+    ret transition.enter(?core.transition_owner);
 }
 
 fun leave(core: *Established) {

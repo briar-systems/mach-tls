@@ -190,7 +190,7 @@ fun owner_overlaps(value: *Handshake, data: *u8, len: usize) bool {
 
 fun enter(value: *Handshake) bool {
     if (!owner_valid(value)) { ret false; }
-    ret transition.enter(?value.transition_owner, os.thread_current_id());
+    ret transition.enter(?value.transition_owner);
 }
 
 fun leave(value: *Handshake) {
@@ -685,9 +685,8 @@ fun fail(value: *Handshake, failure: error.Error,
 }
 
 fun entropy_fill(value: *Handshake, output: *^u8, length: usize) bool {
-    val owner: i64 = os.thread_current_id();
-    if (!owner_valid(value) || owner <= 0 ||
-        !transition.held_by(?value.transition_owner, owner) ||
+    if (!owner_valid(value) ||
+        !transition.held(?value.transition_owner) ||
         !value.entropy.initialized || value.entropy.fill_fn == nil ||
         output == nil) { ret false; }
     val descriptor:       secret.Entropy = value.entropy;
@@ -697,7 +696,7 @@ fun entropy_fill(value: *Handshake, output: *^u8, length: usize) bool {
     val expected_queue:   usize          = value.queue_len;
     val status:           i64            = descriptor.fill_fn(descriptor.context,
         descriptor.secret_context, output, length);
-    val stable: bool = transition.held_by(?value.transition_owner, owner) &&
+    val stable: bool = transition.held(?value.transition_owner) &&
         value.state == expected_state &&
         value.storage.input == expected_storage.input &&
         value.storage.output == expected_storage.output &&

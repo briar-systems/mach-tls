@@ -57,7 +57,7 @@ rec TestTransport {
     mutate_descriptor:    bool;
     mutate_completion:    bool;
     concurrent_reentry:   bool;
-    concurrent_blocked:   bool;
+    concurrent_refused:   bool;
     reentry_rejected:     bool;
     snapshot_rejected:    bool;
     accept_rejected:      bool;
@@ -123,17 +123,13 @@ fun test_submit(context: ptr, scope: *cancel.Scope, kind: io_runtime.Kind, buffe
     if (state.concurrent_reentry) {
         state.concurrent_reentry = false;
         thread.spawn_with(concurrent_destroy, state::*u8, ?state.worker);
+        # the other thread's call is refused at once while this one is inside
         if (state.worker.tid >= 0) {
-            for (atomic.load(?state.concurrent_entered) == 0) {
+            for (atomic.load(?state.concurrent_result) == 0) {
                 atomic.spin_hint();
             }
-            var i: usize = 0;
-            for (i < 1000) {
-                atomic.spin_hint();
-                i = i + 1;
-            }
-            state.concurrent_blocked =
-                atomic.load(?state.concurrent_result) == 0;
+            state.concurrent_refused =
+                atomic.load(?state.concurrent_result) == -1;
         }
     }
     if (state.mutate_descriptor) {
@@ -191,7 +187,7 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
     state.mutate_descriptor    = false;
     state.mutate_completion    = false;
     state.concurrent_reentry   = false;
-    state.concurrent_blocked   = false;
+    state.concurrent_refused   = false;
     state.reentry_rejected     = false;
     state.snapshot_rejected    = false;
     state.accept_rejected      = false;
@@ -665,7 +661,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
         transport.Token{index: 30, generation: 3},
         ?application[0], 3, 0) || state.worker.tid < 0) { ret 13; }
     thread.join(?state.worker);
-    if (!state.concurrent_blocked ||
+    if (!state.concurrent_refused ||
         atomic.load(?state.concurrent_result) != -1 ||
         atomic.load(?concurrent.transition_owner) != 0) { ret 14; }
     var completion: io_runtime.Completion;

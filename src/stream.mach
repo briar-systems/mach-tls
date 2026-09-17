@@ -1008,7 +1008,7 @@ fun drive_owned(stream: *Stream) bool {
 
 fun enter(stream: *Stream) bool {
     if (stream_owner_data(stream) == nil) { ret false; }
-    ret transition.enter(?stream.transition_owner, os.thread_current_id());
+    ret transition.enter(?stream.transition_owner);
 }
 
 fun leave(stream: *Stream, accepted: bool) bool {
