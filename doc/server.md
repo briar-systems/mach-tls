@@ -13,7 +13,9 @@ to a `tls13.established.Established` record, which `server.finish` moves out
 `Event` and `Snapshot` records, and the one map from protocol failure to alert.
 Every role implements the same operations:
 
-- `start` arms the engine and fixes the certificate verification time
+- `start` arms the engine and fixes its `clock.Moment`: the wall reading for
+  certificate validity and ticket lifetimes, the monotonic reading for ticket
+  keys and ages (see [`sessions.md`](sessions.md#two-clocks))
 - `ingest` accepts complete or fragmented handshake bytes at one level
 - `poll` advances the engine without new peer input
 - `next_event` publishes one borrowed event; `complete_event` releases it

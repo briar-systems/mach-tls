@@ -5,15 +5,38 @@ server's ticket key ring, the sealed session state, the bounded replay window,
 and the client's bounded ticket store. Every record is caller-owned and
 explicitly bounded.
 
+## Two clocks
+
+Every engine's `start` takes a `clock.Moment`, which carries two separate
+readings taken by the caller: `wall`, a `time.Time`, and `monotonic`, a
+`time.Instant`. `clock.now` reads both. The rule for which one a value uses:
+
+- A value only ever compared with other readings from this process is an
+  interval and uses `monotonic`: the ticket-key seal and open deadlines, and a
+  client ticket's age.
+- A value that must be compared with something from outside the process uses
+  `wall`: certificate validity, a ticket's issue time and lifetime, and the
+  replay window's expiry.
+
+Neither reading is ever derived from the other, and no field of one moment is
+compared with the other field of another. A wall-clock step therefore moves
+neither key rotation nor a retired key's overlap, and a ticket's lifetime still
+follows real time.
+
 ## Ticket keys and rotation
 
 A server seals sessions under one ticket key at a time. `session.KeyRing` holds
 at most `MAX_TICKET_KEYS` keys, exactly one of which is current for sealing.
-`keyring_init` mints the first key and fixes three policy values:
+`keyring_init` mints the first key and fixes three policy values. Each key
+records a monotonic sealing deadline, a monotonic opening deadline, and the wall
+time it was minted.
 
 - `seal_lifetime_seconds`: how long a key stays current for sealing
 - `overlap_seconds`: how long a retired key stays usable for opening
 - `ticket_lifetime_seconds`: the lifetime written into each issued ticket
+
+The ring is caller-owned and outlives connections, so its moments must come
+from the same monotonic clock as every engine's `start` that uses it.
 
 `keyring_rotate` mints a replacement and retires the current key exactly: the
 retired key stops sealing immediately and stops opening `overlap_seconds` later,
@@ -23,8 +46,10 @@ are wiped and their slots reused. A ring with `MAX_TICKET_KEYS` live keys
 refuses rotation until a key expires, preserving every configured overlap.
 
 A ticket therefore survives rotation for exactly the configured overlap. Its own
-lifetime is independent and is enforced from the issue time sealed inside it, so
-a ticket cannot outlive its lifetime even if its key is still openable.
+lifetime is independent and is enforced against the wall clock from the issue
+time sealed inside it, so a ticket cannot outlive its lifetime even if its key is
+still openable. A ticket whose issue time is later than the current wall time is
+refused.
 
 ## Ticket format
 
@@ -79,19 +104,24 @@ rejected.
 a full store evicts the oldest. Taking a ticket selects the freshest unexpired
 one for the requested server name and **removes** it, so the same ticket is
 never offered twice by this store, and expired tickets are dropped as they are
-passed over.
+passed over. A retained ticket carries a monotonic receipt instant, and a taken
+ticket carries its age in milliseconds measured from it.
 
 A client with a store offers one PSK: it initializes its key schedule from the
 ticket, writes `psk_key_exchange_modes` and a `pre_shared_key` extension last
 with a zeroed binder, then computes the real binder over the truncated encoding
-and patches it in. If the server does not select the PSK, the resumption
-schedule is destroyed and the handshake continues as a full one. The offered
-ticket, accepted or not, is wiped when the handshake completes.
+and patches it in. The identity's `obfuscated_ticket_age` is the ticket's age
+plus its `age_add`, modulo 2^32. If the server does not select the PSK, the
+resumption schedule is destroyed and the handshake continues as a full one. The
+offered ticket, accepted or not, is wiped when the handshake completes.
 
 Tickets arrive after the handshake and are retained by the established core,
-which keeps the resumption master secret only when a store is configured. It
-assembles a ticket in the handshake's input until `finish`, then in a chunk
-from the engine's lease, reserved before the ticket's bytes are taken (a
+which keeps the resumption master secret only when a store is configured. The
+core reads no clock, so it stamps a ticket's receipt instant with the monotonic
+reading its handshake started at. A ticket that arrives late in a long
+connection therefore reports an age that is too large and expires early, never
+late. It assembles a ticket in the handshake's input until `finish`, then in a
+chunk from the engine's lease, reserved before the ticket's bytes are taken (a
 shortage returns `WAITING` with nothing consumed) and returned once the ticket
 is saved. A ticket nothing can retain is skipped without buffering its body.
 
@@ -118,12 +148,13 @@ encryption level carried through `tls.stream`, which this package does not have.
 ## Validation
 
 Unit coverage seals and opens tickets across rotation boundaries, asserts the
-overlap is exact on both sides, rejects tampered tickets and expired ones,
-admits a replayed value exactly once, bounds the client store and its eviction
-order, resumes a real handshake between `tls.client` and `tls.server` with
-matching application secrets, refuses a second presentation of one ticket under
-a single-use policy, and drives thirty-two key updates in each direction while
-the two sides stay in step.
+overlap is exact on both sides, steps the wall clock without moving rotation,
+checks a taken ticket's age and the obfuscated age a client sends, rejects
+tampered tickets and expired ones, admits a replayed value exactly once, bounds
+the client store and its eviction order, resumes a real handshake between
+`tls.client` and `tls.server` with matching application secrets, refuses a
+second presentation of one ticket under a single-use policy, and drives
+thirty-two key updates in each direction while the two sides stay in step.
 
 The external harness resumes against OpenSSL and GnuTLS in both directions and
 performs key updates mid-session against both. See
