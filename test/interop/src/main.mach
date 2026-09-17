@@ -3,8 +3,10 @@ use crypto.encoding.keys;
 use crypto.secret;
 use std.chrono.time;
 use std.crypto.ct;
-use io_error:   std.io.error;
+use io_error: std.io.error;
+use std.io.lifecycle;
 use io_runtime: std.io.runtime;
+use net_async:  std.net.async;
 use std.net.ip;
 use std.net.tcp;
 use std.print;
@@ -241,6 +243,9 @@ fun release(secure: *stream.Stream) bool {
     ret stream.destroy_operation(secure, operation(secure).token);
 }
 
+# a completion that takes longer than this means the leg is stuck
+val WAIT_MS: i32 = 10000;
+
 # an operation parked for memory is resumed once the connection's account is ready
 fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
     for (transport.snapshot(operation(secure)).state !=
@@ -249,8 +254,8 @@ fun settle(secure: *stream.Stream, owner: *io_runtime.Runtime) bool {
             if (!pool.ready(?dial_memory) || !stream.resume(secure)) { ret false; }
         }
         var completion: io_runtime.Completion;
-        val polled:     res[usize, io_error.Error] = io_runtime.poll(owner,
-            ?completion, 1);
+        val polled:     res[usize, io_error.Error] = io_runtime.wait(owner,
+            ?completion, 1, WAIT_MS);
         if (sel polled.err)                                        { ret false; }
         if (polled.ok != 1 || !stream.accept(secure, ?completion)) { ret false; }
     }
@@ -272,6 +277,125 @@ var dial_socket:         tcp.Stream;
 var dial_runtime:        io_runtime.Runtime;
 var dial_blocking:       BlockingTransport;
 var dial_lower:          transport.Transport;
+var dial_driver:         net_async.Driver;
+var dial_adapter:        transport.TcpAdapter;
+var option_duplex:       bool;
+
+# the duplex leg writes this many bytes in one operation while reads run beside
+# it. the peer echoes as it reads, so a client that could not read until its
+# write finished would stall once both socket buffers filled
+val DUPLEX_BYTES: usize = 1 << 20;
+val DUPLEX_LINE:  usize = 64;
+
+var duplex_output: [DUPLEX_BYTES]u8;
+var duplex_input:  [16384]u8;
+
+# every line is the same, so an echo that reverses lines returns it unchanged
+fun duplex_byte(offset: usize) u8 {
+    if (offset % DUPLEX_LINE == DUPLEX_LINE - 1) { ret '\n'; }
+    ret 'x';
+}
+
+fun resume_parked(secure: *stream.Stream) {
+    if ((secure.reading.park == stream.PARK_MEMORY ||
+        secure.writing.park == stream.PARK_MEMORY) && pool.ready(?dial_memory)) {
+        stream.resume(secure);
+    }
+}
+
+# one write of DUPLEX_BYTES with a read outstanding throughout. the leg holds
+# only when every echoed byte matches and a read settled while the write still
+# had a lower write in flight
+fun duplex_exchange(secure: *stream.Stream) i64 {
+    var i: usize = 0;
+    for (i < DUPLEX_BYTES) {
+        duplex_output[i] = duplex_byte(i);
+        i                = i + 1;
+    }
+    var writes: cancel.Scope;
+    var reads:  cancel.Scope;
+    if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
+        !operation_ok(cancel.make_root(?reads, opt[time.Instant].none{}))) { ret 70; }
+    val write_token: transport.Token = transport.Token{index: 8, generation: 1};
+    var read_token:  transport.Token = transport.Token{index: 9, generation: 1};
+    if (!stream.read(secure, ?reads, read_token, ?duplex_input[0], 16384, 9) ||
+        !stream.write(secure, ?writes, write_token, ?duplex_output[0],
+        DUPLEX_BYTES, 8)) { ret 71; }
+    var received: usize = 0;
+    var overlaps: usize = 0;
+    var written:  bool  = false;
+    for (true) {
+        # an operation can settle inside the call that started it, with no
+        # completion to follow, so settled operations are taken before waiting
+        val sent: transport.Snapshot = transport.snapshot(?secure.writing.operation);
+        if (!written && sent.state == transport.OPERATION_TERMINAL) {
+            if (sent.terminal_error != error.OK) {
+                report("duplex write error=", sent.terminal_error::usize);
+                ret 74;
+            }
+            if (sent.application_bytes != DUPLEX_BYTES ||
+                !stream.destroy_operation(secure, write_token)) { ret 75; }
+            written = true;
+        }
+        val got: transport.Snapshot = transport.snapshot(?secure.reading.operation);
+        if (received < DUPLEX_BYTES && got.state == transport.OPERATION_TERMINAL) {
+            if (got.terminal_error != error.OK || got.application_bytes == 0) {
+                report("duplex read error=", got.terminal_error::usize);
+                ret 76;
+            }
+            if (received + got.application_bytes > DUPLEX_BYTES) { ret 77; }
+            i = 0;
+            for (i < got.application_bytes) {
+                if (duplex_input[i] != duplex_byte(received + i)) { ret 78; }
+                i = i + 1;
+            }
+            if (!written && secure.writing.pending_action == transport.TRANSPORT_WRITE) {
+                overlaps = overlaps + 1;
+            }
+            received = received + got.application_bytes;
+            if (!stream.destroy_operation(secure, read_token)) { ret 79; }
+            if (received < DUPLEX_BYTES) {
+                read_token.generation = read_token.generation + 1;
+                if (!stream.read(secure, ?reads, read_token, ?duplex_input[0], 16384,
+                    9)) { ret 80; }
+            }
+            cnt;
+        }
+        if (written && received == DUPLEX_BYTES) { brk; }
+        var completion: io_runtime.Completion;
+        val waited:     res[usize, io_error.Error] = io_runtime.wait(?dial_runtime,
+            ?completion, 1, WAIT_MS);
+        if (sel waited.err)                                        { ret 72; }
+        if (waited.ok != 1 || !stream.accept(secure, ?completion)) { ret 73; }
+        resume_parked(secure);
+    }
+    report("duplex bytes=", received);
+    report("duplex overlaps=", overlaps);
+    if (overlaps == 0 || !operation_ok(cancel.destroy(?writes)) ||
+        !operation_ok(cancel.destroy(?reads))) { ret 81; }
+    ret 0;
+}
+
+# the bundled adapter over the async driver, which completes reads and writes
+# as the socket allows rather than inside submit
+fun dial_async() i64 {
+    if (!runtime_ok(net_async.make(?dial_driver, ?dial_runtime))) { ret 3; }
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 3; }
+    val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_connect(
+        ?dial_driver, ?scope, ip.endpoint(127, 0, 0, 1, 9443), 0);
+    if (sel submitted.err) { ret 2; }
+    var completion: io_runtime.Completion;
+    val waited:     res[usize, io_error.Error] = io_runtime.wait(?dial_runtime,
+        ?completion, 1, WAIT_MS);
+    if (sel waited.err)                         { ret 2; }
+    if (waited.ok != 1 || completion.has_error) { ret 2; }
+    dial_socket = net_async.stream(?completion);
+    if (!operation_ok(cancel.destroy(?scope)) ||
+        !transport.make_tcp(?dial_lower, ?dial_adapter, ?dial_driver, ?dial_socket,
+        lifecycle.GRACEFUL)) { ret 3; }
+    ret 0;
+}
 
 fun streq(a: *u8, b: *u8) bool {
     if (a == nil || b == nil) { ret false; }
@@ -321,22 +445,28 @@ fun report(label: str, value: usize) {
 
 # one complete connection: handshake, bounded settlement checks, exchange, close
 fun dial_one(index: usize) i64 {
-    val connected: res[tcp.Stream, io_error.Error] = tcp.connect(
-        ip.endpoint(127, 0, 0, 1, 9443));
-    if (sel connected.err) { ret 2; }
-    dial_socket = connected.ok;
     if (!runtime_ok(io_runtime.make(?dial_runtime, 16))) {
         ret 3;
     }
-    dial_blocking = BlockingTransport{runtime: ?dial_runtime,
-        stream: ?dial_socket};
-    dial_lower = transport.Transport{runtime: ?dial_runtime,
-        context: (?dial_blocking)::ptr,
-        context_size:    $size_of(BlockingTransport),
-        aliases_state:   blocking_aliases_state,
-        submit_read:     blocking_read, submit_write: blocking_write,
-        submit_shutdown: blocking_shutdown, submit_close: blocking_close,
-        submit_abort:    blocking_close};
+    if (option_duplex) {
+        val dialed: i64 = dial_async();
+        if (dialed != 0) { ret dialed; }
+    }
+    or {
+        val connected: res[tcp.Stream, io_error.Error] = tcp.connect(
+            ip.endpoint(127, 0, 0, 1, 9443));
+        if (sel connected.err) { ret 2; }
+        dial_socket   = connected.ok;
+        dial_blocking = BlockingTransport{runtime: ?dial_runtime,
+            stream: ?dial_socket};
+        dial_lower = transport.Transport{runtime: ?dial_runtime,
+            context: (?dial_blocking)::ptr,
+            context_size:    $size_of(BlockingTransport),
+            aliases_state:   blocking_aliases_state,
+            submit_read:     blocking_read, submit_write: blocking_write,
+            submit_shutdown: blocking_shutdown, submit_close: blocking_close,
+            submit_abort:    blocking_close};
+    }
 
     # one account per connection, on a pool of the recommended class shape
     if (!pool.make(?dial_memory, 1 << 24, 1 << 22)) { ret 3; }
@@ -385,7 +515,9 @@ fun dial_one(index: usize) i64 {
     if (!release(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
 
     var application_input: [64]u8;
-    if (index == 0) {
+    # the cancelled and timed-out read checks rely on the blocking transport
+    # resolving inside submit
+    if (index == 0 && !option_duplex) {
         if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
             !transition_ok(cancel.cancel(?scope)) ||
             !stream.read(?secure, ?scope,
@@ -450,6 +582,11 @@ fun dial_one(index: usize) i64 {
         ret 51;
     }
 
+    if (option_duplex) {
+        val duplexed: i64 = duplex_exchange(?secure);
+        if (duplexed != 0) { ret duplexed; }
+    }
+
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
         !stream.half_close(?secure, ?scope,
         transport.Token{index: 5, generation: 1}, 6) ||
@@ -468,6 +605,7 @@ fun dial_one(index: usize) i64 {
     if (closed.terminal_error != error.OK || !release(?secure) ||
         !stream.destroy(?secure) ||
         !operation_ok(cancel.destroy(?scope)) ||
+        (option_duplex && !runtime_ok(net_async.destroy(?dial_driver))) ||
         !runtime_closed(io_runtime.close(?dial_runtime)) ||
         !runtime_ok(io_runtime.destroy(?dial_runtime))) {
         ret 8;
@@ -501,6 +639,7 @@ fun main(argc: i64, argv: **u8) i64 {
     var use_sessions: bool  = false;
     option_key_update = false;
     option_tls12      = false;
+    option_duplex     = false;
     var argument: i64 = 1;
     for (argument < argc) {
         val current: *u8 = argv[argument];
@@ -517,6 +656,9 @@ fun main(argc: i64, argv: **u8) i64 {
         }
         or (streq(current, "--tls12"::*u8)) {
             option_tls12 = true;
+        }
+        or (streq(current, "--duplex"::*u8)) {
+            option_duplex = true;
         }
         argument = argument + 1;
     }

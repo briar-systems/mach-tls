@@ -5,8 +5,12 @@ use crypto.secret;
 use std.chrono.duration;
 use std.chrono.time;
 use std.crypto.ct;
-use io_error:   std.io.error;
+use io_error: std.io.error;
+use std.io.lifecycle;
 use io_runtime: std.io.runtime;
+use net_async:  std.net.async;
+use std.net.ip;
+use std.net.tcp;
 use std.runtime;
 use std.sync.atomic;
 use std.sync.cancel;
@@ -1959,4 +1963,90 @@ test "stream: a read owing a record and a write short of memory do not deadlock"
         !runtime_closed(io_runtime.close(?runtime)) ||
         !runtime_ok(io_runtime.destroy(?runtime))) { ret 16; }
     ret 0;
+}
+
+fun submitted(result: res[io_runtime.Token, io_error.Error]) bool {
+    ret sel result.ok;
+}
+
+fun waited(runtime: *io_runtime.Runtime, completion: *io_runtime.Completion) bool {
+    val result: res[usize, io_error.Error] = io_runtime.wait(runtime, completion, 1, 5000);
+    ret (sel result.ok) && result.ok == 1;
+}
+
+# a lower close through the bundled adapter in close_mode, then what the peer
+# reads: 1 for a clean end of stream, 2 for a reset, 0 for anything else
+fun adapter_close(close_mode: lifecycle.Mode) i32 {
+    var runtime: io_runtime.Runtime;
+    var driver:  net_async.Driver;
+    var scope:   cancel.Scope;
+    if (!runtime_ok(io_runtime.make(?runtime, 8)) ||
+        !runtime_ok(net_async.make(?driver, ?runtime)) ||
+        !operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 0; }
+    val listening: res[tcp.Listener, io_error.Error] = net_async.listen(
+        ip.endpoint(127, 0, 0, 1, 0), 4);
+    if (sel listening.err) { ret 0; }
+    var listener: tcp.Listener                     = listening.ok;
+    val local:    res[ip.Endpoint, io_error.Error] = tcp.listener_local_endpoint(?listener);
+    if (sel local.err) { ret 0; }
+    var peer_address: ip.Endpoint;
+    if (!submitted(net_async.submit_accept(?driver, ?scope, ?listener, ?peer_address, 1))) { ret 0; }
+    val dialed: res[tcp.Stream, io_error.Error] = tcp.connect(local.ok);
+    if (sel dialed.err) { ret 0; }
+    var client:     tcp.Stream = dialed.ok;
+    var completion: io_runtime.Completion;
+    if (!waited(?runtime, ?completion) || completion.has_error ||
+        completion.kind != io_runtime.ACCEPT) { ret 0; }
+    var server:   tcp.Stream         = net_async.stream(?completion);
+    var adapter:  transport.TcpAdapter;
+    var lower:    transport.Transport;
+    var provider: transport.Provider = transport.no_provider();
+    if (!transport.make_tcp(?lower, ?adapter, ?driver, ?client, close_mode) ||
+        !transport.pin(?provider, ?lower)) { ret 0; }
+    var operation: transport.Operation;
+    if (!transport.begin(?operation, transport.Token{index: 70, generation: 1},
+        transport.APPLICATION_CLOSE, ?scope, nil, 0, 0) ||
+        !transport.begin_action(?operation, ?provider, transport.Action{
+        kind: transport.TRANSPORT_CLOSE, buffer: nil, length: 0, context: 0
+    }) ||
+        !waited(?runtime, ?completion) ||
+        !transport.accept(?operation, ?completion)) { ret 0; }
+    val closed: transport.Snapshot = transport.snapshot(?operation);
+    if (closed.state != transport.OPERATION_TERMINAL ||
+        closed.terminal_error != error.OK ||
+        !transport.destroy_operation(?operation)) { ret 0; }
+    var byte: [1]u8;
+    if (!submitted(net_async.submit_read(?driver, ?scope, ?server, ?byte[0], 1, 2)) ||
+        !waited(?runtime, ?completion) || completion.kind != io_runtime.READ) { ret 0; }
+    var seen: i32 = 0;
+    if (!completion.has_error && completion.end_of_stream && completion.bytes == 0) {
+        seen = 1;
+    }
+    or (completion.has_error) {
+        seen = 2;
+    }
+    var released: io_runtime.Completion;
+    if (!submitted(net_async.submit_stream_close(?driver, ?scope, ?server,
+        lifecycle.ABORTIVE, 3)) || !waited(?runtime, ?released) ||
+        !runtime_ok(tcp.listener_close(?listener)) ||
+        !operation_ok(cancel.destroy(?scope)) ||
+        !runtime_ok(net_async.destroy(?driver)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 0; }
+    ret seen;
+}
+
+# a graceful close releases the socket and the peer reads a clean end of stream.
+# before this, the adapter shut the write side down instead, whose completion a
+# close refused and whose socket was never released
+test "transport: the tcp adapter's graceful close releases the socket" {
+    if (adapter_close(lifecycle.GRACEFUL) != 1) { ret 1; }
+    ret 0;
+}
+
+$if ($mach.build.os == $mach.os.linux) {
+    test "transport: the tcp adapter's abortive close resets the peer" {
+        if (adapter_close(lifecycle.ABORTIVE) != 2) { ret 1; }
+        ret 0;
+    }
 }

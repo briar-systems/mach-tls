@@ -239,6 +239,12 @@ client_leg "1.3 client resumes its own ticket" "--sessions --connections 2" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_3 -alpn h2 -rev -quiet"
 client_leg "1.3 client key update mid session" "--key-update" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_3 -alpn h2 -rev -quiet"
+# a 1 MiB write with a read outstanding over the bundled async tcp adapter. the
+# peer echoes while we write, so both lanes carry traffic at once
+client_leg "1.3 client full duplex openssl" "--duplex" \
+  "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_3 -alpn h2 -rev -quiet"
+client_leg "1.3 client full duplex gnutls" "--duplex" \
+  "gnutls-serv --port 9443 --x509certfile $FIX/leaf.pem --x509keyfile $FIX/leaf.key --x509cafile $FIX/root.pem --priority NORMAL:-VERS-ALL:+VERS-TLS1.3 --alpn h2 --alpn-fatal --require-client-cert --verify-client-cert --echo"
 
 echo "== TLS 1.2 client =="
 client_leg "1.2 client ed25519 server" "--tls12" \
@@ -253,6 +259,8 @@ client_leg "1.2 client ecdhe-ecdsa aes256" "--tls12" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_2 -alpn h2 -cipher ECDHE-ECDSA-AES256-GCM-SHA384 -rev -quiet"
 client_leg "1.2 client ecdhe-ecdsa chacha20" "--tls12" \
   "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_2 -alpn h2 -cipher ECDHE-ECDSA-CHACHA20-POLY1305 -rev -quiet"
+client_leg "1.2 client full duplex openssl" "--tls12 --duplex" \
+  "openssl s_server -accept 9443 -cert $FIX/leaf.pem -key $FIX/leaf.key -tls1_2 -alpn h2 -rev -quiet"
 client_leg "1.2 client gnutls server" "--tls12" \
   "gnutls-serv --port 9443 --x509certfile $FIX/leaf.pem --x509keyfile $FIX/leaf.key --priority NORMAL:-VERS-ALL:+VERS-TLS1.2 --alpn h2 --alpn-fatal --echo"
 client_leg_must_fail "1.2 client refuses a tls 1.3 only server" "--tls12" \
