@@ -137,23 +137,25 @@ pub rec Stream {
     writing:  Lane;
     # the lane that owns wire_out, the lane that may reserve memory while both
     # are parked for it, and whether this step freed what a parked peer awaits
-    sender:                   LaneId;
-    turn:                     LaneId;
-    peer_released:            bool;
-    failure:                  error.Error;
-    read_cipher:              record.Cipher;
-    write_cipher:             record.Cipher;
-    state:                    State;
-    control:                  Control;
-    wire_input_len:           usize;
-    wire_input_read:          usize;
-    wire_output_len:          usize;
-    wire_output_sent:         usize;
-    plaintext_len:            usize;
-    plaintext_read:           usize;
-    application_chunk:        usize;
-    core_event:               engine.Event;
-    core_event_sending:       bool;
+    sender:             LaneId;
+    turn:               LaneId;
+    peer_released:      bool;
+    failure:            error.Error;
+    read_cipher:        record.Cipher;
+    write_cipher:       record.Cipher;
+    state:              State;
+    control:            Control;
+    wire_input_len:     usize;
+    wire_input_read:    usize;
+    wire_output_len:    usize;
+    wire_output_sent:   usize;
+    plaintext_len:      usize;
+    plaintext_read:     usize;
+    application_chunk:  usize;
+    core_event:         engine.Event;
+    core_event_sending: bool;
+    # wire_out holds a record of the borrowed core event
+    event_record:             bool;
     core_event_alert:         bool;
     core_event_offset:        usize;
     core_event_chunk:         usize;
@@ -189,6 +191,11 @@ fun stream_owner_overlaps(stream: *Stream, data: *u8, len: usize) bool {
 fun lane_id(stream: *Stream, lane: *Lane) LaneId {
     if (lane == ?stream.reading) { ret READ_LANE; }
     ret WRITE_LANE;
+}
+
+# the write lane holds the turn unless it names the read lane
+fun holds_turn(stream: *Stream, lane: *Lane) bool {
+    ret (stream.turn == READ_LANE) == (lane == ?stream.reading);
 }
 
 fun other(stream: *Stream, lane: *Lane) *Lane {
@@ -513,6 +520,7 @@ fun clear_core_event(stream: *Stream) {
         engine_complete_event(stream, stream.core_event.token, false);
     }
     stream.core_event_sending = false;
+    stream.event_record       = false;
     stream.core_event_alert   = false;
     stream.core_event_offset  = 0;
     stream.core_event_chunk   = 0;
@@ -524,7 +532,8 @@ fun settle_terminal(stream: *Stream, lane: *Lane) bool {
     val owned: bool = stream.sender == lane_id(stream, lane);
     # an event this lane was sending cannot be finished by anyone once its
     # record is cut short; one it had not started stays for the other lane
-    if (owned || lane_available(other(stream, lane)) || stream.failure != error.OK) {
+    if ((owned && stream.event_record) || lane_available(other(stream, lane)) ||
+        stream.failure != error.OK) {
         clear_core_event(stream);
     }
     if (terminal_requires_failure(stream, lane, snapshot)) {
@@ -720,8 +729,23 @@ fun owe_core_record(stream: *Stream, lane: *Lane) bool {
         if (stream.sender == lane_id(stream, lane)) { ret false; }
         ret park(stream, lane, PARK_PEER);
     }
+    # nothing is sent after close_notify: a key update owed then is dropped,
+    # and an alert owed then only fails the stream
+    if (stream.send_closed && stream.handshake_complete) {
+        val alert_event: bool = stream.core_event_alert;
+        stream.core_event_sending = false;
+        stream.core_event_alert   = false;
+        stream.core_event_offset  = 0;
+        engine_complete_event(stream, stream.core_event.token, !alert_event);
+        stream.peer_released = true;
+        if (alert_event) { ret finish(stream, lane, engine_failure(stream), false); }
+        ret false;
+    }
     val prepared: buffer.Outcome = prepare_core_record(stream, lane);
-    if (prepared == buffer.HELD) { ret false; }
+    if (prepared == buffer.HELD) {
+        stream.event_record = true;
+        ret false;
+    }
     if (prepared == buffer.WAIT) { ret refused(stream, lane, prepared); }
     engine_complete_event(stream, stream.core_event.token, false);
     stream.core_event_sending = false;
@@ -1111,6 +1135,7 @@ fun drive_read(stream: *Stream, lane: *Lane) bool {
     for (true) {
         if (sending(stream, lane))         { ret submit_write(stream, lane); }
         if (owe_core_record(stream, lane)) { ret true; }
+        if (sending(stream, lane))         { cnt; }
         if (handle_core_event(stream, lane)) {
             if (lane_terminal(lane)) { ret true; }
             cnt;
@@ -1127,14 +1152,20 @@ fun drive_control(stream: *Stream, lane: *Lane) bool {
         stream.state = CLOSING;
         ret submit(stream, lane, transport.TRANSPORT_ABORT, nil, 0);
     }
-    if (!stream.control_record_sent && !sending(stream, lane)) {
-        if (stream.wire_output_len != 0) { ret park(stream, lane, PARK_PEER); }
+    # what the engine owes goes out before the alert that ends sending
+    for (!stream.control_record_sent) {
+        if (sending(stream, lane))         { ret submit_write(stream, lane); }
+        if (owe_core_record(stream, lane)) { ret true; }
+        if (sending(stream, lane))         { cnt; }
+        if (stream.wire_output_len != 0)   { ret park(stream, lane, PARK_PEER); }
+        if (handle_core_event(stream, lane)) {
+            if (lane_terminal(lane)) { ret true; }
+            cnt;
+        }
         val prepared: buffer.Outcome = prepare_alert(stream, lane, stream.control_alert);
         if (prepared == buffer.WAIT) { ret refused(stream, lane, prepared); }
         if (prepared == buffer.FAIL) { ret finish(stream, lane, error.INTERNAL_ERROR, false); }
     }
-    if (sending(stream, lane)) { ret submit_write(stream, lane); }
-    stream.control_record_sent = true;
     if (stream.control == CONTROL_ALERT) {
         if (stream.control_alert != record.USER_CANCELED_ALERT) {
             stream.send_closed = true;
@@ -1306,6 +1337,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
     stream.plaintext_read         = 0;
     stream.application_chunk      = 0;
     stream.core_event_sending     = false;
+    stream.event_record           = false;
     stream.core_event_alert       = false;
     stream.core_event_offset      = 0;
     stream.core_event_chunk       = 0;
@@ -1577,7 +1609,8 @@ fun record_written(stream: *Stream, lane: *Lane) {
     stream.wire_output_sent = 0;
     stream.sender           = NO_LANE;
     stream.peer_released    = true;
-    if (stream.core_event_sending) {
+    if (stream.event_record) {
+        stream.event_record = false;
         val alert_event: bool = stream.core_event_alert;
         if (stream.core_event.kind == engine.CRYPTO) {
             stream.core_event_offset = stream.core_event_offset + stream.core_event_chunk;
@@ -1677,14 +1710,16 @@ fun accept_inner(stream: *Stream, completion: *runtime.Completion) bool {
     }
     # while both lanes are parked for memory only the turn's holder reserves
     val peer: *Lane = other(stream, lane);
-    if (reason == PARK_MEMORY && peer.park == PARK_MEMORY &&
-        stream.turn != lane_id(stream, lane)) {
+    if (reason == PARK_MEMORY && peer.park == PARK_MEMORY && !holds_turn(stream, lane)) {
         park(stream, lane, PARK_MEMORY);
         ret true;
     }
     drive_owned(stream, lane);
-    if (reason == PARK_MEMORY && lane.park != PARK_MEMORY) {
+    # the turn passes once its holder acquires, and a lane that stood aside for
+    # it is woken to take its own
+    if (reason == PARK_MEMORY && lane.park != PARK_MEMORY && holds_turn(stream, lane)) {
         stream.turn = lane_id(stream, peer);
+        if (peer.park == PARK_MEMORY) { transport.wake(?peer.operation); }
     }
     ret true;
 }
