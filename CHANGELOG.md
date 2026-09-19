@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+tls builds on mach-std 6.0.0 and mach-crypto 0.18.0, selected by version range, on mach 5.9 (#121). Its own public surface is unchanged.
+
+### Changed
+
+- Dependencies: `[dep.std] version = "^6.0"` realized at v6.0.0 and `[dep.crypto] version = "^0.18"` at v0.18.0, both committed as gitlinks, and `mach = "^5.9"`. std 6.0.0 removed the width-named constant-time comparisons and made `buffers.open_account` take a `buffers.Budgets` value; the two tls sites moved (`ct.is_zero[u8]` in the record layer, the test pool's account open). Nothing else std's migration guide names (sort, heap, map, set, the clock, `Source` members) is used here. crypto 0.14 through 0.18 changed no API tls calls: SHA-2 runs on std's hardware-dispatched states, secret word products use the processor multiply where mach admits it, and x25519 and Ed25519 compute on `u128`, so an x25519 + ECDSA P-256 handshake costs about a third of the instructions it did on crypto 0.13 (#121).
+- On aarch64-linux and aarch64-darwin, a program linking tls turns PSTATE.DIT on before `main` and refuses to start, with status 255, on a processor or kernel without the mode. This is crypto 0.17's DIT-required start through std 5.8; x86_64 and riscv64 are unaffected (#121).
+- `test/interop` pins std and crypto by tag itself, because a path dependency carries no pin for a dependency it selects by version and that tree is not committed (#121).
+- CI passes `dit: required` to the shared pipeline, so the aarch64 legs test under `qemu-aarch64 -cpu max` on a runner without FEAT_DIT and natively where it exists (#121).
+- The tag-triggered workflow is `.github/workflows/cd.yml`, the family's name for it, and it serializes runs per tag so a duplicate tag push waits and then finds the release already published (#117, #119).
+
 ## [0.8.1] - 2026-09-17
 
 The bundled TCP adapter now closes correctly, and the interoperability matrix runs full-duplex traffic over it against OpenSSL and GnuTLS (#113).
