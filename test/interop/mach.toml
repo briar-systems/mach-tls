@@ -1,7 +1,7 @@
 [project]
 id = "tls-client-interop"
 version = "0.0.0"
-mach = "^5.3"
+mach = "^5.9"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -77,3 +77,13 @@ need = []
 
 [dep.tls]
 path = "../.."
+
+# std and crypto are pinned here because a path dependency carries no pin for
+# a dependency it selects by version, and this tree is not committed
+[dep.std]
+git = "https://github.com/briar-systems/mach-std"
+ref = "tag/v6.0.0"
+
+[dep.crypto]
+git = "https://github.com/briar-systems/mach-crypto"
+ref = "tag/v0.18.0"

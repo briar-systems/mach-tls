@@ -19,7 +19,6 @@ pub rec Harness {
     plain:   buffers.Source;
     secret:  buffers.SecretSource;
     account: buffers.Account;
-    budgets: [2]usize;
     made:    bool;
 }
 
@@ -42,12 +41,14 @@ pub fun make(harness: *Harness, global: usize, budget: usize) bool {
     config.global_budget = global;
     config.initial_slots = 8;
     if (!buffers.make(?harness.pool, config, ?harness.backing)) { ret false; }
-    harness.plain      = buffers.source(?harness.pool);
-    harness.secret     = buffers.secret_source(?harness.pool);
-    harness.budgets[0] = budget;
-    harness.budgets[1] = budget;
+    harness.plain  = buffers.source(?harness.pool);
+    harness.secret = buffers.secret_source(?harness.pool);
+    var budgets: buffers.Budgets;
+    budgets.lanes    = 2;
+    budgets.bytes[0] = budget;
+    budgets.bytes[1] = budget;
     var opened: buffers.Reason = buffers.open_account(?harness.pool, ?harness.account,
-        1, ?harness.budgets[0], 0);
+        1, budgets, 0);
     if (!(sel opened.none)) {
         buffers.destroy(?harness.pool);
         ret false;
