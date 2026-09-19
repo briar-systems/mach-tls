@@ -134,8 +134,14 @@ than at every teardown site.
 
 ## Local development
 
-Dependencies use pinned Git tags. Build output uses Mach's default `out/`
-directory inside this repository.
+Dependencies are selected by version range and realized as committed
+gitlinks under `dep/`, so `mach dep pull` checks out the pinned release and
+`mach dep update` moves the pin. `test/interop` pins std and crypto by tag
+itself, because a path dependency carries no pin for a dependency it selects
+by version. On aarch64, tls links crypto's DIT-required start: the program
+turns PSTATE.DIT on before `main` and refuses to start on a processor or
+kernel without the mode. Build output uses Mach's default `out/` directory
+inside this repository.
 
 ```sh
 mach dep pull .

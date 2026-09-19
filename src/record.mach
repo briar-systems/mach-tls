@@ -685,7 +685,7 @@ fun inspect_inner(data: *^u8, length: usize, has_content: *bool,
     var content_end:  ^usize = 0;
     var i:            usize  = 0;
     for (i < length) {
-        val nonzero: ^u8 = 1 ^ ct.is_zero_u8(data[i]);
+        val nonzero: ^u8 = 1 ^ ct.is_zero[u8](data[i]);
         present      = present | nonzero;
         content_type = ct.select_u8(nonzero, data[i], content_type);
         content_end  = ct.select_usize(nonzero, i + 1, content_end);
