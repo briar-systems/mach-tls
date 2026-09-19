@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.0] - 2026-09-19
 
 tls builds on mach-std 6.0.0 and mach-crypto 0.18.0, selected by version range, on mach 5.9 (#121). Its own public surface is unchanged.
 
