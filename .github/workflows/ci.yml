@@ -23,6 +23,9 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
+      # crypto 0.17 and later link a DIT-required aarch64 start, so a runner
+      # without FEAT_DIT runs the tests under qemu-aarch64 -cpu max
+      dit: required
       # the interop harness is built here and run by .github/ci/verify.sh
       subprojects: '[{"path": "test/interop", "build": true, "test": false, "legs": ["x86_64-linux"]}]'
 
