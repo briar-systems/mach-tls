@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- The TLS 1.2 handshake holds one role's configuration snapshot, a tag of `ClientConfig` or `ServerConfig` selected at `init_client` or `init_server`, instead of a copy of both. The role's pointer aliases the tag payload, so every read goes through the same path as before. `$size_of(tls12.connection.Handshake)` drops from 4,384 to 4,176 bytes on x86_64-linux, and behaviour is unchanged (#107).
+
 ## [0.9.0] - 2026-09-19
 
 tls builds on mach-std 6.0.0 and mach-crypto 0.18.0, selected by version range, on mach 5.9 (#121). Its own public surface is unchanged.
