@@ -2835,6 +2835,32 @@ fun exchange(local: *Handshake, peer: *Handshake) i64 {
     ret 6;
 }
 
+test "tls12.connection: the handshake snapshots one role's configuration" {
+    var larger: usize = $size_of(config.ClientConfig);
+    if ($size_of(config.ServerConfig) > larger) {
+        larger = $size_of(config.ServerConfig);
+    }
+    # one payload plus the discriminator's slot, never both configs
+    if ($size_of(Configuration) > larger + $align_of(Configuration)) { ret 1; }
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!loopback_configure(false, ?owner)) { ret 2; }
+    var dialer:   Handshake;
+    var listener: Handshake;
+    if (!init_client(?dialer, ?loopback_client_config, pool.shared()))   { ret 3; }
+    if (!init_server(?listener, ?loopback_server_config, pool.shared())) { ret 4; }
+    if (!sel dialer.configuration.client || dialer.server_config != nil ||
+        dialer.client_config != client_snapshot(?dialer)) { ret 5; }
+    if (!sel listener.configuration.server || listener.client_config != nil ||
+        listener.server_config != server_snapshot(?listener)) { ret 6; }
+    if (dialer.client_config.entropy != ?dialer.entropy ||
+        dialer.client_config.trust != ?dialer.trust ||
+        listener.server_config.entropy != ?listener.entropy) { ret 7; }
+    if (!destroy(?dialer) || !destroy(?listener)) { ret 8; }
+    if (!sel dialer.configuration.none || !sel listener.configuration.none ||
+        dialer.client_config != nil || listener.server_config != nil) { ret 9; }
+    ret 0;
+}
+
 test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(false, ?owner)) { ret 1; }
