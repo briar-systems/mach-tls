@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.10.0] - 2026-09-20
+
+tls builds on mach-std 7.0.2 and mach-crypto 0.20.0, selected by version range (#126). Its own public surface is unchanged.
+
+### Changed
+
+- Dependencies: `[dep.std] version = "^7.0"` realized at v7.0.2 and `[dep.crypto] version = "^0.20"` at v0.20.0, both committed as gitlinks, and test/interop's tag pins moved with them. std 7.0.0 makes `io.runtime.make(runtime, a, initial)` take the allocator the runtime draws from and keep a copy of it. The library never builds a runtime, so the 28 sites are all test code: `src/test/transport.mach` and the interop client and server each hold one module-level page allocator and hand it to every runtime they make. `data.toml.Value` grew and the page, testing and arena allocators honour `align`, neither of which tls observes. crypto 0.20.0 moves its std range to `^7.0` and changes no API tls calls (#126).
+- The TLS 1.2 handshake holds one role's configuration snapshot, a tag of `ClientConfig` or `ServerConfig` selected at `init_client` or `init_server`, instead of a copy of both. The role's pointer aliases the tag payload, so every read goes through the same path as before. `$size_of(tls12.connection.Handshake)` drops from 4,384 to 4,176 bytes on x86_64-linux, and behaviour is unchanged (#107).
+
 ## [0.9.0] - 2026-09-19
 
 tls builds on mach-std 6.0.0 and mach-crypto 0.18.0, selected by version range, on mach 5.9 (#121). Its own public surface is unchanged.

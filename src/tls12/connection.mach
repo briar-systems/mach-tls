@@ -88,12 +88,19 @@ rec Pending {
     alert:        record.AlertDescription;
 }
 
+# one role's snapshot. the case follows the role, and the role's pointer aliases
+# the payload so the handshake reads its configuration through one path
+tag Configuration: u8 {
+    none;
+    client: config.ClientConfig;
+    server: config.ServerConfig;
+}
+
 pub rec Handshake {
     role:                     engine.Role;
     client_config:            *config.ClientConfig;
-    client_configuration:     config.ClientConfig;
     server_config:            *config.ServerConfig;
-    server_configuration:     config.ServerConfig;
+    configuration:            Configuration;
     entropy:                  secret.Entropy;
     trust:                    cert.TrustStore;
     identity:                 credentials.Identity;
@@ -556,30 +563,29 @@ pub fun init_client(value: *Handshake, configuration: *config.ClientConfig,
         leave(value);
         ret false;
     }
-    value.role                         = engine.TLS12_CLIENT;
-    value.client_configuration         = configuration[0];
-    value.entropy                      = configuration.entropy[0];
-    value.trust                        = configuration.trust[0];
-    value.client_configuration.entropy = ?value.entropy;
-    value.client_configuration.trust   = ?value.trust;
+    value.role          = engine.TLS12_CLIENT;
+    value.configuration = Configuration.client{configuration[0]};
+    value.client_config = client_snapshot(value);
+    value.server_config = nil;
+    value.entropy       = configuration.entropy[0];
+    value.trust         = configuration.trust[0];
+    val snapshot: *config.ClientConfig = value.client_config;
+    snapshot.entropy = ?value.entropy;
+    snapshot.trust   = ?value.trust;
     if (configuration.client_identity != nil) {
-        value.identity                             = configuration.client_identity[0];
-        value.client_configuration.client_identity = ?value.identity;
+        value.identity           = configuration.client_identity[0];
+        snapshot.client_identity = ?value.identity;
     }
     or {
-        value.identity                             = credentials.no_identity();
-        value.identity.chain.certificates          = nil;
-        value.identity.private_key                 = nil;
-        value.client_configuration.client_identity = nil;
+        value.identity                    = credentials.no_identity();
+        value.identity.chain.certificates = nil;
+        value.identity.private_key        = nil;
+        snapshot.client_identity          = nil;
     }
-    value.client_config = ?value.client_configuration;
-    value.server_config = nil;
     reset(value, memory, output);
-    value.receive_record_plaintext =
-        value.client_configuration.limits.max_receive_record_plaintext;
-    value.send_record_plaintext =
-        value.client_configuration.limits.max_send_record_plaintext;
-    value.state = C_EXPECT_SERVER_HELLO;
+    value.receive_record_plaintext = snapshot.limits.max_receive_record_plaintext;
+    value.send_record_plaintext    = snapshot.limits.max_send_record_plaintext;
+    value.state                    = C_EXPECT_SERVER_HELLO;
     leave(value);
     ret true;
 }
@@ -609,27 +615,36 @@ pub fun init_server(value: *Handshake, configuration: *config.ServerConfig,
         leave(value);
         ret false;
     }
-    value.role                         = engine.TLS12_SERVER;
-    value.server_configuration         = configuration[0];
-    value.entropy                      = configuration.entropy[0];
-    value.server_configuration.entropy = ?value.entropy;
-    value.server_config                = ?value.server_configuration;
-    value.client_config                = nil;
+    value.role          = engine.TLS12_SERVER;
+    value.configuration = Configuration.server{configuration[0]};
+    value.server_config = server_snapshot(value);
+    value.client_config = nil;
+    value.entropy       = configuration.entropy[0];
+    val snapshot: *config.ServerConfig = value.server_config;
+    snapshot.entropy = ?value.entropy;
     reset(value, memory, FLIGHT_BYTES + configuration.limits.max_chain_bytes);
-    value.receive_record_plaintext =
-        value.server_configuration.limits.max_receive_record_plaintext;
-    value.send_record_plaintext =
-        value.server_configuration.limits.max_send_record_plaintext;
-    value.state = S_EXPECT_CLIENT_HELLO;
+    value.receive_record_plaintext = snapshot.limits.max_receive_record_plaintext;
+    value.send_record_plaintext    = snapshot.limits.max_send_record_plaintext;
+    value.state                    = S_EXPECT_CLIENT_HELLO;
     leave(value);
     ret true;
 }
 
+fun client_snapshot(value: *Handshake) *config.ClientConfig {
+    if (sel value.configuration.client) { ret ?value.configuration.client; }
+    ret nil;
+}
+
+fun server_snapshot(value: *Handshake) *config.ServerConfig {
+    if (sel value.configuration.server) { ret ?value.configuration.server; }
+    ret nil;
+}
+
 fun limits(value: *Handshake) config.Limits {
     if (value.role == engine.TLS12_CLIENT) {
-        ret value.client_configuration.limits;
+        ret value.client_config.limits;
     }
-    ret value.server_configuration.limits;
+    ret value.server_config.limits;
 }
 
 fun queue_clear(value: *Handshake) {
@@ -1044,8 +1059,8 @@ fun start_inner(value: *Handshake) engine.Result {
             ret fail(value, error.INTERNAL_ERROR, record.INTERNAL_ERROR_ALERT);
         }
         # a listener that also speaks tls 1.3 marks every 1.2 negotiation
-        if (supports_tls13(value.server_configuration.versions,
-            value.server_configuration.version_len)) {
+        if (supports_tls13(value.server_config.versions,
+            value.server_config.version_len)) {
             var i: usize = 0;
             for (i < 8) {
                 value.server_random[24 + i] = tls12.DOWNGRADE_TLS12[i];
@@ -1109,12 +1124,12 @@ fun configured_signature(value: *Handshake, scheme: u16) bool {
     var signatures: *tls13.SignatureScheme = nil;
     var count:      usize                  = 0;
     if (value.role == engine.TLS12_CLIENT) {
-        signatures = value.client_configuration.signatures;
-        count      = value.client_configuration.signature_len;
+        signatures = value.client_config.signatures;
+        count      = value.client_config.signature_len;
     }
     or {
-        signatures = value.server_configuration.signatures;
-        count      = value.server_configuration.signature_len;
+        signatures = value.server_config.signatures;
+        count      = value.server_config.signature_len;
     }
     var i: usize = 0;
     for (i < count) {
@@ -1128,12 +1143,12 @@ fun configured_group(value: *Handshake, curve: u16) bool {
     var groups: *tls13.NamedGroup = nil;
     var count:  usize             = 0;
     if (value.role == engine.TLS12_CLIENT) {
-        groups = value.client_configuration.groups;
-        count  = value.client_configuration.group_len;
+        groups = value.client_config.groups;
+        count  = value.client_config.group_len;
     }
     or {
-        groups = value.server_configuration.groups;
-        count  = value.server_configuration.group_len;
+        groups = value.server_config.groups;
+        count  = value.server_config.group_len;
     }
     var i: usize = 0;
     for (i < count) {
@@ -1306,7 +1321,7 @@ fun handle_server_certificate(value: *Handshake, frame: contracts.Bytes,
         ?certificate);
     if (failure != error.OK) { ret failure; }
     failure = verify_peer_chain(value, certificate.entries, certificate.count,
-        verify.SERVER_AUTH, value.client_configuration.server_name);
+        verify.SERVER_AUTH, value.client_config.server_name);
     if (failure != error.OK) { ret failure; }
     failure = absorb(value, frame.data, frame.len);
     if (failure == error.OK) { value.state = C_EXPECT_KEY_EXCHANGE; }
@@ -2130,11 +2145,15 @@ pub fun next_event(value: *Handshake, output: *engine.Event) bool {
 
 # the configured protocol the handshake selected, borrowed from the caller
 fun configured_alpn(value: *Handshake) contracts.Bytes {
-    var names: *config.ProtocolName = value.server_configuration.alpn;
-    var count: usize                = value.server_configuration.alpn_len;
+    var names: *config.ProtocolName = nil;
+    var count: usize                = 0;
     if (value.role == engine.TLS12_CLIENT) {
-        names = value.client_configuration.alpn;
-        count = value.client_configuration.alpn_len;
+        names = value.client_config.alpn;
+        count = value.client_config.alpn_len;
+    }
+    or {
+        names = value.server_config.alpn;
+        count = value.server_config.alpn_len;
     }
     var i: usize = 0;
     for (value.selected_alpn.len != 0 && i < count) {
@@ -2167,7 +2186,7 @@ fun hand_over(value: *Handshake) {
     seed.server_name.data      = nil;
     seed.server_name.len       = 0;
     if (value.role == engine.TLS12_CLIENT) {
-        seed.server_name = value.client_configuration.server_name;
+        seed.server_name = value.client_config.server_name;
     }
     seed.receive_record_limit = value.receive_record_plaintext;
     seed.send_record_limit    = value.send_record_plaintext;
@@ -2292,6 +2311,34 @@ pub fun close(value: *Handshake,
     ret closed;
 }
 
+fun wipe_configuration(value: *Handshake) {
+    if (sel value.configuration.client) {
+        value.configuration.client                 = config.no_client_config();
+        value.configuration.client.alpn            = nil;
+        value.configuration.client.trust           = nil;
+        value.configuration.client.versions        = nil;
+        value.configuration.client.suites          = nil;
+        value.configuration.client.groups          = nil;
+        value.configuration.client.signatures      = nil;
+        value.configuration.client.client_identity = nil;
+        value.configuration.client.entropy         = nil;
+        value.configuration.client.sessions        = nil;
+    }
+    or (sel value.configuration.server) {
+        value.configuration.server             = config.no_server_config();
+        value.configuration.server.credentials = nil;
+        value.configuration.server.alpn        = nil;
+        value.configuration.server.versions    = nil;
+        value.configuration.server.suites      = nil;
+        value.configuration.server.groups      = nil;
+        value.configuration.server.signatures  = nil;
+        value.configuration.server.entropy     = nil;
+        value.configuration.server.tickets     = nil;
+        value.configuration.server.replay      = nil;
+    }
+    value.configuration = Configuration.none{};
+}
+
 fun destroy_inner(value: *Handshake) bool {
     var destroyed: bool = false;
     if (owner_valid(value) && !value.event_active &&
@@ -2303,39 +2350,20 @@ fun destroy_inner(value: *Handshake) bool {
         prf.destroy(?value.secrets);
         release_lease(value);
         release_buffers(value);
-        value.client_config                        = nil;
-        value.server_config                        = nil;
-        value.client_configuration                 = config.no_client_config();
-        value.client_configuration.alpn            = nil;
-        value.client_configuration.trust           = nil;
-        value.client_configuration.versions        = nil;
-        value.client_configuration.suites          = nil;
-        value.client_configuration.groups          = nil;
-        value.client_configuration.signatures      = nil;
-        value.client_configuration.client_identity = nil;
-        value.client_configuration.entropy         = nil;
-        value.client_configuration.sessions        = nil;
-        value.server_configuration                 = config.no_server_config();
-        value.server_configuration.credentials     = nil;
-        value.server_configuration.alpn            = nil;
-        value.server_configuration.versions        = nil;
-        value.server_configuration.suites          = nil;
-        value.server_configuration.groups          = nil;
-        value.server_configuration.signatures      = nil;
-        value.server_configuration.entropy         = nil;
-        value.server_configuration.tickets         = nil;
-        value.server_configuration.replay          = nil;
-        value.entropy                              = config.no_entropy();
-        value.entropy.context                      = nil;
-        value.entropy.secret_context               = nil;
-        value.entropy.fill_fn                      = nil;
-        value.trust                                = cert.no_trust_store();
-        value.trust.anchors                        = nil;
-        value.identity                             = credentials.no_identity();
-        value.identity.chain.certificates          = nil;
-        value.identity.private_key                 = nil;
-        value.selected_alpn.data                   = nil;
-        value.server_name.data                     = nil;
+        value.client_config = nil;
+        value.server_config = nil;
+        wipe_configuration(value);
+        value.entropy                     = config.no_entropy();
+        value.entropy.context             = nil;
+        value.entropy.secret_context      = nil;
+        value.entropy.fill_fn             = nil;
+        value.trust                       = cert.no_trust_store();
+        value.trust.anchors               = nil;
+        value.identity                    = credentials.no_identity();
+        value.identity.chain.certificates = nil;
+        value.identity.private_key        = nil;
+        value.selected_alpn.data          = nil;
+        value.server_name.data            = nil;
         queue_clear(value);
         value.output_used = 0;
         value.state       = DESTROYED;
@@ -2805,6 +2833,32 @@ fun exchange(local: *Handshake, peer: *Handshake) i64 {
         rounds = rounds + 1;
     }
     ret 6;
+}
+
+test "tls12.connection: the handshake snapshots one role's configuration" {
+    var larger: usize = $size_of(config.ClientConfig);
+    if ($size_of(config.ServerConfig) > larger) {
+        larger = $size_of(config.ServerConfig);
+    }
+    # one payload plus the discriminator's slot, never both configs
+    if ($size_of(Configuration) > larger + $align_of(Configuration)) { ret 1; }
+    var owner: secret.Allocator = secret.system_allocator();
+    if (!loopback_configure(false, ?owner)) { ret 2; }
+    var dialer:   Handshake;
+    var listener: Handshake;
+    if (!init_client(?dialer, ?loopback_client_config, pool.shared()))   { ret 3; }
+    if (!init_server(?listener, ?loopback_server_config, pool.shared())) { ret 4; }
+    if (!sel dialer.configuration.client || dialer.server_config != nil ||
+        dialer.client_config != client_snapshot(?dialer)) { ret 5; }
+    if (!sel listener.configuration.server || listener.client_config != nil ||
+        listener.server_config != server_snapshot(?listener)) { ret 6; }
+    if (dialer.client_config.entropy != ?dialer.entropy ||
+        dialer.client_config.trust != ?dialer.trust ||
+        listener.server_config.entropy != ?listener.entropy) { ret 7; }
+    if (!destroy(?dialer) || !destroy(?listener)) { ret 8; }
+    if (!sel dialer.configuration.none || !sel listener.configuration.none ||
+        dialer.client_config != nil || listener.server_config != nil) { ret 9; }
+    ret 0;
 }
 
 test "tls12.connection: a complete ecdhe handshake agrees on every secret" {

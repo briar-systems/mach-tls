@@ -2,6 +2,8 @@
 
 use crypto.contracts;
 use crypto.secret;
+use A: std.allocator;
+use std.allocator.page;
 use std.chrono.duration;
 use std.chrono.time;
 use std.crypto.ct;
@@ -49,6 +51,16 @@ fun transition_ok(outcome: cancel.Transition) bool {
 
 fun runtime_ok(outcome: err[io_error.Error]) bool {
     ret sel outcome.ok;
+}
+
+# std 7 runtimes draw from a caller-owned allocator; the page allocator has no
+# context, so one module-level instance outlives every runtime made here
+var runtime_pages: A.Allocator;
+
+fun make_runtime(runtime: *io_runtime.Runtime, initial: usize) bool {
+    val paged: err[A.Error] = page.make(?runtime_pages);
+    if (sel paged.err) { ret false; }
+    ret runtime_ok(io_runtime.make(runtime, ?runtime_pages, initial));
 }
 
 fun runtime_closed(outcome: res[bool, io_error.Error]) bool {
@@ -243,7 +255,7 @@ fun set_test_time(seconds: i64) {
 
 test "transport: submission callbacks run outside the operation lock" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 4))) { ret 1; }
+    if (!make_runtime(?runtime, 4)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var state:   TestTransport;
@@ -313,7 +325,7 @@ fun take_one(runtime: *io_runtime.Runtime, completion: *io_runtime.Completion) b
 
 test "transport: one application write may drive write and read completions" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 8))) { ret 1; }
+    if (!make_runtime(?runtime, 8)) { ret 1; }
     var scope: cancel.Scope;
     val clock: time.InstantClock = time.instant();
     if (sel clock.err) { ret 2; }
@@ -353,7 +365,7 @@ test "transport: one application write may drive write and read completions" {
 
 test "transport: cancellation waits for lower buffer ownership" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 4))) { ret 1; }
+    if (!make_runtime(?runtime, 4)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -378,7 +390,7 @@ test "transport: cancellation waits for lower buffer ownership" {
 
 test "transport: descriptor drift retains lower ownership and fails closed" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 8))) { ret 1; }
+    if (!make_runtime(?runtime, 8)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var state:   TestTransport;
@@ -467,7 +479,7 @@ test "transport: descriptor drift retains lower ownership and fails closed" {
 
 test "transport: eof and close settle once" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 8))) { ret 1; }
+    if (!make_runtime(?runtime, 8)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -642,7 +654,7 @@ fun make_leased_stream(value: *stream.Stream, core: *client.Handshake,
 
 test "stream: accepted immediate terminals and callback reentry settle once" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 8))) { ret 1; }
+    if (!make_runtime(?runtime, 8)) { ret 1; }
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
@@ -729,7 +741,7 @@ test "stream: accepted immediate terminals and callback reentry settle once" {
 
 test "stream: connect rolls back every retained borrow before rejecting" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 8))) { ret 1; }
+    if (!make_runtime(?runtime, 8)) { ret 1; }
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
@@ -816,7 +828,7 @@ test "stream: connect rolls back every retained borrow before rejecting" {
 
 test "stream: partial write retains application ownership until the whole record settles" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -850,7 +862,7 @@ test "stream: partial write retains application ownership until the whole record
 
 test "stream: write cancellation requires an abortive lower close" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -885,7 +897,7 @@ test "stream: write cancellation requires an abortive lower close" {
 
 test "stream: zero-byte write completion makes sequence reuse impossible" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -923,7 +935,7 @@ test "stream: zero-byte write completion makes sequence reuse impossible" {
 
 test "stream: close notify is fully written before write-side shutdown" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -964,7 +976,7 @@ test "stream: close notify is fully written before write-side shutdown" {
 
 test "stream: encrypted records retain read ownership at every byte boundary" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 32))) { ret 1; }
+    if (!make_runtime(?runtime, 32)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1047,7 +1059,7 @@ test "stream: encrypted records retain read ownership at every byte boundary" {
 # again.
 test "stream: cancelling a read keeps the bytes the transport already settled" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 32))) { ret 1; }
+    if (!make_runtime(?runtime, 32)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1173,7 +1185,7 @@ fun resumed(runtime: *io_runtime.Runtime, secure: *stream.Stream) bool {
 
 test "stream: a write that waits for memory parks and resumes where it stopped" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    if (!make_runtime(?runtime, 16) || !parked_setup()) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1209,7 +1221,7 @@ test "stream: a write that waits for memory parks and resumes where it stopped" 
 
 test "stream: a read waits for memory to buffer and to open a record" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    if (!make_runtime(?runtime, 16) || !parked_setup()) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1286,7 +1298,7 @@ test "stream: a read waits for memory to buffer and to open a record" {
 
 test "stream: cancelling an operation parked for memory settles it as cancelled" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    if (!make_runtime(?runtime, 16) || !parked_setup()) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1397,7 +1409,7 @@ fun seal_application(clear: *^u8, length: usize, wire: *u8) usize {
 # those bytes are the start of a record, and the next read must finish it
 test "stream: a cancelled completion's read bytes reach the record layer" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 32))) { ret 1; }
+    if (!make_runtime(?runtime, 32)) { ret 1; }
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
@@ -1481,7 +1493,7 @@ test "stream: a cancelled completion's read bytes reach the record layer" {
 # a read that timed out as the peer closed reports the end of stream it saw
 test "stream: a timed-out completion's end of stream is kept" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
@@ -1522,7 +1534,7 @@ test "stream: a timed-out completion's end of stream is kept" {
 # at a record boundary and counts; a record cut short fails it
 test "stream: a cancelled completion's written bytes settle their record" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var state:   TestTransport;
     var adapter: transport.Transport;
     make_test_transport(?adapter, ?state, ?runtime);
@@ -1684,7 +1696,7 @@ fun token(index: u32, generation: u32) transport.Token {
 
 test "stream: a read that finds memory first does not starve a parked write" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    if (!make_runtime(?runtime, 16) || !parked_setup()) { ret 1; }
     var writes: cancel.Scope;
     var reads:  cancel.Scope;
     if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
@@ -1733,7 +1745,7 @@ test "stream: a read that finds memory first does not starve a parked write" {
 
 test "stream: a write that went out in full counts its bytes when the read fails" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1779,7 +1791,7 @@ test "stream: a write that went out in full counts its bytes when the read fails
 
 test "stream: a read in flight refuses close while half close and key update proceed" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var writes: cancel.Scope;
     var reads:  cancel.Scope;
     if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
@@ -1830,7 +1842,7 @@ test "stream: a read in flight refuses close while half close and key update pro
 
 test "stream: a peer close notify ends the read and leaves the write finishable" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1864,7 +1876,7 @@ test "stream: a peer close notify ends the read and leaves the write finishable"
 
 test "stream: a failed stream closes over a read in flight and still accounts it" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16))) { ret 1; }
+    if (!make_runtime(?runtime, 16)) { ret 1; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
     var transport_state: TestTransport;
@@ -1907,7 +1919,7 @@ test "stream: a failed stream closes over a read in flight and still accounts it
 
 test "stream: a read owing a record and a write short of memory do not deadlock" {
     var runtime: io_runtime.Runtime;
-    if (!runtime_ok(io_runtime.make(?runtime, 16)) || !parked_setup()) { ret 1; }
+    if (!make_runtime(?runtime, 16) || !parked_setup()) { ret 1; }
     var writes: cancel.Scope;
     var reads:  cancel.Scope;
     if (!operation_ok(cancel.make_root(?writes, opt[time.Instant].none{})) ||
@@ -1980,7 +1992,7 @@ fun adapter_close(close_mode: lifecycle.Mode) i32 {
     var runtime: io_runtime.Runtime;
     var driver:  net_async.Driver;
     var scope:   cancel.Scope;
-    if (!runtime_ok(io_runtime.make(?runtime, 8)) ||
+    if (!make_runtime(?runtime, 8) ||
         !runtime_ok(net_async.make(?driver, ?runtime)) ||
         !operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 0; }
     val listening: res[tcp.Listener, io_error.Error] = net_async.listen(

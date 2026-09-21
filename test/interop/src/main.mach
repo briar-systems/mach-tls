@@ -1,6 +1,8 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use A: std.allocator;
+use std.allocator.page;
 use std.chrono.time;
 use std.crypto.ct;
 use io_error: std.io.error;
@@ -51,6 +53,16 @@ fun transition_ok(outcome: cancel.Transition) bool {
 
 fun runtime_ok(outcome: err[io_error.Error]) bool {
     ret sel outcome.ok;
+}
+
+# std 7 runtimes draw from a caller-owned allocator; the page allocator has no
+# context, so one module-level instance outlives every runtime made here
+var runtime_pages: A.Allocator;
+
+fun make_runtime(runtime: *io_runtime.Runtime, initial: usize) bool {
+    val paged: err[A.Error] = page.make(?runtime_pages);
+    if (sel paged.err) { ret false; }
+    ret runtime_ok(io_runtime.make(runtime, ?runtime_pages, initial));
 }
 
 fun runtime_closed(outcome: res[bool, io_error.Error]) bool {
@@ -445,7 +457,7 @@ fun report(label: str, value: usize) {
 
 # one complete connection: handshake, bounded settlement checks, exchange, close
 fun dial_one(index: usize) i64 {
-    if (!runtime_ok(io_runtime.make(?dial_runtime, 16))) {
+    if (!make_runtime(?dial_runtime, 16)) {
         ret 3;
     }
     if (option_duplex) {
