@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-20
+
 tls builds on mach-std 7.0.2 and mach-crypto 0.20.0, selected by version range (#126). Its own public surface is unchanged.
 
 ### Changed
