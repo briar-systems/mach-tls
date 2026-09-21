@@ -82,8 +82,8 @@ path = "../.."
 # a dependency it selects by version, and this tree is not committed
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v6.0.0"
+ref = "tag/v7.0.2"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.18.0"
+ref = "tag/v0.20.0"
