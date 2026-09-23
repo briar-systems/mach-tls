@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-23
+
+tls builds on mach-crypto 0.21.0 and keeps every AES-GCM key expanded in a stored `aes_gcm.Context` for as long as the key is live, instead of expanding it on every record (#130).
+
+### Changed
+
+- Dependencies: `[dep.crypto] version = "^0.21"` realized at v0.21.0 and committed as a gitlink, and test/interop's crypto tag pin moved with it. crypto 0.21.0 adds the stored `aes_gcm.Context` with `init`, `dnit`, `seal_with` and `open_with` (#130).
+- Breaking: an AES-GCM record cipher expands its traffic key once, at `record.install`, into the new `context` field of `record.Cipher`, and every record seals and opens against it. `record.destroy` wipes the context with `aes_gcm.dnit`, so a key update, a failed install and stream teardown all retire it. `record.Aead` gains `seal_with` and `open_with`, and `aes_128_gcm()` and `aes_256_gcm()` return members that set those and leave `seal` and `open` nil. `record.aead(kind, seal, open)` still builds a per-call member, which is what `chacha20_poly1305()` returns, since crypto has no ChaCha20-Poly1305 context (#130).
+- Breaking: `session.TicketKey` holds its key only as an expanded `aes_gcm.Context`, replacing the raw `key` field. A ticket key is expanded in place when it is minted and wiped when it is pruned or the ring is reset or destroyed (#130).
+- Sizes on x86_64-linux: `record.Cipher` grows from 120 to 1,144 bytes, `stream.Stream` from 1,864 to 3,912 bytes, `session.TicketKey` from 104 to 1,080 bytes and `session.KeyRing` from 472 to 4,376 bytes. An idle established connection is still one resident page, measured by the interoperability matrix's footprint leg (#130).
+
+### Performance
+
+- A TLS 1.3 AES-128-GCM record through `record.seal` costs 7.0 µs at 64 bytes and 61.5 µs at 1,200 bytes, down from 12.4 and 70.1 µs, and a seal plus open costs 13.6 and 120.4 µs, down from 24.6 and 136.8 µs. These are medians of 5 batches of 2,000 calls on an AMD Ryzen 7 5800X3D, release profile, mach 5.10.0 (#130).
+
 ## [0.10.0] - 2026-09-20
 
 tls builds on mach-std 7.0.2 and mach-crypto 0.20.0, selected by version range (#126). Its own public surface is unchanged.

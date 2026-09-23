@@ -86,4 +86,4 @@ ref = "tag/v7.0.2"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.20.0"
+ref = "tag/v0.21.0"

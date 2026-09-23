@@ -67,10 +67,12 @@ pub rec State {
 }
 
 # a key's schedule is an interval on the monotonic clock, so a wall-clock step
-# never moves it. minted_at is when it was made, on the wall clock, for reports
+# never moves it. minted_at is when it was made, on the wall clock, for reports.
+# the key lives only in its context, expanded in place when it is minted and
+# wiped when it is retired, so a ticket key is never copied
 pub rec TicketKey {
     name:       [KEY_NAME_SIZE]u8;
-    key:        [TICKET_KEY_SIZE]^u8;
+    context:    aes_gcm.Context;
     seal_until: time.Instant;
     open_until: time.Instant;
     minted_at:  time.Time;
@@ -182,15 +184,6 @@ fun copy_bytes(destination: *u8, source: *u8, length: usize) {
     }
 }
 
-#[oblivious]
-fun copy_secret(destination: *^u8, source: *^u8, length: usize) {
-    var i: usize = 0;
-    for (i < length) {
-        destination[i] = source[i];
-        i              = i + 1;
-    }
-}
-
 fun names_equal(first: *u8, second: *u8) bool {
     var i: usize = 0;
     for (i < KEY_NAME_SIZE) {
@@ -271,7 +264,7 @@ fun ring_prune(ring: *KeyRing, now: time.Instant) {
     var index: usize = 0;
     for (index < MAX_TICKET_KEYS) {
         if (ring.keys[index].active && time.instant_after(now, ring.keys[index].open_until)) {
-            ct.zeroize(?ring.keys[index].key[0], TICKET_KEY_SIZE);
+            aes_gcm.dnit(?ring.keys[index].context);
             var i: usize = 0;
             for (i < KEY_NAME_SIZE) {
                 ring.keys[index].name[i] = 0;
@@ -338,6 +331,21 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
         }
         index = index + 1;
     }
+    # pruning first empties an expired slot, so the new key expands into it
+    # before anything else changes and a failed expansion changes nothing
+    ring_prune(ring, now);
+    val expanded: contracts.Error = aes_gcm.init(?ring.keys[slot].context,
+        contracts.SecretBytes{data: ?candidate_key[0], len: TICKET_KEY_SIZE});
+    ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
+    if (expanded != contracts.OK) {
+        aes_gcm.dnit(?ring.keys[slot].context);
+        index = 0;
+        for (index < KEY_NAME_SIZE) {
+            candidate_name[index] = 0;
+            index                 = index + 1;
+        }
+        ret false;
+    }
     if (retire) {
         index = 0;
         for (index < MAX_TICKET_KEYS) {
@@ -348,9 +356,7 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
             index = index + 1;
         }
     }
-    ring_prune(ring, now);
     copy_bytes(?ring.keys[slot].name[0], ?candidate_name[0], KEY_NAME_SIZE);
-    copy_secret(?ring.keys[slot].key[0], ?candidate_key[0], TICKET_KEY_SIZE);
     ring.keys[slot].seal_until = after_seconds(now, ring.seal_lifetime_seconds);
     ring.keys[slot].open_until = after_seconds(ring.keys[slot].seal_until,
         ring.overlap_seconds);
@@ -359,8 +365,7 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
     ring.current              = slot;
     ring.count                = ring.count + 1;
     ring.generation           = ring.generation + 1;
-    ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
-    index = 0;
+    index                     = 0;
     for (index < KEY_NAME_SIZE) {
         candidate_name[index] = 0;
         index                 = index + 1;
@@ -383,7 +388,7 @@ pub fun keyring_init(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
         ring.keys[index].seal_until = no_instant();
         ring.keys[index].open_until = no_instant();
         ring.keys[index].minted_at  = time.unix(0, 0);
-        ct.zeroize(?ring.keys[index].key[0], TICKET_KEY_SIZE);
+        aes_gcm.dnit(?ring.keys[index].context);
         var i: usize = 0;
         for (i < KEY_NAME_SIZE) {
             ring.keys[index].name[i] = 0;
@@ -441,7 +446,7 @@ pub fun keyring_destroy(ring: *KeyRing) {
     mutex.lock(?ring.lock);
     var index: usize = 0;
     for (index < MAX_TICKET_KEYS) {
-        ct.zeroize(?ring.keys[index].key[0], TICKET_KEY_SIZE);
+        aes_gcm.dnit(?ring.keys[index].context);
         var i: usize = 0;
         for (i < KEY_NAME_SIZE) {
             ring.keys[index].name[i] = 0;
@@ -619,9 +624,8 @@ pub fun seal(ring: *KeyRing, value: *State, at: clock.Moment,
     copy_bytes(output.data, ?ring.keys[slot].name[0], KEY_NAME_SIZE);
     copy_bytes(?output.data[KEY_NAME_SIZE], ?nonce[0], TICKET_NONCE_SIZE);
     val header:    usize               = KEY_NAME_SIZE + TICKET_NONCE_SIZE;
-    val operation: contracts.Operation = aes_gcm.seal(
-        contracts.SecretBytes{data: ?ring.keys[slot].key[0],
-        len: TICKET_KEY_SIZE},
+    val operation: contracts.Operation = aes_gcm.seal_with(
+        ?ring.keys[slot].context,
         contracts.Bytes{data: ?nonce[0], len: TICKET_NONCE_SIZE},
         contracts.Bytes{data: output.data, len: KEY_NAME_SIZE},
         contracts.SecretBytes{data: ?plaintext[0], len: length},
@@ -660,9 +664,8 @@ pub fun open(ring: *KeyRing, ticket: contracts.Bytes, at: clock.Moment,
     }
     val header:    usize               = KEY_NAME_SIZE + TICKET_NONCE_SIZE;
     var plaintext: [MAX_STATE_BYTES]^u8;
-    val operation: contracts.Operation = aes_gcm.open(
-        contracts.SecretBytes{data: ?ring.keys[slot].key[0],
-        len: TICKET_KEY_SIZE},
+    val operation: contracts.Operation = aes_gcm.open_with(
+        ?ring.keys[slot].context,
         contracts.Bytes{data: ?ticket.data[KEY_NAME_SIZE],
         len: TICKET_NONCE_SIZE},
         contracts.Bytes{data: ticket.data, len: KEY_NAME_SIZE},
