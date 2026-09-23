@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-23
+
 tls builds on mach-crypto 0.21.0 and keeps every AES-GCM key expanded in a stored `aes_gcm.Context` for as long as the key is live, instead of expanding it on every record (#130).
 
 ### Changed
