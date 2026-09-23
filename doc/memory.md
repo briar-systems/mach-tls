@@ -100,5 +100,10 @@ own `std.memory.secret` region and its own account, and reads
 | after one request | 1 | 0 |
 | after `stream.destroy` | 1 | 0 |
 
-The page is the Stream record itself (1,864 bytes, both established records
+The page is the Stream record itself (3,912 bytes, both established records
 and both lanes included). `$size_of(stream.Stream)` is the whole cost of an idle connection.
+Each of its two record ciphers holds its traffic key expanded in an
+`aes_gcm.Context` (1,008 bytes on x86_64-linux), which grows each cipher by
+1,024 bytes with its alignment. The contexts keep an idle connection at one page, and leave the
+Stream further above the ≤ 1 KiB fixed part that the per-connection memory RFC
+(#87) targets.

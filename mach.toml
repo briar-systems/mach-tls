@@ -65,4 +65,4 @@ version = "^7.0"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-version = "^0.20"
+version = "^0.21"
