@@ -1,0 +1,8 @@
+# the library and every test module it does not reach
+# `mach test . --lib tests` runs all of tls's tests
+
+use std.runtime;
+
+use tls.lib;
+
+use transport_tests: tls.test.transport;

@@ -472,7 +472,7 @@ fun dial_one(index: usize) i64 {
         dial_blocking = BlockingTransport{runtime: ?dial_runtime,
             stream: ?dial_socket};
         dial_lower = transport.Transport{runtime: ?dial_runtime,
-            context: (?dial_blocking)::ptr,
+            context:         (?dial_blocking)::ptr,
             context_size:    $size_of(BlockingTransport),
             aliases_state:   blocking_aliases_state,
             submit_read:     blocking_read, submit_write: blocking_write,

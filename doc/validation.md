@@ -8,16 +8,20 @@ as importantly, what it does not.
 ## Unit suites
 
 ```sh
-mach test .
-mach test . -O2
-mach test test/transport
-mach test test/transport -O2
+mach test . --lib tests
+mach test . --lib tests --profile release
+tools/test-selection
 ```
 
-`mach test .` covers every module in `src`. `test/transport` is a separate
-project because it drives the completion runtime and needs a real event loop.
-Both are run at `-O0` and `-O2`, because optimisation has already changed
-observable behaviour in this codebase once.
+mach tests only the closure of the selected artifact, and the library does not
+reach `tls.test.transport`, the completion transport tests that drive a real
+event loop. The test-only `tests` artifact (`src/tests.mach`) reaches the
+library and that module, so `mach test . --lib tests` covers every module in
+`src`, while `mach test .` covers only what the library reaches.
+`tools/test-selection` fails when a test declared under `src` is collected on no
+manifest target, and CI runs it. The suite runs in the debug and release
+profiles, because optimisation has already changed observable behaviour in this
+codebase once.
 
 ## Mutation corpora
 

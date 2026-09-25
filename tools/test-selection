@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+# fails unless `mach test . --lib tests` collects every test declared under src.
+# mach tests only the selected artifact's closure (briar-systems/mach#3813), so a
+# test module that src/tests.mach does not reach would otherwise stop running
+# without a sound. a test may sit behind a target condition, so each one must be
+# collected on at least one manifest target, not on all of them
+
+set -euo pipefail
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+mach=${1:-mach}
+mkdir -p "$root/out"
+scratch=$(mktemp -d "$root/out/test-selection.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+
+cd "$root"
+
+# every declaration as path:line, the form `mach test --list` ends each line with
+grep -rnE --include='*.mach' '^[[:space:]]*test "' src |
+    awk -F: '{ print $1 ":" $2 }' | sort > "$scratch/declared"
+declared=$(wc -l < "$scratch/declared")
+[[ "$declared" -gt 0 ]] || { echo "test-selection: no tests declared under src" >&2; exit 1; }
+
+: > "$scratch/union"
+targets=0
+while IFS= read -r target; do
+    if ! "$mach" test . --lib tests --target "$target" --list > "$scratch/listed" 2> "$scratch/error"; then
+        cat "$scratch/error" >&2
+        echo "test-selection: listing failed on $target" >&2
+        exit 1
+    fi
+    awk '{ print $NF }' "$scratch/listed" | sort > "$scratch/collected"
+    echo "test-selection: $target: $(wc -l < "$scratch/collected") of $declared collected"
+    cat "$scratch/collected" >> "$scratch/union"
+    targets=$((targets + 1))
+done < <(sed -n 's/^\[target\.\(.*\)\]$/\1/p' mach.toml)
+[[ "$targets" -gt 0 ]] || { echo "test-selection: no targets in mach.toml" >&2; exit 1; }
+
+sort -u -o "$scratch/union" "$scratch/union"
+missing=$(comm -23 "$scratch/declared" "$scratch/union")
+if [[ -n "$missing" ]]; then
+    printf 'test-selection: declared tests that `mach test . --lib tests` collects on no target:\n%s\n' \
+        "$missing" >&2
+    echo "test-selection: reach the missing modules from src/tests.mach" >&2
+    exit 1
+fi
+echo "test-selection: every declared test is collected on some target"

@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-25
+
+### Changed
+
+- Breaking: dependencies are `[dep.std] version = "^8.0"` realized at v8.0.0 and `[dep.crypto] version = "^0.22"` at v0.22.0, both committed as gitlinks, and `mach = "^5.12"`. Resolution is flat, so a consumer of tls must move to mach-std 8 and mach 5.12 with it. test/interop's std and crypto tag pins moved with them, and CI seeds mach v5.12.0 until the family pin moves. std 8.0.0 adds the typed secret view, and crypto 0.22.0 moves its std range to `^8.0`. Neither changes an API tls calls, so no source changed (#137).
+- mach 5.12 tests only the selected artifact's closure (briar-systems/mach#3813), and the library does not reach `tls.test.transport`, so `mach test .` collects 145 tests and misses the 28 in that module (27 off linux, where one is linux-only). A test-only `tests` artifact (`src/tests.mach`) reaches the library and the transport tests, and `mach test . --lib tests` collects all of them. `[artifact.tls]` is the default, so `mach build .` and `--all-targets` still build the library alone. CI runs the `tests` selection on every leg, and `tools/test-selection`, run by the verify hook, fails when a test declared under `src` is collected on no manifest target (#137).
+
 ## [0.11.0] - 2026-09-23
 
 tls builds on mach-crypto 0.21.0 and keeps every AES-GCM key expanded in a stored `aes_gcm.Context` for as long as the key is live, instead of expanding it on every record (#130).
