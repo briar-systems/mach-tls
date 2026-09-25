@@ -1,7 +1,7 @@
 [project]
 id = "tls"
 version = "0.11.0"
-mach = "^5.9"
+mach = "^5.12"
 src = "src"
 out = "out/{target.name}/{profile.name}"
 
@@ -61,8 +61,8 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^7.0"
+version = "^8.0"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-version = "^0.21"
+version = "^0.22"
