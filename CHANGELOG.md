@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-25
+
 ### Changed
 
 - Breaking: dependencies are `[dep.std] version = "^8.0"` realized at v8.0.0 and `[dep.crypto] version = "^0.22"` at v0.22.0, both committed as gitlinks, and `mach = "^5.12"`. Resolution is flat, so a consumer of tls must move to mach-std 8 and mach 5.12 with it. test/interop's std and crypto tag pins moved with them, and CI seeds mach v5.12.0 until the family pin moves. std 8.0.0 adds the typed secret view, and crypto 0.22.0 moves its std range to `^8.0`. Neither changes an API tls calls, so no source changed (#137).
