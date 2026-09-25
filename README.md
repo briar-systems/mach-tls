@@ -42,7 +42,8 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.validation` holds the deterministic mutation corpora for every parsing
   surface.
 
-`tls.lib` re-exports these modules for consumers that prefer one import.
+`use tls;` binds `tls.lib.tls`, which re-exports these modules for consumers
+that prefer one import.
 
 ## Status
 
