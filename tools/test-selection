@@ -2,7 +2,7 @@
 
 # fails unless `mach test . --lib tests` collects every test declared under src.
 # mach tests only the selected artifact's closure (briar-systems/mach#3813), so a
-# test module that src/tests.mach does not reach would otherwise stop running
+# test module that src/lib/tests.mach does not reach would otherwise stop running
 # without a sound. a test may sit behind a target condition, so each one must be
 # collected on at least one manifest target, not on all of them
 
@@ -42,7 +42,7 @@ missing=$(comm -23 "$scratch/declared" "$scratch/union")
 if [[ -n "$missing" ]]; then
     printf 'test-selection: declared tests that `mach test . --lib tests` collects on no target:\n%s\n' \
         "$missing" >&2
-    echo "test-selection: reach the missing modules from src/tests.mach" >&2
+    echo "test-selection: reach the missing modules from src/lib/tests.mach" >&2
     exit 1
 fi
 echo "test-selection: every declared test is collected on some target"

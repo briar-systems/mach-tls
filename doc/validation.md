@@ -15,8 +15,8 @@ tools/test-selection
 
 mach tests only the closure of the selected artifact, and the library does not
 reach `tls.test.transport`, the completion transport tests that drive a real
-event loop. The test-only `tests` artifact (`src/tests.mach`) reaches the
-library and that module, so `mach test . --lib tests` covers every module in
+event loop. The test-only `tests` artifact (`src/lib/tests.mach`) reaches
+the library and that module, so `mach test . --lib tests` covers every module in
 `src`, while `mach test .` covers only what the library reaches.
 `tools/test-selection` fails when a test declared under `src` is collected on no
 manifest target, and CI runs it. The suite runs in the debug and release

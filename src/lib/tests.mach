@@ -3,6 +3,6 @@
 
 use std.runtime;
 
-use tls.lib;
+use tls.lib.tls;
 
 use transport_tests: tls.test.transport;
