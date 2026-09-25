@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-09-25
+
+### Changed
+
+- The library entry moved from `src/lib.mach` to `src/lib/tls.mach` and the tests entry from `src/tests.mach` to `src/lib/tests.mach`, the family layout for artifact entries (briar-systems/.github#107). A bare `use tls;` still binds the library entry, and every other module path is unchanged. The entry module itself is now `tls.lib.tls`, so an import that named `tls.lib` directly names that path or uses `use tls;` instead (#141).
+
 ## [0.12.0] - 2026-09-25
 
 ### Changed
