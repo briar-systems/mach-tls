@@ -1,0 +1,47 @@
+# x509 parsing of a peer certificate
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.cert.x509;
+
+use fuzz.verdict;
+
+fun flag(value: bool, bit: u64) u64 {
+    if (value) { ret 1::u64 << bit; }
+    ret 0;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var value:  x509.Certificate;
+    val result: contracts.Error = x509.parse(contracts.Bytes{data: data, len: len}, ?value);
+    if (result != contracts.OK) { ret verdict.answered(result::u64); }
+    verdict.accept();
+    val extensions: *x509.Extensions = ?value.extensions;
+    # every view an accepted certificate publishes points into its own encoding
+    if (!verdict.bytes_inside(value.encoded, data, len) ||
+        !verdict.bytes_inside(value.tbs, data, len) ||
+        !verdict.bytes_inside(value.serial, data, len) ||
+        !verdict.bytes_inside(value.issuer, data, len) ||
+        !verdict.bytes_inside(value.subject, data, len) ||
+        !verdict.bytes_inside(value.signature, data, len) ||
+        !verdict.bytes_inside(value.public_key.encoded, data, len) ||
+        !verdict.bytes_inside(extensions.subject_alt_name, data, len) ||
+        !verdict.bytes_inside(extensions.name_constraints, data, len) ||
+        !verdict.bytes_inside(extensions.subject_key_id, data, len) ||
+        !verdict.bytes_inside(extensions.authority_key_id, data, len)) {
+        ret verdict.violated("certificate: an accepted certificate publishes a view outside its encoding");
+    }
+    var shape: u64 = (value.version::u64 << 8) | value.signature_algorithm::u64;
+    shape = verdict.mix(shape, value.public_key.algorithm::u64);
+    shape = verdict.mix(shape, flag(extensions.basic_constraints_present, 0) |
+        flag(extensions.ca, 1) | flag(extensions.key_usage_present, 2) |
+        flag(extensions.extended_key_usage_present, 3) |
+        flag(extensions.subject_alt_name_present, 4) |
+        flag(extensions.name_constraints_present, 5) |
+        flag(extensions.subject_key_id_present, 6) |
+        flag(extensions.authority_key_id_present, 7));
+    ret verdict.answered(verdict.mix(shape, 1::u64 << 40));
+}

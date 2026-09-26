@@ -1,0 +1,56 @@
+# extension blocks: framing, iteration and per-context validation
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.error;
+use block: tls.handshake.extensions;
+
+use fuzz.verdict;
+
+# walk a list to its end and report how it ended. every step must advance inside the list, so a walk
+# that outlives the list's length has looped. the final status and the size of
+# the count fold into the outcome
+pub fun walk(value: block.List, base: *u8, base_len: usize, outcome: *u64,
+    last: *block.NextStatus) bool {
+    if (!verdict.inside(value.data, value.len, base, base_len)) { ret false; }
+    var state: block.Iterator = block.iterator(value);
+    var item:  block.Extension;
+    var count: usize          = 0;
+    for (count <= value.len) {
+        val status: block.NextStatus = block.next(?state, ?item);
+        if (status != block.NEXT_ITEM) {
+            @outcome = verdict.mix(@outcome, (status::u64 << 8) | verdict.bucket(count));
+            @last    = status;
+            ret true;
+        }
+        if (!verdict.inside(item.data, item.len, value.data, value.len)) { ret false; }
+        count = count + 1;
+    }
+    ret false;
+}
+
+# the walk reads any context the same way, so it runs once, and each context
+# then validates the same bytes by its own placement rules
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64              = 0;
+    var last:    block.NextStatus = block.NEXT_INVALID;
+    if (!walk(block.list(data, len, block.CLIENT_HELLO), data, len, ?outcome, ?last)) {
+        ret verdict.violated("extensions: iteration left the list or did not terminate");
+    }
+    var context: block.Context = block.CLIENT_HELLO;
+    for (context <= block.TLS12_SERVER_HELLO) {
+        val valid: error.Error = block.validate(block.list(data, len, context));
+        # a list that validates is one a walk reads to its end
+        if (valid == error.OK) {
+            verdict.accept();
+            if (last != block.NEXT_DONE) {
+                ret verdict.violated("extensions: a list that validates does not walk to its end");
+            }
+        }
+        outcome = verdict.mix(outcome, valid::u64);
+        context = context + 1;
+    }
+    ret verdict.answered(outcome);
+}

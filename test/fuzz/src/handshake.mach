@@ -1,0 +1,219 @@
+# handshake framing and the tls 1.3 message parsers
+#
+# a message boundary's input is a message body. the harness frames it with its
+# message type and exact length, which is what the framer hands a parser, so a
+# mutation spends itself on the body rather than on a header the framer has
+# already refused
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.error;
+use frame: tls.handshake;
+use tls.handshake.codec;
+use block: tls.handshake.extensions;
+use tls.tls13;
+
+use fuzz.extensions;
+use fuzz.verdict;
+
+pub fun message(kind: frame.MessageType, data: *u8, len: usize) frame.Message {
+    ret frame.Message{
+        header: frame.Header{message_type: kind, length: len::u32},
+        body:   contracts.Bytes{data: data, len: len},
+    };
+}
+
+# a list a parser accepted walks to its end inside the input
+pub fun accepted_list(value: block.List, data: *u8, len: usize, outcome: *u64) bool {
+    var last: block.NextStatus = block.NEXT_INVALID;
+    ret extensions.walk(value, data, len, outcome, ?last) && last == block.NEXT_DONE;
+}
+
+fun parse_one(data: *u8, len: usize, tls12: bool, outcome: *u64) bool {
+    var parsed: frame.Message;
+    val result: frame.Progress = frame.parse_version(data, len, 4096, tls12, ?parsed);
+    @outcome = verdict.mix(@outcome, (result.status::u64 << 16) | result.error::u64);
+    if (result.status == frame.COMPLETE) {
+        verdict.accept();
+        # a body is published exactly where and as long as its header says
+        if (result.consumed > len || parsed.body.len::u32 != parsed.header.length ||
+            result.consumed != frame.HEADER_SIZE + parsed.body.len) { ret false; }
+        ret parsed.body.len == 0 || parsed.body.data == ?data[frame.HEADER_SIZE];
+    }
+    if (result.status == frame.NEED_INPUT) { ret result.required > len; }
+    if (result.status == frame.REJECTED)   { ret result.error != error.OK; }
+    ret false;
+}
+
+pub fun answer_frame(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!parse_one(data, len, false, ?outcome) || !parse_one(data, len, true, ?outcome)) {
+        ret verdict.violated("frame: a body was published outside its header's bounds");
+    }
+    ret verdict.answered(outcome);
+}
+
+fun client_hello_one(data: *u8, len: usize, after_retry: bool, outcome: *u64) bool {
+    var framed: frame.Message = message(frame.CLIENT_HELLO, data, len);
+    var hello:  codec.ClientHello;
+    val result: error.Error   = codec.decode_client_hello(?framed, after_retry, ?hello);
+    @outcome = verdict.mix(@outcome, result::u64);
+    if (result != error.OK) { ret true; }
+    verdict.accept();
+    # an accepted hello is structurally exact
+    if (hello.legacy_version != tls13.LEGACY_VERSION || hello.random.len != 32 ||
+        hello.compression_methods.len != 1 || hello.compression_methods.data[0] != 0 ||
+        (hello.cipher_suites.len & 1) != 0) { ret false; }
+    if (!verdict.bytes_inside(hello.random, data, len) ||
+        !verdict.bytes_inside(hello.legacy_session_id, data, len) ||
+        !verdict.bytes_inside(hello.cipher_suites, data, len)) { ret false; }
+    @outcome = verdict.mix(@outcome, codec.validate_client(?hello)::u64);
+    ret accepted_list(hello.extensions, data, len, outcome);
+}
+
+pub fun answer_client_hello(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!client_hello_one(data, len, false, ?outcome) ||
+        !client_hello_one(data, len, true, ?outcome)) {
+        ret verdict.violated("client-hello: an accepted hello is not structurally exact");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_server_hello(data: *u8, len: usize) verdict.Verdict {
+    var framed:  frame.Message = message(frame.SERVER_HELLO, data, len);
+    var hello:   codec.ServerHello;
+    val result:  error.Error   = codec.decode_server_hello(?framed, ?hello);
+    var outcome: u64           = result::u64;
+    if (result == error.OK) {
+        verdict.accept();
+        if (hello.random.len != 32 || !verdict.bytes_inside(hello.random, data, len) ||
+            !verdict.bytes_inside(hello.legacy_session_id, data, len) ||
+            !accepted_list(hello.extensions, data, len, ?outcome)) {
+            ret verdict.violated("server-hello: an accepted hello published a view outside its input");
+        }
+        outcome = verdict.mix(outcome, (hello.retry::u64 << 8) | codec.validate_server(?hello)::u64);
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_encrypted_extensions(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = message(frame.ENCRYPTED_EXTENSIONS, data, len);
+    var value:  codec.EncryptedExtensions;
+    val result: error.Error   = codec.decode_encrypted_extensions(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    var outcome: u64 = result::u64;
+    if (result == error.OK && !accepted_list(value.extensions, data, len, ?outcome)) {
+        ret verdict.violated("encrypted-extensions: an accepted list does not walk inside its input");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_certificate_request(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = message(frame.CERTIFICATE_REQUEST, data, len);
+    var value:  codec.CertificateRequest;
+    val result: error.Error   = codec.decode_certificate_request(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    var outcome: u64 = result::u64;
+    if (result == error.OK && (!verdict.bytes_inside(value.context, data, len) ||
+        !accepted_list(value.extensions, data, len, ?outcome))) {
+        ret verdict.violated("certificate-request: an accepted request published a view outside its input");
+    }
+    ret verdict.answered(outcome);
+}
+
+fun certificate_one(data: *u8, len: usize, allow_empty: bool, outcome: *u64) bool {
+    var framed: frame.Message = message(frame.CERTIFICATE, data, len);
+    var value:  codec.CertificateMessage;
+    val result: error.Error   = codec.decode_certificate(?framed, allow_empty, ?value);
+    @outcome = verdict.mix(@outcome, result::u64);
+    if (result != error.OK) { ret true; }
+    verdict.accept();
+    if (!verdict.bytes_inside(value.context, data, len) ||
+        !verdict.bytes_inside(value.entries, data, len)) { ret false; }
+    # the entries the parser counted are the entries a walk finds
+    var state: codec.CertificateIterator = codec.certificate_iterator(?value);
+    var entry: codec.CertificateEntry;
+    var count: usize                     = 0;
+    for (count <= value.entries.len) {
+        val status: block.NextStatus = codec.next_certificate(?state, ?entry);
+        if (status == block.NEXT_DONE) {
+            @outcome = verdict.mix(@outcome, verdict.bucket(count));
+            ret count == value.count;
+        }
+        if (status != block.NEXT_ITEM ||
+            !verdict.bytes_inside(entry.certificate, data, len) ||
+            !accepted_list(entry.extensions, data, len, outcome)) { ret false; }
+        count = count + 1;
+    }
+    ret false;
+}
+
+pub fun answer_certificate(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!certificate_one(data, len, false, ?outcome) ||
+        !certificate_one(data, len, true, ?outcome)) {
+        ret verdict.violated("certificate: an accepted chain does not walk to the count it reported");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_certificate_verify(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = message(frame.CERTIFICATE_VERIFY, data, len);
+    var value:  codec.CertificateVerify;
+    val result: error.Error   = codec.decode_certificate_verify(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    if (result == error.OK && (value.signature.len == 0 ||
+        !verdict.bytes_inside(value.signature, data, len))) {
+        ret verdict.violated("certificate-verify: an accepted signature is empty or outside its input");
+    }
+    ret verdict.answered(result::u64);
+}
+
+pub fun answer_finished(data: *u8, len: usize) verdict.Verdict {
+    var framed:  frame.Message = message(frame.FINISHED, data, len);
+    var value:   codec.Finished;
+    var outcome: u64           = 0;
+    var hash:    usize         = 32;
+    for (hash <= 48) {
+        val result: error.Error = codec.decode_finished(?framed, hash, ?value);
+        if (result == error.OK) { verdict.accept(); }
+        outcome = verdict.mix(outcome, result::u64);
+        if (result == error.OK && (value.verify_data.len != hash ||
+            !verdict.bytes_inside(value.verify_data, data, len))) {
+            ret verdict.violated("finished: accepted verify data is not one hash long");
+        }
+        hash = hash + 16;
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_new_session_ticket(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = message(frame.NEW_SESSION_TICKET, data, len);
+    var value:  codec.NewSessionTicket;
+    val result: error.Error   = codec.decode_new_session_ticket(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    var outcome: u64 = result::u64;
+    if (result == error.OK && (value.ticket.len == 0 ||
+        value.lifetime > codec.MAX_TICKET_LIFETIME ||
+        !verdict.bytes_inside(value.nonce, data, len) ||
+        !verdict.bytes_inside(value.ticket, data, len) ||
+        !accepted_list(value.extensions, data, len, ?outcome))) {
+        ret verdict.violated("new-session-ticket: an accepted ticket breaks its bounds");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_key_update(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = message(frame.KEY_UPDATE, data, len);
+    var value:  codec.KeyUpdate;
+    val result: error.Error   = codec.decode_key_update(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    if (result == error.OK && value.request > codec.UPDATE_REQUESTED) {
+        ret verdict.violated("key-update: an accepted request is neither of the two values");
+    }
+    ret verdict.answered(result::u64);
+}
