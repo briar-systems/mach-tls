@@ -1871,26 +1871,32 @@ pub fun destroy(stream: *Stream) bool {
 # tls12.connection.Connection. No consumer needs to erase one today, and
 # mach-quic does not. If one ever must, that is the shape of laurel#27 and the
 # fix is an opaque handle rather than relaxing the weld.
+#[testing]
 fun erase_transport(value: *transport.Transport) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_operation(value: *transport.Operation) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_limits(value: *config.Limits) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_trust_store(value: *cert.TrustStore) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_certificate(value: *cert.Certificate) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_leaf(value: *x509.Certificate) ptr {
     ret value::ptr;
 }
@@ -1918,6 +1924,7 @@ test stream__an_unbound_or_uninitialized_engine_cannot_take_ownership {
     ret 0;
 }
 
+#[testing]
 fun header_stream(stream: *Stream, length: usize) bool {
     stream.state                    = HANDSHAKING;
     stream.memory                   = pool.shared();

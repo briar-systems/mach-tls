@@ -2738,6 +2738,7 @@ pub fun send_record_limit(client: *Handshake) usize {
 }
 
 # see the note on the no_* constructors in config.mach
+#[testing]
 fun no_extra_extension() ExtraExtension {
     var value: ExtraExtension;
     ret value;
@@ -2745,6 +2746,7 @@ fun no_extra_extension() ExtraExtension {
 
 # leave a nonzero pattern on the stack the next declaration will occupy, so a
 # field left unset by a literal is observable rather than coincidentally zero
+#[testing]
 fun dirty_frame(depth: usize) usize {
     var scratch: [32]usize;
     var i:       usize = 0;
@@ -2758,6 +2760,7 @@ fun dirty_frame(depth: usize) usize {
 
 # every field, including the ones a manual clear left out: `sessions`, the
 # five lengths, `entropy_context_size` and `clock`
+#[testing]
 fun configuration_cleared(value: *config.ClientConfig) bool {
     ret value.server_name.data == nil && value.server_name.len == 0
         && value.alpn == nil && value.alpn_len == 0 && value.trust == nil
@@ -2772,20 +2775,25 @@ fun configuration_cleared(value: *config.ClientConfig) bool {
 
 # a destroyed client keeps no callable pointer and no stale bound, on every
 # field rather than the subset a manual clear happened to name
+#[testing]
 var test_moment: clock.Moment;
-var test_clock:  clock.Source;
+#[testing]
+var test_clock: clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
+#[testing]
 fun test_source() *clock.Source {
     if (test_clock.read_fn == nil) { set_test_time(1800000000); }
     ret ?test_clock;
 }
 
+#[testing]
 fun set_test_time(seconds: i64) {
     test_moment = clock.at(seconds, seconds);
     test_clock  = clock.frozen(?test_moment);
 }
 
+#[testing]
 fun start_at(value: *Handshake, seconds: i64) engine.Result {
     set_test_time(seconds);
     ret start(value);
@@ -2834,9 +2842,11 @@ test client__user_canceled_warning_permits_orderly_close {
     ret 0;
 }
 
+#[testing]
 var oversized_extension: [65500]u8;
 
 #[oblivious]
+#[testing]
 fun deterministic_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -2850,11 +2860,16 @@ fun deterministic_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
-var reentry_client:         *Handshake;
-var reentry_rejections:     usize;
+#[testing]
+var reentry_client: *Handshake;
+#[testing]
+var reentry_rejections: usize;
+#[testing]
 var hostile_entropy_client: *Handshake;
-var hostile_entropy_calls:  usize;
+#[testing]
+var hostile_entropy_calls: usize;
 
+#[testing]
 fun reentrant_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     if (reentry_client != nil) {
@@ -2876,6 +2891,7 @@ fun reentrant_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
+#[testing]
 fun hostile_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     hostile_entropy_calls = hostile_entropy_calls + 1;
@@ -3282,6 +3298,7 @@ test client__wrong_level_and_out_of_state_messages_fail_closed_once {
     ret 0;
 }
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (value >= '0' && value <= '9') {
         output[0] = value - '0';
@@ -3294,6 +3311,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
     ret false;
 }
 
+#[testing]
 fun decode_hex(input: *u8, length: usize, output: *u8,
     capacity: usize) bool {
     if (input == nil || output == nil || (length & 1) != 0 ||
@@ -3310,6 +3328,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8,
     ret true;
 }
 
+#[testing]
 fun secrets_equal(first: contracts.SecretBytes,
     second: contracts.SecretBytes) bool {
     if (first.len != second.len || first.data == nil || second.data == nil) {

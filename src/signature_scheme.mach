@@ -73,12 +73,14 @@ pub fun verify(scheme: tls13.SignatureScheme, public_key: *keys.PublicKey,
     ret contracts.UNSUPPORTED;
 }
 
+#[testing]
 fun hex_nibble(value: u8) i32 {
     if (value >= '0' && value <= '9') { ret (value - '0')::i32; }
     if (value >= 'a' && value <= 'f') { ret (value - 'a' + 10)::i32; }
     ret -1;
 }
 
+#[testing]
 fun decode_hex(text: *u8, length: usize, output: *u8,
     output_length: usize) bool {
     if (text == nil || output == nil || length != output_length * 2) {

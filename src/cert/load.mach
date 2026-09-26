@@ -207,6 +207,7 @@ pub fun private_pem(input: contracts.SecretBytes, owner: *secret.Allocator,
     ret keys.decode_private_pem(input, owner, output);
 }
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (output == nil) { ret false; }
     if (value >= '0' && value <= '9') {
@@ -221,6 +222,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
 }
 
 #[oblivious]
+#[testing]
 fun decode_secret_hex(input: *u8, input_len: usize, output: *^u8,
     output_len: usize) bool {
     if (input == nil || output == nil || input_len != output_len * 2) { ret false; }

@@ -3001,44 +3001,54 @@ pub fun send_record_limit(server: *Handshake) usize {
 }
 
 # see the note on the no_* constructors in config.mach
+#[testing]
 fun no_extra_extension() ExtraExtension {
     var value: ExtraExtension;
     ret value;
 }
 
+#[testing]
 var test_moment: clock.Moment;
-var test_clock:  clock.Source;
+#[testing]
+var test_clock: clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
+#[testing]
 fun test_source() *clock.Source {
     if (test_clock.read_fn == nil) { set_test_time(1800000000); }
     ret ?test_clock;
 }
 
+#[testing]
 fun set_test_time(seconds: i64) {
     set_test_moment(clock.at(seconds, seconds));
 }
 
+#[testing]
 fun set_test_moment(value: clock.Moment) {
     test_moment = value;
     test_clock  = clock.frozen(?test_moment);
 }
 
+#[testing]
 fun start_at(value: *Handshake, seconds: i64) engine.Result {
     set_test_time(seconds);
     ret start(value);
 }
 
+#[testing]
 fun start_moment(value: *Handshake, at: clock.Moment) engine.Result {
     set_test_moment(at);
     ret start(value);
 }
 
+#[testing]
 fun client_start_moment(value: *client.Handshake, at: clock.Moment) engine.Result {
     set_test_moment(at);
     ret client.start(value);
 }
 
+#[testing]
 fun client_start_at(value: *client.Handshake, seconds: i64) engine.Result {
     set_test_time(seconds);
     ret client.start(value);
@@ -3105,9 +3115,12 @@ test server__certificate_request_carries_the_maximum_signature_policy {
     ret 0;
 }
 
+#[testing]
 var loopback_root: [341]u8;
+#[testing]
 var loopback_leaf: [393]u8;
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (value >= '0' && value <= '9') {
         output[0] = value - '0';
@@ -3120,6 +3133,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
     ret false;
 }
 
+#[testing]
 fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
     if (input == nil || output == nil || (length & 1) != 0 ||
         length / 2 > capacity) { ret false; }
@@ -3136,6 +3150,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
 }
 
 #[oblivious]
+#[testing]
 fun test_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -3148,6 +3163,7 @@ fun test_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     ret 0;
 }
 
+#[testing]
 fun load_test_credentials(identity: *credentials.Identity,
     chain_storage: *cert.Certificate, key: *keys.PrivateKey,
     owner: *secret.Allocator) bool {
@@ -3177,6 +3193,7 @@ fun load_test_credentials(identity: *credentials.Identity,
 }
 
 # pump one complete handshake between the two engines in this package
+#[testing]
 fun exchange(local: *Handshake, peer: *client.Handshake) i64 {
     var rounds: usize = 0;
     for (rounds < 64) {
@@ -3219,13 +3236,18 @@ fun exchange(local: *Handshake, peer: *client.Handshake) i64 {
 
 var quic_server_parameters: [64]u8;
 var quic_client_parameters: [64]u8;
-var quic_event_kinds:       [64]u8;
-var quic_event_count:       usize = 0;
-var quic_seen_parameters:   [8]u8;
-var quic_seen_len:          usize = 0;
+#[testing]
+var quic_event_kinds: [64]u8;
+#[testing]
+var quic_event_count: usize = 0;
+#[testing]
+var quic_seen_parameters: [8]u8;
+#[testing]
+var quic_seen_len: usize = 0;
 
 # the same loopback as `exchange`, recording the listener's event sequence and
 # the bytes carried by PEER_PARAMETERS while they are still borrowed
+#[testing]
 fun exchange_recording(local: *Handshake, peer: *client.Handshake) i64 {
     var rounds: usize = 0;
     quic_event_count = 0;
@@ -3607,20 +3629,25 @@ test server__quic_transport_parameters_reach_the_caller_as_an_event {
     ret 0;
 }
 
+#[testing]
 var corpus_extensions: [1024]u8;
-var corpus_hello:      [2048]u8;
+#[testing]
+var corpus_hello: [2048]u8;
 
+#[testing]
 fun put_u16_at(output: *u8, offset: usize, value: u16) usize {
     write_u16(output, offset, value);
     ret offset + 2;
 }
 
+#[testing]
 fun put_bytes_at(output: *u8, offset: usize, source: *u8,
     length: usize) usize {
     copy_bytes(?output[offset], source, length);
     ret offset + length;
 }
 
+#[testing]
 fun extension_supported_versions(offset: usize, include_tls13: bool) usize {
     var body:   [5]u8;
     var length: usize = 3;
@@ -3638,6 +3665,7 @@ fun extension_supported_versions(offset: usize, include_tls13: bool) usize {
         contracts.Bytes{data: ?body[0], len: length});
 }
 
+#[testing]
 fun extension_groups(offset: usize, group: u16, duplicate: bool) usize {
     var body:   [6]u8;
     var length: usize = 4;
@@ -3653,6 +3681,7 @@ fun extension_groups(offset: usize, group: u16, duplicate: bool) usize {
         contracts.Bytes{data: ?body[0], len: length});
 }
 
+#[testing]
 fun extension_signatures(offset: usize) usize {
     var body: [4]u8;
     write_u16(?body[0], 0, 2);
@@ -3662,6 +3691,7 @@ fun extension_signatures(offset: usize) usize {
         contracts.Bytes{data: ?body[0], len: 4});
 }
 
+#[testing]
 fun extension_alpn(offset: usize, name: *u8, name_len: usize) usize {
     var body: [64]u8;
     write_u16(?body[0], 0, (1 + name_len)::u16);
@@ -3672,6 +3702,7 @@ fun extension_alpn(offset: usize, name: *u8, name_len: usize) usize {
         contracts.Bytes{data: ?body[0], len: 3 + name_len});
 }
 
+#[testing]
 fun extension_key_share(offset: usize, group: u16, key_len: usize) usize {
     var body: [128]u8;
     write_u16(?body[0], 0, (4 + key_len)::u16);
@@ -3687,6 +3718,7 @@ fun extension_key_share(offset: usize, group: u16, key_len: usize) usize {
         contracts.Bytes{data: ?body[0], len: 6 + key_len});
 }
 
+#[testing]
 fun extension_server_name(offset: usize) usize {
     var body: [32]u8;
     write_u16(?body[0], 0, 18);
@@ -3697,6 +3729,7 @@ fun extension_server_name(offset: usize) usize {
         contracts.Bytes{data: ?body[0], len: 20});
 }
 
+#[testing]
 fun assemble_hello(legacy_version: u16, suite: u16, suite_count: usize,
     compression: u8, extension_len: usize) usize {
     var offset: usize = 4;
@@ -3726,6 +3759,7 @@ fun assemble_hello(legacy_version: u16, suite: u16, suite_count: usize,
     ret offset;
 }
 
+#[testing]
 fun corpus_listener(listener: *config.ServerConfig, store: *credentials.Store,
     protocols: *config.ProtocolName, versions: *u16,
     suites: *tls13.CipherSuite, groups: *tls13.NamedGroup,
@@ -3753,6 +3787,7 @@ fun corpus_listener(listener: *config.ServerConfig, store: *credentials.Store,
 }
 
 # feed one hello to a fresh listener and report the alert it emits
+#[testing]
 fun reject_code(listener: *config.ServerConfig, hello_len: usize,
     failure: *error.Error) record.AlertDescription {
     val storage: buffer.Lease = pool.shared();
@@ -3991,28 +4026,50 @@ test server__malformed_client_hellos_fail_with_protocol_correct_alerts {
     ret 0;
 }
 
-var resume_ring:              session.KeyRing;
-var resume_window:            session.ReplayWindow;
-var resume_store:             session.ClientStore;
-var resume_listener:          config.ServerConfig;
-var resume_dialer:            config.ClientConfig;
-var resume_protocols:         [1]config.ProtocolName;
-var resume_versions:          [1]u16;
-var resume_suites:            [1]tls13.CipherSuite;
-var resume_groups:            [1]tls13.NamedGroup;
-var resume_signatures:        [1]tls13.SignatureScheme;
-var resume_server_entropy:    secret.Entropy;
-var resume_client_entropy:    secret.Entropy;
-var resume_server_counter:    u8;
-var resume_client_counter:    u8;
-var resume_anchor:            cert.Certificate;
-var resume_trust:             cert.TrustStore;
-var resume_chain:             [1]cert.Certificate;
-var resume_key:               keys.PrivateKey;
-var resume_identity:          credentials.Identity;
-var resume_generation:        credentials.Generation;
+#[testing]
+var resume_ring: session.KeyRing;
+#[testing]
+var resume_window: session.ReplayWindow;
+#[testing]
+var resume_store: session.ClientStore;
+#[testing]
+var resume_listener: config.ServerConfig;
+#[testing]
+var resume_dialer: config.ClientConfig;
+#[testing]
+var resume_protocols: [1]config.ProtocolName;
+#[testing]
+var resume_versions: [1]u16;
+#[testing]
+var resume_suites: [1]tls13.CipherSuite;
+#[testing]
+var resume_groups: [1]tls13.NamedGroup;
+#[testing]
+var resume_signatures: [1]tls13.SignatureScheme;
+#[testing]
+var resume_server_entropy: secret.Entropy;
+#[testing]
+var resume_client_entropy: secret.Entropy;
+#[testing]
+var resume_server_counter: u8;
+#[testing]
+var resume_client_counter: u8;
+#[testing]
+var resume_anchor: cert.Certificate;
+#[testing]
+var resume_trust: cert.TrustStore;
+#[testing]
+var resume_chain: [1]cert.Certificate;
+#[testing]
+var resume_key: keys.PrivateKey;
+#[testing]
+var resume_identity: credentials.Identity;
+#[testing]
+var resume_generation: credentials.Generation;
+#[testing]
 var resume_store_credentials: credentials.Store;
 
+#[testing]
 fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     owner: *secret.Allocator, now: clock.Moment) bool {
     if (!load_test_credentials(?resume_identity, ?resume_chain[0], ?resume_key,
@@ -4090,6 +4147,7 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     ret true;
 }
 
+#[testing]
 fun resume_connect(listener_engine: *Handshake, dialer_engine: *client.Handshake,
     now: clock.Moment) i64 {
     val server_storage: buffer.Lease = pool.shared();
@@ -4113,6 +4171,7 @@ fun resume_connect(listener_engine: *Handshake, dialer_engine: *client.Handshake
 }
 
 # drain every queued post-handshake event in both directions
+#[testing]
 fun pump_post(local: *Handshake, peer: *client.Handshake) i64 {
     var rounds: usize = 0;
     for (rounds < 32) {
@@ -4141,6 +4200,7 @@ fun pump_post(local: *Handshake, peer: *client.Handshake) i64 {
     ret 5;
 }
 
+#[testing]
 fun secrets_match(local: *Handshake, peer: *client.Handshake, server_send: bool) bool {
     val size: usize = key_schedule.hash_size(key_schedule.algorithm_for_suite(local.suite));
     if (size == 0 || !local.delegating || !peer.delegating) { ret false; }
@@ -4236,20 +4296,27 @@ test session__a_ticket_resumes_one_connection_and_a_key_update_rekeys_it {
 
 # every engine call below first finds the pool empty. a call that must wait
 # changes nothing, and after a wake its retry proceeds
-var pressure:       pool.Harness;
-var squeezed:       pool.Squeeze;
+#[testing]
+var pressure: pool.Harness;
+#[testing]
+var squeezed: pool.Squeeze;
+#[testing]
 var pressure_waits: usize;
+#[testing]
 var pressure_fault: i64;
 
+#[testing]
 fun hog() {
     squeezed.harness = ?pressure;
     pool.squeeze(?squeezed);
 }
 
+#[testing]
 fun unhog() {
     pool.relax(?squeezed);
 }
 
+#[testing]
 rec Marks {
     state:      u8;
     input_len:  usize;
@@ -4261,6 +4328,7 @@ rec Marks {
     failure:    error.Error;
 }
 
+#[testing]
 fun server_marks(value: *Handshake) Marks {
     ret Marks{state: value.state, input_len: value.input_len,
         input_read: value.input_read, hello_len: value.hello_len,
@@ -4268,6 +4336,7 @@ fun server_marks(value: *Handshake) Marks {
         active:     value.event_active, failure: value.failure};
 }
 
+#[testing]
 fun client_marks(value: *client.Handshake) Marks {
     ret Marks{state: value.state, input_len: value.input_len,
         input_read: value.input_read, hello_len: value.hello_len,
@@ -4275,6 +4344,7 @@ fun client_marks(value: *client.Handshake) Marks {
         active:     value.event_active, failure: value.failure};
 }
 
+#[testing]
 fun marks_equal(first: Marks, second: Marks) bool {
     ret first.state == second.state && first.input_len == second.input_len &&
         first.input_read == second.input_read && first.hello_len == second.hello_len &&
@@ -4283,6 +4353,7 @@ fun marks_equal(first: Marks, second: Marks) bool {
 }
 
 # one pressured call: kind 0 start, 1 ingest, 2 poll
+#[testing]
 fun pressed_server(local: *Handshake, kind: u8, level: engine.Level, data: *u8,
     length: usize, now: clock.Moment) engine.Result {
     hog();
@@ -4305,6 +4376,7 @@ fun pressed_server(local: *Handshake, kind: u8, level: engine.Level, data: *u8,
     ret outcome;
 }
 
+#[testing]
 fun pressed_client(peer: *client.Handshake, kind: u8, level: engine.Level, data: *u8,
     length: usize, now: clock.Moment) engine.Result {
     hog();
@@ -4327,6 +4399,7 @@ fun pressed_client(peer: *client.Handshake, kind: u8, level: engine.Level, data:
     ret outcome;
 }
 
+#[testing]
 fun pressed_exchange(local: *Handshake, peer: *client.Handshake) i64 {
     var rounds: usize = 0;
     for (rounds < 64) {
@@ -4361,6 +4434,7 @@ fun pressed_exchange(local: *Handshake, peer: *client.Handshake) i64 {
     ret 105;
 }
 
+#[testing]
 fun copy_secret_bytes(from: *key_schedule.Secret, output: *u8) {
     val view: contracts.SecretBytes = key_schedule.bytes(from);
     var i:    usize                 = 0;
@@ -4427,6 +4501,7 @@ test memory__a_handshake_that_waits_for_memory_matches_one_that_never_did {
     ret 0;
 }
 
+#[testing]
 fun pump_cores(local: *established.Established,
     peer: *established.Established) i64 {
     var rounds: usize = 0;
@@ -4451,6 +4526,7 @@ fun pump_cores(local: *established.Established,
     ret 5;
 }
 
+#[testing]
 fun cores_match(server_core: *established.Established,
     client_core: *established.Established) bool {
     val sent:     contracts.SecretBytes = key_schedule.bytes(?server_core.send);
@@ -4464,12 +4540,15 @@ fun cores_match(server_core: *established.Established,
     ret true;
 }
 
+#[testing]
 fun unreadable(context: ptr, output: *clock.Moment) bool {
     ret false;
 }
 
+#[testing]
 var broken_clock: clock.Source;
 
+#[testing]
 fun release_resume() i32 {
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?resume_store_credentials, ?retired);
@@ -4544,9 +4623,12 @@ test clock__a_failed_read_refuses_resumption_and_a_client_keeps_its_ticket {
     ret 0;
 }
 
+#[testing]
 var flight_digest: u64;
-var flight_bytes:  usize;
+#[testing]
+var flight_bytes: usize;
 
+#[testing]
 fun digest(data: *u8, length: usize) {
     var i: usize = 0;
     for (i < length) {
@@ -4558,6 +4640,7 @@ fun digest(data: *u8, length: usize) {
 
 # the exchange of `exchange`, folding every flight either side sends into the
 # digest in the order it was sent
+#[testing]
 fun exchange_digest(local: *Handshake, peer: *client.Handshake) i64 {
     var rounds: usize = 0;
     for (rounds < 64) {
@@ -4601,6 +4684,7 @@ fun exchange_digest(local: *Handshake, peer: *client.Handshake) i64 {
 # a full handshake that issues a ticket, then a resumption `shift` monotonic
 # seconds later than otherwise, all under the frozen clock. the digest covers
 # every flight of both connections
+#[testing]
 fun digest_run(shift: i64, output: *u64) i32 {
     var owner: secret.Allocator = secret.system_allocator();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 9000))) {
@@ -4971,6 +5055,7 @@ test server__an_exact_alpn_offer_contains_only_its_single_protocol {
     ret 0;
 }
 
+#[testing]
 fun test_challenge_store_selector(store: *credentials.Store, offer: CredentialOffer,
     output: *credentials.Lease) contracts.Error {
     if (store == nil || !offered_alpn_exactly(offer,

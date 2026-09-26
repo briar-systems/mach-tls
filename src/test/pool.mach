@@ -85,9 +85,11 @@ pub fun destroy(harness: *Harness) bool {
 }
 
 # each test runs in its own process, so one pool per process serves it
+#[testing]
 var shared_harness: Harness;
 
 # a lease on a roomy process-wide pool, made on first use
+#[testing]
 pub fun shared() buffer.Lease {
     if (!shared_harness.made && !make(?shared_harness, 1 << 28, 1 << 27)) {
         ret buffer.no_lease();
@@ -95,6 +97,7 @@ pub fun shared() buffer.Lease {
     ret lease(?shared_harness);
 }
 
+#[testing]
 pub fun shared_secret() buffer.SecretLease {
     if (!shared_harness.made && !make(?shared_harness, 1 << 28, 1 << 27)) {
         ret buffer.no_secret_lease();
@@ -103,19 +106,23 @@ pub fun shared_secret() buffer.SecretLease {
 }
 
 # bytes the shared account holds now
+#[testing]
 pub fun shared_held() usize {
     ret shared_harness.account.held;
 }
 
+#[testing]
 pub val SQUEEZE_CHUNKS: usize = 1024;
 
 # every chunk a small pool has left, held so the next acquisition must wait
+#[testing]
 pub rec Squeeze {
     harness: *Harness;
     chunks:  [SQUEEZE_CHUNKS]buffer.Region;
     count:   usize;
 }
 
+#[testing]
 pub fun squeeze(value: *Squeeze) {
     for (value.count < SQUEEZE_CHUNKS) {
         value.chunks[value.count] = buffer.empty();
@@ -126,6 +133,7 @@ pub fun squeeze(value: *Squeeze) {
 }
 
 # give the chunks back, which wakes the account, and drain the wake-ups
+#[testing]
 pub fun relax(value: *Squeeze) {
     for (value.count > 0) {
         value.count = value.count - 1;
@@ -135,10 +143,12 @@ pub fun relax(value: *Squeeze) {
     buffers.ready(?value.harness.pool, ?handles[0], 4);
 }
 
+#[testing]
 fun erase_lease(value: *buffer.Lease) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_region(value: *buffer.Region) ptr {
     ret value::ptr;
 }

@@ -700,6 +700,7 @@ pub fun destroy(schedule: *Schedule) {
     schedule.resumption_ready    = false;
 }
 
+#[testing]
 fun matches(value: *Secret, expected: *u8, length: usize) bool {
     if (value == nil || !value.active || value.len != length) { ret false; }
     var i: usize = 0;
@@ -710,6 +711,7 @@ fun matches(value: *Secret, expected: *u8, length: usize) bool {
     ret true;
 }
 
+#[testing]
 fun secret_matches(value: *^u8, expected: *u8, length: usize) bool {
     if (value == nil || expected == nil) { ret false; }
     var i: usize = 0;
@@ -720,6 +722,7 @@ fun secret_matches(value: *^u8, expected: *u8, length: usize) bool {
     ret true;
 }
 
+#[testing]
 fun public_matches(value: *u8, expected: *u8, length: usize) bool {
     if (value == nil || expected == nil) { ret false; }
     var i: usize = 0;

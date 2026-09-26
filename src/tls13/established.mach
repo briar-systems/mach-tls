@@ -869,6 +869,7 @@ pub fun failure(core: *Established) error.Error {
     ret core.failure;
 }
 
+#[testing]
 fun test_secret(fill: u8) key_schedule.Secret {
     var value: key_schedule.Secret;
     var i:     usize = 0;
@@ -882,13 +883,17 @@ fun test_secret(fill: u8) key_schedule.Secret {
     ret value;
 }
 
+#[testing]
 var test_moment: clock.Moment;
-var test_clock:  clock.Source;
+#[testing]
+var test_clock: clock.Source;
 
+#[testing]
 fun unreadable(context: ptr, output: *clock.Moment) bool {
     ret false;
 }
 
+#[testing]
 fun test_seed(role: engine.Role) Seed {
     var seed: Seed;
     seed.role                 = role;
@@ -908,6 +913,7 @@ fun test_seed(role: engine.Role) Seed {
     ret seed;
 }
 
+#[testing]
 fun drain(core: *Established, kinds: *engine.EventKind, capacity: usize) usize {
     var count: usize = 0;
     var event: engine.Event;

@@ -942,10 +942,13 @@ pub fun ticket_destroy(value: *Ticket) {
     ticket_clear(value);
 }
 
-var probe_counter:         u8;
+#[testing]
+var probe_counter: u8;
+#[testing]
 var failing_entropy_calls: u8;
 
 #[oblivious]
+#[testing]
 fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -959,6 +962,7 @@ fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
 }
 
 #[oblivious]
+#[testing]
 fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     var i: usize = 0;
@@ -970,6 +974,7 @@ fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
 }
 
 #[oblivious]
+#[testing]
 fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     var i: usize = 0;
@@ -983,6 +988,7 @@ fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
 }
 
 #[oblivious]
+#[testing]
 fun repeating_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     var i: usize = 0;
@@ -993,18 +999,22 @@ fun repeating_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     ret 0;
 }
 
+#[testing]
 fun moment(seconds: i64) clock.Moment {
     ret clock.at(seconds, seconds);
 }
 
+#[testing]
 fun mono(seconds: i64) time.Instant {
     ret time.Instant{sec: seconds, nsec: 0};
 }
 
+#[testing]
 fun wall(seconds: i64) time.Time {
     ret time.unix(seconds, 0);
 }
 
+#[testing]
 fun rotation_state(issued_at: i64) State {
     var value: State = empty_state();
     value.version    = tls13.VERSION;

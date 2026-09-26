@@ -279,6 +279,7 @@ pub fun destroy(value: *Transcript) {
     value.unframed    = false;
 }
 
+#[testing]
 fun bytes_match(actual: *u8, expected: *u8, length: usize) bool {
     if (actual == nil || expected == nil) { ret false; }
     var i: usize = 0;

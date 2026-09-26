@@ -2451,20 +2451,25 @@ pub fun downgrade_signalled(value: *Handshake) bool {
     ret value != nil && value.downgrade_signalled;
 }
 
+#[testing]
 var test_moment: clock.Moment;
-var test_clock:  clock.Source;
+#[testing]
+var test_clock: clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
+#[testing]
 fun test_source() *clock.Source {
     if (test_clock.read_fn == nil) { set_test_time(1800000000); }
     ret ?test_clock;
 }
 
+#[testing]
 fun set_test_time(seconds: i64) {
     test_moment = clock.at(seconds, seconds);
     test_clock  = clock.frozen(?test_moment);
 }
 
+#[testing]
 fun start_at(value: *Handshake, seconds: i64) engine.Result {
     set_test_time(seconds);
     ret start(value);
@@ -2484,28 +2489,50 @@ test tls12_connection__an_unconfigured_connection_accepts_nothing {
     ret 0;
 }
 
-var loopback_root:            [341]u8;
-var loopback_leaf:            [393]u8;
-var loopback_chain:           [1]cert.Certificate;
-var loopback_key:             keys.PrivateKey;
-var loopback_identity:        credentials.Identity;
-var loopback_generation:      credentials.Generation;
-var loopback_store:           credentials.Store;
-var loopback_anchor:          cert.Certificate;
-var loopback_trust:           cert.TrustStore;
-var loopback_protocols:       [1]config.ProtocolName;
+#[testing]
+var loopback_root: [341]u8;
+#[testing]
+var loopback_leaf: [393]u8;
+#[testing]
+var loopback_chain: [1]cert.Certificate;
+#[testing]
+var loopback_key: keys.PrivateKey;
+#[testing]
+var loopback_identity: credentials.Identity;
+#[testing]
+var loopback_generation: credentials.Generation;
+#[testing]
+var loopback_store: credentials.Store;
+#[testing]
+var loopback_anchor: cert.Certificate;
+#[testing]
+var loopback_trust: cert.TrustStore;
+#[testing]
+var loopback_protocols: [1]config.ProtocolName;
+#[testing]
 var loopback_client_versions: [1]u16;
+#[testing]
 var loopback_server_versions: [1]u16;
-var loopback_suites:          [1]tls13.CipherSuite;
-var loopback_groups:          [1]tls13.NamedGroup;
-var loopback_signatures:      [1]tls13.SignatureScheme;
-var loopback_client_entropy:  secret.Entropy;
-var loopback_server_entropy:  secret.Entropy;
-var loopback_client_counter:  u8;
-var loopback_server_counter:  u8;
-var loopback_client_config:   config.ClientConfig;
-var loopback_server_config:   config.ServerConfig;
+#[testing]
+var loopback_suites: [1]tls13.CipherSuite;
+#[testing]
+var loopback_groups: [1]tls13.NamedGroup;
+#[testing]
+var loopback_signatures: [1]tls13.SignatureScheme;
+#[testing]
+var loopback_client_entropy: secret.Entropy;
+#[testing]
+var loopback_server_entropy: secret.Entropy;
+#[testing]
+var loopback_client_counter: u8;
+#[testing]
+var loopback_server_counter: u8;
+#[testing]
+var loopback_client_config: config.ClientConfig;
+#[testing]
+var loopback_server_config: config.ServerConfig;
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (value >= '0' && value <= '9') {
         output[0] = value - '0';
@@ -2518,6 +2545,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
     ret false;
 }
 
+#[testing]
 fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
     if (input == nil || output == nil || (length & 1) != 0 ||
         length / 2 > capacity) { ret false; }
@@ -2534,6 +2562,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
 }
 
 #[oblivious]
+#[testing]
 fun loopback_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -2546,6 +2575,7 @@ fun loopback_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     ret 0;
 }
 
+#[testing]
 fun loopback_configure(versions_include_tls13: bool,
     owner: *secret.Allocator) bool {
     val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
@@ -2649,21 +2679,35 @@ fun loopback_configure(versions_include_tls13: bool,
 #
 # every queued event is drained before any bytes are delivered, which is what
 # the stream does and what keeps ingest from being refused as blocked
+#[testing]
 val MAX_SEGMENTS: usize = 12;
 
-var to_listener:        [32768]u8;
-var to_listener_level:  [MAX_SEGMENTS]engine.Level;
+#[testing]
+var to_listener: [32768]u8;
+#[testing]
+var to_listener_level: [MAX_SEGMENTS]engine.Level;
+#[testing]
 var to_listener_offset: [MAX_SEGMENTS]usize;
+#[testing]
 var to_listener_length: [MAX_SEGMENTS]usize;
-var to_listener_count:  usize;
-var to_listener_used:   usize;
-var to_dialer:          [32768]u8;
-var to_dialer_level:    [MAX_SEGMENTS]engine.Level;
-var to_dialer_offset:   [MAX_SEGMENTS]usize;
-var to_dialer_length:   [MAX_SEGMENTS]usize;
-var to_dialer_count:    usize;
-var to_dialer_used:     usize;
+#[testing]
+var to_listener_count: usize;
+#[testing]
+var to_listener_used: usize;
+#[testing]
+var to_dialer: [32768]u8;
+#[testing]
+var to_dialer_level: [MAX_SEGMENTS]engine.Level;
+#[testing]
+var to_dialer_offset: [MAX_SEGMENTS]usize;
+#[testing]
+var to_dialer_length: [MAX_SEGMENTS]usize;
+#[testing]
+var to_dialer_count: usize;
+#[testing]
+var to_dialer_used: usize;
 
+#[testing]
 fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
     lengths: *usize, count: *usize, used: *usize, level: engine.Level,
     data: *u8, length: usize) bool {
@@ -2683,9 +2727,12 @@ fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
 
 # keys are captured while their event is active, because the engine wipes its
 # secrets once the established queue drains
-var captured_key:     [4][prf.MAX_KEY]^u8;
+#[testing]
+var captured_key: [4][prf.MAX_KEY]^u8;
+#[testing]
 var captured_key_len: [4]usize;
 
+#[testing]
 fun capture_keys(source: *Handshake, event: *engine.Event, dialer: bool) bool {
     var slot: usize = 0;
     if (!dialer)                           { slot = 2; }
@@ -2698,6 +2745,7 @@ fun capture_keys(source: *Handshake, event: *engine.Event, dialer: bool) bool {
         ?captured_key_len[slot]);
 }
 
+#[testing]
 fun drain_events(source: *Handshake, into_listener: bool) i64 {
     var event: engine.Event;
     for (next_event(source, ?event)) {
@@ -2726,12 +2774,18 @@ fun drain_events(source: *Handshake, into_listener: bool) i64 {
 
 # while pressing, every engine call first finds the pool empty. a call that
 # must wait changes nothing, and after a wake its retry proceeds
-var pressing:       bool;
-var pressure:       pool.Harness;
-var squeezed:       pool.Squeeze;
+#[testing]
+var pressing: bool;
+#[testing]
+var pressure: pool.Harness;
+#[testing]
+var squeezed: pool.Squeeze;
+#[testing]
 var pressure_waits: usize;
+#[testing]
 var pressure_fault: i64;
 
+#[testing]
 fun pressed(target: *Handshake, starting: bool, level: engine.Level, data: *u8,
     length: usize) engine.Result {
     if (pressing) {
@@ -2764,6 +2818,7 @@ fun pressed(target: *Handshake, starting: bool, level: engine.Level, data: *u8,
 
 # a target that already has queued events refuses more input, so its queue is
 # drained between segments exactly as the stream would
+#[testing]
 fun deliver(target: *Handshake, into_listener: bool, buffer: *u8,
     levels: *engine.Level, offsets: *usize, lengths: *usize, count: *usize,
     used: *usize) i64 {
@@ -2798,6 +2853,7 @@ fun deliver(target: *Handshake, into_listener: bool, buffer: *u8,
     ret failed;
 }
 
+#[testing]
 fun exchange(local: *Handshake, peer: *Handshake) i64 {
     to_listener_count = 0;
     to_listener_used  = 0;
