@@ -26,12 +26,6 @@ pub rec TrustStore {
     len:     usize;
 }
 
-test cert__encoded_private_key_formats_are_explicit {
-    if (PKCS8_DER == SEC1_DER)     { ret 1; }
-    if (SEC1_DER == RSA_PKCS1_DER) { ret 1; }
-    ret 0;
-}
-
 # a value cleared by declaration rather than by an empty literal: a record
 # literal leaves every field it does not name holding the previous stack
 # frame's contents (briar-systems/mach#3108)

@@ -33,4 +33,3 @@ fwd tls.client;
 fwd tls.stream;
 fwd tls.memory_range;
 fwd tls.buffer;
-fwd tls.validation;

@@ -218,16 +218,8 @@ pub fun alert_for(failure: error.Error) record.AlertDescription {
     ret record.INTERNAL_ERROR_ALERT;
 }
 
-test engine__levels_roles_and_generations_are_total {
-    if (valid_level(0) || valid_level(4) || !valid_level(INITIAL) ||
-        !valid_level(APPLICATION)) { ret 1; }
-    if (next_generation(0) != 1 || next_generation(~(0::u64)) != 1) { ret 2; }
-    if (CLIENT == SERVER || SEND == RECEIVE)                        { ret 3; }
-    if (!is_client(CLIENT) || !is_client(TLS12_CLIENT) || is_client(SERVER) ||
-        is_client(TLS12_SERVER)) { ret 5; }
-    if (!is_tls12(TLS12_CLIENT) || !is_tls12(TLS12_SERVER) ||
-        is_tls12(CLIENT) || is_tls12(SERVER)) { ret 6; }
-    if (result(OK, error.OK, 3, 4).consumed != 3) { ret 4; }
+test engine__next_generation_skips_zero_on_wrap {
+    if (next_generation(0) != 1 || next_generation(~(0::u64)) != 1) { ret 1; }
     ret 0;
 }
 

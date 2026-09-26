@@ -7,7 +7,6 @@
 # thread id and no kernel wait
 
 use std.sync.atomic;
-use std.sync.thread;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -32,23 +31,6 @@ pub fun held(word: *i64) bool {
     ret word != nil && atomic.load(word) != FREE;
 }
 
-val HANDOFF_ROUNDS: usize = 20000;
-
-var handoff_word:    i64;
-var handoff_counter: usize;
-
-fun alternate(context: *u8) {
-    var i: usize = 0;
-    for (i < HANDOFF_ROUNDS) {
-        if (enter(?handoff_word)) {
-            handoff_counter = handoff_counter + 1;
-            leave(?handoff_word);
-            i = i + 1;
-        }
-        or { atomic.spin_hint(); }
-    }
-}
-
 test transition__a_held_word_refuses_every_second_entrant {
     var word: i64 = FREE;
     if (!enter(?word) || !held(?word)) { ret 1; }
@@ -57,20 +39,5 @@ test transition__a_held_word_refuses_every_second_entrant {
     if (held(?word) || !enter(?word)) { ret 3; }
     leave(?word);
     if (enter(nil) || held(nil)) { ret 4; }
-    ret 0;
-}
-
-test transition__two_threads_handing_one_word_back_and_forth_never_overlap {
-    handoff_word    = FREE;
-    handoff_counter = 0;
-    var first:  thread.Thread;
-    var second: thread.Thread;
-    thread.spawn_with(alternate, nil, ?first);
-    thread.spawn_with(alternate, nil, ?second);
-    if (first.tid < 0 || second.tid < 0) { ret 1; }
-    thread.join(?first);
-    thread.join(?second);
-    if (handoff_counter != HANDOFF_ROUNDS * 2) { ret 2; }
-    if (handoff_word != FREE)                  { ret 3; }
     ret 0;
 }

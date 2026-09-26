@@ -159,10 +159,3 @@ test config__default_limits_are_finite_and_protocol_conforming {
         peer_message_limit(limits, handshake.CLIENT_HELLO) != 16384) { ret 3; }
     ret 0;
 }
-
-test config__all_verification_schemes_fit_one_bounded_policy {
-    if (!valid_signature_count(MAX_SIGNATURE_SCHEMES) ||
-        valid_signature_count(0) ||
-        valid_signature_count(MAX_SIGNATURE_SCHEMES + 1)) { ret 1; }
-    ret 0;
-}

@@ -1379,23 +1379,6 @@ test record__sequence_exhaustion_and_key_transitions_are_explicit {
     ret 0;
 }
 
-test record__alert_encoding_and_decoding_preserve_protocol_rules {
-    var wire:    [16]u8;
-    val encoded: Sealed = encode_alert(TLS13, CLOSE_NOTIFY, contracts.Buffer{data: ?wire[0], capacity: 16});
-    if (encoded.error != tls_error.OK || encoded.written != 7 ||
-        wire[5] != WARNING || wire[6] != CLOSE_NOTIFY) { ret 1; }
-    var message: AlertMessage;
-    if (decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.OK || message.description != CLOSE_NOTIFY) { ret 2; }
-    val canceled: Sealed = encode_alert(TLS13, USER_CANCELED_ALERT,
-        contracts.Buffer{data: ?wire[0], capacity: 16});
-    if (canceled.error != tls_error.OK || wire[5] != WARNING ||
-        decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.OK ||
-        message.fatal) { ret 4; }
-    wire[5] = 3;
-    if (decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.DECODE_ERROR) { ret 3; }
-    ret 0;
-}
-
 test record__installation_rejects_self_aliased_public_iv_ownership {
     var key: [16]^u8;
     var iv:  [12]u8;
@@ -1855,7 +1838,17 @@ test record__secret_regions_reject_partial_and_cipher_ownership_aliases {
 }
 
 test record__alerts_classify_known_unknown_warning_and_fatal_values {
-    var wire:        [16]u8;
+    var wire:    [16]u8;
+    var message: AlertMessage;
+    val closing: Sealed = encode_alert(TLS13, CLOSE_NOTIFY,
+        contracts.Buffer{data: ?wire[0], capacity: 16});
+    if (closing.error != tls_error.OK || closing.written != 7 ||
+        wire[5] != WARNING || wire[6] != CLOSE_NOTIFY) { ret 8; }
+    val canceled: Sealed = encode_alert(TLS13, USER_CANCELED_ALERT,
+        contracts.Buffer{data: ?wire[0], capacity: 16});
+    if (canceled.error != tls_error.OK || wire[5] != WARNING ||
+        decode_alert(TLS13, ?wire[5], 2, ?message) != tls_error.OK ||
+        message.fatal) { ret 9; }
     val renegotiate: Sealed = encode_alert(TLS12, NO_RENEGOTIATION_ALERT,
         contracts.Buffer{data: ?wire[0], capacity: 16});
     if (renegotiate.error != tls_error.OK || wire[5] != WARNING) { ret 1; }
@@ -1866,8 +1859,7 @@ test record__alerts_classify_known_unknown_warning_and_fatal_values {
     val unknown: Sealed = encode_alert(TLS13, 200, contracts.Buffer{data: ?wire[0], capacity: 16});
     if (unknown.error != tls_error.ILLEGAL_PARAMETER || wire[0] != 0xaa) { ret 3; }
 
-    var data:    [2]u8 = [2]u8{WARNING, 200};
-    var message: AlertMessage;
+    var data: [2]u8 = [2]u8{WARNING, 200};
     if (decode_alert(TLS13, ?data[0], 2, ?message) != tls_error.OK || message.recognized || !message.fatal
         || message.description != 200) { ret 4; }
     data[1] = CLOSE_NOTIFY;
