@@ -39,9 +39,6 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.stream` implements a completion-driven TLS 1.3 secure byte stream for
   either role.
 
-- `tls.validation` holds the deterministic mutation corpora for every parsing
-  surface.
-
 `use tls;` binds `tls.lib.tls`, which re-exports these modules for consumers
 that prefer one import.
 

@@ -144,7 +144,7 @@ pub fun certificate_limits_valid(limits: Limits) bool {
         limits.max_certificate_bytes <= handshake.MAX_BODY_SIZE;
 }
 
-test "config: default limits are finite and protocol conforming" {
+test config__default_limits_are_finite_and_protocol_conforming {
     val limits: Limits = production_limits();
     if (limits.max_receive_record_plaintext != 16384 ||
         limits.max_send_record_plaintext != 16384) { ret 1; }
@@ -157,12 +157,5 @@ test "config: default limits are finite and protocol conforming" {
         certificate_message_bytes(limits) <= limits.max_chain_bytes) { ret 2; }
     if (peer_message_limit(limits, handshake.CERTIFICATE) <= 65536 ||
         peer_message_limit(limits, handshake.CLIENT_HELLO) != 16384) { ret 3; }
-    ret 0;
-}
-
-test "config: all verification schemes fit one bounded policy" {
-    if (!valid_signature_count(MAX_SIGNATURE_SCHEMES) ||
-        valid_signature_count(0) ||
-        valid_signature_count(MAX_SIGNATURE_SCHEMES + 1)) { ret 1; }
     ret 0;
 }

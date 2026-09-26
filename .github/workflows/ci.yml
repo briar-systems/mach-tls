@@ -13,7 +13,7 @@ on:
         description: heavy work to run on this ref
         type: choice
         default: none
-        options: [none, all, aarch64-linux, x86_64-windows, aarch64-darwin, x86_64-darwin]
+        options: [none, all, aarch64-linux, x86_64-windows, aarch64-darwin, x86_64-darwin, fuzz]
 
 permissions:
   contents: read
@@ -23,20 +23,44 @@ jobs:
     uses: briar-systems/.github/.github/workflows/mach-lib.yml@main
     with:
       heavy: ${{ inputs.heavy }}
-      # tls needs mach 5.12, so it seeds v5.12.0 until the family pin moves (briar-systems/.github#103)
-      mach-version: v5.12.0
+      mach-version: v6.0.0
       # mach tests only the selected artifact's closure, so the test modules run
       # through the tests artifact, and .github/ci/verify.sh fails when it misses one
       test-selections: '[["--lib", "tests"]]'
       # crypto 0.17 and later link a DIT-required aarch64 start, so a runner
       # without FEAT_DIT runs the tests under qemu-aarch64 -cpu max
       dit: required
-      # the interop harness is built here and run by .github/ci/verify.sh
-      subprojects: '[{"path": "test/interop", "build": true, "test": false, "legs": ["x86_64-linux"]}]'
+      # the interop harness is built here and run by .github/ci/verify.sh. the
+      # fuzz lane is built so it cannot rot, and replayed by the fuzz job
+      subprojects: >-
+        [{"path": "test/interop", "build": true, "test": false, "legs": ["x86_64-linux"]},
+         {"path": "test/fuzz", "build": true, "test": false, "legs": ["x86_64-linux"]}]
+
+  # the fuzz lane's deterministic replay: every retained input in
+  # test/fuzz/corpus answered by its boundary's harness, on the heavy tier
+  fuzz:
+    if: github.base_ref == 'main' || inputs.heavy == 'all' || inputs.heavy == 'fuzz'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: briar-systems/.github/.github/actions/seed-mach@main
+        with:
+          tag: v6.0.0
+      - name: build the lane
+        run: |
+          mach dep pull test/fuzz
+          mach build test/fuzz --profile debug
+          mach build test/fuzz --profile release
+      # both profiles, because optimisation has changed observable behaviour here before
+      - name: replay the corpus
+        run: |
+          timeout 10m test/fuzz/out/linux-x86_64/debug/bin/fuzz replay
+          timeout 10m test/fuzz/out/linux-x86_64/release/bin/fuzz replay
 
   gate:
     if: always()
-    needs: [lib]
+    needs: [lib, fuzz]
     runs-on: ubuntu-latest
     steps:
       - uses: briar-systems/.github/.github/actions/gate@main

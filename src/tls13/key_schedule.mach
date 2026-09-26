@@ -700,6 +700,7 @@ pub fun destroy(schedule: *Schedule) {
     schedule.resumption_ready    = false;
 }
 
+#[testing]
 fun matches(value: *Secret, expected: *u8, length: usize) bool {
     if (value == nil || !value.active || value.len != length) { ret false; }
     var i: usize = 0;
@@ -710,6 +711,7 @@ fun matches(value: *Secret, expected: *u8, length: usize) bool {
     ret true;
 }
 
+#[testing]
 fun secret_matches(value: *^u8, expected: *u8, length: usize) bool {
     if (value == nil || expected == nil) { ret false; }
     var i: usize = 0;
@@ -720,6 +722,7 @@ fun secret_matches(value: *^u8, expected: *u8, length: usize) bool {
     ret true;
 }
 
+#[testing]
 fun public_matches(value: *u8, expected: *u8, length: usize) bool {
     if (value == nil || expected == nil) { ret false; }
     var i: usize = 0;
@@ -730,7 +733,7 @@ fun public_matches(value: *u8, expected: *u8, length: usize) bool {
     ret true;
 }
 
-test "key schedule: rfc 8448 handshake secrets match every stage" {
+test key_schedule__rfc_8448_handshake_secrets_match_every_stage {
     var schedule: Schedule;
     if (init(?schedule, tls13.AES_128_GCM_SHA256,
         contracts.SecretBytes{data: nil, len: 0}) != error.OK) { ret 1; }
@@ -944,7 +947,7 @@ test "key schedule: rfc 8448 handshake secrets match every stage" {
     ret 0;
 }
 
-test "key schedule: labels, traffic material, updates, and failures are bounded" {
+test key_schedule__labels_traffic_material_updates_and_failures_are_bounded {
     var schedule: Schedule;
     if (init(?schedule, tls13.AES_256_GCM_SHA384,
         contracts.SecretBytes{data: nil, len: 0}) != error.OK) { ret 1; }
@@ -987,7 +990,7 @@ test "key schedule: labels, traffic material, updates, and failures are bounded"
     ret 0;
 }
 
-test "key schedule: pure psk handshakes use a hash-length zero input" {
+test key_schedule__pure_psk_handshakes_use_a_hash_length_zero_input {
     var psk:        [16]^u8;
     var transcript: [48]u8;
     var schedule:   Schedule;

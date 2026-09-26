@@ -942,10 +942,13 @@ pub fun ticket_destroy(value: *Ticket) {
     ticket_clear(value);
 }
 
-var probe_counter:         u8;
+#[testing]
+var probe_counter: u8;
+#[testing]
 var failing_entropy_calls: u8;
 
 #[oblivious]
+#[testing]
 fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -959,6 +962,7 @@ fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
 }
 
 #[oblivious]
+#[testing]
 fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     var i: usize = 0;
@@ -970,6 +974,7 @@ fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
 }
 
 #[oblivious]
+#[testing]
 fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     var i: usize = 0;
@@ -983,6 +988,7 @@ fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
 }
 
 #[oblivious]
+#[testing]
 fun repeating_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
     var i: usize = 0;
@@ -993,18 +999,22 @@ fun repeating_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     ret 0;
 }
 
+#[testing]
 fun moment(seconds: i64) clock.Moment {
     ret clock.at(seconds, seconds);
 }
 
+#[testing]
 fun mono(seconds: i64) time.Instant {
     ret time.Instant{sec: seconds, nsec: 0};
 }
 
+#[testing]
 fun wall(seconds: i64) time.Time {
     ret time.unix(seconds, 0);
 }
 
+#[testing]
 fun rotation_state(issued_at: i64) State {
     var value: State = empty_state();
     value.version    = tls13.VERSION;
@@ -1020,7 +1030,7 @@ fun rotation_state(issued_at: i64) State {
     ret value;
 }
 
-test "session: full ticket key ring preserves every live overlap" {
+test session__full_ticket_key_ring_preserves_every_live_overlap {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
@@ -1060,7 +1070,7 @@ test "session: full ticket key ring preserves every live overlap" {
     ret 0;
 }
 
-test "session: ticket key rotation failures leave the ring unchanged" {
+test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
@@ -1116,7 +1126,7 @@ test "session: ticket key rotation failures leave the ring unchanged" {
     ret 0;
 }
 
-test "session: tickets survive key rotation for exactly the configured overlap" {
+test session__tickets_survive_key_rotation_for_exactly_the_configured_overlap {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
@@ -1193,7 +1203,7 @@ test "session: tickets survive key rotation for exactly the configured overlap" 
     ret 0;
 }
 
-test "session: single use replay control admits one presentation" {
+test session__single_use_replay_control_admits_one_presentation {
     var window: ReplayWindow;
     if (!replay_init(?window)) { ret 1; }
     var binder: [32]u8;
@@ -1219,7 +1229,7 @@ test "session: single use replay control admits one presentation" {
     ret 0;
 }
 
-test "session: a wall clock step moves neither rotation nor the key window" {
+test session__a_wall_clock_step_moves_neither_rotation_nor_the_key_window {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
@@ -1257,7 +1267,7 @@ test "session: a wall clock step moves neither rotation nor the key window" {
     ret 0;
 }
 
-test "session: a taken ticket carries its monotonic age in milliseconds" {
+test session__a_taken_ticket_carries_its_monotonic_age_in_milliseconds {
     var store: ClientStore;
     if (!client_store_init(?store)) { ret 1; }
     var value: Ticket;
@@ -1283,7 +1293,7 @@ test "session: a taken ticket carries its monotonic age in milliseconds" {
     ret 0;
 }
 
-test "session: client ticket retention is bounded and freshest first" {
+test session__client_ticket_retention_is_bounded_and_freshest_first {
     var store: ClientStore;
     if (!client_store_init(?store)) { ret 1; }
     var value: Ticket;

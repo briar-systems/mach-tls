@@ -279,6 +279,7 @@ pub fun destroy(value: *Transcript) {
     value.unframed    = false;
 }
 
+#[testing]
 fun bytes_match(actual: *u8, expected: *u8, length: usize) bool {
     if (actual == nil || expected == nil) { ret false; }
     var i: usize = 0;
@@ -289,7 +290,7 @@ fun bytes_match(actual: *u8, expected: *u8, length: usize) bool {
     ret true;
 }
 
-test "transcript: fragmented snapshots and consuming finals are exact" {
+test transcript__fragmented_snapshots_and_consuming_finals_are_exact {
     var value: Transcript = empty();
     if (init_for_suite(?value, tls13.AES_128_GCM_SHA256) != error.OK) { ret 1; }
     if (update(?value, contracts.Bytes{data: "a"::*u8, len: 1}) != error.OK
@@ -329,7 +330,7 @@ test "transcript: fragmented snapshots and consuming finals are exact" {
     ret 0;
 }
 
-test "transcript: complete frames reject truncation and trailing bytes" {
+test transcript__complete_frames_reject_truncation_and_trailing_bytes {
     var body:    [3]u8              = [3]u8{1, 2, 3};
     var wire:    [8]u8;
     val encoded: handshake.Progress = handshake.serialize(handshake.CERTIFICATE_VERIFY,
@@ -355,7 +356,7 @@ test "transcript: complete frames reject truncation and trailing bytes" {
     ret 0;
 }
 
-test "transcript: rfc 8448 hello retry rewrite is exact and single-use" {
+test transcript__rfc_8448_hello_retry_rewrite_is_exact_and_single_use {
     var client_hello: [180]u8 = [180]u8{
         0x01, 0x00, 0x00, 0xb0, 0x03, 0x03, 0xb0, 0xb1,
         0xc5, 0xa5, 0xaa, 0x37, 0xc5, 0x91, 0x9f, 0x2e,
