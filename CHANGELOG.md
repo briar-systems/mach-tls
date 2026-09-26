@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-26
+
+tls builds on mach 6, mach-std 9.0.0 and mach-crypto 0.24.0 (#145). Its protocol surface is unchanged.
+
+### Changed
+
+- Breaking: requires mach 6 (`mach = "^6"`), with `[dep.std] version = "^9.0"` realized at v9.0.0 and `[dep.crypto] version = "^0.24"` at v0.24.0, both committed as gitlinks. Resolution is flat, so a consumer of tls moves to mach 6, std 9 and crypto 0.24 with it. test/interop pins `tag/v9.0.0` and `tag/v0.24.0`, and CI seeds mach v6.0.0 (#145).
+- Every test is named by identifier (`test subject__case`), as mach 6 requires, and `tools/test-selection` compares qualified names (`module#name`). Test-only helpers and fixtures are `#[testing]`, so ordinary builds omit them. `tls.test.pool` keeps the parts the interop harness links unmarked (#145).
+- The suite is pruned to mach's test policy, from 173 tests to 159. One case per protocol rule, handshake state transition and attack shape stays, as does every test that is the only coverage of a suite or key exchange path. Constant pins (registry ids, lifecycle order, error and key format distinctness, the TLS 1.2 suite version and plaintext pins) and the 20000-round two-thread transition stress test are gone. The long-session integration test rekeys twice in each direction instead of 32 times, and the record alert encoding test folds into the alert classification test (#145).
+
+### Added
+
+- A fuzz lane in `test/fuzz` with one harness for each of 23 untrusted-input boundaries: the record layer, alerts, handshake framing, extensions, the nine TLS 1.3 and nine TLS 1.2 message parsers, and x509. Every input is copied to end at an unreadable page, and each harness checks that published views stay inside the input, refusals carry an error, framers never ask for bytes they hold, walks are bounded and each parser's structural promises hold. `fuzz replay` answers the checked-in corpus of 226 inputs (44 seeds and 182 minimized retained inputs) and `fuzz mutate` is the on-demand seeded search. CI builds the lane on every pull request and replays it in both profiles on the heavy tier. `doc/validation.md` describes it and names the engine-level gap (#145).
+
+### Removed
+
+- Breaking: the `tls.validation` module, its public `mutate` and `advance`, and its `fwd` from the library entry. It held the seeded mutation corpora for records, handshake frames, hellos, key exchanges and alerts, which the fuzz lane replaces. Its allocation failure test moved to `tls.cert.credentials`. The two engine-level mutated-hello corpora are removed too, and the TLS 1.2 corpus keeps its one targeted check as `tls12_connection__a_second_hello_is_never_a_renegotiation` (#145).
+
 ## [0.12.1] - 2026-09-25
 
 ### Changed

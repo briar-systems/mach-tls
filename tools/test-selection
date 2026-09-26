@@ -16,9 +16,10 @@ trap 'rm -rf -- "$scratch"' EXIT
 
 cd "$root"
 
-# every declaration as path:line, the form `mach test --list` ends each line with
-grep -rnE --include='*.mach' '^[[:space:]]*test "' src |
-    awk -F: '{ print $1 ":" $2 }' | sort > "$scratch/declared"
+# every declaration as its qualified name, the form `mach test --list` starts each line with
+grep -rE --include='*.mach' '^[[:space:]]*test [A-Za-z_][A-Za-z0-9_]* *\{' src |
+    sed -E 's#^src/(.*)\.mach:[[:space:]]*test ([A-Za-z0-9_]+).*#tls.\1\#\2#; s#/#.#g' |
+    sort > "$scratch/declared"
 declared=$(wc -l < "$scratch/declared")
 [[ "$declared" -gt 0 ]] || { echo "test-selection: no tests declared under src" >&2; exit 1; }
 
@@ -30,7 +31,7 @@ while IFS= read -r target; do
         echo "test-selection: listing failed on $target" >&2
         exit 1
     fi
-    awk '{ print $NF }' "$scratch/listed" | sort > "$scratch/collected"
+    awk '{ print $1 }' "$scratch/listed" | sort > "$scratch/collected"
     echo "test-selection: $target: $(wc -l < "$scratch/collected") of $declared collected"
     cat "$scratch/collected" >> "$scratch/union"
     targets=$((targets + 1))

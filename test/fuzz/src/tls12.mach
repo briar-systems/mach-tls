@@ -1,0 +1,171 @@
+# the tls 1.2 message parsers
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.error;
+use frame: tls.handshake;
+use block: tls.handshake.extensions;
+use tls.tls12;
+use tls.tls12.messages;
+use tls.tls13;
+
+use fuzz.handshake;
+use fuzz.verdict;
+
+pub fun answer_client_hello(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.CLIENT_HELLO, data, len);
+    var hello:  messages.ClientHello;
+    val result: error.Error   = messages.decode_client_hello(?framed, ?hello);
+    if (result == error.OK) { verdict.accept(); }
+    var outcome: u64 = result::u64;
+    if (result == error.OK && (hello.random.len != 32 || hello.session_id.len > 32 ||
+        hello.legacy_version < tls12.VERSION || (hello.cipher_suites.len & 1) != 0 ||
+        !verdict.bytes_inside(hello.random, data, len) ||
+        !verdict.bytes_inside(hello.session_id, data, len) ||
+        !verdict.bytes_inside(hello.cipher_suites, data, len) ||
+        !verdict.bytes_inside(hello.compression_methods, data, len) ||
+        !handshake.accepted_list(hello.extensions, data, len, ?outcome))) {
+        ret verdict.violated("tls12-client-hello: an accepted hello is not structurally exact");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_server_hello(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.SERVER_HELLO, data, len);
+    var hello:  messages.ServerHello;
+    val result: error.Error   = messages.decode_server_hello(?framed, ?hello);
+    if (result == error.OK) { verdict.accept(); }
+    var outcome: u64 = result::u64;
+    if (result == error.OK && (hello.random.len != 32 || hello.session_id.len > 32 ||
+        hello.legacy_version != tls12.VERSION || hello.compression_method != 0 ||
+        !verdict.bytes_inside(hello.random, data, len) ||
+        !verdict.bytes_inside(hello.session_id, data, len) ||
+        !handshake.accepted_list(hello.extensions, data, len, ?outcome))) {
+        ret verdict.violated("tls12-server-hello: an accepted hello is not structurally exact");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_certificate(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.CERTIFICATE, data, len);
+    var value:  messages.CertificateMessage;
+    val result: error.Error   = messages.decode_certificate(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    var outcome: u64 = result::u64;
+    if (result != error.OK) { ret verdict.answered(outcome); }
+    if (!verdict.bytes_inside(value.entries, data, len)) {
+        ret verdict.violated("tls12-certificate: the entries lie outside the input");
+    }
+    # the entries the parser counted are the entries a walk finds
+    var state: messages.CertificateIterator = messages.certificate_iterator(?value);
+    var entry: contracts.Bytes;
+    var count: usize                        = 0;
+    for (count <= value.entries.len) {
+        val status: block.NextStatus = messages.next_certificate(?state, ?entry);
+        if (status == block.NEXT_DONE) {
+            if (count != value.count) { brk; }
+            ret verdict.answered(verdict.mix(outcome, verdict.bucket(count)));
+        }
+        if (status != block.NEXT_ITEM || entry.len == 0 ||
+            !verdict.bytes_inside(entry, data, len)) { brk; }
+        count = count + 1;
+    }
+    ret verdict.violated("tls12-certificate: an accepted chain does not walk to the count it reported");
+}
+
+pub fun answer_server_key_exchange(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.SERVER_KEY_EXCHANGE, data, len);
+    var value:  messages.ServerKeyExchange;
+    val result: error.Error   = messages.decode_server_key_exchange(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    if (result != error.OK) { ret verdict.answered(result::u64); }
+    # every accepted point matches its curve, and the signed prefix is the
+    # exact start of the message
+    if (!messages.valid_named_curve(value.curve) ||
+        !messages.valid_signature_scheme(value.scheme) ||
+        (value.curve == tls13.X25519 && value.public_key.len != 32) ||
+        (value.curve == tls13.SECP256R1 &&
+        (value.public_key.len != 65 || value.public_key.data[0] != 4)) ||
+        value.params.data != data || value.params.len > len ||
+        value.signature.len == 0 || value.signature.len > messages.MAX_SIGNATURE ||
+        !verdict.bytes_inside(value.public_key, data, len) ||
+        !verdict.bytes_inside(value.signature, data, len)) {
+        ret verdict.violated("tls12-server-key-exchange: an accepted exchange carries an unchecked point or prefix");
+    }
+    ret verdict.answered(verdict.mix(result::u64, (value.curve::u64 << 16) | value.scheme::u64));
+}
+
+pub fun answer_certificate_request(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.CERTIFICATE_REQUEST, data, len);
+    var value:  messages.CertificateRequest;
+    val result: error.Error   = messages.decode_certificate_request(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    if (result == error.OK && (value.certificate_types.len == 0 ||
+        value.signature_algorithms.len < 2 || (value.signature_algorithms.len & 1) != 0 ||
+        !verdict.bytes_inside(value.certificate_types, data, len) ||
+        !verdict.bytes_inside(value.signature_algorithms, data, len) ||
+        !verdict.bytes_inside(value.authorities, data, len))) {
+        ret verdict.violated("tls12-certificate-request: an accepted request breaks its bounds");
+    }
+    ret verdict.answered(result::u64);
+}
+
+pub fun answer_server_hello_done(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.SERVER_HELLO_DONE, data, len);
+    val result: error.Error   = messages.decode_server_hello_done(?framed);
+    if (result == error.OK) { verdict.accept(); }
+    if (result == error.OK && len != 0) {
+        ret verdict.violated("tls12-server-hello-done: a non-empty body was accepted");
+    }
+    ret verdict.answered(result::u64);
+}
+
+fun client_key_exchange_one(data: *u8, len: usize, curve: u16, outcome: *u64) bool {
+    var framed: frame.Message = handshake.message(frame.CLIENT_KEY_EXCHANGE, data, len);
+    var value:  messages.ClientKeyExchange;
+    val result: error.Error   = messages.decode_client_key_exchange(?framed, curve, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    @outcome = verdict.mix(@outcome, result::u64);
+    if (result != error.OK)                                  { ret true; }
+    if (curve == tls13.X25519 && value.public_key.len != 32) { ret false; }
+    if (curve == tls13.SECP256R1 &&
+        (value.public_key.len != 65 || value.public_key.data[0] != 4)) { ret false; }
+    ret verdict.bytes_inside(value.public_key, data, len);
+}
+
+pub fun answer_client_key_exchange(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!client_key_exchange_one(data, len, tls13.X25519, ?outcome) ||
+        !client_key_exchange_one(data, len, tls13.SECP256R1, ?outcome)) {
+        ret verdict.violated("tls12-client-key-exchange: an accepted point does not match its curve");
+    }
+    ret verdict.answered(outcome);
+}
+
+pub fun answer_certificate_verify(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.CERTIFICATE_VERIFY, data, len);
+    var value:  messages.CertificateVerify;
+    val result: error.Error   = messages.decode_certificate_verify(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    if (result == error.OK && (!messages.valid_signature_scheme(value.scheme) ||
+        value.signature.len == 0 || value.signature.len > messages.MAX_SIGNATURE ||
+        !verdict.bytes_inside(value.signature, data, len))) {
+        ret verdict.violated("tls12-certificate-verify: an accepted signature breaks its bounds");
+    }
+    ret verdict.answered(result::u64);
+}
+
+pub fun answer_finished(data: *u8, len: usize) verdict.Verdict {
+    var framed: frame.Message = handshake.message(frame.FINISHED, data, len);
+    var value:  messages.Finished;
+    val result: error.Error   = messages.decode_finished(?framed, ?value);
+    if (result == error.OK) { verdict.accept(); }
+    if (result == error.OK && (value.verify_data.len != tls12.VERIFY_DATA_SIZE ||
+        !verdict.bytes_inside(value.verify_data, data, len))) {
+        ret verdict.violated("tls12-finished: accepted verify data is not twelve bytes");
+    }
+    ret verdict.answered(result::u64);
+}

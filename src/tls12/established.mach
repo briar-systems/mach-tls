@@ -298,12 +298,12 @@ pub fun send_record_limit(core: *Established) usize {
     ret limit;
 }
 
-test "tls12.established: the record fits its budget" {
+test tls12_established__the_record_fits_its_budget {
     if ($size_of(Established) > MAX_BYTES) { ret 1; }
     ret 0;
 }
 
-test "tls12.established: renegotiation is refused with its own error" {
+test tls12_established__renegotiation_is_refused_with_its_own_error {
     var seed: Seed;
     seed.role                 = engine.TLS12_SERVER;
     seed.suite                = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;
@@ -325,7 +325,7 @@ test "tls12.established: renegotiation is refused with its own error" {
     ret 0;
 }
 
-test "tls12.established: close queues exactly one alert" {
+test tls12_established__close_queues_exactly_one_alert {
     var seed: Seed;
     seed.role  = engine.TLS12_CLIENT;
     seed.suite = tls12.ECDHE_ECDSA_AES_128_GCM_SHA256;

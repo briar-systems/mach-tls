@@ -178,8 +178,8 @@ under a frozen clock, rejects tampered tickets and expired ones, admits a
 replayed value exactly once, bounds the client store and its eviction order,
 resumes a real handshake between `tls.client` and `tls.server` with matching
 application secrets, refuses a second presentation of one ticket under a
-single-use policy, and drives thirty-two key updates in each direction while the
-two sides stay in step.
+single-use policy, and rekeys twice in each direction while the two sides stay in
+step.
 
 The external harness resumes against OpenSSL and GnuTLS in both directions and
 performs key updates mid-session against both. See

@@ -39,7 +39,6 @@ use tls.tls13;
 use tls.tls13.key_schedule;
 use tls.tls13.transcript;
 use tls.transition;
-use tls.validation;
 
 pub val MAX_POINT:                usize = 65;
 pub val MAX_PUBLIC_KEY:           usize = 512;
@@ -2452,26 +2451,31 @@ pub fun downgrade_signalled(value: *Handshake) bool {
     ret value != nil && value.downgrade_signalled;
 }
 
+#[testing]
 var test_moment: clock.Moment;
-var test_clock:  clock.Source;
+#[testing]
+var test_clock: clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
+#[testing]
 fun test_source() *clock.Source {
     if (test_clock.read_fn == nil) { set_test_time(1800000000); }
     ret ?test_clock;
 }
 
+#[testing]
 fun set_test_time(seconds: i64) {
     test_moment = clock.at(seconds, seconds);
     test_clock  = clock.frozen(?test_moment);
 }
 
+#[testing]
 fun start_at(value: *Handshake, seconds: i64) engine.Result {
     set_test_time(seconds);
     ret start(value);
 }
 
-test "tls12.connection: an unconfigured connection accepts nothing" {
+test tls12_connection__an_unconfigured_connection_accepts_nothing {
     var value:  Handshake;
     var client: config.ClientConfig;
     var server: config.ServerConfig;
@@ -2485,28 +2489,50 @@ test "tls12.connection: an unconfigured connection accepts nothing" {
     ret 0;
 }
 
-var loopback_root:            [341]u8;
-var loopback_leaf:            [393]u8;
-var loopback_chain:           [1]cert.Certificate;
-var loopback_key:             keys.PrivateKey;
-var loopback_identity:        credentials.Identity;
-var loopback_generation:      credentials.Generation;
-var loopback_store:           credentials.Store;
-var loopback_anchor:          cert.Certificate;
-var loopback_trust:           cert.TrustStore;
-var loopback_protocols:       [1]config.ProtocolName;
+#[testing]
+var loopback_root: [341]u8;
+#[testing]
+var loopback_leaf: [393]u8;
+#[testing]
+var loopback_chain: [1]cert.Certificate;
+#[testing]
+var loopback_key: keys.PrivateKey;
+#[testing]
+var loopback_identity: credentials.Identity;
+#[testing]
+var loopback_generation: credentials.Generation;
+#[testing]
+var loopback_store: credentials.Store;
+#[testing]
+var loopback_anchor: cert.Certificate;
+#[testing]
+var loopback_trust: cert.TrustStore;
+#[testing]
+var loopback_protocols: [1]config.ProtocolName;
+#[testing]
 var loopback_client_versions: [1]u16;
+#[testing]
 var loopback_server_versions: [1]u16;
-var loopback_suites:          [1]tls13.CipherSuite;
-var loopback_groups:          [1]tls13.NamedGroup;
-var loopback_signatures:      [1]tls13.SignatureScheme;
-var loopback_client_entropy:  secret.Entropy;
-var loopback_server_entropy:  secret.Entropy;
-var loopback_client_counter:  u8;
-var loopback_server_counter:  u8;
-var loopback_client_config:   config.ClientConfig;
-var loopback_server_config:   config.ServerConfig;
+#[testing]
+var loopback_suites: [1]tls13.CipherSuite;
+#[testing]
+var loopback_groups: [1]tls13.NamedGroup;
+#[testing]
+var loopback_signatures: [1]tls13.SignatureScheme;
+#[testing]
+var loopback_client_entropy: secret.Entropy;
+#[testing]
+var loopback_server_entropy: secret.Entropy;
+#[testing]
+var loopback_client_counter: u8;
+#[testing]
+var loopback_server_counter: u8;
+#[testing]
+var loopback_client_config: config.ClientConfig;
+#[testing]
+var loopback_server_config: config.ServerConfig;
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (value >= '0' && value <= '9') {
         output[0] = value - '0';
@@ -2519,6 +2545,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
     ret false;
 }
 
+#[testing]
 fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
     if (input == nil || output == nil || (length & 1) != 0 ||
         length / 2 > capacity) { ret false; }
@@ -2535,6 +2562,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
 }
 
 #[oblivious]
+#[testing]
 fun loopback_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -2547,6 +2575,7 @@ fun loopback_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     ret 0;
 }
 
+#[testing]
 fun loopback_configure(versions_include_tls13: bool,
     owner: *secret.Allocator) bool {
     val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
@@ -2650,21 +2679,35 @@ fun loopback_configure(versions_include_tls13: bool,
 #
 # every queued event is drained before any bytes are delivered, which is what
 # the stream does and what keeps ingest from being refused as blocked
+#[testing]
 val MAX_SEGMENTS: usize = 12;
 
-var to_listener:        [32768]u8;
-var to_listener_level:  [MAX_SEGMENTS]engine.Level;
+#[testing]
+var to_listener: [32768]u8;
+#[testing]
+var to_listener_level: [MAX_SEGMENTS]engine.Level;
+#[testing]
 var to_listener_offset: [MAX_SEGMENTS]usize;
+#[testing]
 var to_listener_length: [MAX_SEGMENTS]usize;
-var to_listener_count:  usize;
-var to_listener_used:   usize;
-var to_dialer:          [32768]u8;
-var to_dialer_level:    [MAX_SEGMENTS]engine.Level;
-var to_dialer_offset:   [MAX_SEGMENTS]usize;
-var to_dialer_length:   [MAX_SEGMENTS]usize;
-var to_dialer_count:    usize;
-var to_dialer_used:     usize;
+#[testing]
+var to_listener_count: usize;
+#[testing]
+var to_listener_used: usize;
+#[testing]
+var to_dialer: [32768]u8;
+#[testing]
+var to_dialer_level: [MAX_SEGMENTS]engine.Level;
+#[testing]
+var to_dialer_offset: [MAX_SEGMENTS]usize;
+#[testing]
+var to_dialer_length: [MAX_SEGMENTS]usize;
+#[testing]
+var to_dialer_count: usize;
+#[testing]
+var to_dialer_used: usize;
 
+#[testing]
 fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
     lengths: *usize, count: *usize, used: *usize, level: engine.Level,
     data: *u8, length: usize) bool {
@@ -2684,9 +2727,12 @@ fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
 
 # keys are captured while their event is active, because the engine wipes its
 # secrets once the established queue drains
-var captured_key:     [4][prf.MAX_KEY]^u8;
+#[testing]
+var captured_key: [4][prf.MAX_KEY]^u8;
+#[testing]
 var captured_key_len: [4]usize;
 
+#[testing]
 fun capture_keys(source: *Handshake, event: *engine.Event, dialer: bool) bool {
     var slot: usize = 0;
     if (!dialer)                           { slot = 2; }
@@ -2699,6 +2745,7 @@ fun capture_keys(source: *Handshake, event: *engine.Event, dialer: bool) bool {
         ?captured_key_len[slot]);
 }
 
+#[testing]
 fun drain_events(source: *Handshake, into_listener: bool) i64 {
     var event: engine.Event;
     for (next_event(source, ?event)) {
@@ -2727,12 +2774,18 @@ fun drain_events(source: *Handshake, into_listener: bool) i64 {
 
 # while pressing, every engine call first finds the pool empty. a call that
 # must wait changes nothing, and after a wake its retry proceeds
-var pressing:       bool;
-var pressure:       pool.Harness;
-var squeezed:       pool.Squeeze;
+#[testing]
+var pressing: bool;
+#[testing]
+var pressure: pool.Harness;
+#[testing]
+var squeezed: pool.Squeeze;
+#[testing]
 var pressure_waits: usize;
+#[testing]
 var pressure_fault: i64;
 
+#[testing]
 fun pressed(target: *Handshake, starting: bool, level: engine.Level, data: *u8,
     length: usize) engine.Result {
     if (pressing) {
@@ -2765,6 +2818,7 @@ fun pressed(target: *Handshake, starting: bool, level: engine.Level, data: *u8,
 
 # a target that already has queued events refuses more input, so its queue is
 # drained between segments exactly as the stream would
+#[testing]
 fun deliver(target: *Handshake, into_listener: bool, buffer: *u8,
     levels: *engine.Level, offsets: *usize, lengths: *usize, count: *usize,
     used: *usize) i64 {
@@ -2799,6 +2853,7 @@ fun deliver(target: *Handshake, into_listener: bool, buffer: *u8,
     ret failed;
 }
 
+#[testing]
 fun exchange(local: *Handshake, peer: *Handshake) i64 {
     to_listener_count = 0;
     to_listener_used  = 0;
@@ -2835,7 +2890,7 @@ fun exchange(local: *Handshake, peer: *Handshake) i64 {
     ret 6;
 }
 
-test "tls12.connection: the handshake snapshots one role's configuration" {
+test tls12_connection__the_handshake_snapshots_one_role_s_configuration {
     var larger: usize = $size_of(config.ClientConfig);
     if ($size_of(config.ServerConfig) > larger) {
         larger = $size_of(config.ServerConfig);
@@ -2861,7 +2916,7 @@ test "tls12.connection: the handshake snapshots one role's configuration" {
     ret 0;
 }
 
-test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
+test tls12_connection__a_complete_ecdhe_handshake_agrees_on_every_secret {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(false, ?owner)) { ret 1; }
     var dialer:   Handshake;
@@ -2942,7 +2997,7 @@ test "tls12.connection: a complete ecdhe handshake agrees on every secret" {
     ret 0;
 }
 
-test "tls12.connection: a handshake that waits for memory matches one that never did" {
+test tls12_connection__a_handshake_that_waits_for_memory_matches_one_that_never_did {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(false, ?owner)) { ret 1; }
     var dialer:   Handshake;
@@ -3000,7 +3055,7 @@ test "tls12.connection: a handshake that waits for memory matches one that never
     ret 0;
 }
 
-test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
+test tls12_connection__a_signalled_downgrade_is_refused_by_a_1_3_client {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(true, ?owner)) { ret 1; }
     # the listener also speaks tls 1.3, so it marks the 1.2 negotiation and
@@ -3060,50 +3115,7 @@ test "tls12.connection: a signalled downgrade is refused by a 1.3 client" {
     ret 0;
 }
 
-var mutation_case: [validation.MAX_CORPUS]u8;
-
-# every outcome of one mutated hello must be a complete, bounded state
-fun feed_mutation(length: usize) i64 {
-    var listener: Handshake;
-    if (!init_server(?listener, ?loopback_server_config, pool.shared()) ||
-        start_at(?listener, 1800000000).status != engine.OK) { ret 1; }
-    val fed: engine.Result = ingest(?listener, engine.INITIAL,
-        ?mutation_case[0], length);
-    var outcome: i64 = 0;
-    if (fed.status == engine.FAILED) {
-        if (listener.queue_len != 1 ||
-            listener.queue[0].kind != engine.ALERT ||
-            listener.queue[0].alert == record.NO_ALERT) { outcome = 2; }
-        if (outcome == 0 && ingest(?listener, engine.INITIAL,
-            ?mutation_case[0], length).status != engine.FAILED) {
-            outcome = 3;
-        }
-    }
-    or (fed.status == engine.OK) {
-        if (!pending(?listener)) { outcome = 4; }
-        var index: usize = 0;
-        for (index < listener.queue_len) {
-            val item: Pending = listener.queue[index];
-            if (item.kind == engine.CRYPTO &&
-                (item.offset > listener.buffers.output.chunk.bytes ||
-                item.length > listener.buffers.output.chunk.bytes - item.offset ||
-                item.length == 0)) { outcome = 5; }
-            index = index + 1;
-        }
-        if (outcome == 0 && !tls12.valid_suite(listener.suite)) { outcome = 6; }
-        if (outcome == 0 && snapshot(?listener).status == engine.COMPLETE) {
-            outcome = 7;
-        }
-    }
-    or (fed.status == engine.MORE) {
-        if (pending(?listener)) { outcome = 8; }
-    }
-    or { outcome = 9; }
-    destroy(?listener);
-    ret outcome;
-}
-
-test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
+test tls12_connection__a_second_hello_is_never_a_renegotiation {
     var owner: secret.Allocator = secret.system_allocator();
     if (!loopback_configure(false, ?owner)) { ret 1; }
     var dialer: Handshake;
@@ -3111,48 +3123,25 @@ test "validation: mutated tls 1.2 hellos leave the server in a bounded state" {
         pool.shared()) ||
         start_at(?dialer, 1800000000).status != engine.OK) { ret 2; }
     val length: usize = dialer.hello_len;
-    if (length == 0 || length > validation.MAX_CORPUS) { ret 3; }
-    var seed_bytes: [2048]u8;
-    if (length > 2048) { ret 4; }
+    var hello:  [2048]u8;
+    if (length == 0 || length > 2048) { ret 3; }
     var i: usize = 0;
     for (i < length) {
-        seed_bytes[i] = dialer.buffers.hello.chunk.data[i];
-        i             = i + 1;
+        hello[i] = dialer.buffers.hello.chunk.data[i];
+        i        = i + 1;
     }
-    if (!destroy(?dialer)) { ret 5; }
+    if (!destroy(?dialer)) { ret 4; }
 
-    var state:     u64   = 0x0badc0de1234;
-    var iteration: usize = 0;
-    for (iteration < 256) {
-        i = 0;
-        for (i < length) {
-            mutation_case[i] = seed_bytes[i];
-            i                = i + 1;
-        }
-        val mutated: usize = validation.mutate(?state, ?mutation_case[0],
-            length, validation.MAX_CORPUS);
-        val outcome: i64 = feed_mutation(mutated);
-        if (outcome != 0) { ret 10 + outcome::i32; }
-        iteration = iteration + 1;
-    }
-
-    # a hello at the wrong level or in the wrong state fails closed
-    var wrong: Handshake;
-    if (!init_server(?wrong, ?loopback_server_config, pool.shared()) ||
-        start_at(?wrong, 1800000000).status != engine.OK) { ret 6; }
-    i = 0;
-    for (i < length) {
-        mutation_case[i] = seed_bytes[i];
-        i                = i + 1;
-    }
-    if (ingest(?wrong, engine.INITIAL, ?mutation_case[0], length).status !=
-        engine.OK) { ret 7; }
-    # a second hello in the same connection is never a renegotiation
-    if (ingest(?wrong, engine.INITIAL, ?mutation_case[0], length).status !=
-        engine.BLOCKED) { ret 8; }
-    if (!destroy(?wrong)) { ret 9; }
+    var listener: Handshake;
+    if (!init_server(?listener, ?loopback_server_config, pool.shared()) ||
+        start_at(?listener, 1800000000).status != engine.OK) { ret 5; }
+    if (ingest(?listener, engine.INITIAL, ?hello[0], length).status !=
+        engine.OK) { ret 6; }
+    if (ingest(?listener, engine.INITIAL, ?hello[0], length).status !=
+        engine.BLOCKED) { ret 7; }
+    if (!destroy(?listener)) { ret 8; }
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?loopback_store, ?retired);
-    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 30; }
+    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 9; }
     ret 0;
 }

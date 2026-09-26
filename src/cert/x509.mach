@@ -1241,7 +1241,7 @@ pub fun parse_trust_anchor(input: contracts.Bytes,
     ret parse_with(input, output, true, false);
 }
 
-test "cert.x509: strict utc and generalized time parsing" {
+test cert_x509__strict_utc_and_generalized_time_parsing {
     var utc_bytes: [15]u8 = [15]u8{
         0x17, 0x0d, '4', '9', '1', '2', '3', '1', '2', '3', '5', '9', '5', '9', 'Z',
     };
@@ -1265,7 +1265,7 @@ test "cert.x509: strict utc and generalized time parsing" {
     ret 0;
 }
 
-test "cert.x509: dns constraints distinguish subdomains" {
+test cert_x509__dns_constraints_distinguish_subdomains {
     if (!valid_dns_constraint(contracts.Bytes{
         data: ".example.com"::*u8,
         len:  12,
@@ -1285,7 +1285,7 @@ test "cert.x509: dns constraints distinguish subdomains" {
     ret 0;
 }
 
-test "cert.x509: unique identifiers require canonical unused bits" {
+test cert_x509__unique_identifiers_require_canonical_unused_bits {
     var canonical:    [2]u8 = [2]u8{3, 0xa0};
     var noncanonical: [2]u8 = [2]u8{3, 0xa1};
     if (!valid_implicit_bit_string(contracts.Bytes{
@@ -1303,7 +1303,7 @@ test "cert.x509: unique identifiers require canonical unused bits" {
     ret 0;
 }
 
-test "cert.x509: distinguished names compare prepared directory strings" {
+test cert_x509__distinguished_names_compare_prepared_directory_strings {
     var first: [22]u8 = [22]u8{
         0x30, 0x14, 0x31, 0x12, 0x30, 0x10, 0x06, 0x03, 0x55, 0x04, 0x03,
         0x0c, 0x09, ' ', 'E', 'x', 'a', 'm', 'p', 'l', 'e', ' ',
@@ -1320,7 +1320,7 @@ test "cert.x509: distinguished names compare prepared directory strings" {
     ret 0;
 }
 
-test "cert.x509: a tls-alpn challenge has exactly one matching dns san" {
+test cert_x509__a_tls_alpn_challenge_has_exactly_one_matching_dns_san {
     var valid: [15]u8 = [15]u8{
         0x30, 0x0d, 0x82, 0x0b, 'A', 'p', 'i', '.', 'E', 'x', 'a', 'm', 'p',
         'l', 'e'
@@ -1360,10 +1360,11 @@ test "cert.x509: a tls-alpn challenge has exactly one matching dns san" {
     ret 0;
 }
 
+#[testing]
 val TLS_ALPN_CERTIFICATE_FIXTURE: str =
     "MIIBejCCASygAwIBAgIUcOUWr9c1zHTCLeBvrVLI47ZLz74wBQYDK2VwMAwxCjAIBgNVBAMMAWkwHhcNMjYwODMxMjAyMzI1WhcNMjYwOTAxMjAyMzI1WjAMMQowCAYDVQQDDAFpMCowBQYDK2VwAyEAwoSBn3yOAF/HvizR83asMyXsHkJXUq2kj5jt1OpWdTSjgZ8wgZwwHQYDVR0OBBYEFKIrhX8xARkFbY8H5e2vXNJp4J6mMB8GA1UdIwQYMBaAFKIrhX8xARkFbY8H5e2vXNJp4J6mMA8GA1UdEwEB/wQFMAMBAf8wFgYDVR0RBA8wDYILQXBpLkV4YW1wbGUwMQYIKwYBBQUHAR8BAf8EIgQgAAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8wBQYDK2VwA0EAPoT1BqwjpSal0uWBHFZYQkf+3m4mC4MOiNQxKWAR6omfSUlBuNSilJG9xZc5OYjefZ1LnWhSx7/us5OymlxlDA==";
 
-test "cert.x509: challenge parsing rejects wildcard and multiple sans transactionally" {
+test cert_x509__challenge_parsing_rejects_wildcard_and_multiple_sans_transactionally {
     var encoded: [382]u8;
     if (base64.decode(TLS_ALPN_CERTIFICATE_FIXTURE::*u8, 512,
         ?encoded[0], 382) != 382) { ret 1; }
@@ -1406,7 +1407,7 @@ test "cert.x509: challenge parsing rejects wildcard and multiple sans transactio
     ret 0;
 }
 
-test "cert.x509: parse a strict ed25519 server certificate" {
+test cert_x509__parse_a_strict_ed25519_server_certificate {
     var certificate_der: [480]u8 = [480]u8{
         0x30, 0x82, 0x01, 0xdc, 0x30, 0x82, 0x01, 0x8e, 0xa0, 0x03, 0x02, 0x01,
         0x02, 0x02, 0x14, 0x13, 0x3b, 0x05, 0x92, 0x1a, 0x78, 0x86, 0xe4, 0xbe,

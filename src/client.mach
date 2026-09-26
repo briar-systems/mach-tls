@@ -2738,6 +2738,7 @@ pub fun send_record_limit(client: *Handshake) usize {
 }
 
 # see the note on the no_* constructors in config.mach
+#[testing]
 fun no_extra_extension() ExtraExtension {
     var value: ExtraExtension;
     ret value;
@@ -2745,6 +2746,7 @@ fun no_extra_extension() ExtraExtension {
 
 # leave a nonzero pattern on the stack the next declaration will occupy, so a
 # field left unset by a literal is observable rather than coincidentally zero
+#[testing]
 fun dirty_frame(depth: usize) usize {
     var scratch: [32]usize;
     var i:       usize = 0;
@@ -2758,6 +2760,7 @@ fun dirty_frame(depth: usize) usize {
 
 # every field, including the ones a manual clear left out: `sessions`, the
 # five lengths, `entropy_context_size` and `clock`
+#[testing]
 fun configuration_cleared(value: *config.ClientConfig) bool {
     ret value.server_name.data == nil && value.server_name.len == 0
         && value.alpn == nil && value.alpn_len == 0 && value.trust == nil
@@ -2772,26 +2775,31 @@ fun configuration_cleared(value: *config.ClientConfig) bool {
 
 # a destroyed client keeps no callable pointer and no stale bound, on every
 # field rather than the subset a manual clear happened to name
+#[testing]
 var test_moment: clock.Moment;
-var test_clock:  clock.Source;
+#[testing]
+var test_clock: clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
+#[testing]
 fun test_source() *clock.Source {
     if (test_clock.read_fn == nil) { set_test_time(1800000000); }
     ret ?test_clock;
 }
 
+#[testing]
 fun set_test_time(seconds: i64) {
     test_moment = clock.at(seconds, seconds);
     test_clock  = clock.frozen(?test_moment);
 }
 
+#[testing]
 fun start_at(value: *Handshake, seconds: i64) engine.Result {
     set_test_time(seconds);
     ret start(value);
 }
 
-test "client: destroy leaves no residue in any cleared record" {
+test client__destroy_leaves_no_residue_in_any_cleared_record {
     if (dirty_frame(4) == 0) { ret 1; }
     val cleared: config.ClientConfig = config.no_client_config();
     if (!configuration_cleared(?cleared)) { ret 2; }
@@ -2808,14 +2816,14 @@ test "client: destroy leaves no residue in any cleared record" {
     ret 0;
 }
 
-test "client: configuration rejects unbounded and missing ownership" {
+test client__configuration_rejects_unbounded_and_missing_ownership {
     var client:        Handshake;
     var configuration: config.ClientConfig;
     if (init(?client, ?configuration, pool.shared(), no_extra_extension(), 0)) { ret 1; }
     ret 0;
 }
 
-test "client: user canceled warning permits orderly close" {
+test client__user_canceled_warning_permits_orderly_close {
     var client: Handshake;
     client.state = ESTABLISHED;
     if (close(?client, record.USER_CANCELED_ALERT).status != OK ||
@@ -2834,9 +2842,11 @@ test "client: user canceled warning permits orderly close" {
     ret 0;
 }
 
+#[testing]
 var oversized_extension: [65500]u8;
 
 #[oblivious]
+#[testing]
 fun deterministic_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     val counter: *u8   = context::*u8;
@@ -2850,11 +2860,16 @@ fun deterministic_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
-var reentry_client:         *Handshake;
-var reentry_rejections:     usize;
+#[testing]
+var reentry_client: *Handshake;
+#[testing]
+var reentry_rejections: usize;
+#[testing]
 var hostile_entropy_client: *Handshake;
-var hostile_entropy_calls:  usize;
+#[testing]
+var hostile_entropy_calls: usize;
 
+#[testing]
 fun reentrant_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     if (reentry_client != nil) {
@@ -2876,6 +2891,7 @@ fun reentrant_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
+#[testing]
 fun hostile_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
     hostile_entropy_calls = hostile_entropy_calls + 1;
@@ -2893,7 +2909,7 @@ fun hostile_entropy(context: ptr, secret_context: *^u8,
     ret 0;
 }
 
-test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary" {
+test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
     var entropy_counter: u8             = 1;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
         secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
@@ -3173,7 +3189,7 @@ test "client: rfc 8446 retry is transcript-safe at every fragmentation boundary"
     ret 0;
 }
 
-test "client: event rejection has one terminal alert ownership path" {
+test client__event_rejection_has_one_terminal_alert_ownership_path {
     var entropy_counter: u8             = 3;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
         secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
@@ -3225,7 +3241,7 @@ test "client: event rejection has one terminal alert ownership path" {
     ret 0;
 }
 
-test "client: wrong-level and out-of-state messages fail closed once" {
+test client__wrong_level_and_out_of_state_messages_fail_closed_once {
     var entropy_counter: u8             = 5;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
         secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
@@ -3282,6 +3298,7 @@ test "client: wrong-level and out-of-state messages fail closed once" {
     ret 0;
 }
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (value >= '0' && value <= '9') {
         output[0] = value - '0';
@@ -3294,6 +3311,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
     ret false;
 }
 
+#[testing]
 fun decode_hex(input: *u8, length: usize, output: *u8,
     capacity: usize) bool {
     if (input == nil || output == nil || (length & 1) != 0 ||
@@ -3310,6 +3328,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8,
     ret true;
 }
 
+#[testing]
 fun secrets_equal(first: contracts.SecretBytes,
     second: contracts.SecretBytes) bool {
     if (first.len != second.len || first.data == nil || second.data == nil) {
@@ -3323,7 +3342,7 @@ fun secrets_equal(first: contracts.SecretBytes,
     ret true;
 }
 
-test "client: complete authenticated rfc 8446 flight has exact traffic transitions" {
+test client__complete_authenticated_rfc_8446_flight_has_exact_traffic_transitions {
     val root_hex: *u8 = "3082015130820103a00302010202141d7193bab7ae596e287e9e4bf29af4f4be7a0ce9300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3336303832353133323131315a30163114301206035504030c0b4d616368544c53526f6f74302a300506032b657003210019033c2a825bf32d9ef128e4c1e053c148488fb0125c7d4087dccbe60760331da3633061301d0603551d0e04160414a3e1f1ea703e2e0fcde6217a83888df333c4e8ea301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300f0603551d130101ff040530030101ff300e0603551d0f0101ff040403020106300506032b65700341009b3793c855daa7b89b9f615856bcaf046d37244ecb5de6fab461f83542a884af4f47f23fda39e91d5fa77646c754bf61220533faa84e5795e6ac4493e4278a0d"::*u8;
     val leaf_hex: *u8 = "3082018530820137a00302010202147da845f0ef3c4bedac9ebe18bdafc1e948a34249300506032b657030163114301206035504030c0b4d616368544c53526f6f74301e170d3236303832383133323131315a170d3237303832383133323131315a301a3118301606035504030c0f6170692e6578616d706c652e636f6d302a300506032b6570032100cf37004bca6a1c334d1a7e487239adfc92a1b93cf1b911afd8d032b0b8158e65a3819230818f300c0603551d130101ff04023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505070301301a0603551d1104133011820f6170692e6578616d706c652e636f6d301d0603551d0e041604147720306b64aa6266fad59d6aa94234f18ca7b510301f0603551d23041830168014a3e1f1ea703e2e0fcde6217a83888df333c4e8ea300506032b65700341009c055b8841c91781cb2b281a48805b9f205d59c30b03141e9922f3b14accadc3cf4b059d0eafa7e5cc2dc72baf5f2ba821905414a7f5f2ab5ff78b8a148f6a04"::*u8;
     var root_der: [341]u8;

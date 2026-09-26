@@ -276,7 +276,7 @@ pub fun validate_server_selection(server: *codec.ServerHello,
     ret error.OK;
 }
 
-test "negotiation: server preference selects a share or one retry" {
+test negotiation__server_preference_selects_a_share_or_one_retry {
     var suites:      [2]u8  = [2]u8{0x13, 0x01};
     var compression: [1]u8;
     var random:      [32]u8;
@@ -336,7 +336,7 @@ test "negotiation: server preference selects a share or one retry" {
     ret 0;
 }
 
-test "negotiation: psk selection requires the matching exchange mode" {
+test negotiation__psk_selection_requires_the_matching_exchange_mode {
     var suites:            [2]u8 = [2]u8{0x13, 0x01};
     var compression:       [1]u8;
     var random:            [32]u8;
@@ -407,7 +407,7 @@ test "negotiation: psk selection requires the matching exchange mode" {
 # RFC 7301 section 3.2 distinguishes a client that advertised protocols the
 # server does not have from a client that advertised none. only the first is a
 # no_application_protocol alert, so `require_protocol` must not answer both.
-test "negotiation: an absent alpn extension is not a failed negotiation" {
+test negotiation__an_absent_alpn_extension_is_not_a_failed_negotiation {
     var suites:      [2]u8  = [2]u8{0x13, 0x01};
     var compression: [1]u8;
     var random:      [32]u8;

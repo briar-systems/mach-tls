@@ -1,0 +1,62 @@
+# the record layer: header inspection and alert decoding
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.error;
+use wire: tls.record;
+
+use fuzz.verdict;
+
+fun inspect_one(data: *u8, len: usize, protocol: wire.Protocol, protected: bool,
+    outcome: *u64) bool {
+    val parsed: wire.Parsed = wire.inspect(data, len, protocol, protected);
+    @outcome = verdict.mix(@outcome, (parsed.status::u64 << 16) | parsed.error::u64);
+    if (parsed.status == wire.PARSE_READY) {
+        verdict.accept();
+        # a frame is only ever published inside the bytes it was given
+        if (parsed.frame.consumed > len || parsed.frame.length > len - wire.HEADER_SIZE ||
+            parsed.frame.consumed != wire.HEADER_SIZE + parsed.frame.length) { ret false; }
+        if (parsed.frame.length != 0 && parsed.frame.fragment != ?data[wire.HEADER_SIZE]) {
+            ret false;
+        }
+        ret true;
+    }
+    # asking for bytes it already has would never progress
+    if (parsed.status == wire.PARSE_MORE)   { ret parsed.required > len; }
+    if (parsed.status == wire.PARSE_FAILED) { ret parsed.error != error.OK; }
+    ret false;
+}
+
+pub fun answer_record(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!inspect_one(data, len, wire.TLS13, false, ?outcome) ||
+        !inspect_one(data, len, wire.TLS13, true, ?outcome) ||
+        !inspect_one(data, len, wire.TLS12, false, ?outcome) ||
+        !inspect_one(data, len, wire.TLS12, true, ?outcome)) {
+        ret verdict.violated("record: a parse published a frame outside its input or failed without an error");
+    }
+    ret verdict.answered(outcome);
+}
+
+fun decode_one(data: *u8, len: usize, protocol: wire.Protocol, outcome: *u64) bool {
+    var message: wire.AlertMessage;
+    val decoded: error.Error = wire.decode_alert(protocol, data, len, ?message);
+    @outcome = verdict.mix(@outcome, decoded::u64);
+    if (decoded != error.OK) { ret true; }
+    verdict.accept();
+    @outcome = verdict.mix(@outcome, (message.recognized::u64 << 1) | message.fatal::u64);
+    # an alert is exactly a known level and the description it carried
+    ret len == 2 && message.description == data[1] &&
+        (data[0] == wire.WARNING || data[0] == wire.FATAL);
+}
+
+pub fun answer_alert(data: *u8, len: usize) verdict.Verdict {
+    var outcome: u64 = 0;
+    if (!decode_one(data, len, wire.TLS13, ?outcome) ||
+        !decode_one(data, len, wire.TLS12, ?outcome)) {
+        ret verdict.violated("alert: a decoded alert is not the level and description it was given");
+    }
+    ret verdict.answered(outcome);
+}

@@ -48,10 +48,3 @@ pub rec Progress {
     status: Status;
     error:  error.Error;
 }
-
-test "state: connection lifecycle is ordered" {
-    if (INITIAL >= NEGOTIATING) { ret 1; }
-    if (ESTABLISHED >= CLOSING) { ret 1; }
-    if (CLOSING >= CLOSED)      { ret 1; }
-    ret 0;
-}

@@ -207,6 +207,7 @@ pub fun private_pem(input: contracts.SecretBytes, owner: *secret.Allocator,
     ret keys.decode_private_pem(input, owner, output);
 }
 
+#[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
     if (output == nil) { ret false; }
     if (value >= '0' && value <= '9') {
@@ -221,6 +222,7 @@ fun hex_nibble(value: u8, output: *u8) bool {
 }
 
 #[oblivious]
+#[testing]
 fun decode_secret_hex(input: *u8, input_len: usize, output: *^u8,
     output_len: usize) bool {
     if (input == nil || output == nil || input_len != output_len * 2) { ret false; }
@@ -236,7 +238,7 @@ fun decode_secret_hex(input: *u8, input_len: usize, output: *^u8,
     ret true;
 }
 
-test "cert.load: decode certificate PEM and bounded bundles" {
+test cert_load__decode_certificate_pem_and_bounded_bundles {
     val certificate_pem_data: *u8                 = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAVKgAwIBAgIUcUBdqlz8lEoxcPtVyGLrQN0qDrwwBQYDK2VwMDwxCzAJ\nBgNVBAYTAlVTMRMwEQYDVQQKDApCcmlhciBUZXN0MRgwFgYDVQQDDA9CcmlhciBU\nZXN0IFJvb3QwHhcNMjYwODI4MTEzMjQ1WhcNMzYwODI1MTEzMjQ1WjA8MQswCQYD\nVQQGEwJVUzETMBEGA1UECgwKQnJpYXIgVGVzdDEYMBYGA1UEAwwPQnJpYXIgVGVz\ndCBSb290MCowBQYDK2VwAyEA1zQsVUhtzx5sroC8d3ohC0MJZbzDcOsY4SoyGpTY\ncU2jZjBkMB8GA1UdIwQYMBaAFELfNo+RqDCA56syuG7lnW5tmzn+MBIGA1UdEwEB\n/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRC3zaPkagwgOer\nMrhu5Z1ubZs5/jAFBgMrZXADQQB+WLFqB51+X7MOjRk2ZhOLGMvH4WNx8S8TO5rD\nVHQtXkYNVwGK3eDz3CZdB9uJH2HCTrIISG55wgGR3yg6cHoJ\n-----END CERTIFICATE-----\n"::*u8;
     var der_bytes:            [420]u8;
     var certificate:          cert.Certificate;
@@ -282,7 +284,7 @@ test "cert.load: decode certificate PEM and bounded bundles" {
     ret 0;
 }
 
-test "cert.load: load DER and PEM private key containers" {
+test cert_load__load_der_and_pem_private_key_containers {
     val key_hex: *u8 = "302e020100300506032b6570042204207e8382904986fb20533e917fee01ff4a2a1f85e8d24b9ded7f4eb5d4a64f8250"::*u8;
     var key_der: [48]^u8;
     if (!decode_secret_hex(key_hex, 96, ?key_der[0], 48)) { ret 1; }

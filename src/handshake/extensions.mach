@@ -546,7 +546,7 @@ pub fun contains(value: List, kind: ExtensionType) bool {
     ret find(value, kind, ?extension);
 }
 
-test "extensions: iterator rejects truncation without overrun" {
+test extensions__iterator_rejects_truncation_without_overrun {
     var bytes: [9]u8 = [9]u8{0, 43, 0, 3, 2, 3, 4, 0, 1};
     var i:     usize = 0;
     for (i < 9) {
@@ -565,7 +565,7 @@ test "extensions: iterator rejects truncation without overrun" {
     ret 0;
 }
 
-test "extensions: placement duplicates and psk ordering are strict" {
+test extensions__placement_duplicates_and_psk_ordering_are_strict {
     var good: [7]u8 = [7]u8{0, 43, 0, 3, 2, 3, 4};
     if (validate(list(?good[0], 7, CLIENT_HELLO)) != error.OK) { ret 1; }
     if (validate(list(?good[0], 7, SERVER_HELLO)) == error.OK) { ret 2; }
@@ -583,7 +583,7 @@ test "extensions: placement duplicates and psk ordering are strict" {
     ret 0;
 }
 
-test "extensions: key shares and algorithm vectors enforce structure" {
+test extensions__key_shares_and_algorithm_vectors_enforce_structure {
     var share: [38]u8;
     share[0] = 0;
     share[1] = 36;
@@ -616,7 +616,7 @@ test "extensions: key shares and algorithm vectors enforce structure" {
     ret 0;
 }
 
-test "extensions: psk identities and binders have matching cardinality" {
+test extensions__psk_identities_and_binders_have_matching_cardinality {
     var psk: [48]u8;
     psk[0]  = 0;
     psk[1]  = 41;

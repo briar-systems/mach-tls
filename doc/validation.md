@@ -1,8 +1,8 @@
 # Validation gates
 
 This package is validated by three things that run here, on any machine with
-the compiler, OpenSSL, and GnuTLS: the unit suites, the mutation corpora, and
-the interoperability matrix. This document says what each one covers and, just
+the compiler, OpenSSL, and GnuTLS: the unit suites, the fuzz lane, and the
+interoperability matrix. This document says what each one covers and, just
 as importantly, what it does not.
 
 ## Unit suites
@@ -23,45 +23,43 @@ manifest target, and CI runs it. The suite runs in the debug and release
 profiles, because optimisation has already changed observable behaviour in this
 codebase once.
 
-## Mutation corpora
+## Fuzz lane
 
-`tls.validation` holds a deterministic, seeded mutator and the corpora built on
-it. This is **not** coverage-guided fuzzing. It is a reproducible mutation run
-over a valid input at each parsing surface, and its assertions are about what a
-parser is allowed to claim rather than about crashing:
+`test/fuzz` answers every untrusted-input entry point: the record layer, alert
+decoding, handshake framing, the extension walk and each context's validation,
+every TLS 1.3 and TLS 1.2 handshake message parser, and X.509 certificate
+parsing. Each boundary has a harness and a directory of retained inputs in
+`test/fuzz/corpus`. The property is that no peer byte sequence crashes a parser,
+reads past its input, loops, or is accepted or refused wrongly:
 
-- a record parser never reports a frame outside the bytes it was given, never
-  asks for fewer bytes than it already has, and never fails without an error
-- a handshake framer never publishes a body whose length disagrees with its
-  header, and never points a body outside its own buffer
-- a TLS 1.3 ClientHello, a TLS 1.2 ServerHello, and a TLS 1.2
-  ServerKeyExchange that survive mutation are still structurally exact: the
-  random is 32 bytes, the compression method is null, the key-exchange point
-  matches its curve, and the signed prefix stays inside the message
-- an alert never decodes outside the known level and description set
+- every input is parsed or refused with a typed error, and a refusal never
+  carries `OK`
+- every view a parse publishes lies inside the input, and each input ends on the
+  last byte before an unreadable page, so a read one byte past it faults
+- a framer never publishes a body outside its header's bounds and never asks for
+  bytes it already holds
+- an accepted hello is structurally exact, an accepted key-exchange point matches
+  its curve and the signed prefix is the start of the message, a list that
+  validates walks to its end, and a certificate chain walks to the count it
+  reported
+- every walk a harness drives is bounded by its input's length, and the replay
+  runs under a timeout
 
-Each corpus asserts that it exercised **both** outcomes. A corpus where every
-mutation is rejected proves nothing about the accepting path, and one where
-every mutation is accepted proves nothing about the rejecting path, so both are
-failures.
+The replay is deterministic and runs in both profiles on the heavy tier (a pull
+request into `main`, or a dispatch with `heavy: fuzz`). The lane is built on
+every pull request so it cannot rot. `fuzz mutate` is the on-demand search: a
+seeded structural mutator over a boundary's corpus that writes findings and,
+with `--retain`, adds a minimized input for each outcome the corpus does not
+hold yet. [`test/fuzz/README.md`](../test/fuzz/README.md) has the commands.
 
-Two more corpora run at the engine level, one per version. They mutate a valid
-ClientHello and feed each case to a fresh server, then require the outcome to be
-one of exactly three bounded states:
-
-- **failed**: exactly one queued event, which is an alert with a real
-  description, a non-OK error, and no further peer input accepted
-- **progressed**: a non-empty queue whose every CRYPTO event lies inside the
-  output buffer, a negotiated suite the listener actually configured, and never
-  a completed handshake from one message
-- **needs more**: an empty queue
-
-The mutators are seeded from constants in the source, so a failure is
-reproducible by rerunning the test.
+The corpus replaces the seeded mutation corpora the unit suite used to run on
+every build. Those checked the same invariants over a few thousand fresh
+mutations each time. The lane keeps the inputs that reached a distinct answer,
+replays them exactly, and leaves the search to a deliberate run.
 
 ## Negative corpora
 
-Beyond mutation, `tls.server` carries a hand-written malformed-ClientHello
+`tls.server` carries a hand-written malformed-ClientHello
 corpus that asserts the exact error and alert for each named condition
 (`doc/server.md` has the table), that every truncation prefix of a valid hello
 reports a requirement without publishing state, and that a terminal engine
@@ -71,7 +69,7 @@ their own hostile cases.
 
 ## Allocation failure, short I/O, and cancellation
 
-`tls.validation` supplies a secret allocator that always fails and asserts that
+`tls.cert.credentials` supplies a secret allocator that always fails and asserts that
 private-key loading refuses cleanly, publishes no partial key, and that a
 credential generation is never published from the result. The same input then
 succeeds with the working allocator, so the refusal is attributable to the
@@ -183,10 +181,15 @@ Two rules follow, for anyone extending this package:
 These are real gaps, named so nobody has to discover them:
 
 - **Coverage-guided fuzzing.** There is no libFuzzer, AFL, or equivalent
-  coverage instrumentation available for Mach on this machine, and none was
-  built. The corpora above are seeded mutation, not coverage-guided search: they
-  will not discover a path that needs a specific 32-bit constant to reach.
-- **Multi-day sessions.** The longest session exercised is thirty-two key
+  coverage instrumentation available for Mach, and none was built. The fuzz
+  lane's mutation is seeded, not coverage-guided, and it retains an input for a
+  new answer rather than for new code: it will not discover a path that needs a
+  specific 32-bit constant to reach, and two inputs that reach different code
+  with the same answer count as one.
+- **The engines under hostile input.** The fuzz lane drives the parsers. The
+  handshake engines see malformed input through the negative corpora and the
+  interop matrix's failure legs, not through the lane.
+- **Multi-day sessions.** The longest session exercised is two key
   updates in each direction on one connection, plus ticket lifetimes checked
   against a controlled clock. No wall-clock long-running soak was performed.
 - **Concurrency stress.** Rotation, leases, and the replay window are exercised

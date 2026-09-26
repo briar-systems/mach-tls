@@ -1871,31 +1871,37 @@ pub fun destroy(stream: *Stream) bool {
 # tls12.connection.Connection. No consumer needs to erase one today, and
 # mach-quic does not. If one ever must, that is the shape of laurel#27 and the
 # fix is an opaque handle rather than relaxing the weld.
+#[testing]
 fun erase_transport(value: *transport.Transport) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_operation(value: *transport.Operation) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_limits(value: *config.Limits) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_trust_store(value: *cert.TrustStore) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_certificate(value: *cert.Certificate) ptr {
     ret value::ptr;
 }
 
+#[testing]
 fun erase_leaf(value: *x509.Certificate) ptr {
     ret value::ptr;
 }
 
-test "stream: the unwelded public types erase to the untyped ptr" {
+test stream__the_unwelded_public_types_erase_to_the_untyped_ptr {
     if (erase_transport(nil) != nil
         || erase_operation(nil) != nil || erase_limits(nil) != nil) { ret 1; }
     if (erase_trust_store(nil) != nil || erase_certificate(nil) != nil
@@ -1903,7 +1909,7 @@ test "stream: the unwelded public types erase to the untyped ptr" {
     ret 0;
 }
 
-test "stream: an unbound or uninitialized engine cannot take ownership" {
+test stream__an_unbound_or_uninitialized_engine_cannot_take_ownership {
     var stream:   Stream;
     var lower:    transport.Transport;
     var core:     client.Handshake;
@@ -1918,6 +1924,7 @@ test "stream: an unbound or uninitialized engine cannot take ownership" {
     ret 0;
 }
 
+#[testing]
 fun header_stream(stream: *Stream, length: usize) bool {
     stream.state                    = HANDSHAKING;
     stream.memory                   = pool.shared();
@@ -1936,7 +1943,7 @@ fun header_stream(stream: *Stream, length: usize) bool {
     ret true;
 }
 
-test "stream: a record header sizes the next read within the record limit" {
+test stream__a_record_header_sizes_the_next_read_within_the_record_limit {
     var stream: Stream;
     if (!header_stream(?stream, 60)) { ret 1; }
     if (process_record(?stream, ?stream.reading) || stream.wire_needed != record.HEADER_SIZE + 60 ||
@@ -1944,7 +1951,7 @@ test "stream: a record header sizes the next read within the record limit" {
     ret 0;
 }
 
-test "stream: an incomplete record cannot exceed the record limit" {
+test stream__an_incomplete_record_cannot_exceed_the_record_limit {
     var stream: Stream;
     if (!header_stream(?stream, 100)) { ret 1; }
     if (!process_record(?stream, ?stream.reading) || stream.state != FAILED ||
@@ -1955,7 +1962,7 @@ test "stream: an incomplete record cannot exceed the record limit" {
     ret 0;
 }
 
-test "stream: tls 1.3 user canceled warning keeps the stream open" {
+test stream__tls_1_3_user_canceled_warning_keeps_the_stream_open {
     var stream: Stream;
     stream.state              = OPEN;
     stream.handshake_complete = true;
