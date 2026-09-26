@@ -79,7 +79,7 @@ pub fun suite_requires_ecdsa(suite: u16) bool {
         suite == ECDHE_ECDSA_CHACHA20_POLY1305;
 }
 
-test "tls12: suite properties are total and distinct" {
+test tls12__suite_properties_are_total_and_distinct {
     if (VERSION != 0x0303 || MAX_PLAINTEXT != 16384) { ret 1; }
     if (valid_suite(0x1301) || valid_suite(0))       { ret 2; }
     if (suite_hash(ECDHE_RSA_AES_256_GCM_SHA384) != key_schedule.SHA384 ||

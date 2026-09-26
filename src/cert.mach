@@ -26,7 +26,7 @@ pub rec TrustStore {
     len:     usize;
 }
 
-test "cert: encoded private key formats are explicit" {
+test cert__encoded_private_key_formats_are_explicit {
     if (PKCS8_DER == SEC1_DER)     { ret 1; }
     if (SEC1_DER == RSA_PKCS1_DER) { ret 1; }
     ret 0;

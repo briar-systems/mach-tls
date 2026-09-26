@@ -143,12 +143,12 @@ fun erase_region(value: *buffer.Region) ptr {
     ret value::ptr;
 }
 
-test "buffer: the plain lease and region erase to the untyped ptr" {
+test buffer__the_plain_lease_and_region_erase_to_the_untyped_ptr {
     if (erase_lease(nil) != nil || erase_region(nil) != nil) { ret 1; }
     ret 0;
 }
 
-test "buffer: a region grows by copy and returns everything it held" {
+test buffer__a_region_grows_by_copy_and_returns_everything_it_held {
     var harness: Harness;
     if (!make(?harness, 1 << 20, 1 << 20)) { ret 1; }
     val plain:  buffer.Lease  = lease(?harness);
@@ -170,7 +170,7 @@ test "buffer: a region grows by copy and returns everything it held" {
     ret 0;
 }
 
-test "buffer: exhaustion waits unchanged and a budget overrun fails" {
+test buffer__exhaustion_waits_unchanged_and_a_budget_overrun_fails {
     var harness: Harness;
     if (!make(?harness, 4096, 1 << 20)) { ret 1; }
     val plain: buffer.Lease  = lease(?harness);
@@ -191,7 +191,7 @@ test "buffer: exhaustion waits unchanged and a budget overrun fails" {
     ret 0;
 }
 
-test "buffer: a secret region keeps its prefix and is wiped on release" {
+test buffer__a_secret_region_keeps_its_prefix_and_is_wiped_on_release {
     var harness: Harness;
     if (!make(?harness, 1 << 20, 1 << 20)) { ret 1; }
     val secret: buffer.SecretLease  = secret_lease(?harness);

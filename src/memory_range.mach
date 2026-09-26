@@ -37,7 +37,7 @@ pub fun overlap(first: *u8, first_len: usize, second: *u8,
     ret overlap_addresses(first::usize, first_len, second::usize, second_len);
 }
 
-test "memory range: maximum-address endpoints remain representable" {
+test memory_range__maximum_address_endpoints_remain_representable {
     val maximum: usize = ~(0::usize);
     if (!valid(1::*u8, maximum) ||
         !overlap(1::*u8, maximum, maximum::*u8, 1) ||

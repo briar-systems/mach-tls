@@ -269,7 +269,7 @@ pub fun match_ip(reference: contracts.Bytes, presented: contracts.Bytes) bool {
     ret true;
 }
 
-test "cert.name: dns matching is ascii, label-bound, and wildcard-exact" {
+test cert_name__dns_matching_is_ascii_label_bound_and_wildcard_exact {
     if (!match_dns(contracts.Bytes{data: "WWW.Example.COM."::*u8, len: 16},
         contracts.Bytes{data: "www.example.com"::*u8, len: 15})) { ret 1; }
     if (!match_dns(contracts.Bytes{data: "api.example.com"::*u8, len: 15},
@@ -285,7 +285,7 @@ test "cert.name: dns matching is ascii, label-bound, and wildcard-exact" {
     ret 0;
 }
 
-test "cert.name: ipv4 and ipv6 normalize to exact address bytes" {
+test cert_name__ipv4_and_ipv6_normalize_to_exact_address_bytes {
     var output:    [16]u8;
     var operation: contracts.Operation = parse_ip(
         contracts.Bytes{data: "192.0.2.1"::*u8, len: 9},

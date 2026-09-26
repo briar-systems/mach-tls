@@ -20,7 +20,7 @@ pub val ED25519:                SignatureScheme = 0x0807;
 pub val RSA_PSS_RSAE_SHA256:    SignatureScheme = 0x0804;
 pub val RSA_PSS_RSAE_SHA384:    SignatureScheme = 0x0805;
 
-test "tls13: protocol and cipher suite ids match the registry" {
+test tls13__protocol_and_cipher_suite_ids_match_the_registry {
     if (VERSION != 0x0304)                  { ret 1; }
     if (AES_128_GCM_SHA256 != 0x1301)       { ret 1; }
     if (CHACHA20_POLY1305_SHA256 != 0x1303) { ret 1; }

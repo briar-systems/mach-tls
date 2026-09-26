@@ -32,7 +32,7 @@ pub val INAPPROPRIATE_FALLBACK:  Error = 26;
 pub val NO_RENEGOTIATION:        Error = 27;
 pub val INSUFFICIENT_SECURITY:   Error = 28;
 
-test "error: terminal results are distinct" {
+test error__terminal_results_are_distinct {
     if (CANCELLED == TIMEOUT)                             { ret 1; }
     if (CLOSED == OK)                                     { ret 1; }
     if (BAD_CERTIFICATE == UNKNOWN_CA)                    { ret 1; }

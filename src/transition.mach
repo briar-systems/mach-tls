@@ -49,7 +49,7 @@ fun alternate(context: *u8) {
     }
 }
 
-test "transition: a held word refuses every second entrant" {
+test transition__a_held_word_refuses_every_second_entrant {
     var word: i64 = FREE;
     if (!enter(?word) || !held(?word)) { ret 1; }
     if (enter(?word))                  { ret 2; }
@@ -60,7 +60,7 @@ test "transition: a held word refuses every second entrant" {
     ret 0;
 }
 
-test "transition: two threads handing one word back and forth never overlap" {
+test transition__two_threads_handing_one_word_back_and_forth_never_overlap {
     handoff_word    = FREE;
     handoff_counter = 0;
     var first:  thread.Thread;

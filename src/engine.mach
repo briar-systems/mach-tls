@@ -218,7 +218,7 @@ pub fun alert_for(failure: error.Error) record.AlertDescription {
     ret record.INTERNAL_ERROR_ALERT;
 }
 
-test "engine: levels, roles, and generations are total" {
+test engine__levels_roles_and_generations_are_total {
     if (valid_level(0) || valid_level(4) || !valid_level(INITIAL) ||
         !valid_level(APPLICATION)) { ret 1; }
     if (next_generation(0) != 1 || next_generation(~(0::u64)) != 1) { ret 2; }
@@ -231,7 +231,7 @@ test "engine: levels, roles, and generations are total" {
     ret 0;
 }
 
-test "engine: every protocol failure maps to one distinct alert" {
+test engine__every_protocol_failure_maps_to_one_distinct_alert {
     if (alert_for(error.UNEXPECTED_MESSAGE) != record.UNEXPECTED_MESSAGE_ALERT ||
         alert_for(error.DECODE_ERROR) != record.DECODE_ERROR_ALERT ||
         alert_for(error.PROTOCOL_VERSION) != record.PROTOCOL_VERSION_ALERT ||

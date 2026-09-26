@@ -95,7 +95,7 @@ fun decode_hex(text: *u8, length: usize, output: *u8,
     ret true;
 }
 
-test "signature scheme: p-384 verifies peers but is never locally selected" {
+test signature_scheme__p_384_verifies_peers_but_is_never_locally_selected {
     var public_bytes:    [97]u8;
     var signature_bytes: [103]u8;
     if (!decode_hex(

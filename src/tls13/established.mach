@@ -919,12 +919,12 @@ fun drain(core: *Established, kinds: *engine.EventKind, capacity: usize) usize {
     ret count;
 }
 
-test "established: the record fits its budget" {
+test established__the_record_fits_its_budget {
     if ($size_of(Established) > MAX_BYTES) { ret 1; }
     ret 0;
 }
 
-test "established: a requested key update rekeys both directions once" {
+test established__a_requested_key_update_rekeys_both_directions_once {
     var send:    key_schedule.Secret = test_secret(1);
     var receive: key_schedule.Secret = test_secret(2);
     var core:    Established         = empty();
@@ -953,7 +953,7 @@ test "established: a requested key update rekeys both directions once" {
     ret 0;
 }
 
-test "established: quic refuses key updates and drops delivered secrets" {
+test established__quic_refuses_key_updates_and_drops_delivered_secrets {
     var send:    key_schedule.Secret = test_secret(3);
     var receive: key_schedule.Secret = test_secret(4);
     var core:    Established         = empty();
@@ -969,7 +969,7 @@ test "established: quic refuses key updates and drops delivered secrets" {
     ret 0;
 }
 
-test "established: a client without a store skips tickets unbuffered" {
+test established__a_client_without_a_store_skips_tickets_unbuffered {
     var send:    key_schedule.Secret = test_secret(5);
     var receive: key_schedule.Secret = test_secret(6);
     var core:    Established         = empty();
@@ -991,7 +991,7 @@ test "established: a client without a store skips tickets unbuffered" {
     ret 0;
 }
 
-test "established: move carries the core and wipes the source" {
+test established__move_carries_the_core_and_wipes_the_source {
     var send:    key_schedule.Secret = test_secret(7);
     var receive: key_schedule.Secret = test_secret(8);
     var source:  Established         = empty();
@@ -1017,7 +1017,7 @@ test "established: move carries the core and wipes the source" {
     ret 0;
 }
 
-test "established: a client with a store retains a split ticket" {
+test established__a_client_with_a_store_retains_a_split_ticket {
     var send:       key_schedule.Secret = test_secret(9);
     var receive:    key_schedule.Secret = test_secret(10);
     var resumption: key_schedule.Secret = test_secret(11);
@@ -1044,7 +1044,7 @@ test "established: a client with a store retains a split ticket" {
     ret 0;
 }
 
-test "established: a ticket waits for memory without consuming anything" {
+test established__a_ticket_waits_for_memory_without_consuming_anything {
     var send:       key_schedule.Secret = test_secret(12);
     var receive:    key_schedule.Secret = test_secret(13);
     var resumption: key_schedule.Secret = test_secret(14);
@@ -1074,7 +1074,7 @@ test "established: a ticket waits for memory without consuming anything" {
     ret 0;
 }
 
-test "established: a ticket's age runs from its receipt, not the handshake" {
+test established__a_ticket_s_age_runs_from_its_receipt_not_the_handshake {
     var send:       key_schedule.Secret = test_secret(15);
     var receive:    key_schedule.Secret = test_secret(16);
     var resumption: key_schedule.Secret = test_secret(17);
@@ -1104,7 +1104,7 @@ test "established: a ticket's age runs from its receipt, not the handshake" {
     ret 0;
 }
 
-test "established: a ticket the clock cannot stamp is counted and leaves nothing" {
+test established__a_ticket_the_clock_cannot_stamp_is_counted_and_leaves_nothing {
     var send:       key_schedule.Secret = test_secret(18);
     var receive:    key_schedule.Secret = test_secret(19);
     var resumption: key_schedule.Secret = test_secret(20);

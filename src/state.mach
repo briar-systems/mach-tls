@@ -49,7 +49,7 @@ pub rec Progress {
     error:  error.Error;
 }
 
-test "state: connection lifecycle is ordered" {
+test state__connection_lifecycle_is_ordered {
     if (INITIAL >= NEGOTIATING) { ret 1; }
     if (ESTABLISHED >= CLOSING) { ret 1; }
     if (CLOSING >= CLOSED)      { ret 1; }
