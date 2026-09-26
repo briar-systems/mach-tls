@@ -1,8 +1,8 @@
 # Validation gates
 
-This package is validated by two things that run here, on any machine with
-the compiler, OpenSSL, and GnuTLS: the unit suites and the interoperability
-matrix. This document says what each one covers and, just
+This package is validated by three things that run here, on any machine with
+the compiler, OpenSSL, and GnuTLS: the unit suites, the fuzz lane, and the
+interoperability matrix. This document says what each one covers and, just
 as importantly, what it does not.
 
 ## Unit suites
@@ -22,6 +22,40 @@ the library and that module, so `mach test . --lib tests` covers every module in
 manifest target, and CI runs it. The suite runs in the debug and release
 profiles, because optimisation has already changed observable behaviour in this
 codebase once.
+
+## Fuzz lane
+
+`test/fuzz` answers every untrusted-input entry point: the record layer, alert
+decoding, handshake framing, the extension walk and each context's validation,
+every TLS 1.3 and TLS 1.2 handshake message parser, and X.509 certificate
+parsing. Each boundary has a harness and a directory of retained inputs in
+`test/fuzz/corpus`. The property is that no peer byte sequence crashes a parser,
+reads past its input, loops, or is accepted or refused wrongly:
+
+- every input is parsed or refused with a typed error, and a refusal never
+  carries `OK`
+- every view a parse publishes lies inside the input, and each input ends on the
+  last byte before an unreadable page, so a read one byte past it faults
+- a framer never publishes a body outside its header's bounds and never asks for
+  bytes it already holds
+- an accepted hello is structurally exact, an accepted key-exchange point matches
+  its curve and the signed prefix is the start of the message, a list that
+  validates walks to its end, and a certificate chain walks to the count it
+  reported
+- every walk a harness drives is bounded by its input's length, and the replay
+  runs under a timeout
+
+The replay is deterministic and runs in both profiles on the heavy tier (a pull
+request into `main`, or a dispatch with `heavy: fuzz`). The lane is built on
+every pull request so it cannot rot. `fuzz mutate` is the on-demand search: a
+seeded structural mutator over a boundary's corpus that writes findings and,
+with `--retain`, adds a minimized input for each outcome the corpus does not
+hold yet. [`test/fuzz/README.md`](../test/fuzz/README.md) has the commands.
+
+The corpus replaces the seeded mutation corpora the unit suite used to run on
+every build. Those checked the same invariants over a few thousand fresh
+mutations each time. The lane keeps the inputs that reached a distinct answer,
+replays them exactly, and leaves the search to a deliberate run.
 
 ## Negative corpora
 
@@ -146,10 +180,15 @@ Two rules follow, for anyone extending this package:
 
 These are real gaps, named so nobody has to discover them:
 
-- **Fuzzing.** There is no libFuzzer, AFL, or equivalent coverage
-  instrumentation available for Mach on this machine, and none was built. The
-  negative corpora above are hand-written cases, one per rejection rule, not a
-  search: they will not discover a path nobody named.
+- **Coverage-guided fuzzing.** There is no libFuzzer, AFL, or equivalent
+  coverage instrumentation available for Mach, and none was built. The fuzz
+  lane's mutation is seeded, not coverage-guided, and it retains an input for a
+  new answer rather than for new code: it will not discover a path that needs a
+  specific 32-bit constant to reach, and two inputs that reach different code
+  with the same answer count as one.
+- **The engines under hostile input.** The fuzz lane drives the parsers. The
+  handshake engines see malformed input through the negative corpora and the
+  interop matrix's failure legs, not through the lane.
 - **Multi-day sessions.** The longest session exercised is two key
   updates in each direction on one connection, plus ticket lifetimes checked
   against a controlled clock. No wall-clock long-running soak was performed.
