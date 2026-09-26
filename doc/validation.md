@@ -1,8 +1,8 @@
 # Validation gates
 
-This package is validated by three things that run here, on any machine with
-the compiler, OpenSSL, and GnuTLS: the unit suites, the mutation corpora, and
-the interoperability matrix. This document says what each one covers and, just
+This package is validated by two things that run here, on any machine with
+the compiler, OpenSSL, and GnuTLS: the unit suites and the interoperability
+matrix. This document says what each one covers and, just
 as importantly, what it does not.
 
 ## Unit suites
@@ -23,45 +23,9 @@ manifest target, and CI runs it. The suite runs in the debug and release
 profiles, because optimisation has already changed observable behaviour in this
 codebase once.
 
-## Mutation corpora
-
-`tls.validation` holds a deterministic, seeded mutator and the corpora built on
-it. This is **not** coverage-guided fuzzing. It is a reproducible mutation run
-over a valid input at each parsing surface, and its assertions are about what a
-parser is allowed to claim rather than about crashing:
-
-- a record parser never reports a frame outside the bytes it was given, never
-  asks for fewer bytes than it already has, and never fails without an error
-- a handshake framer never publishes a body whose length disagrees with its
-  header, and never points a body outside its own buffer
-- a TLS 1.3 ClientHello, a TLS 1.2 ServerHello, and a TLS 1.2
-  ServerKeyExchange that survive mutation are still structurally exact: the
-  random is 32 bytes, the compression method is null, the key-exchange point
-  matches its curve, and the signed prefix stays inside the message
-- an alert never decodes outside the known level and description set
-
-Each corpus asserts that it exercised **both** outcomes. A corpus where every
-mutation is rejected proves nothing about the accepting path, and one where
-every mutation is accepted proves nothing about the rejecting path, so both are
-failures.
-
-Two more corpora run at the engine level, one per version. They mutate a valid
-ClientHello and feed each case to a fresh server, then require the outcome to be
-one of exactly three bounded states:
-
-- **failed**: exactly one queued event, which is an alert with a real
-  description, a non-OK error, and no further peer input accepted
-- **progressed**: a non-empty queue whose every CRYPTO event lies inside the
-  output buffer, a negotiated suite the listener actually configured, and never
-  a completed handshake from one message
-- **needs more**: an empty queue
-
-The mutators are seeded from constants in the source, so a failure is
-reproducible by rerunning the test.
-
 ## Negative corpora
 
-Beyond mutation, `tls.server` carries a hand-written malformed-ClientHello
+`tls.server` carries a hand-written malformed-ClientHello
 corpus that asserts the exact error and alert for each named condition
 (`doc/server.md` has the table), that every truncation prefix of a valid hello
 reports a requirement without publishing state, and that a terminal engine
@@ -71,7 +35,7 @@ their own hostile cases.
 
 ## Allocation failure, short I/O, and cancellation
 
-`tls.validation` supplies a secret allocator that always fails and asserts that
+`tls.cert.credentials` supplies a secret allocator that always fails and asserts that
 private-key loading refuses cleanly, publishes no partial key, and that a
 credential generation is never published from the result. The same input then
 succeeds with the working allocator, so the refusal is attributable to the
@@ -182,11 +146,11 @@ Two rules follow, for anyone extending this package:
 
 These are real gaps, named so nobody has to discover them:
 
-- **Coverage-guided fuzzing.** There is no libFuzzer, AFL, or equivalent
-  coverage instrumentation available for Mach on this machine, and none was
-  built. The corpora above are seeded mutation, not coverage-guided search: they
-  will not discover a path that needs a specific 32-bit constant to reach.
-- **Multi-day sessions.** The longest session exercised is thirty-two key
+- **Fuzzing.** There is no libFuzzer, AFL, or equivalent coverage
+  instrumentation available for Mach on this machine, and none was built. The
+  negative corpora above are hand-written cases, one per rejection rule, not a
+  search: they will not discover a path nobody named.
+- **Multi-day sessions.** The longest session exercised is two key
   updates in each direction on one connection, plus ticket lifetimes checked
   against a controlled clock. No wall-clock long-running soak was performed.
 - **Concurrency stress.** Rotation, leases, and the replay window are exercised
