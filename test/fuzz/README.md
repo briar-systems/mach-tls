@@ -13,6 +13,7 @@ point of the library. Each directory pairs with a row of the registry in
 | `client-hello`, `server-hello`, `encrypted-extensions`, `certificate-request`, `certificate`, `certificate-verify`, `finished`, `new-session-ticket`, `key-update` | the TLS 1.3 parsers in `handshake.codec` |
 | `tls12-client-hello`, `tls12-server-hello`, `tls12-certificate`, `tls12-server-key-exchange`, `tls12-certificate-request`, `tls12-server-hello-done`, `tls12-client-key-exchange`, `tls12-certificate-verify`, `tls12-finished` | the TLS 1.2 parsers in `tls12.messages` |
 | `x509` | `cert.x509.parse` |
+| `bundle` | `cert.bundle.measure` and `cert.bundle.parse` |
 
 A message boundary's input is the message body. The harness frames it with its
 type and exact length, which is what the framer hands a parser.
@@ -23,8 +24,10 @@ An input is answered when its entry point parses it or refuses it with a typed
 error, and every view the parse publishes lies inside the input. A harness
 also checks what its parser promises: an accepted hello is structurally exact,
 an accepted key-exchange point matches its curve, a list that validates walks
-to its end, a certificate chain walks to the count it reported, and a framer
-never asks for bytes it already holds. Breaking any of these is a finding.
+to its end, a certificate chain walks to the count it reported, a framer
+never asks for bytes it already holds, and a bundle accounts for every block as
+a distinct trust anchor or a skip inside the input, in the storage `measure`
+sized. Breaking any of these is a finding.
 
 Each input is copied so that it ends on the last byte before an unreadable page
 (`std.allocator.testing`), so a parser that reads one byte past its input
@@ -69,6 +72,10 @@ The named files are valid seeds, each accepted by its parser: the valid inputs
 the unit suite's former mutation corpora started from, a seed for each parser
 they did not reach, and the interop fixtures' certificates in DER. The `m-*`
 files were retained by `fuzz mutate all 20000 1 --retain`.
+
+The `bundle` seeds are cut from the Debian bundle and from a bundle with comment
+lines between its blocks, with one block in CRLF, beside bundles of malformed,
+unterminated and unusable blocks that the parser skips or refuses.
 
 To retain a new input by hand, put the file in its boundary's directory. When a
 finding is fixed, retain the input that found it, so the replay keeps it fixed.
