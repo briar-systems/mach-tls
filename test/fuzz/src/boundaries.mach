@@ -5,6 +5,7 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 
+use fuzz.bundle;
 use fuzz.certificate;
 use fuzz.extensions;
 use fuzz.handshake;
@@ -53,6 +54,7 @@ pub fun all(out: *Boundary) usize {
     i = put(out, i, "tls12-certificate-verify", tls12.answer_certificate_verify);
     i = put(out, i, "tls12-finished", tls12.answer_finished);
     i = put(out, i, "x509", certificate.answer);
+    i = put(out, i, "bundle", bundle.answer);
     ret i;
 }
 
