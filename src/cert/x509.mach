@@ -655,7 +655,9 @@ fun decimal(data: *u8, offset: usize, width: usize, output: *i64) bool {
     ret true;
 }
 
-fun parse_time(element: *der.Element, output: *i64) bool {
+# a trust anchor may carry a generalizedtime before 2050, which rfc 5280
+# 4.1.2.5 forbids an issuer to write but does not make the anchor untrusted
+fun parse_time(element: *der.Element, output: *i64, trust_anchor: bool) bool {
     if (element == nil || output == nil || element.content.data == nil) { ret false; }
     var year:   i64   = 0;
     var offset: usize = 0;
@@ -666,7 +668,8 @@ fun parse_time(element: *der.Element, output: *i64) bool {
         offset = 2;
     }
     or (element.tag == 0x18 && element.content.len == 15) {
-        if (!decimal(element.content.data, 0, 4, ?year) || year < 2050) {
+        if (!decimal(element.content.data, 0, 4, ?year) ||
+            (year < 2050 && !trust_anchor)) {
             ret false;
         }
         offset = 4;
@@ -720,7 +723,10 @@ fun parse_basic_constraints(input: contracts.Bytes,
     ret true;
 }
 
-fun parse_key_usage(input: contracts.Bytes, output: *Extensions) bool {
+# a trust anchor may keep trailing zero bits, which der strips from a named
+# bit list, since the bits it sets are what bind it
+fun parse_key_usage(input: contracts.Bytes, output: *Extensions,
+    trust_anchor: bool) bool {
     var value: der.Element;
     if (output == nil || !one_element(input, der.BIT_STRING, ?value) ||
         value.content.len < 2 || value.content.len > 3) { ret false; }
@@ -735,7 +741,10 @@ fun parse_key_usage(input: contracts.Bytes, output: *Extensions) bool {
         }
         i = i + 1;
     }
-    if ((usage & (1::u16 << (bit_count - 1))) == 0) { ret false; }
+    if (usage == 0 ||
+        (!trust_anchor && (usage & (1::u16 << (bit_count - 1))) == 0)) {
+        ret false;
+    }
     if ((usage & (KEY_USAGE_ENCIPHER_ONLY | KEY_USAGE_DECIPHER_ONLY)) != 0 &&
         (usage & KEY_USAGE_KEY_AGREEMENT) == 0) { ret false; }
     output.key_usage = usage;
@@ -939,8 +948,11 @@ fun parse_authority_key_id(input: contracts.Bytes,
     var serial:   bool = false;
     for (!der.complete(?body)) {
         var field: der.Element;
-        if (der.next(?body, ?field) != contracts.OK || field.tag < 0x80 ||
-            field.tag > 0x82 || field.tag <= previous) { ret false; }
+        if (der.next(?body, ?field) != contracts.OK ||
+            (field.tag != 0x80 && field.tag != 0xa1 && field.tag != 0x82) ||
+            (previous != 0x7f && (field.tag & 0x1f) <= (previous & 0x1f))) {
+            ret false;
+        }
         previous = field.tag;
         if (field.tag == 0x80) {
             if (field.content.len == 0) { ret false; }
@@ -992,7 +1004,7 @@ val OID_ACME_IDENTIFIER: [8]u8 = [8]u8{0x2b, 0x06, 0x01, 0x05, 0x05, 0x07,
     0x01, 0x1f};
 
 fun parse_extensions(element: *der.Element, output: *Extensions,
-    tls_alpn_challenge: bool) bool {
+    trust_anchor: bool, tls_alpn_challenge: bool) bool {
     if (element == nil || output == nil || element.tag != 0xa3) { ret false; }
     var outer_parent: der.Cursor = der.cursor(element.encoded);
     var outer:        der.Cursor;
@@ -1031,7 +1043,7 @@ fun parse_extensions(element: *der.Element, output: *Extensions,
         or (oid_equal(oid.content, (?OID_KEY_USAGE[0]), 3)) {
             output.key_usage_present  = true;
             output.key_usage_critical = critical;
-            if (!parse_key_usage(value.content, output)) { ret false; }
+            if (!parse_key_usage(value.content, output, trust_anchor)) { ret false; }
         }
         or (oid_equal(oid.content, (?OID_EXTENDED_KEY_USAGE[0]), 3)) {
             output.extended_key_usage_present  = true;
@@ -1133,11 +1145,14 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
         version = parsed_version::u8;
         if (der.next(?values, ?current) != contracts.OK) { ret contracts.INVALID_INPUT; }
     }
-    var serial: contracts.Bytes;
-    if (current.tag != der.INTEGER || current.content.len > MAX_SERIAL_SIZE ||
-        der.positive_integer(?current, ?serial) != contracts.OK || serial.len == 0) {
-        ret contracts.INVALID_INPUT;
-    }
+    # rfc 5280 4.1.2.2 asks users to handle a zero or negative serial
+    # gracefully. a chain member's must be positive, and an anchor's is kept
+    # as encoded, since the anchor is trusted by configuration
+    var serial: contracts.Bytes = current.content;
+    if (current.tag != der.INTEGER || current.content.len == 0 ||
+        current.content.len > MAX_SERIAL_SIZE ||
+        (!trust_anchor && (der.positive_integer(?current, ?serial) != contracts.OK ||
+        serial.len == 0))) { ret contracts.INVALID_INPUT; }
     var inner_algorithm: der.Element;
     var issuer:          der.Element;
     var validity:        der.Element;
@@ -1164,8 +1179,9 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
     if (der.next(?validity_body, ?not_before_element) != contracts.OK ||
         der.next(?validity_body, ?not_after_element) != contracts.OK ||
         !der.complete(?validity_body) ||
-        !parse_time(?not_before_element, ?not_before) ||
-        !parse_time(?not_after_element, ?not_after) || not_after < not_before) {
+        !parse_time(?not_before_element, ?not_before, trust_anchor) ||
+        !parse_time(?not_after_element, ?not_after, trust_anchor) ||
+        not_after < not_before) {
         ret contracts.INVALID_INPUT;
     }
     var public_key: keys.PublicKey;
@@ -1187,7 +1203,8 @@ fun parse_with(input: contracts.Bytes, output: *Certificate,
         }
         or (optional.tag == 0xa3 && !saw_extensions && version == 2) {
             saw_extensions = true;
-            if (!parse_extensions(?optional, ?extensions, tls_alpn_challenge)) { ret contracts.INVALID_INPUT; }
+            if (!parse_extensions(?optional, ?extensions, trust_anchor,
+                tls_alpn_challenge)) { ret contracts.INVALID_INPUT; }
         }
         or { ret contracts.INVALID_INPUT; }
     }
@@ -1248,19 +1265,23 @@ test cert_x509__strict_utc_and_generalized_time_parsing {
     var utc:       der.Element;
     var timestamp: i64 = 0;
     if (der.exact(contracts.Bytes{data: ?utc_bytes[0], len: 15}, ?utc) != contracts.OK ||
-        !parse_time(?utc, ?timestamp) || timestamp != 2524607999) { ret 1; }
+        !parse_time(?utc, ?timestamp, false) || timestamp != 2524607999) { ret 1; }
     var generalized_bytes: [17]u8 = [17]u8{
         0x18, 0x0f, '2', '0', '5', '0', '0', '1', '0', '1', '0', '0', '0', '0', '0', '0', 'Z',
     };
     var generalized: der.Element;
     if (der.exact(contracts.Bytes{data: ?generalized_bytes[0], len: 17},
         ?generalized) != contracts.OK ||
-        !parse_time(?generalized, ?timestamp) || timestamp != 2524608000) { ret 2; }
+        !parse_time(?generalized, ?timestamp, false) || timestamp != 2524608000) { ret 2; }
     generalized_bytes[4] = '4';
     generalized_bytes[5] = '9';
     if (der.exact(contracts.Bytes{data: ?generalized_bytes[0], len: 17},
-        ?generalized) != contracts.OK || parse_time(?generalized, ?timestamp)) {
+        ?generalized) != contracts.OK || parse_time(?generalized, ?timestamp, false)) {
         ret 3;
+    }
+    # an anchor's generalizedtime before 2050 is read, not refused
+    if (!parse_time(?generalized, ?timestamp, true) || timestamp != 2493072000) {
+        ret 4;
     }
     ret 0;
 }
