@@ -41,6 +41,10 @@ Distinguished names compare exact encodings first. PrintableString and ASCII UTF
 
 `tls.cert.load.certificate_pem` decodes one `CERTIFICATE` block into caller-owned public storage. `tls.cert.load.chain_pem` accepts one or more adjacent `CERTIFICATE` blocks separated only by ASCII whitespace. It measures and validates the complete bundle before publishing the output chain. Input and output storage must not overlap.
 
+`tls.cert.bundle` reads a PEM CA bundle, such as `/etc/ssl/certs/ca-certificates.crt`, into a `cert.TrustStore` for `config.ClientConfig.trust`. `parse` reads bytes into caller storage that `measure` sizes. `load` reads a file into memory from a `std.allocator.Allocator`, which `release` returns after the trust store's last use. Text outside a block is ignored, so the comment lines distributions write between certificates are accepted. A block opens with a line starting `-----BEGIN ` and closes with the next line starting `-----END `.
+
+Every block becomes an anchor or a `Skip` naming its index, byte range, reason and the underlying error. The reasons are `MALFORMED_PEM` (framing or base64 the PEM codec refuses, or a block that never closes), `NOT_A_CERTIFICATE`, `MALFORMED_CERTIFICATE` (the X.509 parser refuses it), `UNSUPPORTED` (a key or form this build cannot represent), and `DUPLICATE`. Anchors are parsed with `parse_trust_anchor`. A bundle with no usable anchor returns `NO_ANCHORS` with its skips. A bundle over `MAX_BYTES` (1 MiB), `MAX_BLOCKS` (1,024 blocks), or `MAX_ANCHORS` (the client's `MAX_TRUST_ANCHORS`) is refused whole with `TOO_LARGE`, never truncated.
+
 `tls.cert.load.private_der` loads PKCS #8, SEC 1, or RSA PKCS #1 DER into an owned `crypto.encoding.keys.PrivateKey`. `tls.cert.load.private_pem` accepts `PRIVATE KEY`, `EC PRIVATE KEY`, and `RSA PRIVATE KEY` labels. The caller owns the returned key and must destroy it through `crypto.encoding.keys.destroy_private`.
 
 ## Generation ownership

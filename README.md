@@ -18,6 +18,7 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.cert.x509` parses strict borrowed X.509 certificate views.
 - `tls.cert.verify` constructs and verifies bounded certificate paths.
 - `tls.cert.load` loads certificate chains and owned private keys from DER and PEM.
+- `tls.cert.bundle` loads trust anchors from a PEM CA bundle, reporting every certificate it skips.
 - `tls.cert.credentials` selects and safely rotates immutable credential generations.
 - `tls.engine` defines the role-independent handshake engine contract.
 - `tls.transport` provides completion-based TLS operation ownership and ordered-byte adapters.
