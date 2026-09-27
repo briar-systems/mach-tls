@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-27
+
+### Added
+
+- `tls.cert.bundle` loads trust anchors from a PEM CA bundle such as `/etc/ssl/certs/ca-certificates.crt` into the `cert.TrustStore` that `config.ClientConfig.trust` takes. `measure` and `parse` work over bytes in caller storage, and `load` and `release` read a file through an allocator. Text between blocks is ignored. Every block becomes an anchor or a reported skip (`MALFORMED_PEM`, `NOT_A_CERTIFICATE`, `MALFORMED_CERTIFICATE`, `UNSUPPORTED` or `DUPLICATE`), and a bundle past `MAX_BYTES` (1 MiB), `MAX_BLOCKS` (1024) or `MAX_ANCHORS` (256) is refused whole with `TOO_LARGE` rather than truncated. The Debian and Alpine system bundles are committed as test fixtures. The strict X.509 parser refuses some real system roots (14 of Debian's 150, 7 of Alpine's 121), which the loader reports as `MALFORMED_CERTIFICATE` skips (#135).
+- The fuzz lane gains a `bundle` boundary over `cert.bundle.measure` and `cert.bundle.parse`, with a corpus of 6 inputs (#135).
+
 ## [0.13.0] - 2026-09-26
 
 tls builds on mach 6, mach-std 9.0.0 and mach-crypto 0.24.0 (#145). Its protocol surface is unchanged.
