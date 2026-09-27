@@ -939,8 +939,11 @@ fun parse_authority_key_id(input: contracts.Bytes,
     var serial:   bool = false;
     for (!der.complete(?body)) {
         var field: der.Element;
-        if (der.next(?body, ?field) != contracts.OK || field.tag < 0x80 ||
-            field.tag > 0x82 || field.tag <= previous) { ret false; }
+        if (der.next(?body, ?field) != contracts.OK ||
+            (field.tag != 0x80 && field.tag != 0xa1 && field.tag != 0x82) ||
+            (previous != 0x7f && (field.tag & 0x1f) <= (previous & 0x1f))) {
+            ret false;
+        }
         previous = field.tag;
         if (field.tag == 0x80) {
             if (field.content.len == 0) { ret false; }
