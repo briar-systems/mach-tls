@@ -1,0 +1,102 @@
+# trust-anchor bundles: tls.cert.bundle.parse over PEM text
+
+use crypto.contracts;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use tls.cert;
+use tls.cert.bundle;
+use tls.cert.x509;
+
+use fuzz.verdict;
+
+# the lane's largest input bounds the der it can decode to
+val DER_CAPACITY: usize = 16384;
+
+var der:     [DER_CAPACITY]u8;
+var anchors: [bundle.MAX_ANCHORS]cert.Certificate;
+var skips:   [bundle.MAX_BLOCKS]bundle.Skip;
+
+fun same(first: cert.Certificate, second: cert.Certificate) bool {
+    if (first.der_len != second.der_len) { ret false; }
+    var i: usize = 0;
+    for (i < first.der_len) {
+        if (first.der[i] != second.der[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# every block is an anchor or a skip, skips are in bundle order inside the
+# input, and every anchor is a distinct trust anchor inside the der storage
+fun accounted(value: *bundle.Bundle, data: *u8, len: usize, reasons: *u64) bool {
+    if (value.store.len + value.skipped != value.blocks ||
+        value.store.len > bundle.MAX_ANCHORS) { ret false; }
+    var i:   usize = 0;
+    var end: usize = 0;
+    for (i < value.skipped) {
+        val skip: bundle.Skip = value.skips[i];
+        if (skip.index >= value.blocks || (i != 0 && skip.index <= value.skips[i - 1].index) ||
+            skip.offset < end || skip.length == 0 ||
+            !verdict.inside(?data[skip.offset], skip.length, data, len) ||
+            skip.reason < bundle.MALFORMED_PEM || skip.reason > bundle.DUPLICATE) {
+            ret false;
+        }
+        end      = skip.offset + skip.length;
+        @reasons = @reasons | (1::u64 << skip.reason::u64);
+        i        = i + 1;
+    }
+    i = 0;
+    for (i < value.store.len) {
+        val anchor: cert.Certificate = value.store.anchors[i];
+        var parsed: x509.Certificate;
+        if (anchor.der_len == 0 || !verdict.inside(anchor.der, anchor.der_len, ?der[0],
+            DER_CAPACITY) || x509.parse_trust_anchor(contracts.Bytes{data: anchor.der,
+            len: anchor.der_len}, ?parsed) != contracts.OK) { ret false; }
+        var j: usize = 0;
+        for (j < i) {
+            if (same(value.store.anchors[j], anchor)) { ret false; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun answer(data: *u8, len: usize) verdict.Verdict {
+    var required: bundle.Requirements;
+    val measured: bundle.Status = bundle.measure(contracts.Bytes{data: data, len: len},
+        ?required);
+    var value:  bundle.Bundle;
+    val status: bundle.Status = bundle.parse(contracts.Bytes{data: data, len: len},
+        bundle.Storage{der: contracts.Buffer{data: ?der[0], capacity: DER_CAPACITY},
+        anchors: ?anchors[0], anchor_capacity: bundle.MAX_ANCHORS,
+        skips:   ?skips[0], skip_capacity: bundle.MAX_BLOCKS}, ?value);
+    # measure is the storage contract, so it must refuse what parse refuses
+    if (measured != bundle.OK) {
+        if (status != measured) {
+            ret verdict.violated("bundle: parse and measure disagree on a refusal");
+        }
+        ret verdict.answered(verdict.mix(1::u64 << 40, status::u64));
+    }
+    if (required.der > len || required.certificates > required.blocks) {
+        ret verdict.violated("bundle: measure asked for more than the input can decode to");
+    }
+    if (status != bundle.OK && status != bundle.NO_ANCHORS) {
+        if (status == bundle.TOO_LARGE && required.certificates > bundle.MAX_ANCHORS) {
+            ret verdict.answered(verdict.mix(2::u64 << 40, status::u64));
+        }
+        ret verdict.violated("bundle: storage measure sized was refused");
+    }
+    var reasons: u64 = 0;
+    if (value.blocks != required.blocks || !accounted(?value, data, len, ?reasons) ||
+        (status == bundle.OK) != (value.store.len != 0)) {
+        ret verdict.violated("bundle: a block is unaccounted for, outside its input, or repeated");
+    }
+    if (status == bundle.OK) { verdict.accept(); }
+    var outcome: u64 = verdict.mix(3::u64 << 40, status::u64);
+    outcome = verdict.mix(outcome, verdict.bucket(value.store.len));
+    outcome = verdict.mix(outcome, verdict.bucket(value.skipped));
+    ret verdict.answered(verdict.mix(outcome, reasons));
+}
