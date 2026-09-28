@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-28
+
+### Breaking
+
+- Every expanded AES-GCM context is borrowed from the caller's `buffers.SecretSource` instead of living inside the connection and ticket-ring records (#134). A context is held while its key is live and returned wiped when the key is destroyed. `record.install` gains a `context` parameter, `record.keyed` is public, `session.keyring_init` takes a `buffer.SecretLease`, `session.TicketKey` holds `storage` and a context pointer, and `stream.Stream` gains a read and a write context region. `record.CONTEXT_SIZE` and `record.CONTEXT_ALIGN` size the secret class a pool needs, and the recommended class shape in `doc/memory.md` gains one. `record.Cipher` shrinks from 1,192 to 144 bytes, `stream.Stream` from 4,008 to 1,992 and `session.KeyRing` from 4,568 to 560 on x86_64-linux.
+- Dependencies: requires mach-std 9.4 and mach-crypto 0.26.0, selected by `version = "^9.4"` and `version = "^0.26"` with the gitlinks at v9.4.1 and v0.26.0. Resolution is flat, so a consumer of tls moves to std 9.4 and crypto 0.26 with it. std 9.4.1 maps a guard page below every linux thread stack. test/fuzz and test/interop pin `tag/v9.4.1` and `tag/v0.26.0`.
+
+### Added
+
+- `buffer.TypedRegion` holds one secret chunk sized and aligned from a type, through `typed_empty`, `typed_reserve[T]`, `typed_view[T]` and `typed_release` (#134).
+- The fuzz lane gains `server13` and `server12` boundaries, a fresh TLS 1.3 and TLS 1.2 server fed one mutated ClientHello and required to fail with one alert, progress, or ask for more, with a retained corpus of 28 inputs (#147).
+
+### Changed
+
+- `tls.test.pool` is test-only. The interop binaries and the fuzz lane carry pool harnesses of their own, and the interop project id is `interop` (#148, #162).
+
 ## [0.15.0] - 2026-09-27
 
 ### Changed
