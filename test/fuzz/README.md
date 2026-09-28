@@ -14,9 +14,15 @@ point of the library. Each directory pairs with a row of the registry in
 | `tls12-client-hello`, `tls12-server-hello`, `tls12-certificate`, `tls12-server-key-exchange`, `tls12-certificate-request`, `tls12-server-hello-done`, `tls12-client-key-exchange`, `tls12-certificate-verify`, `tls12-finished` | the TLS 1.2 parsers in `tls12.messages` |
 | `x509` | `cert.x509.parse` |
 | `bundle` | `cert.bundle.measure` and `cert.bundle.parse` |
+| `server13`, `server12` | `server.ingest` and `tls12.connection.ingest` on a fresh server at the initial level |
 
 A message boundary's input is the message body. The harness frames it with its
-type and exact length, which is what the framer hands a parser.
+type and exact length, which is what the framer hands a parser. An engine
+boundary's input is what the engine ingests: a whole handshake message, header
+included, so a mutation reaches the engine's own framing. Its server is built
+from the interop fixtures (`test/interop/fixtures`), an Ed25519 identity for
+TLS 1.3 and a P-256 one for TLS 1.2, with a frozen clock and fixed entropy, so
+the lane runs from the repository root.
 
 ## Answers
 
@@ -27,7 +33,12 @@ an accepted key-exchange point matches its curve, a list that validates walks
 to its end, a certificate chain walks to the count it reported, a framer
 never asks for bytes it already holds, and a bundle accounts for every block as
 a distinct trust anchor or a skip inside the input, in the storage `measure`
-sized. Breaking any of these is a finding.
+sized. A server fed one hello comes to one of three bounded states: failed,
+with exactly one alert queued and further input refused; progressed, with every
+crypto event non-empty and inside its output buffer, a suite it was configured
+with, and no completed handshake; or waiting for more with nothing queued. Once
+destroyed, it holds no chunk of its connection's account. Breaking any of these
+is a finding.
 
 Each input is copied so that it ends on the last byte before an unreadable page
 (`std.allocator.testing`), so a parser that reads one byte past its input
@@ -70,8 +81,10 @@ reach different code with the same answer count as one.
 
 The named files are valid seeds, each accepted by its parser: the valid inputs
 the unit suite's former mutation corpora started from, a seed for each parser
-they did not reach, and the interop fixtures' certificates in DER. The `m-*`
-files were retained by `fuzz mutate all 20000 1 --retain`.
+they did not reach, and the interop fixtures' certificates in DER. The engine
+seeds are the `client-hello` and `tls12-client-hello` seeds framed as messages,
+beside each with a server name and an ALPN offer. The `m-*` files were retained
+by `fuzz mutate all 20000 1 --retain`.
 
 The `bundle` seeds are cut from the Debian bundle and from a bundle with comment
 lines between its blocks, with one block in CRLF, beside bundles of malformed,

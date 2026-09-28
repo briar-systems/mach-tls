@@ -27,8 +27,8 @@ codebase once.
 
 `test/fuzz` answers every untrusted-input entry point: the record layer, alert
 decoding, handshake framing, the extension walk and each context's validation,
-every TLS 1.3 and TLS 1.2 handshake message parser, and X.509 certificate
-parsing. Each boundary has a harness and a directory of retained inputs in
+every TLS 1.3 and TLS 1.2 handshake message parser, X.509 certificate
+parsing, and a TLS 1.3 and a TLS 1.2 server fed one client hello. Each boundary has a harness and a directory of retained inputs in
 `test/fuzz/corpus`. The property is that no peer byte sequence crashes a parser,
 reads past its input, loops, or is accepted or refused wrongly:
 
@@ -44,6 +44,10 @@ reads past its input, loops, or is accepted or refused wrongly:
   reported
 - every walk a harness drives is bounded by its input's length, and the replay
   runs under a timeout
+- a server fed one hello either fails with exactly one alert and refuses
+  further input, progresses with every crypto event inside its output buffer, a
+  configured suite and no completed handshake, or waits for more with nothing
+  queued, and once destroyed holds no chunk of its account
 
 The replay is deterministic and runs in both profiles on the heavy tier (a pull
 request into `main`, or a dispatch with `heavy: fuzz`). The lane is built on
@@ -186,9 +190,6 @@ These are real gaps, named so nobody has to discover them:
   new answer rather than for new code: it will not discover a path that needs a
   specific 32-bit constant to reach, and two inputs that reach different code
   with the same answer count as one.
-- **The engines under hostile input.** The fuzz lane drives the parsers. The
-  handshake engines see malformed input through the negative corpora and the
-  interop matrix's failure legs, not through the lane.
 - **Multi-day sessions.** The longest session exercised is two key
   updates in each direction on one connection, plus ticket lifetimes checked
   against a controlled clock. No wall-clock long-running soak was performed.
