@@ -34,7 +34,6 @@ use tls.error;
 use tls.record;
 use tls.server;
 use tls.session;
-use tls.test.pool;
 use tls.tls12;
 use tls12_connection: tls.tls12.connection;
 use tls.tls13;
@@ -42,6 +41,7 @@ use tls.tls13;
 use A:  std.allocator;
 use fs: std.filesystem;
 
+use fuzz.pool;
 use fuzz.verdict;
 
 val FIXTURES: str   = "test/interop/fixtures";
