@@ -3,6 +3,7 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use interop.pool;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.duration;
@@ -41,7 +42,6 @@ use tls.record;
 use tls.server;
 use tls.session;
 use tls.stream;
-use tls.test.pool;
 use tls.tls12;
 use tls12_connection: tls.tls12.connection;
 use tls.tls13;
