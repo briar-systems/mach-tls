@@ -23,6 +23,7 @@ use tls.handshake.codec;
 use tls.memory_range;
 use tls.record;
 use tls.session;
+#[testing]
 use tls.test.pool;
 use tls.tls13;
 use tls.tls13.key_schedule;

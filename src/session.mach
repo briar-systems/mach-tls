@@ -16,6 +16,7 @@ use std.types.size.usize;
 use tls.buffer;
 use tls.clock;
 use tls.memory_range;
+#[testing]
 use tls.test.pool;
 use tls.tls13;
 

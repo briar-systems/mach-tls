@@ -33,6 +33,7 @@ use tls.memory_range;
 use tls.record;
 use tls.session;
 use tls.signature_scheme;
+#[testing]
 use tls.test.pool;
 use tls.tls13;
 use tls.tls13.established;

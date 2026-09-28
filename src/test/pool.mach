@@ -1,4 +1,4 @@
-# a buffers pool and one connection account for tests
+# a buffers pool and one connection account for the library's tests
 
 use crypto.aead.aes_gcm;
 use A: std.allocator;
@@ -12,8 +12,10 @@ use std.types.size.usize;
 use tls.buffer;
 use tls.record;
 
+#[testing]
 pub val CLASS_COUNT: usize = 7;
 
+#[testing]
 pub rec Harness {
     backing: A.Allocator;
     classes: [CLASS_COUNT]buffers.ClassConfig;
@@ -26,6 +28,7 @@ pub rec Harness {
 
 # the class shape the documentation recommends: 512 B, 4 KiB and one record,
 # each plain and secret, and a secret class that holds one cipher context
+#[testing]
 pub fun make(harness: *Harness, global: usize, budget: usize) bool {
     var made: err[A.Error] = page.make(?harness.backing);
     if (sel made.err) { ret false; }
@@ -61,25 +64,30 @@ pub fun make(harness: *Harness, global: usize, budget: usize) bool {
     ret true;
 }
 
+#[testing]
 pub fun lease(harness: *Harness) buffer.Lease {
     ret buffer.Lease{source: ?harness.plain, account: ?harness.account, lane: 0};
 }
 
+#[testing]
 pub fun secret_lease(harness: *Harness) buffer.SecretLease {
     ret buffer.SecretLease{source: ?harness.secret, account: ?harness.account, lane: 0};
 }
 
 # bytes the account holds now
+#[testing]
 pub fun held(harness: *Harness) usize {
     ret harness.account.held;
 }
 
+#[testing]
 pub fun ready(harness: *Harness) bool {
     var handle: u64 = 0;
     ret buffers.ready(?harness.pool, ?handle, 1) == 1 && handle == 1;
 }
 
 # false when the account still holds a chunk
+#[testing]
 pub fun destroy(harness: *Harness) bool {
     if (!harness.made) { ret true; }
     var closed: buffers.Reason = buffers.close_account(?harness.pool, ?harness.account);

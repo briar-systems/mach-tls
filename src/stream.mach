@@ -45,6 +45,7 @@ use tls.error;
 use tls.memory_range;
 use tls.record;
 use tls.server;
+#[testing]
 use tls.test.pool;
 use tls12_connection:  tls.tls12.connection;
 use tls12_established: tls.tls12.established;
