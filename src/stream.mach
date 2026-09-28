@@ -22,6 +22,7 @@
 # `close` on a failed stream is abortive and is allowed while the other lane is
 # outstanding, and the lower abort is what ends that lane's action.
 
+use crypto.aead.aes_gcm;
 use crypto.contracts;
 use std.crypto.ct;
 use std.io.runtime;
@@ -137,12 +138,16 @@ pub rec Stream {
     writing:  Lane;
     # the lane that owns wire_out, the lane that may reserve memory while both
     # are parked for it, and whether this step freed what a parked peer awaits
-    sender:             LaneId;
-    turn:               LaneId;
-    peer_released:      bool;
-    failure:            error.Error;
+    sender:        LaneId;
+    turn:          LaneId;
+    peer_released: bool;
+    failure:       error.Error;
+    # each cipher's context lives in a chunk borrowed from the secret source
+    # from its first keyed install until the stream is destroyed
     read_cipher:        record.Cipher;
     write_cipher:       record.Cipher;
+    read_context:       buffer.TypedRegion;
+    write_context:      buffer.TypedRegion;
     state:              State;
     control:            Control;
     wire_input_len:     usize;
@@ -154,6 +159,8 @@ pub rec Stream {
     application_chunk:  usize;
     core_event:         engine.Event;
     core_event_sending: bool;
+    # the borrowed core event is a traffic secret waiting for its context
+    core_event_installing: bool;
     # wire_out holds a record of the borrowed core event
     event_record:             bool;
     core_event_alert:         bool;
@@ -463,7 +470,25 @@ fun stream_protocol(stream: *Stream) record.Protocol {
     ret record.TLS13;
 }
 
-fun install_secret(stream: *Stream, event: *engine.Event) bool {
+# install a traffic secret. a keyed member expands into the direction's
+# borrowed context, taken at its first install and reused by every later key,
+# so only that first install can wait for memory
+fun install_secret(stream: *Stream, event: *engine.Event) buffer.Outcome {
+    var target: *record.Cipher      = ?stream.read_cipher;
+    var region: *buffer.TypedRegion = ?stream.read_context;
+    if (event.direction == engine.SEND) {
+        target = ?stream.write_cipher;
+        region = ?stream.write_context;
+    }
+    val aead:    record.Aead      = algorithm(event.aead);
+    var context: *aes_gcm.Context = nil;
+    if (record.keyed(aead)) {
+        val held: buffer.Outcome = buffer.typed_reserve[aes_gcm.Context](stream.secrets,
+            region, true);
+        if (held != buffer.HELD) { ret held; }
+        context = buffer.typed_view[aes_gcm.Context](stream.secrets, region);
+        if (context == nil) { ret buffer.FAIL; }
+    }
     var key:        [engine.MAX_TRAFFIC_KEY]^u8;
     var iv:         [engine.TRAFFIC_IV_SIZE]u8;
     var key_length: usize = 0;
@@ -478,21 +503,19 @@ fun install_secret(stream: *Stream, event: *engine.Event) bool {
         ?key_length) || key_length == 0 ||
         key_length > engine.MAX_TRAFFIC_KEY) {
         ct.zeroize(?key[0], engine.MAX_TRAFFIC_KEY);
-        ret false;
+        ret buffer.FAIL;
     }
-    var target: *record.Cipher = ?stream.read_cipher;
-    if (event.direction == engine.SEND) { target = ?stream.write_cipher; }
-    val installed: bool = record.install(target, stream_protocol(stream),
-        algorithm(event.aead),
+    val installed: bool = record.install(target, stream_protocol(stream), aead,
         contracts.SecretBytes{data: ?key[0], len: key_length},
-        contracts.Bytes{data: ?iv[0], len: iv_length});
+        contracts.Bytes{data: ?iv[0], len: iv_length}, context);
     ct.zeroize(?key[0], engine.MAX_TRAFFIC_KEY);
     var i: usize = 0;
     for (i < engine.TRAFFIC_IV_SIZE) {
         iv[i] = 0;
         i     = i + 1;
     }
-    ret installed;
+    if (!installed) { ret buffer.FAIL; }
+    ret buffer.HELD;
 }
 
 # the first failure is the one the other lane reports
@@ -516,14 +539,15 @@ fun terminal_requires_failure(stream: *Stream, lane: *Lane,
 }
 
 fun clear_core_event(stream: *Stream) {
-    if (stream.core_event_sending) {
+    if (stream.core_event_sending || stream.core_event_installing) {
         engine_complete_event(stream, stream.core_event.token, false);
     }
-    stream.core_event_sending = false;
-    stream.event_record       = false;
-    stream.core_event_alert   = false;
-    stream.core_event_offset  = 0;
-    stream.core_event_chunk   = 0;
+    stream.core_event_sending    = false;
+    stream.core_event_installing = false;
+    stream.event_record          = false;
+    stream.core_event_alert      = false;
+    stream.core_event_offset     = 0;
+    stream.core_event_chunk      = 0;
 }
 
 fun settle_terminal(stream: *Stream, lane: *Lane) bool {
@@ -753,9 +777,13 @@ fun owe_core_record(stream: *Stream, lane: *Lane) bool {
     ret finish(stream, lane, error.INTERNAL_ERROR, false);
 }
 
+# take the engine's next event, or retry the traffic secret still waiting for
+# its context. true when an event was handled, which may have parked the lane
 fun handle_core_event(stream: *Stream, lane: *Lane) bool {
     var event: engine.Event;
-    if (stream.core_event_sending || !engine_next_event(stream, ?event)) { ret false; }
+    if (stream.core_event_sending)          { ret false; }
+    if (stream.core_event_installing)       { event = stream.core_event; }
+    or (!engine_next_event(stream, ?event)) { ret false; }
     stream.send_record_plaintext = engine_send_limit(stream);
     if (event.kind == engine.CRYPTO || event.kind == engine.ALERT ||
         event.kind == engine.CHANGE_CIPHER_SPEC) {
@@ -767,10 +795,19 @@ fun handle_core_event(stream: *Stream, lane: *Lane) bool {
         stream.core_event_chunk   = 0;
         ret true;
     }
-    if (event.kind == engine.TRAFFIC_SECRET && !install_secret(stream, ?event)) {
-        engine_complete_event(stream, event.token, false);
-        finish(stream, lane, error.INTERNAL_ERROR, false);
-        ret true;
+    if (event.kind == engine.TRAFFIC_SECRET) {
+        val installed: buffer.Outcome = install_secret(stream, ?event);
+        if (installed == buffer.WAIT) {
+            stream.core_event            = event;
+            stream.core_event_installing = true;
+            ret refused(stream, lane, installed);
+        }
+        stream.core_event_installing = false;
+        if (installed != buffer.HELD) {
+            engine_complete_event(stream, event.token, false);
+            finish(stream, lane, error.INTERNAL_ERROR, false);
+            ret true;
+        }
     }
     if (event.kind == engine.HANDSHAKE_COMPLETE) {
         stream.handshake_complete = true;
@@ -1067,7 +1104,7 @@ fun drive_handshake(stream: *Stream, lane: *Lane) bool {
             advanced = true;
         }
         if (!advanced && handle_core_event(stream, lane)) {
-            if (lane_terminal(lane)) { ret true; }
+            if (settled(stream, lane)) { ret true; }
             if (stream.handshake_complete && !stream.core_event_sending) {
                 ret finish(stream, lane, error.OK, false);
             }
@@ -1079,11 +1116,15 @@ fun drive_handshake(stream: *Stream, lane: *Lane) bool {
                 ret park(stream, lane, PARK_MEMORY);
             }
             if (polled.status == engine.FAILED) {
-                if (handle_core_event(stream, lane)) { advanced = true; }
-                or                                   { ret finish(stream, lane, polled.error, false); }
+                if (!handle_core_event(stream, lane)) { ret finish(stream, lane, polled.error, false); }
+                if (settled(stream, lane))            { ret true; }
+                advanced = true;
             }
         }
-        if (!advanced && handle_core_event(stream, lane)) { advanced = true; }
+        if (!advanced && handle_core_event(stream, lane)) {
+            if (settled(stream, lane)) { ret true; }
+            advanced = true;
+        }
         if (!advanced && process_record(stream, lane)) {
             if (settled(stream, lane)) { ret true; }
             advanced = true;
@@ -1102,7 +1143,7 @@ fun drive_key_update(stream: *Stream, lane: *Lane) bool {
         if (sending(stream, lane))            { cnt; }
         if (stream.wire_output_len != 0)      { ret park(stream, lane, PARK_PEER); }
         if (!handle_core_event(stream, lane)) { ret finish(stream, lane, error.OK, false); }
-        if (lane_terminal(lane))              { ret true; }
+        if (settled(stream, lane))            { ret true; }
     }
     ret false;
 }
@@ -1115,7 +1156,7 @@ fun drive_write(stream: *Stream, lane: *Lane) bool {
         if (sending(stream, lane))         { cnt; }
         if (stream.wire_output_len != 0)   { ret park(stream, lane, PARK_PEER); }
         if (handle_core_event(stream, lane)) {
-            if (lane_terminal(lane)) { ret true; }
+            if (settled(stream, lane)) { ret true; }
             cnt;
         }
         val snapshot: transport.Snapshot = transport.snapshot(?lane.operation);
@@ -1137,7 +1178,7 @@ fun drive_read(stream: *Stream, lane: *Lane) bool {
         if (owe_core_record(stream, lane)) { ret true; }
         if (sending(stream, lane))         { cnt; }
         if (handle_core_event(stream, lane)) {
-            if (lane_terminal(lane)) { ret true; }
+            if (settled(stream, lane)) { ret true; }
             cnt;
         }
         if (consume_plaintext(stream, lane)) { ret true; }
@@ -1159,7 +1200,7 @@ fun drive_control(stream: *Stream, lane: *Lane) bool {
         if (sending(stream, lane))         { cnt; }
         if (stream.wire_output_len != 0)   { ret park(stream, lane, PARK_PEER); }
         if (handle_core_event(stream, lane)) {
-            if (lane_terminal(lane)) { ret true; }
+            if (settled(stream, lane)) { ret true; }
             cnt;
         }
         val prepared: buffer.Outcome = prepare_alert(stream, lane, stream.control_alert);
@@ -1266,6 +1307,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
         (stream.state != 0 && stream.state != DESTROYED) ||
         !lane_available(?stream.reading) || !lane_available(?stream.writing) ||
         stream.read_cipher.installed || stream.write_cipher.installed ||
+        stream.read_context.held || stream.write_context.held ||
         (role != engine.CLIENT && role != engine.SERVER &&
         !engine.is_tls12(role)) ||
         (role == engine.CLIENT && (client_engine == nil ||
@@ -1337,6 +1379,7 @@ fun init_inner(stream: *Stream, role: engine.Role,
     stream.plaintext_read         = 0;
     stream.application_chunk      = 0;
     stream.core_event_sending     = false;
+    stream.core_event_installing  = false;
     stream.event_record           = false;
     stream.core_event_alert       = false;
     stream.core_event_offset      = 0;
@@ -1521,7 +1564,7 @@ fun key_update_inner(stream: *Stream, scope: *cancel.Scope,
     val lane: *Lane = ?stream.writing;
     if (stream == nil || stream.state != OPEN || stream.send_closed ||
         !lane_ready(stream, lane) || stream.core_event_sending ||
-        !operation_inputs_valid(stream, scope, nil, 0) ||
+        stream.core_event_installing || !operation_inputs_valid(stream, scope, nil, 0) ||
         !token_free(stream, lane, token) ||
         engine_request_key_update(stream, request).status != engine.OK ||
         !begin_lane(stream, lane, token, transport.HANDSHAKE, scope,
@@ -1841,6 +1884,8 @@ fun destroy_inner(stream: *Stream) bool {
     stream.sender           = NO_LANE;
     record.destroy(?stream.read_cipher);
     record.destroy(?stream.write_cipher);
+    if (!buffer.typed_release(stream.secrets, ?stream.read_context) ||
+        !buffer.typed_release(stream.secrets, ?stream.write_context)) { ret false; }
     established.wipe(?stream.core13);
     tls12_established.wipe(?stream.core12);
     stream.finished = false;

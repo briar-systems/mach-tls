@@ -51,7 +51,9 @@ A server seals sessions under one ticket key at a time. `session.KeyRing` holds
 at most `MAX_TICKET_KEYS` keys, exactly one of which is current for sealing.
 `keyring_init` mints the first key and fixes three policy values. Each key
 records a monotonic sealing deadline, a monotonic opening deadline, and the wall
-time it was minted.
+time it was minted. Each live key's expanded context is borrowed from the
+`buffer.SecretLease` the ring is given (see [`memory.md`](memory.md#cipher-contexts)),
+so a mint or rotation fails when that source cannot lend one.
 
 - `seal_lifetime_seconds`: how long a key stays current for sealing
 - `overlap_seconds`: how long a retired key stays usable for opening
