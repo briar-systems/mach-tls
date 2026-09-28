@@ -1,5 +1,6 @@
 # completion transport ownership tests
 
+use crypto.aead.aes_gcm;
 use crypto.contracts;
 use crypto.secret;
 use A: std.allocator;
@@ -35,6 +36,7 @@ use tls.error;
 use tls.memory_range;
 use tls.record;
 use tls.stream;
+#[testing]
 use tls.test.pool;
 use tls.tls13;
 use tls.tls13.established;
@@ -685,12 +687,19 @@ fun make_leased_stream(value: *stream.Stream, core: *client.Handshake,
         iv[i] = (0x80 + i)::u8;
         i     = i + 1;
     }
+    value.read_context  = buffer.typed_empty();
+    value.write_context = buffer.typed_empty();
+    if (buffer.typed_reserve[aes_gcm.Context](secrets, ?value.write_context, false) !=
+        buffer.HELD || buffer.typed_reserve[aes_gcm.Context](secrets, ?value.read_context,
+        false) != buffer.HELD) { ret false; }
     val installed: bool = record.install(?value.write_cipher, record.TLS13,
         record.aes_128_gcm(), contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12});
+        contracts.Bytes{data: ?iv[0], len: 12},
+        buffer.typed_view[aes_gcm.Context](secrets, ?value.write_context));
     val read_installed: bool = record.install(?value.read_cipher, record.TLS13,
         record.aes_128_gcm(), contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12});
+        contracts.Bytes{data: ?iv[0], len: 12},
+        buffer.typed_view[aes_gcm.Context](secrets, ?value.read_context));
     ct.zeroize(?key[0], 16);
     ret installed && read_installed && transport.pin(?value.lower, ?value.lower.descriptor);
 }
@@ -1040,10 +1049,11 @@ test stream__encrypted_records_retain_read_ownership_at_every_byte_boundary {
         iv[i] = (0x80 + i)::u8;
         i     = i + 1;
     }
-    var peer: record.Cipher;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
     if (!record.install(?peer, record.TLS13, record.aes_128_gcm(),
         contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12})) { ret 4; }
+        contracts.Bytes{data: ?iv[0], len: 12}, ?peer_context)) { ret 4; }
     ct.zeroize(?key[0], 16);
     var clear:   [5]^u8        = [5]^u8{'w', 'o', 'r', 'l', 'd'};
     var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
@@ -1123,10 +1133,11 @@ test stream__cancelling_a_read_keeps_the_bytes_the_transport_already_settled {
         iv[i] = (0x80 + i)::u8;
         i     = i + 1;
     }
-    var peer: record.Cipher;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
     if (!record.install(?peer, record.TLS13, record.aes_128_gcm(),
         contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12})) { ret 4; }
+        contracts.Bytes{data: ?iv[0], len: 12}, ?peer_context)) { ret 4; }
     ct.zeroize(?key[0], 16);
     var clear:   [5]^u8        = [5]^u8{'h', 'e', 'l', 'l', 'o'};
     var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
@@ -1290,10 +1301,11 @@ test stream__a_read_waits_for_memory_to_buffer_and_to_open_a_record {
         iv[i] = (0x80 + i)::u8;
         i     = i + 1;
     }
-    var peer: record.Cipher;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
     if (!record.install(?peer, record.TLS13, record.aes_128_gcm(),
         contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12})) { ret 4; }
+        contracts.Bytes{data: ?iv[0], len: 12}, ?peer_context)) { ret 4; }
     ct.zeroize(?key[0], 16);
     var clear:   [5]^u8        = [5]^u8{'p', 'a', 'r', 'k', 's'};
     var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
@@ -1444,10 +1456,11 @@ fun seal_application(clear: *^u8, length: usize, wire: *u8) usize {
         iv[i] = (0x80 + i)::u8;
         i     = i + 1;
     }
-    var peer: record.Cipher;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
     if (!record.install(?peer, record.TLS13, record.aes_128_gcm(),
         contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12})) { ret 0; }
+        contracts.Bytes{data: ?iv[0], len: 12}, ?peer_context)) { ret 0; }
     ct.zeroize(?key[0], 16);
     var scratch: [record.MAX_INNER_PLAINTEXT]^u8;
     val sealed:  record.Sealed = record.seal(?peer, record.APPLICATION_DATA,
@@ -1695,7 +1708,7 @@ fun make_finished_stream(value: *stream.Stream, core: *client.Handshake,
 
 # the peer seals with the key the test stream reads with
 #[testing]
-fun make_peer(peer: *record.Cipher) bool {
+fun make_peer(peer: *record.Cipher, context: *aes_gcm.Context) bool {
     var key: [16]^u8;
     var iv:  [12]u8;
     var i:   usize = 0;
@@ -1710,7 +1723,7 @@ fun make_peer(peer: *record.Cipher) bool {
     }
     val installed: bool = record.install(peer, record.TLS13, record.aes_128_gcm(),
         contracts.SecretBytes{data: ?key[0], len: 16},
-        contracts.Bytes{data: ?iv[0], len: 12});
+        contracts.Bytes{data: ?iv[0], len: 12}, context);
     ct.zeroize(?key[0], 16);
     ret installed;
 }
@@ -1754,6 +1767,42 @@ fun lane_ended(lane: *stream.Lane, failure: error.Error, bytes: usize) bool {
 #[testing]
 fun token(index: u32, generation: u32) transport.Token {
     ret transport.Token{index: index, generation: generation};
+}
+
+test stream__a_key_s_first_install_waits_for_its_context_and_resumes {
+    var runtime: io_runtime.Runtime;
+    if (!make_runtime(?runtime, 16) || !parked_setup()) { ret 1; }
+    var scope: cancel.Scope;
+    if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 2; }
+    var transport_state: TestTransport;
+    var adapter:         transport.Transport;
+    make_test_transport(?adapter, ?transport_state, ?runtime);
+    var secure: stream.Stream;
+    if (!make_finished_stream(?secure, ?core_a, ?adapter, pool.lease(?parked_harness),
+        pool.secret_lease(?parked_harness))) { ret 3; }
+    # the write direction holds no key, and so no context, yet
+    record.destroy(?secure.write_cipher);
+    if (!buffer.typed_release(pool.secret_lease(?parked_harness), ?secure.write_context) ||
+        pool.held(?parked_harness) != record.CONTEXT_SIZE) { ret 4; }
+    if (!stream.key_update(?secure, ?scope, token(64, 1), 0, 0) ||
+        transport_state.writes != 1) { ret 5; }
+    pool.squeeze(?parked_squeeze);
+    # the key update is sent, and its new key waits for a context with its
+    # event held
+    if (!runtime_ok(io_runtime.complete(?runtime, secure.writing.operation.lower_token,
+        secure.wire_output_len, 0, false)) || !step(?runtime, ?secure) ||
+        !parked(?secure, ?transport_state, 0, 1) || !secure.core_event_installing ||
+        secure.write_cipher.installed || secure.write_context.held) { ret 6; }
+    if (!resumed(?runtime, ?secure) || !lane_ended(?secure.writing, error.OK, 0) ||
+        secure.core_event_installing || !secure.write_cipher.installed ||
+        !secure.write_context.held ||
+        pool.held(?parked_harness) != 2 * record.CONTEXT_SIZE) { ret 7; }
+    if (!settle(?secure) || !stream.destroy(?secure) ||
+        pool.held(?parked_harness) != 0 || !pool.destroy(?parked_harness) ||
+        !operation_ok(cancel.destroy(?scope)) ||
+        !runtime_closed(io_runtime.close(?runtime)) ||
+        !runtime_ok(io_runtime.destroy(?runtime))) { ret 8; }
+    ret 0;
 }
 
 test stream__a_read_that_finds_memory_first_does_not_starve_a_parked_write {
@@ -1813,9 +1862,10 @@ test stream__a_write_that_went_out_in_full_counts_its_bytes_when_the_read_fails 
     var transport_state: TestTransport;
     var adapter:         transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
-    var secure: stream.Stream;
-    var peer:   record.Cipher;
-    if (!make_open_stream(?secure, ?core_a, ?adapter) || !make_peer(?peer)) { ret 3; }
+    var secure:       stream.Stream;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
+    if (!make_open_stream(?secure, ?core_a, ?adapter) || !make_peer(?peer, ?peer_context)) { ret 3; }
     var output: [3]u8 = [3]u8{1, 2, 3};
     var input:  [5]u8;
     if (!stream.write(?secure, ?scope, token(61, 1), ?output[0], 3, 0) ||
@@ -1910,9 +1960,10 @@ test stream__a_peer_close_notify_ends_the_read_and_leaves_the_write_finishable {
     var transport_state: TestTransport;
     var adapter:         transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
-    var secure: stream.Stream;
-    var peer:   record.Cipher;
-    if (!make_open_stream(?secure, ?core_a, ?adapter) || !make_peer(?peer)) { ret 3; }
+    var secure:       stream.Stream;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
+    if (!make_open_stream(?secure, ?core_a, ?adapter) || !make_peer(?peer, ?peer_context)) { ret 3; }
     var output: [3]u8 = [3]u8{1, 2, 3};
     var input:  [5]u8;
     if (!stream.write(?secure, ?scope, token(63, 1), ?output[0], 3, 0) ||
@@ -1989,10 +2040,11 @@ test stream__a_read_owing_a_record_and_a_write_short_of_memory_do_not_deadlock {
     var transport_state: TestTransport;
     var adapter:         transport.Transport;
     make_test_transport(?adapter, ?transport_state, ?runtime);
-    var secure: stream.Stream;
-    var peer:   record.Cipher;
+    var secure:       stream.Stream;
+    var peer:         record.Cipher;
+    var peer_context: aes_gcm.Context;
     if (!make_finished_stream(?secure, ?core_a, ?adapter, pool.lease(?parked_harness),
-        pool.secret_lease(?parked_harness)) || !make_peer(?peer)) { ret 3; }
+        pool.secret_lease(?parked_harness)) || !make_peer(?peer, ?peer_context)) { ret 3; }
     var output: [3]u8 = [3]u8{1, 2, 3};
     var input:  [5]u8;
     if (!stream.write(?secure, ?writes, token(65, 1), ?output[0], 3, 0) ||

@@ -53,6 +53,13 @@ pub rec SecretRegion {
     held:     bool;
 }
 
+# a held secret chunk viewed as one value of a type, such as an expanded key.
+# the chunk is sized and aligned from the type, never from a constant
+pub rec TypedRegion {
+    chunk: buffers.Chunk;
+    held:  bool;
+}
+
 pub fun no_lease() Lease {
     ret Lease{source: nil, account: nil, lane: 0};
 }
@@ -97,6 +104,14 @@ pub fun secret_empty() SecretRegion {
     value.data     = nil;
     value.capacity = 0;
     value.held     = false;
+    ret value;
+}
+
+pub fun typed_empty() TypedRegion {
+    var value: TypedRegion;
+    value.chunk.data  = nil;
+    value.chunk.bytes = 0;
+    value.held        = false;
     ret value;
 }
 
@@ -217,5 +232,40 @@ pub fun secret_release(lease: SecretLease, region: *SecretRegion) bool {
         lease.account, region.chunk);
     if (!(sel kind.none)) { ret false; }
     @region = secret_empty();
+    ret true;
+}
+
+# hold a secret chunk for one T, zeroed on its first view. a held region is
+# left alone. register says whether a wait registers the account for a wake-up
+pub fun typed_reserve[T](lease: SecretLease, region: *TypedRegion, register: bool) Outcome {
+    if (region == nil) { ret FAIL; }
+    if (region.held)   { ret HELD; }
+    val got: buffers.Acquired = buffers.secret_source_acquire(lease.source, lease.account,
+        buffers.Request{bytes: $size_of(T), align: $align_of(T), lane: lease.lane,
+        secret: true}, register);
+    var status: buffers.Status = got.status;
+    if (!(sel status.ok)) { ret refused(got.reason); }
+    if (buffers.secret_source_view_typed[T](lease.source, got.chunk, 1) == nil) {
+        buffers.secret_source_release(lease.source, lease.account, got.chunk);
+        ret FAIL;
+    }
+    region.chunk = got.chunk;
+    region.held  = true;
+    ret HELD;
+}
+
+# the T a held region holds, nil when it holds none
+pub fun typed_view[T](lease: SecretLease, region: *TypedRegion) *T {
+    if (region == nil || !region.held) { ret nil; }
+    ret buffers.secret_source_view_typed[T](lease.source, region.chunk, 1);
+}
+
+# the source wipes the chunk in full on release
+pub fun typed_release(lease: SecretLease, region: *TypedRegion) bool {
+    if (region == nil || !region.held) { ret true; }
+    var kind: buffers.Reason = buffers.secret_source_release(lease.source,
+        lease.account, region.chunk);
+    if (!(sel kind.none)) { ret false; }
+    @region = typed_empty();
     ret true;
 }

@@ -13,8 +13,11 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
+use tls.buffer;
 use tls.clock;
 use tls.memory_range;
+#[testing]
+use tls.test.pool;
 use tls.tls13;
 
 pub val KEY_NAME_SIZE:     usize = 16;
@@ -69,10 +72,12 @@ pub rec State {
 # a key's schedule is an interval on the monotonic clock, so a wall-clock step
 # never moves it. minted_at is when it was made, on the wall clock, for reports.
 # the key lives only in its context, expanded in place when it is minted and
-# wiped when it is retired, so a ticket key is never copied
+# wiped when it is retired, so a ticket key is never copied. the context is a
+# chunk the ring borrows from its secret source while the key is live
 pub rec TicketKey {
     name:       [KEY_NAME_SIZE]u8;
-    context:    aes_gcm.Context;
+    storage:    buffer.TypedRegion;
+    context:    *aes_gcm.Context;
     seal_until: time.Instant;
     open_until: time.Instant;
     minted_at:  time.Time;
@@ -82,6 +87,7 @@ pub rec TicketKey {
 # one ring seals under exactly one key while older keys stay openable
 pub rec KeyRing {
     keys:                    [MAX_TICKET_KEYS]TicketKey;
+    secrets:                 buffer.SecretLease;
     count:                   usize;
     current:                 usize;
     seal_lifetime_seconds:   u32;
@@ -260,11 +266,18 @@ fun key_expired(key: *TicketKey, now: time.Instant) bool {
     ret !key.active || time.instant_after(now, key.open_until);
 }
 
+# wipe a key's context and give its storage back to the source
+fun retire_context(ring: *KeyRing, key: *TicketKey) {
+    if (key.context != nil) { aes_gcm.dnit(key.context); }
+    key.context = nil;
+    buffer.typed_release(ring.secrets, ?key.storage);
+}
+
 fun ring_prune(ring: *KeyRing, now: time.Instant) {
     var index: usize = 0;
     for (index < MAX_TICKET_KEYS) {
         if (ring.keys[index].active && time.instant_after(now, ring.keys[index].open_until)) {
-            aes_gcm.dnit(?ring.keys[index].context);
+            retire_context(ring, ?ring.keys[index]);
             var i: usize = 0;
             for (i < KEY_NAME_SIZE) {
                 ring.keys[index].name[i] = 0;
@@ -332,13 +345,23 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
         index = index + 1;
     }
     # pruning first empties an expired slot, so the new key expands into it
-    # before anything else changes and a failed expansion changes nothing
+    # before anything else changes and a failed expansion changes nothing. a
+    # source that cannot lend the context now refuses the mint, and nothing
+    # registers for a wake-up: the caller rotates again later
     ring_prune(ring, now);
-    val expanded: contracts.Error = aes_gcm.init(?ring.keys[slot].context,
-        contracts.SecretBytes{data: ?candidate_key[0], len: TICKET_KEY_SIZE});
+    var context: *aes_gcm.Context = nil;
+    if (buffer.typed_reserve[aes_gcm.Context](ring.secrets, ?ring.keys[slot].storage,
+        false) == buffer.HELD) {
+        context = buffer.typed_view[aes_gcm.Context](ring.secrets, ?ring.keys[slot].storage);
+    }
+    var expanded: contracts.Error = contracts.INVALID_STATE;
+    if (context != nil) {
+        expanded = aes_gcm.init(context, contracts.SecretBytes{data: ?candidate_key[0],
+            len: TICKET_KEY_SIZE});
+    }
     ct.zeroize(?candidate_key[0], TICKET_KEY_SIZE);
     if (expanded != contracts.OK) {
-        aes_gcm.dnit(?ring.keys[slot].context);
+        retire_context(ring, ?ring.keys[slot]);
         index = 0;
         for (index < KEY_NAME_SIZE) {
             candidate_name[index] = 0;
@@ -356,6 +379,7 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
             index = index + 1;
         }
     }
+    ring.keys[slot].context = context;
     copy_bytes(?ring.keys[slot].name[0], ?candidate_name[0], KEY_NAME_SIZE);
     ring.keys[slot].seal_until = after_seconds(now, ring.seal_lifetime_seconds);
     ring.keys[slot].open_until = after_seconds(ring.keys[slot].seal_until,
@@ -373,10 +397,15 @@ fun ring_mint(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
     ret true;
 }
 
-pub fun keyring_init(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
-    seal_lifetime_seconds: u32, overlap_seconds: u32,
+# secrets lends each live key's context. the source, its account and the lease
+# outlive the ring, and the source is never entered concurrently: mint, prune
+# and destroy take and give back chunks under the ring's lock
+pub fun keyring_init(ring: *KeyRing, secrets: buffer.SecretLease, entropy: *secret.Entropy,
+    at: clock.Moment, seal_lifetime_seconds: u32, overlap_seconds: u32,
     ticket_lifetime_seconds: u32) bool {
-    if (ring == nil || ring.initialized || seal_lifetime_seconds == 0 ||
+    if (ring == nil || ring.initialized || !buffer.secret_lease_valid(secrets) ||
+        buffer.secret_lease_overlaps(secrets, (?ring.count)::*u8, 1) ||
+        seal_lifetime_seconds == 0 ||
         ticket_lifetime_seconds == 0 ||
         ticket_lifetime_seconds > MAX_TICKET_LIFETIME_SECONDS ||
         seal_lifetime_seconds > MAX_TICKET_LIFETIME_SECONDS ||
@@ -388,7 +417,8 @@ pub fun keyring_init(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
         ring.keys[index].seal_until = no_instant();
         ring.keys[index].open_until = no_instant();
         ring.keys[index].minted_at  = time.unix(0, 0);
-        aes_gcm.dnit(?ring.keys[index].context);
+        ring.keys[index].storage    = buffer.typed_empty();
+        ring.keys[index].context    = nil;
         var i: usize = 0;
         for (i < KEY_NAME_SIZE) {
             ring.keys[index].name[i] = 0;
@@ -396,6 +426,7 @@ pub fun keyring_init(ring: *KeyRing, entropy: *secret.Entropy, at: clock.Moment,
         }
         index = index + 1;
     }
+    ring.secrets                 = secrets;
     ring.count                   = 0;
     ring.current                 = 0;
     ring.generation              = 0;
@@ -446,7 +477,7 @@ pub fun keyring_destroy(ring: *KeyRing) {
     mutex.lock(?ring.lock);
     var index: usize = 0;
     for (index < MAX_TICKET_KEYS) {
-        aes_gcm.dnit(?ring.keys[index].context);
+        retire_context(ring, ?ring.keys[index]);
         var i: usize = 0;
         for (i < KEY_NAME_SIZE) {
             ring.keys[index].name[i] = 0;
@@ -625,7 +656,7 @@ pub fun seal(ring: *KeyRing, value: *State, at: clock.Moment,
     copy_bytes(?output.data[KEY_NAME_SIZE], ?nonce[0], TICKET_NONCE_SIZE);
     val header:    usize               = KEY_NAME_SIZE + TICKET_NONCE_SIZE;
     val operation: contracts.Operation = aes_gcm.seal_with(
-        ?ring.keys[slot].context,
+        ring.keys[slot].context,
         contracts.Bytes{data: ?nonce[0], len: TICKET_NONCE_SIZE},
         contracts.Bytes{data: output.data, len: KEY_NAME_SIZE},
         contracts.SecretBytes{data: ?plaintext[0], len: length},
@@ -665,7 +696,7 @@ pub fun open(ring: *KeyRing, ticket: contracts.Bytes, at: clock.Moment,
     val header:    usize               = KEY_NAME_SIZE + TICKET_NONCE_SIZE;
     var plaintext: [MAX_STATE_BYTES]^u8;
     val operation: contracts.Operation = aes_gcm.open_with(
-        ?ring.keys[slot].context,
+        ring.keys[slot].context,
         contracts.Bytes{data: ?ticket.data[KEY_NAME_SIZE],
         len: TICKET_NONCE_SIZE},
         contracts.Bytes{data: ticket.data, len: KEY_NAME_SIZE},
@@ -1035,7 +1066,7 @@ test session__full_ticket_key_ring_preserves_every_live_overlap {
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
     var ring: KeyRing;
-    if (!keyring_init(?ring, ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
+    if (!keyring_init(?ring, pool.shared_secret(), ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
     var state:  State = rotation_state(1000);
     var ticket: [MAX_TICKET_BYTES]u8;
     val length: usize = seal(?ring, ?state, moment(1000), ?entropy,
@@ -1075,7 +1106,7 @@ test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
     var ring: KeyRing;
-    if (!keyring_init(?ring, ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
+    if (!keyring_init(?ring, pool.shared_secret(), ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
     var state:  State = rotation_state(1000);
     var ticket: [MAX_TICKET_BYTES]u8;
     val length: usize = seal(?ring, ?state, moment(1000), ?entropy,
@@ -1110,7 +1141,7 @@ test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     var collision_entropy: secret.Entropy = secret.Entropy{context: nil,
         secret_context: nil, fill_fn: repeating_entropy, initialized: true};
     var collision_ring: KeyRing;
-    if (!keyring_init(?collision_ring, ?collision_entropy, moment(1000), 3600, 1800,
+    if (!keyring_init(?collision_ring, pool.shared_secret(), ?collision_entropy, moment(1000), 3600, 1800,
         7200)) { ret 8; }
     val collision_generation: u64          = keyring_generation(?collision_ring);
     val collision_current:    usize        = collision_ring.current;
@@ -1131,8 +1162,8 @@ test session__tickets_survive_key_rotation_for_exactly_the_configured_overlap {
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
     var ring: KeyRing;
-    if (!keyring_init(?ring, ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
-    if (keyring_openable(?ring, mono(1000)) != 1)                       { ret 2; }
+    if (!keyring_init(?ring, pool.shared_secret(), ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
+    if (keyring_openable(?ring, mono(1000)) != 1)                                             { ret 2; }
     var state: State = empty_state();
     state.version    = tls13.VERSION;
     state.suite      = tls13.AES_128_GCM_SHA256;
@@ -1234,7 +1265,7 @@ test session__a_wall_clock_step_moves_neither_rotation_nor_the_key_window {
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
         secret_context: nil, fill_fn: probe_entropy, initialized: true};
     var ring: KeyRing;
-    if (!keyring_init(?ring, ?entropy, clock.at(1000, 50), 3600, 1800, 7200)) { ret 1; }
+    if (!keyring_init(?ring, pool.shared_secret(), ?entropy, clock.at(1000, 50), 3600, 1800, 7200)) { ret 1; }
     var state:  State = rotation_state(1000);
     var ticket: [MAX_TICKET_BYTES]u8;
     val length: usize = seal(?ring, ?state, clock.at(1000, 50), ?entropy,

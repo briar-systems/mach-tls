@@ -30,6 +30,7 @@ use tls.handshake.extensions;
 use tls.memory_range;
 use tls.record;
 use tls.signature_scheme;
+#[testing]
 use tls.test.pool;
 use tls.tls12;
 use tls12_established: tls.tls12.established;

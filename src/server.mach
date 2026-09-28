@@ -36,6 +36,7 @@ use tls.memory_range;
 use tls.record;
 use tls.session;
 use tls.signature_scheme;
+#[testing]
 use tls.test.pool;
 use tls.tls13;
 use tls.tls13.established;
@@ -4086,8 +4087,8 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
         secret_context: nil, fill_fn: test_entropy, initialized: true};
     resume_client_entropy = secret.Entropy{context: ?resume_client_counter,
         secret_context: nil, fill_fn: test_entropy, initialized: true};
-    if (!session.keyring_init(?resume_ring, ?resume_server_entropy, now, 3600,
-        1800, 7200) || !session.replay_init(?resume_window) ||
+    if (!session.keyring_init(?resume_ring, pool.shared_secret(), ?resume_server_entropy, now,
+        3600, 1800, 7200) || !session.replay_init(?resume_window) ||
         !session.client_store_init(?resume_store)) { ret false; }
     resume_protocols[0]                             = config.ProtocolName{data: "h2"::*u8, len: 2};
     resume_versions[0]                              = tls13.VERSION;

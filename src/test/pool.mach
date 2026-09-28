@@ -1,5 +1,6 @@
-# a buffers pool and one connection account for tests
+# a buffers pool and one connection account for the library's tests
 
+use crypto.aead.aes_gcm;
 use A: std.allocator;
 use std.allocator.page;
 use std.memory.buffers;
@@ -9,9 +10,12 @@ use std.types.bool.true;
 use std.types.error.err;
 use std.types.size.usize;
 use tls.buffer;
+use tls.record;
 
-pub val CLASS_COUNT: usize = 6;
+#[testing]
+pub val CLASS_COUNT: usize = 7;
 
+#[testing]
 pub rec Harness {
     backing: A.Allocator;
     classes: [CLASS_COUNT]buffers.ClassConfig;
@@ -23,17 +27,20 @@ pub rec Harness {
 }
 
 # the class shape the documentation recommends: 512 B, 4 KiB and one record,
-# each plain and secret
+# each plain and secret, and a secret class that holds one cipher context
+#[testing]
 pub fun make(harness: *Harness, global: usize, budget: usize) bool {
     var made: err[A.Error] = page.make(?harness.backing);
     if (sel made.err) { ret false; }
     val sizes: [3]usize = [3]usize{512, 4096, 17408};
     var i:     usize    = 0;
-    for (i < CLASS_COUNT) {
+    for (i < 6) {
         harness.classes[i] = buffers.ClassConfig{size: sizes[i % 3], align: 0,
             secret: i >= 3, high_water: 4};
         i = i + 1;
     }
+    harness.classes[6] = buffers.ClassConfig{size: record.CONTEXT_SIZE,
+        align: record.CONTEXT_ALIGN, secret: true, high_water: 4};
     var config: buffers.Config;
     config.classes       = ?harness.classes[0];
     config.class_count   = CLASS_COUNT;
@@ -57,25 +64,30 @@ pub fun make(harness: *Harness, global: usize, budget: usize) bool {
     ret true;
 }
 
+#[testing]
 pub fun lease(harness: *Harness) buffer.Lease {
     ret buffer.Lease{source: ?harness.plain, account: ?harness.account, lane: 0};
 }
 
+#[testing]
 pub fun secret_lease(harness: *Harness) buffer.SecretLease {
     ret buffer.SecretLease{source: ?harness.secret, account: ?harness.account, lane: 0};
 }
 
 # bytes the account holds now
+#[testing]
 pub fun held(harness: *Harness) usize {
     ret harness.account.held;
 }
 
+#[testing]
 pub fun ready(harness: *Harness) bool {
     var handle: u64 = 0;
     ret buffers.ready(?harness.pool, ?handle, 1) == 1 && handle == 1;
 }
 
 # false when the account still holds a chunk
+#[testing]
 pub fun destroy(harness: *Harness) bool {
     if (!harness.made) { ret true; }
     var closed: buffers.Reason = buffers.close_account(?harness.pool, ?harness.account);
@@ -210,10 +222,21 @@ test buffer__a_secret_region_keeps_its_prefix_and_is_wiped_on_release {
         region.chunk.bytes != 512) { ret 2; }
     region.data[3] = 0x5a;
     val first: *^u8 = region.data;
-    if (buffer.secret_reserve(secret, ?region, 1000, 10) != buffer.HELD ||
+    if (buffer.secret_reserve(secret, ?region, 2000, 10) != buffer.HELD ||
         region.chunk.bytes != 4096 || region.data[3]:>u8 != 0x5a) { ret 3; }
     if (first[3]:>u8 != 0) { ret 4; }
     if (!buffer.secret_release(secret, ?region) || region.held ||
-        held(?harness) != 0 || !destroy(?harness)) { ret 5; }
+        held(?harness) != 0) { ret 5; }
+    # a cipher context takes one chunk of its own class, sized from its type
+    var typed: buffer.TypedRegion = buffer.typed_empty();
+    if (buffer.typed_view[aes_gcm.Context](secret, ?typed) != nil ||
+        buffer.typed_reserve[aes_gcm.Context](secret, ?typed, false) != buffer.HELD ||
+        typed.chunk.bytes != record.CONTEXT_SIZE || held(?harness) != record.CONTEXT_SIZE ||
+        buffer.typed_reserve[aes_gcm.Context](secret, ?typed, false) != buffer.HELD ||
+        held(?harness) != record.CONTEXT_SIZE) { ret 6; }
+    val context: *aes_gcm.Context = buffer.typed_view[aes_gcm.Context](secret, ?typed);
+    if (context == nil || context.state != aes_gcm.EMPTY) { ret 7; }
+    if (!buffer.typed_release(secret, ?typed) || typed.held || held(?harness) != 0 ||
+        !destroy(?harness)) { ret 8; }
     ret 0;
 }
