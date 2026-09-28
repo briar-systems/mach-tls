@@ -404,10 +404,12 @@ rec Connection {
     secure: stream.Stream;
 }
 
-var cur:              *Connection;
-var cur_engine:       *server.Handshake;
-var handshake_held:   bool;
-var cur_memory:       pool.Harness;
+var cur:            *Connection;
+var cur_engine:     *server.Handshake;
+var handshake_held: bool;
+var cur_memory:     pool.Harness;
+# the ticket ring outlives connections, so it borrows from a pool of its own
+var ticket_memory:    pool.Harness;
 var option_footprint: bool;
 var footprint_base:   usize;
 
@@ -985,8 +987,9 @@ fun main(argc: i64, argv: **u8) i64 {
     if (option_tickets != 0) {
         var ring_moment: clock.Moment;
         if (!clock.read(?harness_clock, ?ring_moment) ||
-            !session.keyring_init(?ticket_ring, ?entropy, ring_moment, 3600,
-            1800, 7200)) {
+            !pool.make(?ticket_memory, 1 << 20, 1 << 20) ||
+            !session.keyring_init(?ticket_ring, pool.secret_lease(?ticket_memory), ?entropy,
+            ring_moment, 3600, 1800, 7200)) {
             print.print("cannot initialize the ticket key ring\n");
             ret 43;
         }
@@ -1074,8 +1077,11 @@ fun main(argc: i64, argv: **u8) i64 {
         index = index + 1;
     }
     tcp.listener_close(?listener);
-    if (option_tickets != 0) { session.keyring_destroy(?ticket_ring); }
-    if (option_single_use)   { session.replay_destroy(?replay_window); }
+    if (option_tickets != 0) {
+        session.keyring_destroy(?ticket_ring);
+        if (!pool.destroy(?ticket_memory)) { ret 45; }
+    }
+    if (option_single_use) { session.replay_destroy(?replay_window); }
     file.root_close(?fixtures);
     print.print("ok\n");
     ret 0;
