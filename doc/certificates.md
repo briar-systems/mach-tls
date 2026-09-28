@@ -13,7 +13,7 @@ P-384 key-share group. RSA-PSS parameters must select the same supported hash
 for the message and MGF1 and must use a salt whose length equals the hash
 length.
 
-A trust anchor's self-signature is not part of certification path validation. `parse_trust_anchor` therefore accepts an otherwise valid anchor whose outer self-signature algorithm is not supported. Every non-anchor certificate still requires a supported signature algorithm.
+A trust anchor's self-signature is not part of certification path validation. `parse_trust_anchor` therefore accepts an otherwise valid anchor whose outer self-signature algorithm is not supported. For the same reason it accepts three encodings RFC 5280 asks issuers to avoid but that deployed roots carry: a zero or negative serial number, a `GeneralizedTime` validity before 2050, and a key usage bit string with trailing zero bits. Every non-anchor certificate still requires a supported signature algorithm and is held to the strict forms.
 
 ## Path validation
 

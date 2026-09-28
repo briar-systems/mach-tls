@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-27
+
+### Changed
+
+- Dependencies: requires mach-std 9.3.0 and mach-crypto 0.25.0, selected by `version = "^9.3"` and `version = "^0.25"` and committed as gitlinks. Resolution is flat, so a consumer of tls moves to std 9.3 and crypto 0.25 with it. test/fuzz and test/interop pin `tag/v9.3.0` and `tag/v0.25.0` (#155).
+
+### Fixed
+
+- Every well-formed system root loads as a trust anchor: Debian's bundle loads 150 of 150 roots and Alpine's 120 of 121, the last a P-521 key reported as an `UNSUPPORTED` skip (#136). The X.509 parser accepts an authority key identifier that names its issuer (`authorityCertIssuer`, a constructed `[1]`), for every certificate. Under `parse_trust_anchor` only, an anchor may carry serial number 0, a `GeneralizedTime` validity before 2050 and a key usage bit string with trailing zero bits, since an anchor is trusted by configuration. Chain members keep every strict form, and `doc/certificates.md` lists the leniencies. The bundle test pins those counts and requires every skip in a system bundle to be `UNSUPPORTED`.
+
 ## [0.14.0] - 2026-09-27
 
 ### Added

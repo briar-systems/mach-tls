@@ -1,6 +1,6 @@
 [project]
 id = "tls"
-version = "0.14.0"
+version = "0.15.0"
 mach = "^6"
 src = "src"
 out = "out/{target.name}/{profile.name}"
@@ -63,11 +63,11 @@ need = []
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-version = "^9.0"
+version = "^9.3"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-version = "^0.24"
+version = "^0.25"
 
 # test-only: the library and every test module, run with `mach test . --lib tests`
 [artifact.tests]
