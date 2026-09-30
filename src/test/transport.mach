@@ -260,7 +260,7 @@ fun make_test_transport(adapter: *transport.Transport, state: *TestTransport, ru
 #[testing]
 var test_moment: clock.Moment;
 #[testing]
-var test_clock: clock.Source;
+var test_clock:  clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
 #[testing]
@@ -559,33 +559,33 @@ fun test_entropy(context: ptr, secret_context: *^u8,
 #[testing]
 var open_entropy_counter: u8;
 #[testing]
-var open_anchor: cert.Certificate;
+var open_anchor:          cert.Certificate;
 #[testing]
-var open_trust: cert.TrustStore;
+var open_trust:           cert.TrustStore;
 #[testing]
-var open_protocols: [1]config.ProtocolName;
+var open_protocols:       [1]config.ProtocolName;
 #[testing]
-var open_versions: [1]u16;
+var open_versions:        [1]u16;
 #[testing]
-var open_suites: [1]tls13.CipherSuite;
+var open_suites:          [1]tls13.CipherSuite;
 #[testing]
-var open_groups: [1]tls13.NamedGroup;
+var open_groups:          [1]tls13.NamedGroup;
 #[testing]
-var open_signatures: [1]tls13.SignatureScheme;
+var open_signatures:      [1]tls13.SignatureScheme;
 #[testing]
-var open_entropy: secret.Entropy;
+var open_entropy:         secret.Entropy;
 #[testing]
-var open_configuration: config.ClientConfig;
+var open_configuration:   config.ClientConfig;
 #[testing]
-var open_identity: credentials.Identity;
+var open_identity:        credentials.Identity;
 #[testing]
-var core_a: client.Handshake;
+var core_a:               client.Handshake;
 #[testing]
-var core_b: client.Handshake;
+var core_b:               client.Handshake;
 #[testing]
-var core_c: client.Handshake;
+var core_c:               client.Handshake;
 #[testing]
-var core_d: client.Handshake;
+var core_d:               client.Handshake;
 
 # an open stream still borrows a real engine, so ownership queries stay honest
 #[testing]
