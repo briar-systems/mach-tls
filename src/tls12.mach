@@ -1,8 +1,6 @@
 # tls 1.2 registry values and suite properties
 
 use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 use std.types.size.usize;
 use tls.record;
 use tls.tls13.key_schedule;

@@ -9,8 +9,6 @@
 use std.sync.atomic;
 use std.types.bool.bool;
 use std.types.bool.false;
-use std.types.bool.true;
-use std.types.size.usize;
 
 val FREE: i64 = 0;
 val HELD: i64 = 1;
