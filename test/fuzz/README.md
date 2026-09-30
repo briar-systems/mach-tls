@@ -58,10 +58,8 @@ test/fuzz/out/linux-x86_64/debug/bin/fuzz mutate <boundary|all> <runs> <seed> [-
 ```
 
 `replay` answers every retained input and fails on a finding, on an empty
-boundary directory, or on a directory no boundary answers. CI replays it in both
-profiles on the heavy tier: a pull request into `main`, or a dispatch with
-`heavy: fuzz` or `heavy: all`. `mach build test/fuzz` runs on every pull request
-so the lane cannot rot.
+boundary directory, or on a directory no boundary answers. Run it in both
+profiles before a change to a parser lands.
 
 `mutate` is the on-demand search. It draws from a boundary's corpus, applies one
 to three structural mutations (flip a bit, set a byte, truncate, extend, swap,
