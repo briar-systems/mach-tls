@@ -8,18 +8,19 @@ as importantly, what it does not.
 ## Unit suites
 
 ```sh
-mach test . --lib tests
-mach test . --lib tests --profile release
+mach test . -a tests -p debug
+mach test . -a tests -p release
 tools/test-selection
 ```
 
 mach tests only the closure of the selected artifact, and the library does not
 reach `tls.test.transport`, the completion transport tests that drive a real
 event loop. The test-only `tests` artifact (`src/lib/tests.mach`) reaches
-the library and that module, so `mach test . --lib tests` covers every module in
-`src`, while `mach test .` covers only what the library reaches.
+the library and that module, so `mach test . -a tests` covers every module in
+`src`, while `mach test .` covers only what the library reaches. CI runs
+`mach test . --all`, which selects every artifact and so includes `tests`.
 `tools/test-selection` fails when a test declared under `src` is collected on no
-manifest target, and CI runs it. The suite runs in the debug and release
+manifest target. The suite runs in the debug and release
 profiles, because optimisation has already changed observable behaviour in this
 codebase once.
 
@@ -49,9 +50,8 @@ reads past its input, loops, or is accepted or refused wrongly:
   configured suite and no completed handshake, or waits for more with nothing
   queued, and once destroyed holds no chunk of its account
 
-The replay is deterministic and runs in both profiles on the heavy tier (a pull
-request into `main`, or a dispatch with `heavy: fuzz`). The lane is built on
-every pull request so it cannot rot. `fuzz mutate` is the on-demand search: a
+The replay is deterministic and is run locally in both profiles.
+`fuzz mutate` is the on-demand search: a
 seeded structural mutator over a boundary's corpus that writes findings and,
 with `--retain`, adds a minimized input for each outcome the corpus does not
 hold yet. [`test/fuzz/README.md`](../test/fuzz/README.md) has the commands.
@@ -145,12 +145,11 @@ prints it at the end of every matrix run.
 The target and profile matrix is the build itself:
 
 ```sh
-mach build . --all-targets --profile debug --verify-ir
-mach build . --all-targets --profile release --verify-ir
+mach build . --all
 ```
 
 linux-x86_64, linux-arm64, linux-riscv64, windows-x86_64, darwin-x86_64, and
-darwin-aarch64, at both profiles, with the IR verifier enabled.
+darwin-aarch64, at both profiles.
 
 ## What interoperability legs structurally cannot cover
 
@@ -208,4 +207,4 @@ These are real gaps, named so nobody has to discover them:
   implementation is driven from this repository. mach-quic exercises it from
   the consumer side.
 - **Native execution on non-x86_64 targets.** The other five targets are built
-  and IR-verified but not run; this machine is linux-x86_64.
+  but not run; this machine is linux-x86_64.

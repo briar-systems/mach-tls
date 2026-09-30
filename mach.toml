@@ -51,7 +51,7 @@ simd = "scalarize"
 vectorize = true
 float_reassoc = false
 
-# the library, and the only artifact `mach build .` and `--all-targets` select
+# the library, and the only artifact `mach build .` selects
 [artifact.tls]
 kind = "static"
 default = true
@@ -69,7 +69,7 @@ version = "^9.4"
 git = "https://github.com/briar-systems/mach-crypto"
 version = "^0.26"
 
-# test-only: the library and every test module, run with `mach test . --lib tests`
+# test-only: the library and every test module, run with `mach test . -a tests`
 [artifact.tests]
 kind = "static"
 entry = "lib/tests.mach"
