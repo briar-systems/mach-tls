@@ -62,7 +62,7 @@ need = []
 [dep.tls]
 path = "../.."
 
-# std and crypto are pinned here because a path dependency carries no pin for
+# std, crypto and pki are pinned here because a path dependency carries no pin for
 # a dependency it selects by version, and this tree is not committed
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
@@ -71,3 +71,7 @@ ref = "tag/v9.4.1"
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
 ref = "tag/v0.26.0"
+
+[dep.pki]
+git = "https://github.com/briar-systems/mach-pki"
+ref = "tag/v0.1.0"

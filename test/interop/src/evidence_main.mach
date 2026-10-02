@@ -1,5 +1,6 @@
 # release evidence: the algorithm matrix printed from the library's own tables
 
+use pki.verify;
 use std.print;
 use std.runtime;
 use std.types.bool.bool;
@@ -8,7 +9,6 @@ use std.types.bool.true;
 use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
-use tls.cert.verify;
 use tls.handshake.codec;
 use tls.record;
 use tls.session;

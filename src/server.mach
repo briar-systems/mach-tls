@@ -6,6 +6,11 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use pki.cert;
+use pki.load;
+use pki.name;
+use pki.verify;
+use pki.x509;
 use std.chrono.duration;
 use std.chrono.time;
 use std.crypto.ct;
@@ -17,12 +22,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.load;
-use tls.cert.name;
-use tls.cert.verify;
-use tls.cert.x509;
 use tls.client;
 use tls.clock;
 use tls.config;
@@ -2206,12 +2206,12 @@ fun handle_client_certificate(server: *Handshake, frame: contracts.Bytes,
     var now: clock.Moment;
     if (!clock.read(server.config.clock, ?now)) { ret error.INTERNAL_ERROR; }
     var options: verify.Options;
-    options.identity             = contracts.Bytes{data: nil, len: 0};
-    options.purpose              = verify.CLIENT_AUTH;
+    options.purpose              = verify.client_auth();
     options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
-    failure                      = verify.chain(server.client_trust, ?chain, ?options);
+    failure                      = error.from_verify(verify.chain(server.client_trust,
+        ?chain, ?options));
     if (failure != error.OK) { ret failure; }
     if (x509.parse(contracts.Bytes{data: server.certificates[0].der,
         len: server.certificates[0].der_len},

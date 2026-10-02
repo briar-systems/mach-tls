@@ -3,6 +3,7 @@
 use crypto.aead.aes_gcm;
 use crypto.contracts;
 use crypto.secret;
+use pki.cert;
 use A: std.allocator;
 use std.allocator.page;
 use std.chrono.duration;
@@ -26,7 +27,6 @@ use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
 use tls.client;
 use tls.clock;

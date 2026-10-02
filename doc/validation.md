@@ -68,8 +68,8 @@ corpus that asserts the exact error and alert for each named condition
 (`doc/server.md` has the table), that every truncation prefix of a valid hello
 reports a requirement without publishing state, and that a terminal engine
 refuses further input. `tls.record`, `tls.handshake`, `tls.handshake.codec`,
-`tls.handshake.extensions`, `tls.cert.x509`, and `tls.cert.verify` each carry
-their own hostile cases.
+and `tls.handshake.extensions` each carry their own hostile cases. X.509 parsing
+and path validation carry theirs in mach-pki.
 
 ## Allocation failure, short I/O, and cancellation
 

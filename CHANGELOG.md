@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Breaking
+
+- X.509 moved to [mach-pki](https://github.com/briar-systems/mach-pki) 0.1.0, which tls now depends on (`version = "^0.1"`, gitlink at v0.1.0) (#167). `tls.cert` is now `pki.cert`, `tls.cert.x509` is `pki.x509`, `tls.cert.name` is `pki.name`, `tls.cert.load` is `pki.load` and `tls.cert.verify` is `pki.verify`. tls re-exports none of them, so a caller imports them from mach-pki. `tls.cert.bundle` and `tls.cert.credentials` stay. The moved API changed on the way: `verify.Options` no longer carries the identity, which a caller checks with `verify.identity` beside `verify.chain` (formerly `verify.server_identity`). `verify.Purpose` is a record built by `verify.server_auth()` and `verify.client_auth()` in place of `SERVER_AUTH` and `CLIENT_AUTH`. `verify.chain` returns its own `verify.Error`, and `x509.parse_with` and `x509.extension` let a caller process a critical extension the parser does not know.
+- `x509.parse_tls_alpn_challenge` and `x509.tls_alpn_challenge_name_matches` are now `tls.cert.credentials.parse_tls_alpn_challenge` and `tls.cert.credentials.tls_alpn_challenge_name_matches`, built on `x509.parse_with` (#167).
+- test/fuzz and test/interop pin mach-pki at `tag/v0.1.0`, and the fuzz lane's `x509` boundary and its corpus moved to mach-pki (#167).
+
+### Changed
+
+- A certificate path failure maps from `verify.Error` to the tls error and alert it reported before (#167). `BAD_SIGNATURE`, `RESOURCE_LIMIT` and `INVALID_INPUT` are `bad_certificate`. A client now checks the server name after the path validates, so a certificate that fails both reports the path failure rather than `HOSTNAME_MISMATCH`.
+
 ## [0.16.0] - 2026-09-28
 
 ### Breaking

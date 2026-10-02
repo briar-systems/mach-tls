@@ -6,6 +6,11 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use pki.cert;
+use pki.load;
+use pki.name;
+use pki.verify;
+use pki.x509;
 use std.crypto.ct;
 use std.memory.buffers;
 use std.sync.atomic;
@@ -15,12 +20,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.load;
-use tls.cert.name;
-use tls.cert.verify;
-use tls.cert.x509;
 use tls.clock;
 use tls.config;
 use tls.engine;
@@ -1258,8 +1258,7 @@ fun handle_server_hello(value: *Handshake, frame: contracts.Bytes,
 }
 
 fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
-    count: usize, purpose: verify.Purpose,
-    identity: contracts.Bytes) error.Error {
+    count: usize) error.Error {
     if (count == 0 || count > verify.MAX_CHAIN_DEPTH ||
         count > verify.MAX_CHAIN_DEPTH ||
         entries.len > limits(value).max_chain_bytes) {
@@ -1294,23 +1293,27 @@ fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
     };
     var now: clock.Moment;
     if (!clock.read(configured_clock(value), ?now)) { ret error.INTERNAL_ERROR; }
+    val server:  bool = value.role == engine.TLS12_SERVER;
     var options: verify.Options;
-    options.identity             = identity;
-    options.purpose              = purpose;
+    options.purpose              = verify.server_auth();
     options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
     var trust: *cert.TrustStore = ?value.trust;
-    if (value.role == engine.TLS12_SERVER) {
-        trust = value.lease.generation.client_trust;
+    if (server) {
+        options.purpose = verify.client_auth();
+        trust           = value.lease.generation.client_trust;
     }
-    val verified: error.Error = verify.chain(trust, ?chain, ?options);
+    val verified: error.Error = error.from_verify(verify.chain(trust, ?chain,
+        ?options));
     if (verified != error.OK) { ret verified; }
     if (x509.parse(contracts.Bytes{data: value.certificates[0].der,
         len: value.certificates[0].der_len},
-        ?value.peer_leaf) != contracts.OK || !retain_peer_key(value)) {
-        ret error.BAD_CERTIFICATE;
-    }
+        ?value.peer_leaf) != contracts.OK) { ret error.BAD_CERTIFICATE; }
+    # a client certificate names no reference identity to match
+    if (!server && !verify.identity(?value.peer_leaf,
+        value.client_config.server_name)) { ret error.HOSTNAME_MISMATCH; }
+    if (!retain_peer_key(value)) { ret error.BAD_CERTIFICATE; }
     ret error.OK;
 }
 
@@ -1320,8 +1323,7 @@ fun handle_server_certificate(value: *Handshake, frame: contracts.Bytes,
     var failure:     error.Error = messages.decode_certificate(message,
         ?certificate);
     if (failure != error.OK) { ret failure; }
-    failure = verify_peer_chain(value, certificate.entries, certificate.count,
-        verify.SERVER_AUTH, value.client_config.server_name);
+    failure = verify_peer_chain(value, certificate.entries, certificate.count);
     if (failure != error.OK) { ret failure; }
     failure = absorb(value, frame.data, frame.len);
     if (failure == error.OK) { value.state = C_EXPECT_KEY_EXCHANGE; }

@@ -6,6 +6,11 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use pki.cert;
+use pki.load;
+use pki.name;
+use pki.verify;
+use pki.x509;
 use std.crypto.ct;
 use std.memory.buffers;
 use std.sync.atomic;
@@ -15,12 +20,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.load;
-use tls.cert.name;
-use tls.cert.verify;
-use tls.cert.x509;
 use tls.clock;
 use tls.config;
 use tls.engine;
@@ -1728,18 +1728,19 @@ fun handle_certificate(client: *Handshake, frame: contracts.Bytes,
     var now:  clock.Moment;
     if (!clock.read(client.config.clock, ?now)) { ret error.INTERNAL_ERROR; }
     var options: verify.Options;
-    options.identity             = name;
-    options.purpose              = verify.SERVER_AUTH;
+    options.purpose              = verify.server_auth();
     options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
-    failure                      = verify.chain(client.config.trust, ?chain, ?options);
+    failure                      = error.from_verify(verify.chain(client.config.trust,
+        ?chain, ?options));
     if (failure != error.OK) { ret failure; }
     if (x509.parse(contracts.Bytes{data: client.certificates[0].der,
-        len: client.certificates[0].der_len}, ?client.peer_leaf) != contracts.OK ||
-        !retain_peer_key(client)) {
+        len: client.certificates[0].der_len}, ?client.peer_leaf) != contracts.OK) {
         ret error.BAD_CERTIFICATE;
     }
+    if (!verify.identity(?client.peer_leaf, name)) { ret error.HOSTNAME_MISMATCH; }
+    if (!retain_peer_key(client))                  { ret error.BAD_CERTIFICATE; }
     failure = transcript.update_frame(?client.transcript, frame);
     if (failure == error.OK) { client.state = EXPECT_CERTIFICATE_VERIFY; }
     ret failure;
