@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-02
+
 ### Breaking
 
 - X.509 moved to [mach-pki](https://github.com/briar-systems/mach-pki) 0.1.0, which tls now depends on (`version = "^0.1"`, gitlink at v0.1.0) (#167). `tls.cert` is now `pki.cert`, `tls.cert.x509` is `pki.x509`, `tls.cert.name` is `pki.name`, `tls.cert.load` is `pki.load` and `tls.cert.verify` is `pki.verify`. tls re-exports none of them, so a caller imports them from mach-pki. `tls.cert.bundle` and `tls.cert.credentials` stay. The moved API changed on the way: `verify.Options` no longer carries the identity, which a caller checks with `verify.identity` beside `verify.chain` (formerly `verify.server_identity`). `verify.Purpose` is a record built by `verify.server_auth()` and `verify.client_auth()` in place of `SERVER_AUTH` and `CLIENT_AUTH`. `verify.chain` returns its own `verify.Error`, and `x509.parse_with` and `x509.extension` let a caller process a critical extension the parser does not know.
