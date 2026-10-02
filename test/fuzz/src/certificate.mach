@@ -1,11 +1,11 @@
 # x509 parsing of a peer certificate
 
 use crypto.contracts;
+use pki.x509;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use tls.cert.x509;
 
 use fuzz.verdict;
 

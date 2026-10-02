@@ -1,13 +1,13 @@
 # trust-anchor bundles: tls.cert.bundle.parse over PEM text
 
 use crypto.contracts;
+use pki.cert;
+use pki.x509;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use tls.cert;
 use tls.cert.bundle;
-use tls.cert.x509;
 
 use fuzz.verdict;
 

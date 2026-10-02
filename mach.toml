@@ -68,6 +68,10 @@ version = "^9.4"
 git = "https://github.com/briar-systems/mach-crypto"
 version = "^0.26"
 
+[dep.pki]
+git = "https://github.com/briar-systems/mach-pki"
+version = "^0.1"
+
 # test-only: the library and every test module, run with `mach test . -a tests`
 [artifact.tests]
 kind = "static"

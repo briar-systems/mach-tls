@@ -12,6 +12,8 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use pki.cert;
+use pki.load;
 use std.allocator.page;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -24,9 +26,7 @@ use std.types.result.res;
 use std.types.size.usize;
 use std.types.string.str;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.load;
 use tls.clock;
 use tls.config;
 use tls.engine;

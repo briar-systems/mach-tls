@@ -24,6 +24,8 @@
 
 use crypto.aead.aes_gcm;
 use crypto.contracts;
+use pki.cert;
+use pki.x509;
 use std.crypto.ct;
 use std.io.runtime;
 use std.memory.buffers;
@@ -35,9 +37,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.x509;
 use tls.client;
 use tls.config;
 use tls.engine;
