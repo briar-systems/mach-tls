@@ -1,51 +1,33 @@
 # Certificates and credential generations
 
-`tls.cert.x509` parses certificates without allocation. Every slice in a parsed certificate borrows the input DER and remains valid only while that input remains stable. Parsing rejects malformed DER, duplicate extensions, unknown critical extensions, invalid time forms, invalid names, mismatched inner and outer signature identifiers, noncanonical defaults, malformed key encodings, and invalid extension placement.
+X.509 comes from [mach-pki](https://github.com/briar-systems/mach-pki): `pki.cert` holds the borrowed certificate, chain and trust store handles, `pki.x509` parses certificates, `pki.name` matches DNS and IP identities, `pki.load` loads DER and PEM certificates, chains and private keys, and `pki.verify` validates certification paths. Its README describes parsing, the supported keys and signatures, path validation, identity matching and loading. This page covers what tls adds on top.
 
-## Supported certificate keys and signatures
+## Peer validation
 
-Subject public keys support Ed25519, P-256, P-384, and RSA with 2048 through
-4096-bit moduli. Certificate signatures support Ed25519, ECDSA P-256 with
-SHA-256, ECDSA P-384 with SHA-384, RSA-PSS with SHA-256 or SHA-384, and RSA
-PKCS #1 v1.5 with SHA-256 or SHA-384. P-384 is verification-only. The package
-does not load a P-384 private key, select P-384 for local signing, or expose a
-P-384 key-share group. RSA-PSS parameters must select the same supported hash
-for the message and MGF1 and must use a salt whose length equals the hash
-length.
+Every handshake path, the TLS 1.3 client and server and both TLS 1.2 roles, validates a peer chain the same way. It bounds the presented certificates by `verify.MAX_CHAIN_DEPTH` and the configured byte limits, then calls `verify.chain` with `verify.MAX_SIGNATURE_CHECKS` and the configured clock. A server certificate is validated for `verify.server_auth()` and a client certificate for `verify.client_auth()`, so a leaf with a key usage extension must permit digital signatures and the leaf and every intermediate carrying an extended key usage must list the purpose. Once the path validates, a client checks the leaf against its configured server name with `verify.identity`, which requires `subjectAltName` and never falls back to the common name.
 
-A trust anchor's self-signature is not part of certification path validation. `parse_trust_anchor` therefore accepts an otherwise valid anchor whose outer self-signature algorithm is not supported. For the same reason it accepts three encodings RFC 5280 asks issuers to avoid but that deployed roots carry: a zero or negative serial number, a `GeneralizedTime` validity before 2050, and a key usage bit string with trailing zero bits. Every non-anchor certificate still requires a supported signature algorithm and is held to the strict forms.
+A path failure reaches the peer as the alert of its `tls.error` code:
 
-## Path validation
+| `verify.Error` | `tls.error` | alert |
+|---|---|---|
+| `CERTIFICATE_EXPIRED` | `CERTIFICATE_EXPIRED` | `certificate_expired` |
+| `UNKNOWN_CA` | `UNKNOWN_CA` | `unknown_ca` |
+| `UNSUPPORTED_ALGORITHM` | `UNSUPPORTED_ALGORITHM` | `handshake_failure` |
+| `BAD_CERTIFICATE`, `BAD_SIGNATURE`, `RESOURCE_LIMIT`, `INVALID_INPUT` | `BAD_CERTIFICATE` | `bad_certificate` |
 
-`tls.cert.verify.chain` accepts a leaf-first presented set. Intermediates after the leaf may be unordered. The builder backtracks across issuer candidates and trust anchors up to `MAX_CHAIN_DEPTH` and the caller-selected `max_signature_checks` bound, rejects duplicate presented certificates, checks authority and subject key identifiers when both exist, and authenticates each selected link before publishing success. Signature-budget exhaustion rejects the path without performing another public-key operation.
+A leaf that does not hold the server name fails with `HOSTNAME_MISMATCH`, which is also `bad_certificate`.
 
-Validation checks the leaf purpose and every intermediate's extended key usage. TLS 1.3 leaf certificates with a key usage extension must permit digital signatures. Intermediates must carry a critical CA basic constraint and, when key usage is present, `keyCertSign`. Path length excludes the leaf and self-issued rollover certificates as required by RFC 5280.
+P-384 is verification-only. The package does not load a P-384 private key, select P-384 for local signing, or expose a P-384 key-share group.
 
-DNS, IP, and directory name constraints are processed for every applicable subordinate certificate. Excluded subtrees always win. A constrained name form that this package cannot process causes rejection when that form appears in a subordinate certificate. Self-issued intermediates are exempt from name constraints, while the final leaf is never exempt.
+## TLS-ALPN-01 challenges
 
-The trust anchor certificate's validity, extensions, and self-signature are not processed as path members. Its subject and public key identify the configured trust anchor.
+`tls.cert.credentials.parse_tls_alpn_challenge` parses an RFC 8737 challenge certificate with `x509.parse_with`, naming the `acmeIdentifier` extension as one it handles. The extension must be critical and hold a 32-byte digest, and the certificate must carry exactly one subject alternative name, a non-wildcard DNS name. On failure the output is left untouched. `tls_alpn_challenge_name_matches` checks that name against the validation name. `initialize_tls_alpn_challenge` is the only path that accepts such a certificate as a credential: every other parse refuses its critical extension.
 
-## Identity matching
-
-Server identity verification requires `subjectAltName`. Common-name fallback is not supported.
-
-DNS reference names and presented names use strict ASCII preferred-name syntax. One trailing root dot is normalized. A wildcard is valid only as the complete leftmost label and matches exactly one reference label. Partial-label wildcards and broad two-label wildcard names are rejected.
-
-IPv4 text rejects leading zeroes. IPv6 accepts full, compressed, and embedded IPv4 forms. Zone identifiers and bracketed literals are not certificate identities. Parsed address bytes must exactly match a four-byte or sixteen-byte `iPAddress` entry.
-
-Distinguished names compare exact encodings first. PrintableString and ASCII UTF8String values also receive case folding, leading and trailing space removal, and internal space compression. Valid non-ASCII UTF8String values match exact encodings and otherwise fail closed.
-
-## Loading
-
-`tls.cert.load.certificate_der` validates one borrowed DER certificate.
-
-`tls.cert.load.certificate_pem` decodes one `CERTIFICATE` block into caller-owned public storage. `tls.cert.load.chain_pem` accepts one or more adjacent `CERTIFICATE` blocks separated only by ASCII whitespace. It measures and validates the complete bundle before publishing the output chain. Input and output storage must not overlap.
+## Trust anchor bundles
 
 `tls.cert.bundle` reads a PEM CA bundle, such as `/etc/ssl/certs/ca-certificates.crt`, into a `cert.TrustStore` for `config.ClientConfig.trust`. `parse` reads bytes into caller storage that `measure` sizes. `load` reads a file into memory from a `std.allocator.Allocator`, which `release` returns after the trust store's last use. Text outside a block is ignored, so the comment lines distributions write between certificates are accepted. A block opens with a line starting `-----BEGIN ` and closes with the next line starting `-----END `.
 
 Every block becomes an anchor or a `Skip` naming its index, byte range, reason and the underlying error. The reasons are `MALFORMED_PEM` (framing or base64 the PEM codec refuses, or a block that never closes), `NOT_A_CERTIFICATE`, `MALFORMED_CERTIFICATE` (the X.509 parser refuses it), `UNSUPPORTED` (a key or form this build cannot represent), and `DUPLICATE`. Anchors are parsed with `parse_trust_anchor`. A bundle with no usable anchor returns `NO_ANCHORS` with its skips. A bundle over `MAX_BYTES` (1 MiB), `MAX_BLOCKS` (1,024 blocks), or `MAX_ANCHORS` (the client's `MAX_TRUST_ANCHORS`) is refused whole with `TOO_LARGE`, never truncated.
-
-`tls.cert.load.private_der` loads PKCS #8, SEC 1, or RSA PKCS #1 DER into an owned `crypto.encoding.keys.PrivateKey`. `tls.cert.load.private_pem` accepts `PRIVATE KEY`, `EC PRIVATE KEY`, and `RSA PRIVATE KEY` labels. The caller owns the returned key and must destroy it through `crypto.encoding.keys.destroy_private`.
 
 ## Generation ownership
 

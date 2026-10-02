@@ -4,7 +4,9 @@ A lightweight TLS implementation for Mach.
 
 The package targets complete TLS 1.2 and TLS 1.3 clients and servers. It owns TLS records,
 handshakes, key scheduling, certificates, authentication, session resumption,
-and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
+and encrypted transport. Cryptographic algorithms come from `mach-crypto`, and
+X.509 parsing, loading, and certification path validation from `mach-pki`
+(`pki.cert`, `pki.x509`, `pki.name`, `pki.load`, `pki.verify`).
 
 ## Modules
 
@@ -14,12 +16,8 @@ and encrypted transport. Cryptographic algorithms come from `mach-crypto`.
 - `tls.tls12.connection` implements the TLS 1.2 handshake for both roles.
 - `tls.tls12.established` holds what an established TLS 1.2 connection keeps.
 - `tls.config` defines bounded client and server configuration.
-- `tls.cert` defines borrowed certificate, chain, and trust store contracts.
-- `tls.cert.x509` parses strict borrowed X.509 certificate views.
-- `tls.cert.verify` constructs and verifies bounded certificate paths.
-- `tls.cert.load` loads certificate chains and owned private keys from DER and PEM.
 - `tls.cert.bundle` loads trust anchors from a PEM CA bundle, reporting every certificate it skips.
-- `tls.cert.credentials` selects and safely rotates immutable credential generations.
+- `tls.cert.credentials` selects and safely rotates immutable credential generations, and parses RFC 8737 TLS-ALPN-01 challenge certificates.
 - `tls.engine` defines the role-independent handshake engine contract.
 - `tls.transport` provides completion-based TLS operation ownership and ordered-byte adapters.
 - `tls.record` implements TLS 1.2 and TLS 1.3 framing, alerts, padding, sequencing, and AEAD protection.
@@ -49,7 +47,7 @@ The transport layer is implemented against the shared `mach-std` completion runt
 
 A native TCP adapter is included. QUIC handshake streams implement the same submission callbacks without creating a dependency from TLS back to QUIC.
 
-TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, credential loading, SNI selection, client-auth trust snapshots, and safe credential rotation are implemented.
+TLS 1.2 and TLS 1.3 record protection is implemented with mach-crypto AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305. TLS 1.3 handshake framing, message codecs, extension validation, transcript hashing, negotiation, and the complete key schedule are also implemented. X.509 parsing, certificate path verification, identity matching, and credential loading come from mach-pki. SNI selection, client-auth trust snapshots, and safe credential rotation are implemented.
 
 The TLS 1.3 client is complete. It supports authenticated SNI and ALPN negotiation, X25519 and P-256 including HelloRetryRequest, all three TLS 1.3 cipher suites, optional client authentication, post-handshake tickets and KeyUpdate, alerts, bounded incremental input, exact secret transitions, and deterministic destruction.
 
@@ -63,7 +61,7 @@ Session resumption is implemented for both roles. A server seals sessions under 
 
 ## Certificates and credentials
 
-Certificate parsing is strict DER and publishes only borrowed views after the entire certificate validates. Path construction backtracks across unordered intermediates and trust anchors within an explicit depth bound. It verifies signatures, validity, basic constraints, path length, key usage, extended key usage, authority key identifiers, DNS and IP name constraints, and the requested server or client purpose. Unknown critical extensions fail closed.
+Certificates are parsed, loaded, and validated by mach-pki. Parsing is strict DER and publishes only borrowed views after the entire certificate validates. Path construction backtracks across unordered intermediates and trust anchors within an explicit depth bound. It verifies signatures, validity, basic constraints, path length, key usage, extended key usage, authority key identifiers, DNS and IP name constraints, and the requested server or client purpose. Unknown critical extensions fail closed.
 
 Certificate paths authenticate Ed25519, ECDSA P-256 SHA-256, ECDSA P-384
 SHA-384, RSA-PSS SHA-256/SHA-384, and RSA PKCS #1 v1.5 SHA-256/SHA-384
