@@ -1,5 +1,7 @@
 # tls protocol and operation errors
 
+use pki.verify;
+
 pub def Error: u16;
 
 pub val OK:                      Error = 0;
@@ -31,3 +33,25 @@ pub val CERTIFICATE_REQUIRED:    Error = 25;
 pub val INAPPROPRIATE_FALLBACK:  Error = 26;
 pub val NO_RENEGOTIATION:        Error = 27;
 pub val INSUFFICIENT_SECURITY:   Error = 28;
+
+# a certificate path failure as the tls error whose alert reports it. a failure
+# tls names no alert for is the peer's bad_certificate
+pub fun from_verify(failure: verify.Error) Error {
+    if (failure == verify.OK)                    { ret OK; }
+    if (failure == verify.CERTIFICATE_EXPIRED)   { ret CERTIFICATE_EXPIRED; }
+    if (failure == verify.UNKNOWN_CA)            { ret UNKNOWN_CA; }
+    if (failure == verify.UNSUPPORTED_ALGORITHM) { ret UNSUPPORTED_ALGORITHM; }
+    ret BAD_CERTIFICATE;
+}
+
+test error__certificate_path_failures_map_to_their_alerts {
+    if (from_verify(verify.OK) != OK ||
+        from_verify(verify.CERTIFICATE_EXPIRED) != CERTIFICATE_EXPIRED ||
+        from_verify(verify.UNKNOWN_CA) != UNKNOWN_CA ||
+        from_verify(verify.UNSUPPORTED_ALGORITHM) != UNSUPPORTED_ALGORITHM) { ret 1; }
+    if (from_verify(verify.BAD_CERTIFICATE) != BAD_CERTIFICATE ||
+        from_verify(verify.BAD_SIGNATURE) != BAD_CERTIFICATE ||
+        from_verify(verify.RESOURCE_LIMIT) != BAD_CERTIFICATE ||
+        from_verify(verify.INVALID_INPUT) != BAD_CERTIFICATE) { ret 2; }
+    ret 0;
+}

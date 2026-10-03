@@ -12,7 +12,6 @@ point of the library. Each directory pairs with a row of the registry in
 | `extensions` | `extensions.next` and `extensions.validate` in every context |
 | `client-hello`, `server-hello`, `encrypted-extensions`, `certificate-request`, `certificate`, `certificate-verify`, `finished`, `new-session-ticket`, `key-update` | the TLS 1.3 parsers in `handshake.codec` |
 | `tls12-client-hello`, `tls12-server-hello`, `tls12-certificate`, `tls12-server-key-exchange`, `tls12-certificate-request`, `tls12-server-hello-done`, `tls12-client-key-exchange`, `tls12-certificate-verify`, `tls12-finished` | the TLS 1.2 parsers in `tls12.messages` |
-| `x509` | `cert.x509.parse` |
 | `bundle` | `cert.bundle.measure` and `cert.bundle.parse` |
 | `server13`, `server12` | `server.ingest` and `tls12.connection.ingest` on a fresh server at the initial level |
 
@@ -58,10 +57,8 @@ test/fuzz/out/linux-x86_64/debug/bin/fuzz mutate <boundary|all> <runs> <seed> [-
 ```
 
 `replay` answers every retained input and fails on a finding, on an empty
-boundary directory, or on a directory no boundary answers. CI replays it in both
-profiles on the heavy tier: a pull request into `main`, or a dispatch with
-`heavy: fuzz` or `heavy: all`. `mach build test/fuzz` runs on every pull request
-so the lane cannot rot.
+boundary directory, or on a directory no boundary answers. Run it in both
+profiles before a change to a parser lands.
 
 `mutate` is the on-demand search. It draws from a boundary's corpus, applies one
 to three structural mutations (flip a bit, set a byte, truncate, extend, swap,
@@ -80,8 +77,8 @@ reach different code with the same answer count as one.
 ## The corpus
 
 The named files are valid seeds, each accepted by its parser: the valid inputs
-the unit suite's former mutation corpora started from, a seed for each parser
-they did not reach, and the interop fixtures' certificates in DER. The engine
+the unit suite's former mutation corpora started from and a seed for each
+parser they did not reach. The engine
 seeds are the `client-hello` and `tls12-client-hello` seeds framed as messages,
 beside each with a server name and an ALPN offer. The `m-*` files were retained
 by `fuzz mutate all 20000 1 --retain`.

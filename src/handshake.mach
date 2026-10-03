@@ -3,7 +3,6 @@
 use crypto.contracts;
 use std.types.bool.bool;
 use std.types.bool.false;
-use std.types.bool.true;
 use std.types.size.usize;
 use tls.error;
 

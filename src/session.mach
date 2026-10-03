@@ -974,7 +974,7 @@ pub fun ticket_destroy(value: *Ticket) {
 }
 
 #[testing]
-var probe_counter: u8;
+var probe_counter:         u8;
 #[testing]
 var failing_entropy_calls: u8;
 

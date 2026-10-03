@@ -4,3 +4,6 @@
 [submodule "dep/crypto"]
 	path = dep/crypto
 	url = https://github.com/briar-systems/mach-crypto
+[submodule "dep/pki"]
+	path = dep/pki
+	url = https://github.com/briar-systems/mach-pki

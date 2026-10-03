@@ -2,11 +2,11 @@
 
 use crypto.contracts;
 use crypto.secret;
+use pki.cert;
+use pki.verify;
 use std.types.bool.bool;
 use std.types.size.usize;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.verify;
 use tls.clock;
 use tls.handshake;
 use tls.session;

@@ -6,6 +6,11 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use pki.cert;
+use pki.load;
+use pki.name;
+use pki.verify;
+use pki.x509;
 use std.crypto.ct;
 use std.memory.buffers;
 use std.sync.atomic;
@@ -15,12 +20,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.load;
-use tls.cert.name;
-use tls.cert.verify;
-use tls.cert.x509;
 use tls.clock;
 use tls.config;
 use tls.engine;
@@ -1258,8 +1258,7 @@ fun handle_server_hello(value: *Handshake, frame: contracts.Bytes,
 }
 
 fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
-    count: usize, purpose: verify.Purpose,
-    identity: contracts.Bytes) error.Error {
+    count: usize) error.Error {
     if (count == 0 || count > verify.MAX_CHAIN_DEPTH ||
         count > verify.MAX_CHAIN_DEPTH ||
         entries.len > limits(value).max_chain_bytes) {
@@ -1294,23 +1293,27 @@ fun verify_peer_chain(value: *Handshake, entries: contracts.Bytes,
     };
     var now: clock.Moment;
     if (!clock.read(configured_clock(value), ?now)) { ret error.INTERNAL_ERROR; }
+    val server:  bool = value.role == engine.TLS12_SERVER;
     var options: verify.Options;
-    options.identity             = identity;
-    options.purpose              = purpose;
+    options.purpose              = verify.server_auth();
     options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
     var trust: *cert.TrustStore = ?value.trust;
-    if (value.role == engine.TLS12_SERVER) {
-        trust = value.lease.generation.client_trust;
+    if (server) {
+        options.purpose = verify.client_auth();
+        trust           = value.lease.generation.client_trust;
     }
-    val verified: error.Error = verify.chain(trust, ?chain, ?options);
+    val verified: error.Error = error.from_verify(verify.chain(trust, ?chain,
+        ?options));
     if (verified != error.OK) { ret verified; }
     if (x509.parse(contracts.Bytes{data: value.certificates[0].der,
         len: value.certificates[0].der_len},
-        ?value.peer_leaf) != contracts.OK || !retain_peer_key(value)) {
-        ret error.BAD_CERTIFICATE;
-    }
+        ?value.peer_leaf) != contracts.OK) { ret error.BAD_CERTIFICATE; }
+    # a client certificate names no reference identity to match
+    if (!server && !verify.identity(?value.peer_leaf,
+        value.client_config.server_name)) { ret error.HOSTNAME_MISMATCH; }
+    if (!retain_peer_key(value)) { ret error.BAD_CERTIFICATE; }
     ret error.OK;
 }
 
@@ -1320,8 +1323,7 @@ fun handle_server_certificate(value: *Handshake, frame: contracts.Bytes,
     var failure:     error.Error = messages.decode_certificate(message,
         ?certificate);
     if (failure != error.OK) { ret failure; }
-    failure = verify_peer_chain(value, certificate.entries, certificate.count,
-        verify.SERVER_AUTH, value.client_config.server_name);
+    failure = verify_peer_chain(value, certificate.entries, certificate.count);
     if (failure != error.OK) { ret failure; }
     failure = absorb(value, frame.data, frame.len);
     if (failure == error.OK) { value.state = C_EXPECT_KEY_EXCHANGE; }
@@ -2455,7 +2457,7 @@ pub fun downgrade_signalled(value: *Handshake) bool {
 #[testing]
 var test_moment: clock.Moment;
 #[testing]
-var test_clock: clock.Source;
+var test_clock:  clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
 #[testing]
@@ -2491,47 +2493,47 @@ test tls12_connection__an_unconfigured_connection_accepts_nothing {
 }
 
 #[testing]
-var loopback_root: [341]u8;
+var loopback_root:            [341]u8;
 #[testing]
-var loopback_leaf: [393]u8;
+var loopback_leaf:            [393]u8;
 #[testing]
-var loopback_chain: [1]cert.Certificate;
+var loopback_chain:           [1]cert.Certificate;
 #[testing]
-var loopback_key: keys.PrivateKey;
+var loopback_key:             keys.PrivateKey;
 #[testing]
-var loopback_identity: credentials.Identity;
+var loopback_identity:        credentials.Identity;
 #[testing]
-var loopback_generation: credentials.Generation;
+var loopback_generation:      credentials.Generation;
 #[testing]
-var loopback_store: credentials.Store;
+var loopback_store:           credentials.Store;
 #[testing]
-var loopback_anchor: cert.Certificate;
+var loopback_anchor:          cert.Certificate;
 #[testing]
-var loopback_trust: cert.TrustStore;
+var loopback_trust:           cert.TrustStore;
 #[testing]
-var loopback_protocols: [1]config.ProtocolName;
+var loopback_protocols:       [1]config.ProtocolName;
 #[testing]
 var loopback_client_versions: [1]u16;
 #[testing]
 var loopback_server_versions: [1]u16;
 #[testing]
-var loopback_suites: [1]tls13.CipherSuite;
+var loopback_suites:          [1]tls13.CipherSuite;
 #[testing]
-var loopback_groups: [1]tls13.NamedGroup;
+var loopback_groups:          [1]tls13.NamedGroup;
 #[testing]
-var loopback_signatures: [1]tls13.SignatureScheme;
+var loopback_signatures:      [1]tls13.SignatureScheme;
 #[testing]
-var loopback_client_entropy: secret.Entropy;
+var loopback_client_entropy:  secret.Entropy;
 #[testing]
-var loopback_server_entropy: secret.Entropy;
+var loopback_server_entropy:  secret.Entropy;
 #[testing]
-var loopback_client_counter: u8;
+var loopback_client_counter:  u8;
 #[testing]
-var loopback_server_counter: u8;
+var loopback_server_counter:  u8;
 #[testing]
-var loopback_client_config: config.ClientConfig;
+var loopback_client_config:   config.ClientConfig;
 #[testing]
-var loopback_server_config: config.ServerConfig;
+var loopback_server_config:   config.ServerConfig;
 
 #[testing]
 fun hex_nibble(value: u8, output: *u8) bool {
@@ -2684,29 +2686,29 @@ fun loopback_configure(versions_include_tls13: bool,
 val MAX_SEGMENTS: usize = 12;
 
 #[testing]
-var to_listener: [32768]u8;
+var to_listener:        [32768]u8;
 #[testing]
-var to_listener_level: [MAX_SEGMENTS]engine.Level;
+var to_listener_level:  [MAX_SEGMENTS]engine.Level;
 #[testing]
 var to_listener_offset: [MAX_SEGMENTS]usize;
 #[testing]
 var to_listener_length: [MAX_SEGMENTS]usize;
 #[testing]
-var to_listener_count: usize;
+var to_listener_count:  usize;
 #[testing]
-var to_listener_used: usize;
+var to_listener_used:   usize;
 #[testing]
-var to_dialer: [32768]u8;
+var to_dialer:          [32768]u8;
 #[testing]
-var to_dialer_level: [MAX_SEGMENTS]engine.Level;
+var to_dialer_level:    [MAX_SEGMENTS]engine.Level;
 #[testing]
-var to_dialer_offset: [MAX_SEGMENTS]usize;
+var to_dialer_offset:   [MAX_SEGMENTS]usize;
 #[testing]
-var to_dialer_length: [MAX_SEGMENTS]usize;
+var to_dialer_length:   [MAX_SEGMENTS]usize;
 #[testing]
-var to_dialer_count: usize;
+var to_dialer_count:    usize;
 #[testing]
-var to_dialer_used: usize;
+var to_dialer_used:     usize;
 
 #[testing]
 fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
@@ -2729,7 +2731,7 @@ fun queue_segment(buffer: *u8, levels: *engine.Level, offsets: *usize,
 # keys are captured while their event is active, because the engine wipes its
 # secrets once the established queue drains
 #[testing]
-var captured_key: [4][prf.MAX_KEY]^u8;
+var captured_key:     [4][prf.MAX_KEY]^u8;
 #[testing]
 var captured_key_len: [4]usize;
 
@@ -2776,11 +2778,11 @@ fun drain_events(source: *Handshake, into_listener: bool) i64 {
 # while pressing, every engine call first finds the pool empty. a call that
 # must wait changes nothing, and after a wake its retry proceeds
 #[testing]
-var pressing: bool;
+var pressing:       bool;
 #[testing]
-var pressure: pool.Harness;
+var pressure:       pool.Harness;
 #[testing]
-var squeezed: pool.Squeeze;
+var squeezed:       pool.Squeeze;
 #[testing]
 var pressure_waits: usize;
 #[testing]

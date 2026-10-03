@@ -136,10 +136,10 @@ generation. The caller may reclaim the retired arrays and keys only after
 
 `credentials.initialize_tls_alpn_challenge` creates the one-identity,
 one-certificate transient generation RFC 8737 requires. It accepts the
-critical `acmeIdentifier` extension only through `x509.parse_tls_alpn_challenge`
+critical `acmeIdentifier` extension only through `credentials.parse_tls_alpn_challenge`
 and only after proving the key matches and the SAN contains exactly one
 non-wildcard `dNSName` equal case-insensitively to the validation name. Ordinary
-`x509.parse`, normal generation initialization, and all client verification
+mach-pki's `x509.parse`, normal generation initialization, and all client verification
 continue to reject unknown critical extensions. A selector must choose this
 generation only when `server.offered_alpn_exactly` confirms the current
 ClientHello offers `acme-tls/1` and no other ALPN protocol. The generic selector

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# fails unless `mach test . --lib tests` collects every test declared under src.
+# fails unless `mach test . -a tests` collects every test declared under src.
 # mach tests only the selected artifact's closure (briar-systems/mach#3813), so a
 # test module that src/lib/tests.mach does not reach would otherwise stop running
 # without a sound. a test may sit behind a target condition, so each one must be
@@ -26,7 +26,7 @@ declared=$(wc -l < "$scratch/declared")
 : > "$scratch/union"
 targets=0
 while IFS= read -r target; do
-    if ! "$mach" test . --lib tests --target "$target" --list > "$scratch/listed" 2> "$scratch/error"; then
+    if ! "$mach" test . -a tests -t "$target" --list > "$scratch/listed" 2> "$scratch/error"; then
         cat "$scratch/error" >&2
         echo "test-selection: listing failed on $target" >&2
         exit 1
@@ -41,7 +41,7 @@ done < <(sed -n 's/^\[target\.\(.*\)\]$/\1/p' mach.toml)
 sort -u -o "$scratch/union" "$scratch/union"
 missing=$(comm -23 "$scratch/declared" "$scratch/union")
 if [[ -n "$missing" ]]; then
-    printf 'test-selection: declared tests that `mach test . --lib tests` collects on no target:\n%s\n' \
+    printf 'test-selection: declared tests that `mach test . -a tests` collects on no target:\n%s\n' \
         "$missing" >&2
     echo "test-selection: reach the missing modules from src/lib/tests.mach" >&2
     exit 1

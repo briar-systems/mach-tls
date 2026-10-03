@@ -886,19 +886,19 @@ pub fun open(cipher: *Cipher, input: *u8, length: usize, output: contracts.Secre
 }
 
 #[testing]
-var fake_seal_calls: usize;
+var fake_seal_calls:        usize;
 #[testing]
-var fake_open_calls: usize;
+var fake_open_calls:        usize;
 #[testing]
 var observed_seal_capacity: usize;
 #[testing]
 var observed_open_capacity: usize;
 #[testing]
-var max_padding_scratch: [MAX_INNER_PLAINTEXT]^u8;
+var max_padding_scratch:    [MAX_INNER_PLAINTEXT]^u8;
 #[testing]
-var max_padding_wire: [HEADER_SIZE + MAX_CIPHERTEXT]u8;
+var max_padding_wire:       [HEADER_SIZE + MAX_CIPHERTEXT]u8;
 #[testing]
-var max_padding_plaintext: [MAX_INNER_PLAINTEXT]^u8;
+var max_padding_plaintext:  [MAX_INNER_PLAINTEXT]^u8;
 
 #[testing]
 fun fake_tag(aad: contracts.Bytes, nonce: contracts.Bytes, data: *u8, length: usize) u32 {

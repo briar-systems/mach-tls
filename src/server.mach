@@ -6,6 +6,11 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use pki.cert;
+use pki.load;
+use pki.name;
+use pki.verify;
+use pki.x509;
 use std.chrono.duration;
 use std.chrono.time;
 use std.crypto.ct;
@@ -17,12 +22,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use tls.buffer;
-use tls.cert;
 use tls.cert.credentials;
-use tls.cert.load;
-use tls.cert.name;
-use tls.cert.verify;
-use tls.cert.x509;
 use tls.client;
 use tls.clock;
 use tls.config;
@@ -2206,12 +2206,12 @@ fun handle_client_certificate(server: *Handshake, frame: contracts.Bytes,
     var now: clock.Moment;
     if (!clock.read(server.config.clock, ?now)) { ret error.INTERNAL_ERROR; }
     var options: verify.Options;
-    options.identity             = contracts.Bytes{data: nil, len: 0};
-    options.purpose              = verify.CLIENT_AUTH;
+    options.purpose              = verify.client_auth();
     options.now                  = now.wall;
     options.max_depth            = verify.MAX_CHAIN_DEPTH;
     options.max_signature_checks = verify.MAX_SIGNATURE_CHECKS;
-    failure                      = verify.chain(server.client_trust, ?chain, ?options);
+    failure                      = error.from_verify(verify.chain(server.client_trust,
+        ?chain, ?options));
     if (failure != error.OK) { ret failure; }
     if (x509.parse(contracts.Bytes{data: server.certificates[0].der,
         len: server.certificates[0].der_len},
@@ -3011,7 +3011,7 @@ fun no_extra_extension() ExtraExtension {
 #[testing]
 var test_moment: clock.Moment;
 #[testing]
-var test_clock: clock.Source;
+var test_clock:  clock.Source;
 
 # every test configuration reads this frozen clock, set by the helper below
 #[testing]
@@ -3238,13 +3238,13 @@ fun exchange(local: *Handshake, peer: *client.Handshake) i64 {
 var quic_server_parameters: [64]u8;
 var quic_client_parameters: [64]u8;
 #[testing]
-var quic_event_kinds: [64]u8;
+var quic_event_kinds:       [64]u8;
 #[testing]
-var quic_event_count: usize = 0;
+var quic_event_count:       usize = 0;
 #[testing]
-var quic_seen_parameters: [8]u8;
+var quic_seen_parameters:   [8]u8;
 #[testing]
-var quic_seen_len: usize = 0;
+var quic_seen_len:          usize = 0;
 
 # the same loopback as `exchange`, recording the listener's event sequence and
 # the bytes carried by PEER_PARAMETERS while they are still borrowed
@@ -3633,7 +3633,7 @@ test server__quic_transport_parameters_reach_the_caller_as_an_event {
 #[testing]
 var corpus_extensions: [1024]u8;
 #[testing]
-var corpus_hello: [2048]u8;
+var corpus_hello:      [2048]u8;
 
 #[testing]
 fun put_u16_at(output: *u8, offset: usize, value: u16) usize {
@@ -4028,45 +4028,45 @@ test server__malformed_client_hellos_fail_with_protocol_correct_alerts {
 }
 
 #[testing]
-var resume_ring: session.KeyRing;
+var resume_ring:              session.KeyRing;
 #[testing]
-var resume_window: session.ReplayWindow;
+var resume_window:            session.ReplayWindow;
 #[testing]
-var resume_store: session.ClientStore;
+var resume_store:             session.ClientStore;
 #[testing]
-var resume_listener: config.ServerConfig;
+var resume_listener:          config.ServerConfig;
 #[testing]
-var resume_dialer: config.ClientConfig;
+var resume_dialer:            config.ClientConfig;
 #[testing]
-var resume_protocols: [1]config.ProtocolName;
+var resume_protocols:         [1]config.ProtocolName;
 #[testing]
-var resume_versions: [1]u16;
+var resume_versions:          [1]u16;
 #[testing]
-var resume_suites: [1]tls13.CipherSuite;
+var resume_suites:            [1]tls13.CipherSuite;
 #[testing]
-var resume_groups: [1]tls13.NamedGroup;
+var resume_groups:            [1]tls13.NamedGroup;
 #[testing]
-var resume_signatures: [1]tls13.SignatureScheme;
+var resume_signatures:        [1]tls13.SignatureScheme;
 #[testing]
-var resume_server_entropy: secret.Entropy;
+var resume_server_entropy:    secret.Entropy;
 #[testing]
-var resume_client_entropy: secret.Entropy;
+var resume_client_entropy:    secret.Entropy;
 #[testing]
-var resume_server_counter: u8;
+var resume_server_counter:    u8;
 #[testing]
-var resume_client_counter: u8;
+var resume_client_counter:    u8;
 #[testing]
-var resume_anchor: cert.Certificate;
+var resume_anchor:            cert.Certificate;
 #[testing]
-var resume_trust: cert.TrustStore;
+var resume_trust:             cert.TrustStore;
 #[testing]
-var resume_chain: [1]cert.Certificate;
+var resume_chain:             [1]cert.Certificate;
 #[testing]
-var resume_key: keys.PrivateKey;
+var resume_key:               keys.PrivateKey;
 #[testing]
-var resume_identity: credentials.Identity;
+var resume_identity:          credentials.Identity;
 #[testing]
-var resume_generation: credentials.Generation;
+var resume_generation:        credentials.Generation;
 #[testing]
 var resume_store_credentials: credentials.Store;
 
@@ -4298,9 +4298,9 @@ test session__a_ticket_resumes_one_connection_and_a_key_update_rekeys_it {
 # every engine call below first finds the pool empty. a call that must wait
 # changes nothing, and after a wake its retry proceeds
 #[testing]
-var pressure: pool.Harness;
+var pressure:       pool.Harness;
 #[testing]
-var squeezed: pool.Squeeze;
+var squeezed:       pool.Squeeze;
 #[testing]
 var pressure_waits: usize;
 #[testing]
@@ -4627,7 +4627,7 @@ test clock__a_failed_read_refuses_resumption_and_a_client_keeps_its_ticket {
 #[testing]
 var flight_digest: u64;
 #[testing]
-var flight_bytes: usize;
+var flight_bytes:  usize;
 
 #[testing]
 fun digest(data: *u8, length: usize) {

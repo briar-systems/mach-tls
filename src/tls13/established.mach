@@ -887,7 +887,7 @@ fun test_secret(fill: u8) key_schedule.Secret {
 #[testing]
 var test_moment: clock.Moment;
 #[testing]
-var test_clock: clock.Source;
+var test_clock:  clock.Source;
 
 #[testing]
 fun unreadable(context: ptr, output: *clock.Moment) bool {
