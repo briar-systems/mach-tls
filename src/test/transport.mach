@@ -888,7 +888,7 @@ test stream__partial_write_retains_application_ownership_until_the_whole_record_
     make_test_transport(?adapter, ?transport_state, ?runtime);
     var secure: stream.Stream;
     if (!make_open_stream(?secure, ?core_a, ?adapter)) { ret 3; }
-    var application: [5]u8 = [5]u8{'h', 'e', 'l', 'l', 'o'};
+    var application: [5]u8 = "hello";
     if (!stream.write(?secure, ?scope, transport.Token{index: 10, generation: 1},
         ?application[0], 5, 44)) { ret 4; }
     val wire_length: usize = secure.wire_output_len;

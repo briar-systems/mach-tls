@@ -88,9 +88,9 @@ pub rec Loaded {
     skip_count:   usize;
 }
 
-val BEGIN:       [11]u8 = [11]u8{'-', '-', '-', '-', '-', 'B', 'E', 'G', 'I', 'N', ' '};
-val END:         [9]u8  = [9]u8{'-', '-', '-', '-', '-', 'E', 'N', 'D', ' '};
-val DASHES:      [5]u8  = [5]u8{'-', '-', '-', '-', '-'};
+val BEGIN:       [11]u8 = "-----BEGIN ";
+val END:         [9]u8  = "-----END ";
+val DASHES:      [5]u8  = "-----";
 val CERTIFICATE: [11]u8 = [11]u8{
     'C', 'E', 'R', 'T', 'I', 'F', 'I', 'C', 'A', 'T', 'E',
 };

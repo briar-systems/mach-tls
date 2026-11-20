@@ -3085,8 +3085,7 @@ test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
     alias_configuration.alpn = ?wrapping_protocols[0];
     if (config_valid(?alias_configuration, quic_extra,
         QUIC_TRANSPORT_PARAMETERS)) { ret 60; }
-    var nul_name: [15]u8 = [15]u8{'a', 'p', 'i', 0, 'e', 'x', 'a', 'm',
-        'p', 'l', 'e', '.', 'c', 'o', 'm'};
+    var nul_name: [15]u8 = "api\0example.com";
     alias_configuration             = configuration;
     alias_configuration.server_name = contracts.Bytes{
         data: ?nul_name[0], len: 15
