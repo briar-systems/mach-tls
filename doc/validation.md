@@ -98,14 +98,14 @@ pre-timed-out read against a live peer and requires the exact terminal error.
 
 ```sh
 mach dep pull test/interop
-mach dep update test/interop tls
 mach build test/interop
 ./test/interop/run.sh
 ```
 
-`test/interop` takes the library as a path dependency, and `mach dep pull` does
-not refresh an existing path copy. Run `mach dep update test/interop tls` after
-changing the library, or the harness builds against the copy taken earlier.
+`test/interop` takes the library as a path dependency, and `mach dep pull`
+refreshes that copy from the working tree every time. A build never refreshes
+it, so pull after changing the library, or the harness builds against the copy
+taken earlier.
 
 The runner executes every leg in `test/interop/README.md`, prints a pass or
 FAILED line per leg, prints the peer versions and the release evidence, and
