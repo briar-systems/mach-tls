@@ -200,10 +200,10 @@ fun names_equal(first: *u8, second: *u8) bool {
 }
 
 fun fill_public(entropy: *secret.Entropy, output: *u8, length: usize) bool {
-    if (entropy == nil || !entropy.initialized || entropy.fill_fn == nil ||
+    if (entropy == nil || !entropy.initialized || entropy.fn_fill == nil ||
         output == nil || length == 0 || length > MAX_TICKET_BYTES) { ret false; }
     var temporary: [MAX_TICKET_BYTES]^u8;
-    val status:    i64 = entropy.fill_fn(entropy.context, entropy.secret_context,
+    val status:    i64 = entropy.fn_fill(entropy.context, entropy.secret_context,
         ?temporary[0], length);
     if (status != 0) {
         ct.zeroize(?temporary[0], MAX_TICKET_BYTES);
@@ -219,10 +219,10 @@ fun fill_public(entropy: *secret.Entropy, output: *u8, length: usize) bool {
 }
 
 fun fill_secret(entropy: *secret.Entropy, output: *^u8, length: usize) bool {
-    if (entropy == nil || !entropy.initialized || entropy.fill_fn == nil ||
+    if (entropy == nil || !entropy.initialized || entropy.fn_fill == nil ||
         output == nil || length == 0) { ret false; }
     ct.zeroize(output, length);
-    ret entropy.fill_fn(entropy.context, entropy.secret_context, output,
+    ret entropy.fn_fill(entropy.context, entropy.secret_context, output,
         length) == 0;
 }
 
@@ -492,6 +492,7 @@ pub fun keyring_destroy(ring: *KeyRing) {
     mutex.unlock(?ring.lock);
 }
 
+#[constant_time("soft")]
 fun state_valid(value: *State) bool {
     ret value != nil && value.version == tls13.VERSION &&
         value.secret_len != 0 && value.secret_len <= MAX_SECRET &&
@@ -500,7 +501,7 @@ fun state_valid(value: *State) bool {
         value.alpn_len <= MAX_ALPN && value.server_name_len <= MAX_SERVER_NAME;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 fun encode_state(value: *State, output: *^u8) usize {
     var offset: usize = 0;
     output[0] = (value.version >> 8)::u8;
@@ -558,7 +559,7 @@ fun encode_state(value: *State, output: *^u8) usize {
     ret offset + value.server_name_len;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 fun decode_state(input: *^u8, length: usize, output: *State) bool {
     if (length < STATE_FIXED_SIZE + 2) { ret false; }
     @output           = empty_state();
@@ -741,14 +742,14 @@ pub fun replay_init(window: *ReplayWindow) bool {
 
 fun digest_binder(binder: contracts.Bytes, output: *u8) bool {
     var context: hash.Sha256 = hash.empty_sha256();
-    if (hash.init_sha256(?context) != contracts.OK ||
+    if (hash.sha256_init(?context) != contracts.OK ||
         hash.update_sha256(?context, binder) != contracts.OK) {
-        hash.destroy_sha256(?context);
+        hash.sha256_dnit(?context);
         ret false;
     }
     val operation: contracts.Operation = hash.final_sha256(?context,
         contracts.Buffer{data: output, capacity: 32});
-    hash.destroy_sha256(?context);
+    hash.sha256_dnit(?context);
     ret operation.error == contracts.OK && operation.written == 32;
 }
 
@@ -978,7 +979,7 @@ var probe_counter:         u8;
 #[testing]
 var failing_entropy_calls: u8;
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
@@ -992,7 +993,7 @@ fun probe_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     ret 0;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
@@ -1004,7 +1005,7 @@ fun failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     ret -1;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
@@ -1018,7 +1019,7 @@ fun secret_failing_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     ret 0;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun repeating_entropy(context: ptr, secret_context: *^u8, output: *^u8,
     length: usize) i64 {
@@ -1064,7 +1065,7 @@ fun rotation_state(issued_at: i64) State {
 test session__full_ticket_key_ring_preserves_every_live_overlap {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
-        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+        secret_context: nil, fn_fill: probe_entropy, initialized: true};
     var ring: KeyRing;
     if (!keyring_init(?ring, pool.shared_secret(), ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
     var state:  State = rotation_state(1000);
@@ -1104,7 +1105,7 @@ test session__full_ticket_key_ring_preserves_every_live_overlap {
 test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
-        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+        secret_context: nil, fn_fill: probe_entropy, initialized: true};
     var ring: KeyRing;
     if (!keyring_init(?ring, pool.shared_secret(), ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
     var state:  State = rotation_state(1000);
@@ -1116,7 +1117,7 @@ test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     val current:    usize        = ring.current;
     val seal_until: time.Instant = ring.keys[current].seal_until;
     val open_until: time.Instant = ring.keys[current].open_until;
-    entropy.fill_fn = failing_entropy;
+    entropy.fn_fill = failing_entropy;
     if (keyring_rotate(?ring, ?entropy, moment(1010))) { ret 3; }
     if (keyring_generation(?ring) != generation || ring.current != current ||
         !time.instant_equal(ring.keys[current].seal_until, seal_until) ||
@@ -1126,7 +1127,7 @@ test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     if (!open(?ring, contracts.Bytes{data: ?ticket[0], len: length}, moment(1010),
         ?recovered)) { ret 5; }
     failing_entropy_calls = 0;
-    entropy.fill_fn       = secret_failing_entropy;
+    entropy.fn_fill       = secret_failing_entropy;
     if (keyring_rotate(?ring, ?entropy, moment(1010))) { ret 6; }
     if (keyring_generation(?ring) != generation || ring.current != current ||
         !time.instant_equal(ring.keys[current].seal_until, seal_until) ||
@@ -1139,7 +1140,7 @@ test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
     state_destroy(?recovered);
 
     var collision_entropy: secret.Entropy = secret.Entropy{context: nil,
-        secret_context: nil, fill_fn: repeating_entropy, initialized: true};
+        secret_context: nil, fn_fill: repeating_entropy, initialized: true};
     var collision_ring: KeyRing;
     if (!keyring_init(?collision_ring, pool.shared_secret(), ?collision_entropy, moment(1000), 3600, 1800,
         7200)) { ret 8; }
@@ -1160,7 +1161,7 @@ test session__ticket_key_rotation_failures_leave_the_ring_unchanged {
 test session__tickets_survive_key_rotation_for_exactly_the_configured_overlap {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
-        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+        secret_context: nil, fn_fill: probe_entropy, initialized: true};
     var ring: KeyRing;
     if (!keyring_init(?ring, pool.shared_secret(), ?entropy, moment(1000), 3600, 1800, 7200)) { ret 1; }
     if (keyring_openable(?ring, mono(1000)) != 1)                                             { ret 2; }
@@ -1263,7 +1264,7 @@ test session__single_use_replay_control_admits_one_presentation {
 test session__a_wall_clock_step_moves_neither_rotation_nor_the_key_window {
     probe_counter = 1;
     var entropy: secret.Entropy = secret.Entropy{context: ?probe_counter,
-        secret_context: nil, fill_fn: probe_entropy, initialized: true};
+        secret_context: nil, fn_fill: probe_entropy, initialized: true};
     var ring: KeyRing;
     if (!keyring_init(?ring, pool.shared_secret(), ?entropy, clock.at(1000, 50), 3600, 1800, 7200)) { ret 1; }
     var state:  State = rotation_state(1000);

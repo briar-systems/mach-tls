@@ -6,6 +6,7 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use system_allocator: crypto.system.allocator;
 use pki.cert;
 use pki.load;
 use pki.name;
@@ -558,7 +559,7 @@ fun server_flight_requirement(value: *config.ServerConfig,
 fun entropy_equal(first: secret.Entropy, second: secret.Entropy) bool {
     ret first.context == second.context &&
         first.secret_context == second.secret_context &&
-        first.fill_fn == second.fill_fn && first.initialized == second.initialized;
+        first.fn_fill == second.fn_fill && first.initialized == second.initialized;
 }
 
 fun limits_equal(first: config.Limits, second: config.Limits) bool {
@@ -617,7 +618,7 @@ fun entropy_fill(server: *Handshake, output: *^u8, length: usize) bool {
     if (!server_owner_valid(server) ||
         !transition.held(?server.transition_owner) ||
         server.config != ?server.configuration || !server.entropy.initialized ||
-        server.entropy.fill_fn == nil || output == nil) { ret false; }
+        server.entropy.fn_fill == nil || output == nil) { ret false; }
     val descriptor:              secret.Entropy          = server.entropy;
     val expected_config:         *config.ServerConfig    = server.config;
     val expected_configuration:  config.ServerConfig     = server.configuration;
@@ -637,7 +638,7 @@ fun entropy_fill(server: *Handshake, output: *^u8, length: usize) bool {
     val expected_event_active:   bool                    = server.event_active;
     val expected_receive_limit:  usize                   = server.receive_record_plaintext;
     val expected_send_limit:     usize                   = server.send_record_plaintext;
-    val status:                  i64                     = descriptor.fill_fn(descriptor.context,
+    val status:                  i64                     = descriptor.fn_fill(descriptor.context,
         descriptor.secret_context, output, length);
     val valid: bool = transition.held(?server.transition_owner) &&
         server.config == expected_config && server.state == expected_state &&
@@ -745,7 +746,7 @@ pub fun config_valid(value: *config.ServerConfig, extra: ExtraExtension,
         ret false;
     }
     if (value.entropy == nil || !value.entropy.initialized ||
-        value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
+        value.entropy.fn_fill == nil || value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
         !memory_range.valid(value.entropy.context::*u8,
         value.entropy_context_size) ||
@@ -3150,7 +3151,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
     ret true;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun test_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
@@ -3314,7 +3315,7 @@ fun exchange_recording(local: *Handshake, peer: *client.Handshake) i64 {
 }
 
 test server__a_complete_tls_1_3_handshake_authenticates_the_mach_client {
-    var owner:         secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = system_allocator.make();
     var chain_storage: [1]cert.Certificate;
     var key:           keys.PrivateKey;
     var identity:      credentials.Identity;
@@ -3331,7 +3332,7 @@ test server__a_complete_tls_1_3_handshake_authenticates_the_mach_client {
 
     var server_counter: u8             = 3;
     var server_entropy: secret.Entropy = secret.Entropy{
-        context:     ?server_counter, secret_context: nil, fill_fn: test_entropy,
+        context:     ?server_counter, secret_context: nil, fn_fill: test_entropy,
         initialized: true
     };
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
@@ -3387,7 +3388,7 @@ test server__a_complete_tls_1_3_handshake_authenticates_the_mach_client {
     var trust:          cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
     var client_counter: u8              = 91;
     var client_entropy: secret.Entropy  = secret.Entropy{
-        context:     ?client_counter, secret_context: nil, fill_fn: test_entropy,
+        context:     ?client_counter, secret_context: nil, fn_fill: test_entropy,
         initialized: true
     };
     var dialer: config.ClientConfig;
@@ -3488,12 +3489,12 @@ test server__a_complete_tls_1_3_handshake_authenticates_the_mach_client {
     if (credentials.retire_store(?store, ?retired) != contracts.OK ||
         !credentials.reclaimable(retired)) { ret 38; }
     if (!destroy(?listener_engine) || !client.destroy(?dialer_engine)) { ret 45; }
-    if (keys.destroy_private(?key) != contracts.OK)                    { ret 39; }
+    if (keys.private_dnit(?key) != contracts.OK)                       { ret 39; }
     ret 0;
 }
 
 test server__quic_transport_parameters_reach_the_caller_as_an_event {
-    var owner:         secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = system_allocator.make();
     var chain_storage: [1]cert.Certificate;
     var key:           keys.PrivateKey;
     var identity:      credentials.Identity;
@@ -3510,7 +3511,7 @@ test server__quic_transport_parameters_reach_the_caller_as_an_event {
 
     var server_counter: u8             = 3;
     var server_entropy: secret.Entropy = secret.Entropy{
-        context:     ?server_counter, secret_context: nil, fill_fn: test_entropy,
+        context:     ?server_counter, secret_context: nil, fn_fill: test_entropy,
         initialized: true
     };
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
@@ -3563,7 +3564,7 @@ test server__quic_transport_parameters_reach_the_caller_as_an_event {
     var trust:          cert.TrustStore = cert.TrustStore{anchors: ?anchor, len: 1};
     var client_counter: u8              = 91;
     var client_entropy: secret.Entropy  = secret.Entropy{
-        context:     ?client_counter, secret_context: nil, fill_fn: test_entropy,
+        context:     ?client_counter, secret_context: nil, fn_fill: test_entropy,
         initialized: true
     };
     var dialer: config.ClientConfig;
@@ -3626,7 +3627,7 @@ test server__quic_transport_parameters_reach_the_caller_as_an_event {
     }
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK) { ret 41; }
-    if (keys.destroy_private(?key) != contracts.OK)                 { ret 42; }
+    if (keys.private_dnit(?key) != contracts.OK)                    { ret 42; }
     ret 0;
 }
 
@@ -3825,7 +3826,7 @@ fun reject_code(listener: *config.ServerConfig, hello_len: usize,
 }
 
 test server__malformed_client_hellos_fail_with_protocol_correct_alerts {
-    var owner:         secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = system_allocator.make();
     var chain_storage: [1]cert.Certificate;
     var key:           keys.PrivateKey;
     var identity:      credentials.Identity;
@@ -3841,7 +3842,7 @@ test server__malformed_client_hellos_fail_with_protocol_correct_alerts {
     }
     var counter: u8             = 5;
     var entropy: secret.Entropy = secret.Entropy{context: ?counter,
-        secret_context: nil, fill_fn: test_entropy, initialized: true};
+        secret_context: nil, fn_fill: test_entropy, initialized: true};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
         config.ProtocolName{data: "h2"::*u8, len: 2}
     };
@@ -4023,7 +4024,7 @@ test server__malformed_client_hellos_fail_with_protocol_correct_alerts {
     var retired: *credentials.Generation = nil;
     if (credentials.retire_store(?store, ?retired) != contracts.OK ||
         !credentials.reclaimable(retired)) { ret 21; }
-    if (keys.destroy_private(?key) != contracts.OK) { ret 22; }
+    if (keys.private_dnit(?key) != contracts.OK) { ret 22; }
     ret 0;
 }
 
@@ -4084,9 +4085,9 @@ fun resume_configure(policy: session.ReplayPolicy, tickets: u8,
     resume_server_counter = 11;
     resume_client_counter = 71;
     resume_server_entropy = secret.Entropy{context: ?resume_server_counter,
-        secret_context: nil, fill_fn: test_entropy, initialized: true};
+        secret_context: nil, fn_fill: test_entropy, initialized: true};
     resume_client_entropy = secret.Entropy{context: ?resume_client_counter,
-        secret_context: nil, fill_fn: test_entropy, initialized: true};
+        secret_context: nil, fn_fill: test_entropy, initialized: true};
     if (!session.keyring_init(?resume_ring, pool.shared_secret(), ?resume_server_entropy, now,
         3600, 1800, 7200) || !session.replay_init(?resume_window) ||
         !session.client_store_init(?resume_store)) { ret false; }
@@ -4225,7 +4226,7 @@ fun secrets_match(local: *Handshake, peer: *client.Handshake, server_send: bool)
 }
 
 test session__a_ticket_resumes_one_connection_and_a_key_update_rekeys_it {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -4291,7 +4292,7 @@ test session__a_ticket_resumes_one_connection_and_a_key_update_rekeys_it {
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 59; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 59; }
     ret 0;
 }
 
@@ -4446,7 +4447,7 @@ fun copy_secret_bytes(from: *key_schedule.Secret, output: *u8) {
 }
 
 test memory__a_handshake_that_waits_for_memory_matches_one_that_never_did {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -4498,7 +4499,7 @@ test memory__a_handshake_that_waits_for_memory_matches_one_that_never_did {
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 10; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 10; }
     ret 0;
 }
 
@@ -4556,12 +4557,12 @@ fun release_resume() i32 {
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 1; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 1; }
     ret 0;
 }
 
 test clock__a_server_that_cannot_read_its_clock_issues_no_ticket {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 2, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -4585,7 +4586,7 @@ test clock__a_server_that_cannot_read_its_clock_issues_no_ticket {
 }
 
 test clock__a_failed_read_refuses_resumption_and_a_client_keeps_its_ticket {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -4687,7 +4688,7 @@ fun exchange_digest(local: *Handshake, peer: *client.Handshake) i64 {
 # every flight of both connections
 #[testing]
 fun digest_run(shift: i64, output: *u64) i32 {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 9000))) {
         ret 1;
     }
@@ -4741,7 +4742,7 @@ test clock__a_frozen_source_makes_the_flights_of_two_runs_identical {
 }
 
 test resume__the_offered_identity_carries_the_ticket_s_obfuscated_age {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 5000))) {
         ret 1;
     }
@@ -4798,12 +4799,12 @@ test resume__the_offered_identity_carries_the_ticket_s_obfuscated_age {
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 12; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 12; }
     ret 0;
 }
 
 test finish__established_cores_carry_the_connection_and_the_handshakes_are_reused {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 1, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -4868,12 +4869,12 @@ test finish__established_cores_carry_the_connection_and_the_handshakes_are_reuse
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 18; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 18; }
     ret 0;
 }
 
 test limits__input_grows_for_a_long_chain_and_an_oversized_entry_is_refused {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_PERMISSIVE, 0, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -4900,12 +4901,12 @@ test limits__input_grows_for_a_long_chain_and_an_oversized_entry_is_refused {
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 8; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 8; }
     ret 0;
 }
 
 test session__replay_control_rotation_overlap_and_long_sessions_hold {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!resume_configure(session.REPLAY_SINGLE_USE, 1, ?owner, clock.at(1800000000, 1800000000))) {
         ret 1;
     }
@@ -5005,7 +5006,7 @@ test session__replay_control_rotation_overlap_and_long_sessions_hold {
     session.keyring_destroy(?resume_ring);
     session.replay_destroy(?resume_window);
     session.client_store_destroy(?resume_store);
-    if (keys.destroy_private(?resume_key) != contracts.OK) { ret 30; }
+    if (keys.private_dnit(?resume_key) != contracts.OK) { ret 30; }
     ret 0;
 }
 
@@ -5067,7 +5068,7 @@ fun test_challenge_store_selector(store: *credentials.Store, offer: CredentialOf
 }
 
 test server__transient_selector_leases_its_store_before_retirement {
-    var owner:         secret.Allocator = secret.system_allocator();
+    var owner:         secret.Allocator = system_allocator.make();
     var chain_storage: [1]cert.Certificate;
     var key:           keys.PrivateKey;
     var identity:      credentials.Identity;
@@ -5100,7 +5101,7 @@ test server__transient_selector_leases_its_store_before_retirement {
         credentials.clear(retired) != contracts.OK) { ret 6; }
     var refused: credentials.Lease = credentials.empty_lease();
     if (test_challenge_store_selector(?challenge_store, offer, ?refused) !=
-        contracts.INVALID_STATE || keys.destroy_private(?key) != contracts.OK) {
+        contracts.INVALID_STATE || keys.private_dnit(?key) != contracts.OK) {
         ret 7;
     }
     ret 0;

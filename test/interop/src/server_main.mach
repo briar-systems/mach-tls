@@ -3,6 +3,8 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
+use system_entropy:   crypto.system.entropy;
 use interop.pool;
 use pki.cert;
 use pki.load;
@@ -63,7 +65,7 @@ var runtime_pages: A.Allocator;
 fun make_runtime(runtime: *io_runtime.Runtime, initial: usize) bool {
     val paged: err[A.Error] = page.make(?runtime_pages);
     if (sel paged.err) { ret false; }
-    ret runtime_ok(io_runtime.make(runtime, ?runtime_pages, initial));
+    ret runtime_ok(io_runtime.init(runtime, ?runtime_pages, initial));
 }
 
 rec BlockingTransport {
@@ -315,7 +317,7 @@ fun read_fixture(path: str, buffer: *u8, capacity: usize,
     ret @length != 0 && @length < capacity;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 fun copy_secret(destination: *^u8, source: *u8, length: usize) {
     var i: usize = 0;
     for (i < length) {
@@ -640,7 +642,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         print.print(?name_text[0]);
         print.print("\n");
     }
-    if (!release(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
+    if (!release(?cur.secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 23;
     }
     # the handshake operation is gone, so the stream has finished the engine and
@@ -697,7 +699,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     }
     report("read=", read.application_bytes);
     if (!option_tls12) { footprint("request"); }
-    if (!release(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
+    if (!release(?cur.secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 32;
     }
 
@@ -711,7 +713,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
             report("key update error=", updated.terminal_error::usize);
             ret 61;
         }
-        if (!release(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
+        if (!release(?cur.secure) || !operation_ok(cancel.dnit(?scope))) {
             ret 62;
         }
         print.print("key-updated\n");
@@ -742,7 +744,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
     if (written.terminal_error != error.OK || written.application_bytes != 16) {
         ret 34;
     }
-    if (!release(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
+    if (!release(?cur.secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 35;
     }
 
@@ -752,7 +754,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         !settle(?cur.secure, ?connection_runtime)) { ret 36; }
     val half_closed: transport.Snapshot = transport.snapshot(operation(?cur.secure));
     if (half_closed.terminal_error != error.OK || !cur.secure.send_closed ||
-        !release(?cur.secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?cur.secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 37;
     }
 
@@ -762,7 +764,7 @@ fun serve_one(index: usize, allocator: *secret.Allocator,
         !settle(?cur.secure, ?connection_runtime)) { ret 38; }
     val closed: transport.Snapshot = transport.snapshot(operation(?cur.secure));
     if (closed.terminal_error != error.OK || !release(?cur.secure) ||
-        !stream.destroy(?cur.secure) || !operation_ok(cancel.destroy(?scope))) { ret 39; }
+        !stream.destroy(?cur.secure) || !operation_ok(cancel.dnit(?scope))) { ret 39; }
 
     if (option_tls12) {
         if (!tls12_connection.destroy(?legacy_engine)) { ret 40; }
@@ -885,7 +887,7 @@ fun main(argc: i64, argv: **u8) i64 {
         ret 2;
     }
 
-    var allocator:        secret.Allocator = secret.system_allocator();
+    var allocator:        secret.Allocator = system_allocator.make();
     var certificate_path: str              = "server-ed25519.pem";
     var key_path:         str              = "server-ed25519.key";
     if (streq(identity_choice::*u8, "server-p256"::*u8)) {
@@ -962,7 +964,7 @@ fun main(argc: i64, argv: **u8) i64 {
         tls13.ECDSA_SECP384R1_SHA384, tls13.RSA_PSS_RSAE_SHA256,
         tls13.RSA_PSS_RSAE_SHA384
     };
-    var entropy: secret.Entropy = secret.system_entropy();
+    var entropy: secret.Entropy = system_entropy.make();
 
     listener_configuration                        = config.ServerConfig{};
     listener_configuration.credentials            = ?store;
@@ -1062,17 +1064,21 @@ fun main(argc: i64, argv: **u8) i64 {
         connection_socket = accepted.ok;
         if (!make_runtime(?connection_runtime, 16)) { ret 9; }
         footprint_base = resident_pages();
-        cur            = mem_secret.allocate_typed[Connection](1);
-        cur_engine     = mem_secret.allocate_typed[server.Handshake](1);
+        cur            = nil;
+        cur_engine     = nil;
+        val region: err[io_error.Error] = mem_secret.allocate_typed[Connection](1, ?cur);
+        val engine: err[io_error.Error] = mem_secret.allocate_typed[server.Handshake](1,
+            ?cur_engine);
         handshake_held = true;
-        if (cur == nil || cur_engine == nil || !pool.make(?cur_memory, 1 << 24, 1 << 22)) {
+        if (sel region.err || sel engine.err || cur == nil || cur_engine == nil ||
+            !pool.make(?cur_memory, 1 << 24, 1 << 22)) {
             print.print("cannot allocate the connection\n");
             ret 9;
         }
         val served: i64 = serve_one(index, ?allocator, trust, ?store);
         if (!release_connection()) { ret 9; }
         io_runtime.close(?connection_runtime);
-        io_runtime.destroy(?connection_runtime);
+        io_runtime.dnit(?connection_runtime);
         if (served != 0) { ret served; }
         index = index + 1;
     }

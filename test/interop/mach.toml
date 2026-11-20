@@ -1,60 +1,55 @@
 [project]
 id = "interop"
 version = "0.0.0"
-mach = "^6"
+mach = "^7"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-default = true
-isa = "x86_64"
-os = "linux"
+arch = "x86_64"
+sys = "linux"
 abi = "sysv64"
 
 [target.linux-arm64]
-isa = "aarch64"
-os = "linux"
+arch = "aarch64"
+sys = "linux"
 abi = "aapcs64"
 
 [target.linux-riscv64]
-isa = "riscv64"
-os = "linux"
+arch = "riscv64"
+sys = "linux"
 abi = "lp64d"
 
 [target.windows-x86_64]
-isa = "x86_64"
-os = "windows"
+arch = "x86_64"
+sys = "windows"
 abi = "win64"
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os = "darwin"
+arch = "x86_64"
+sys = "darwin"
 abi = "sysv64"
 
 [target.darwin-aarch64]
-isa = "aarch64"
-os = "darwin"
-abi = "aapcs64"
+arch = "aarch64"
+sys = "darwin"
+abi = "darwinpcs"
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [artifact.tls-client-interop]
 kind = "bin"
 entry = "main.mach"
-out = "bin/tls-client-interop"
+out = "{project.work}/bin/tls-client-interop{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -62,7 +57,7 @@ need = []
 [artifact.tls-server-interop]
 kind = "bin"
 entry = "server_main.mach"
-out = "bin/tls-server-interop"
+out = "{project.work}/bin/tls-server-interop{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -70,7 +65,7 @@ need = []
 [artifact.tls-evidence]
 kind = "bin"
 entry = "evidence_main.mach"
-out = "bin/tls-evidence"
+out = "{project.work}/bin/tls-evidence{artifact.suffix}"
 targets = ["*"]
 link = []
 need = []
@@ -78,16 +73,16 @@ need = []
 [dep.tls]
 path = "../.."
 
-# std, crypto and pki are pinned here because a path dependency carries no pin for
-# a dependency it selects by version, and this tree is not committed
+# std, crypto and pki are declared here at the refs the root names, since this
+# tree is not committed and holds no pins of its own
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "tag/v9.4.1"
+ref = "branch/dev"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "tag/v0.26.0"
+ref = "branch/dev"
 
 [dep.pki]
 git = "https://github.com/briar-systems/mach-pki"
-ref = "tag/v0.1.0"
+ref = "branch/dev"

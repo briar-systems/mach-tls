@@ -103,14 +103,17 @@ fun hidden(name: str) bool {
 
 # the files of one boundary's directory, or none when it cannot be listed
 fun files(dir: str, out: *Vector[str]) bool {
-    val listed: res[Vector[str], fs.FsError] = fs.read_dir(?backing, dir);
+    val listed: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(?backing, dir);
     if (sel listed.err) { ret false; }
-    var names: Vector[str] = listed.ok;
+    var names: Vector[fs.Listed] = listed.ok;
     @out = vector.init[str](?backing);
     var i: usize = 0;
     for (i < names.len) {
-        val name: str = names.data[i];
+        val entry: fs.Listed = names.data[i];
         i = i + 1;
+        # a name with no utf-8 spelling cannot be joined into a path
+        if (sel entry.unspellable) { ret false; }
+        val name: str = entry.name;
         if (hidden(name)) { cnt; }
         val path: str = join(?backing, dir, name);
         if (path == nil || !is_file(path)) { cnt; }
@@ -163,13 +166,15 @@ fun replay(root: str) i64 {
         b = b + 1;
     }
     # a directory no boundary answers would be skipped without a sound
-    val listed: res[Vector[str], fs.FsError] = fs.read_dir(?backing, root);
+    val listed: res[Vector[fs.Listed], fs.FsError] = fs.read_dir(?backing, root);
     if (sel listed.err) { ret HARNESS; }
-    var names: Vector[str] = listed.ok;
-    var i:     usize       = 0;
+    var names: Vector[fs.Listed] = listed.ok;
+    var i:     usize             = 0;
     for (i < names.len) {
-        val name: str = names.data[i];
+        val entry: fs.Listed = names.data[i];
         i = i + 1;
+        if (sel entry.unspellable) { ret HARNESS; }
+        val name: str = entry.name;
         if (hidden(name) || !is_dir(join(?backing, root, name))) { cnt; }
         val known: opt[usize] = boundaries.lookup(?table[0], count, name);
         if (sel known.none) {
@@ -407,7 +412,7 @@ fun usage() i64 {
 #[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
     val made:    err[A.Error] = page.make(?backing);
-    val guarded: err[A.Error] = testing.make(?guard);
+    val guarded: err[A.Error] = testing.init(?guard);
     if (sel made.err)    { ret HARNESS; }
     if (sel guarded.err) { ret HARNESS; }
     count = boundaries.all(?table[0]);

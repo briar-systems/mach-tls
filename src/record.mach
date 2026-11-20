@@ -612,7 +612,6 @@ fun open_failure(status: ParseStatus, error: tls_error.Error, alert: AlertDescri
         written: 0, consumed: consumed, required: required};
 }
 
-#[oblivious]
 fun seal_with_cipher(cipher: *Cipher, nonce: contracts.Bytes, aad: contracts.Bytes,
     plaintext: contracts.SecretBytes, output: contracts.Buffer) contracts.Operation {
     if (keyed(cipher.aead)) {
@@ -622,7 +621,6 @@ fun seal_with_cipher(cipher: *Cipher, nonce: contracts.Bytes, aad: contracts.Byt
         nonce, aad, plaintext, output);
 }
 
-#[oblivious]
 fun open_with_cipher(cipher: *Cipher, nonce: contracts.Bytes, aad: contracts.Bytes,
     input: contracts.Bytes, output: contracts.SecretBuffer) contracts.Operation {
     if (keyed(cipher.aead)) {
@@ -749,7 +747,7 @@ fun mark_peer_failure(cipher: *Cipher, error: tls_error.Error, alert: AlertDescr
     ret open_failure(PARSE_FAILED, error, alert, consumed, required);
 }
 
-#[oblivious]
+#[constant_time("soft")]
 fun inspect_inner(data: *^u8, length: usize, has_content: *bool,
     decoded_type: *ContentType, decoded_end: *usize) {
     var present:      ^u8    = 0;
@@ -921,7 +919,7 @@ fun fake_tag(aad: contracts.Bytes, nonce: contracts.Bytes, data: *u8, length: us
     ret value & 0xff;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun fake_seal(key: contracts.SecretBytes, nonce: contracts.Bytes, aad: contracts.Bytes,
     plaintext: contracts.SecretBytes, output: contracts.Buffer) contracts.Operation {
@@ -942,7 +940,7 @@ fun fake_seal(key: contracts.SecretBytes, nonce: contracts.Bytes, aad: contracts
     ret contracts.Operation{error: contracts.OK, written: required};
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun fake_open(key: contracts.SecretBytes, nonce: contracts.Bytes, aad: contracts.Bytes,
     input: contracts.Bytes, output: contracts.SecretBuffer) contracts.Operation {

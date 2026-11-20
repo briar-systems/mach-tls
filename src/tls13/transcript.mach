@@ -70,12 +70,12 @@ pub fun digest_size(value: *Transcript) usize {
 fun reset_context(value: *Transcript) error.Error {
     var failure: contracts.Error;
     if (value.algorithm == key_schedule.SHA256) {
-        failure = hash.destroy_sha256(?value.sha256);
-        if (failure == contracts.OK) { failure = hash.init_sha256(?value.sha256); }
+        failure = hash.sha256_dnit(?value.sha256);
+        if (failure == contracts.OK) { failure = hash.sha256_init(?value.sha256); }
     }
     or (value.algorithm == key_schedule.SHA384) {
-        failure = hash.destroy_sha384(?value.sha384);
-        if (failure == contracts.OK) { failure = hash.init_sha384(?value.sha384); }
+        failure = hash.sha384_dnit(?value.sha384);
+        if (failure == contracts.OK) { failure = hash.sha384_init(?value.sha384); }
     }
     or                           { ret error.UNSUPPORTED_ALGORITHM; }
     if (failure != contracts.OK) { ret mapped(failure); }
@@ -89,8 +89,8 @@ pub fun init(value: *Transcript,
         ret error.ILLEGAL_PARAMETER;
     }
     if (key_schedule.hash_size(algorithm) == 0) { ret error.UNSUPPORTED_ALGORITHM; }
-    hash.destroy_sha256(?value.sha256);
-    hash.destroy_sha384(?value.sha384);
+    hash.sha256_dnit(?value.sha256);
+    hash.sha384_dnit(?value.sha384);
     value.algorithm   = algorithm;
     value.total       = 0;
     value.retry_used  = false;
@@ -245,8 +245,8 @@ pub fun rewrite_for_retry(value: *Transcript,
         i            = i + 1;
     }
     if (failure != error.OK) {
-        hash.destroy_sha256(?value.sha256);
-        hash.destroy_sha384(?value.sha384);
+        hash.sha256_dnit(?value.sha256);
+        hash.sha384_dnit(?value.sha384);
         value.algorithm   = 0;
         value.state       = DESTROYED;
         value.total       = 0;
@@ -267,8 +267,8 @@ pub fun rewrite_for_retry(value: *Transcript,
 
 pub fun destroy(value: *Transcript) {
     if (value == nil) { ret; }
-    hash.destroy_sha256(?value.sha256);
-    hash.destroy_sha384(?value.sha384);
+    hash.sha256_dnit(?value.sha256);
+    hash.sha384_dnit(?value.sha384);
     value.algorithm   = 0;
     value.state       = DESTROYED;
     value.total       = 0;

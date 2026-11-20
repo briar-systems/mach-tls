@@ -12,6 +12,7 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
 use pki.cert;
 use pki.load;
 use std.allocator.page;
@@ -86,7 +87,7 @@ var engine13:  server.Handshake;
 var engine12:  tls12_connection.Handshake;
 
 # the same bytes for every input, so an answer does not depend on the ones before it
-#[oblivious]
+#[constant_time("soft")]
 fun counter_fill(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
     val state: *u8   = context::*u8;
@@ -131,7 +132,7 @@ fun read_fixture(name: str, output: *u8, length: *usize) bool {
     ret fits;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 fun copy_secret(destination: *^u8, source: *u8, length: usize) {
     var i: usize = 0;
     for (i < length) {
@@ -146,11 +147,11 @@ fun prepare_shared() bool {
     val made: err[A.Error] = page.make(?backing);
     if (sel made.err)                          { ret false; }
     if (!pool.make(?memory, 1 << 24, 1 << 22)) { ret false; }
-    owner   = secret.system_allocator();
+    owner   = system_allocator.make();
     moment  = clock.at(WALL, 0);
     frozen  = clock.frozen(?moment);
     entropy = secret.Entropy{context: (?counter)::ptr, secret_context: nil,
-        fill_fn: counter_fill, initialized: true};
+        fn_fill: counter_fill, initialized: true};
     shared = true;
     ret true;
 }

@@ -6,6 +6,7 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use system_allocator: crypto.system.allocator;
 use pki.cert;
 use pki.load;
 use pki.name;
@@ -412,7 +413,7 @@ pub fun client_config_valid(value: *config.ClientConfig) bool {
     if (value == nil || !client_output_requirement(value, ?output) ||
         !clock.source_valid(value.clock) ||
         value.entropy == nil || !value.entropy.initialized ||
-        value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
+        value.entropy.fn_fill == nil || value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
         !memory_range.valid(value.entropy.context::*u8,
         value.entropy_context_size) ||
@@ -463,7 +464,7 @@ pub fun client_config_valid(value: *config.ClientConfig) bool {
 pub fun server_config_valid(value: *config.ServerConfig) bool {
     if (value == nil || !clock.source_valid(value.clock) ||
         value.entropy == nil || !value.entropy.initialized ||
-        value.entropy.fill_fn == nil || value.entropy.secret_context != nil ||
+        value.entropy.fn_fill == nil || value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) != (value.entropy_context_size == 0)) ||
         !memory_range.valid(value.entropy.context::*u8,
         value.entropy_context_size) ||
@@ -712,7 +713,7 @@ fun fail(value: *Handshake, failure: error.Error,
 fun entropy_fill(value: *Handshake, output: *^u8, length: usize) bool {
     if (!owner_valid(value) ||
         !transition.held(?value.transition_owner) ||
-        !value.entropy.initialized || value.entropy.fill_fn == nil ||
+        !value.entropy.initialized || value.entropy.fn_fill == nil ||
         output == nil) { ret false; }
     val descriptor:       secret.Entropy = value.entropy;
     val expected_state:   u8             = value.state;
@@ -720,7 +721,7 @@ fun entropy_fill(value: *Handshake, output: *^u8, length: usize) bool {
     val expected_memory:  buffer.Lease   = value.memory;
     val expected_output:  usize          = value.output_used;
     val expected_queue:   usize          = value.queue_len;
-    val status:           i64            = descriptor.fill_fn(descriptor.context,
+    val status:           i64            = descriptor.fn_fill(descriptor.context,
         descriptor.secret_context, output, length);
     val stable: bool = transition.held(?value.transition_owner) &&
         value.state == expected_state &&
@@ -731,7 +732,7 @@ fun entropy_fill(value: *Handshake, output: *^u8, length: usize) bool {
         value.memory.account == expected_memory.account &&
         value.output_used == expected_output &&
         value.queue_len == expected_queue &&
-        value.entropy.fill_fn == descriptor.fill_fn &&
+        value.entropy.fn_fill == descriptor.fn_fill &&
         value.entropy.context == descriptor.context;
     if (!stable || status != 0) {
         ct.zeroize(output, length);
@@ -2358,7 +2359,7 @@ fun destroy_inner(value: *Handshake) bool {
         value.entropy                     = config.no_entropy();
         value.entropy.context             = nil;
         value.entropy.secret_context      = nil;
-        value.entropy.fill_fn             = nil;
+        value.entropy.fn_fill             = nil;
         value.trust                       = cert.no_trust_store();
         value.trust.anchors               = nil;
         value.identity                    = credentials.no_identity();
@@ -2564,7 +2565,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8, capacity: usize) bool {
     ret true;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun loopback_entropy(context: ptr, secret_context: *^u8, destination: *^u8,
     length: usize) i64 {
@@ -2617,9 +2618,9 @@ fun loopback_configure(versions_include_tls13: bool,
     loopback_client_counter = 13;
     loopback_server_counter = 41;
     loopback_client_entropy = secret.Entropy{context: ?loopback_client_counter,
-        secret_context: nil, fill_fn: loopback_entropy, initialized: true};
+        secret_context: nil, fn_fill: loopback_entropy, initialized: true};
     loopback_server_entropy = secret.Entropy{context: ?loopback_server_counter,
-        secret_context: nil, fill_fn: loopback_entropy, initialized: true};
+        secret_context: nil, fn_fill: loopback_entropy, initialized: true};
     loopback_protocols[0]       = config.ProtocolName{data: "h2"::*u8, len: 2};
     loopback_client_versions[0] = tls12.VERSION;
     loopback_server_versions[0] = tls12.VERSION;
@@ -2894,13 +2895,11 @@ fun exchange(local: *Handshake, peer: *Handshake) i64 {
 }
 
 test tls12_connection__the_handshake_snapshots_one_role_s_configuration {
-    var larger: usize = $size_of(config.ClientConfig);
-    if ($size_of(config.ServerConfig) > larger) {
-        larger = $size_of(config.ServerConfig);
-    }
-    # one payload plus the discriminator's slot, never both configs
-    if ($size_of(Configuration) > larger + $align_of(Configuration)) { ret 1; }
-    var owner: secret.Allocator = secret.system_allocator();
+    # the two configs reach secrets through fields at different offsets, so each
+    # payload takes its own area after the discriminator's slot (tag.md, layout)
+    if ($size_of(Configuration) > $align_of(Configuration) +
+        $size_of(config.ClientConfig) + $size_of(config.ServerConfig)) { ret 1; }
+    var owner: secret.Allocator = system_allocator.make();
     if (!loopback_configure(false, ?owner)) { ret 2; }
     var dialer:   Handshake;
     var listener: Handshake;
@@ -2920,7 +2919,7 @@ test tls12_connection__the_handshake_snapshots_one_role_s_configuration {
 }
 
 test tls12_connection__a_complete_ecdhe_handshake_agrees_on_every_secret {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!loopback_configure(false, ?owner)) { ret 1; }
     var dialer:   Handshake;
     var listener: Handshake;
@@ -2996,12 +2995,12 @@ test tls12_connection__a_complete_ecdhe_handshake_agrees_on_every_secret {
     if (!destroy(?dialer) || !destroy(?listener))          { ret 28; }
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?loopback_store, ?retired);
-    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 29; }
+    if (keys.private_dnit(?loopback_key) != contracts.OK) { ret 29; }
     ret 0;
 }
 
 test tls12_connection__a_handshake_that_waits_for_memory_matches_one_that_never_did {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!loopback_configure(false, ?owner)) { ret 1; }
     var dialer:   Handshake;
     var listener: Handshake;
@@ -3054,12 +3053,12 @@ test tls12_connection__a_handshake_that_waits_for_memory_matches_one_that_never_
     if (!pool.destroy(?pressure)) { ret 9; }
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?loopback_store, ?retired);
-    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 10; }
+    if (keys.private_dnit(?loopback_key) != contracts.OK) { ret 10; }
     ret 0;
 }
 
 test tls12_connection__a_signalled_downgrade_is_refused_by_a_1_3_client {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!loopback_configure(true, ?owner)) { ret 1; }
     # the listener also speaks tls 1.3, so it marks the 1.2 negotiation and
     # refuses the deliberate fallback the client signals
@@ -3114,12 +3113,12 @@ test tls12_connection__a_signalled_downgrade_is_refused_by_a_1_3_client {
     if (!destroy(?plain_dialer) || !destroy(?marking_listener)) { ret 14; }
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?loopback_store, ?retired);
-    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 15; }
+    if (keys.private_dnit(?loopback_key) != contracts.OK) { ret 15; }
     ret 0;
 }
 
 test tls12_connection__a_second_hello_is_never_a_renegotiation {
-    var owner: secret.Allocator = secret.system_allocator();
+    var owner: secret.Allocator = system_allocator.make();
     if (!loopback_configure(false, ?owner)) { ret 1; }
     var dialer: Handshake;
     if (!init_client(?dialer, ?loopback_client_config,
@@ -3145,6 +3144,6 @@ test tls12_connection__a_second_hello_is_never_a_renegotiation {
     if (!destroy(?listener)) { ret 8; }
     var retired: *credentials.Generation = nil;
     credentials.retire_store(?loopback_store, ?retired);
-    if (keys.destroy_private(?loopback_key) != contracts.OK) { ret 9; }
+    if (keys.private_dnit(?loopback_key) != contracts.OK) { ret 9; }
     ret 0;
 }

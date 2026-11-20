@@ -6,6 +6,7 @@ use crypto.group.p256;
 use crypto.group.x25519;
 use crypto.secret;
 use crypto.signature;
+use system_allocator: crypto.system.allocator;
 use pki.cert;
 use pki.load;
 use pki.name;
@@ -645,7 +646,7 @@ fun client_flight_requirement(value: *config.ClientConfig,
 fun entropy_equal(first: secret.Entropy, second: secret.Entropy) bool {
     ret first.context == second.context &&
         first.secret_context == second.secret_context &&
-        first.fill_fn == second.fill_fn && first.initialized == second.initialized;
+        first.fn_fill == second.fn_fill && first.initialized == second.initialized;
 }
 
 fun limits_equal(first: config.Limits, second: config.Limits) bool {
@@ -702,7 +703,7 @@ fun entropy_fill(client: *Handshake, output: *^u8, length: usize) bool {
     if (!client_owner_valid(client) ||
         !transition.held(?client.transition_owner) ||
         client.config != ?client.configuration || !client.entropy.initialized ||
-        client.entropy.fill_fn == nil || output == nil) { ret false; }
+        client.entropy.fn_fill == nil || output == nil) { ret false; }
     val descriptor:              secret.Entropy          = client.entropy;
     val expected_config:         *config.ClientConfig    = client.config;
     val expected_configuration:  config.ClientConfig     = client.configuration;
@@ -722,7 +723,7 @@ fun entropy_fill(client: *Handshake, output: *^u8, length: usize) bool {
     val expected_event_active:   bool                    = client.event_active;
     val expected_receive_limit:  usize                   = client.receive_record_plaintext;
     val expected_send_limit:     usize                   = client.send_record_plaintext;
-    val status:                  i64                     = descriptor.fill_fn(descriptor.context,
+    val status:                  i64                     = descriptor.fn_fill(descriptor.context,
         descriptor.secret_context, output, length);
     val valid: bool = transition.held(?client.transition_owner) &&
         client.config == expected_config && client.state == expected_state &&
@@ -802,7 +803,7 @@ fun config_valid(value: *config.ClientConfig,
         ret false;
     }
     if (value.entropy == nil ||
-        !value.entropy.initialized || value.entropy.fill_fn == nil ||
+        !value.entropy.initialized || value.entropy.fn_fill == nil ||
         value.entropy.secret_context != nil ||
         ((value.entropy.context == nil) !=
         (value.entropy_context_size == 0)) ||
@@ -2807,7 +2808,7 @@ test client__destroy_leaves_no_residue_in_any_cleared_record {
     if (!configuration_cleared(?cleared)) { ret 2; }
     val entropy: secret.Entropy = config.no_entropy();
     if (entropy.context != nil || entropy.secret_context != nil
-        || entropy.fill_fn != nil || entropy.initialized) { ret 3; }
+        || entropy.fn_fill != nil || entropy.initialized) { ret 3; }
     val trust: cert.TrustStore = cert.no_trust_store();
     if (trust.anchors != nil || trust.len != 0) { ret 4; }
     val identity: credentials.Identity = credentials.no_identity();
@@ -2847,7 +2848,7 @@ test client__user_canceled_warning_permits_orderly_close {
 #[testing]
 var oversized_extension: [65500]u8;
 
-#[oblivious]
+#[constant_time("soft")]
 #[testing]
 fun deterministic_entropy(context: ptr, secret_context: *^u8,
     destination: *^u8, length: usize) i64 {
@@ -2914,7 +2915,7 @@ fun hostile_entropy(context: ptr, secret_context: *^u8,
 test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
     var entropy_counter: u8             = 1;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
-        secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
+        secret_context: nil, fn_fill: deterministic_entropy, initialized: true};
     var anchor:    cert.Certificate       = cert.Certificate{der: "x"::*u8, der_len: 1};
     var trust:     cert.TrustStore        = cert.TrustStore{anchors: ?anchor, len: 1};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
@@ -2948,7 +2949,7 @@ test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
     configuration.entropy                             = ?entropy;
     configuration.entropy_context_size                = 1;
     configuration.clock                               = test_source();
-    entropy.fill_fn                                   = reentrant_entropy;
+    entropy.fn_fill                                   = reentrant_entropy;
     configuration.limits                              = config.production_limits();
     configuration.limits.max_peer_handshake_bytes     = 4096;
     configuration.limits.max_chain_bytes              = 3072;
@@ -2977,7 +2978,7 @@ test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
     if (config_valid(?bounded_configuration, no_extra_extension(), 0)) { ret 70; }
     bounded_configuration = configuration;
     var missing_fill_entropy: secret.Entropy = entropy;
-    missing_fill_entropy.fill_fn  = nil;
+    missing_fill_entropy.fn_fill  = nil;
     bounded_configuration.entropy = ?missing_fill_entropy;
     if (config_valid(?bounded_configuration, no_extra_extension(), 0)) { ret 71; }
     var oversized_configuration: config.ClientConfig = configuration;
@@ -3003,7 +3004,7 @@ test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
     if (decode_own_hello(?local_bound_client, ?local_hello) != error.OK ||
         !destroy(?local_bound_client)) { ret 74; }
     var hostile_descriptor: secret.Entropy = entropy;
-    hostile_descriptor.fill_fn = hostile_entropy;
+    hostile_descriptor.fn_fill = hostile_entropy;
     var hostile_configuration: config.ClientConfig = configuration;
     hostile_configuration.entropy = ?hostile_descriptor;
     var hostile_client: Handshake;
@@ -3194,7 +3195,7 @@ test client__rfc_8446_retry_is_transcript_safe_at_every_fragmentation_boundary {
 test client__event_rejection_has_one_terminal_alert_ownership_path {
     var entropy_counter: u8             = 3;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
-        secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
+        secret_context: nil, fn_fill: deterministic_entropy, initialized: true};
     var anchor:    cert.Certificate       = cert.Certificate{der: "x"::*u8, der_len: 1};
     var trust:     cert.TrustStore        = cert.TrustStore{anchors: ?anchor, len: 1};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
@@ -3246,7 +3247,7 @@ test client__event_rejection_has_one_terminal_alert_ownership_path {
 test client__wrong_level_and_out_of_state_messages_fail_closed_once {
     var entropy_counter: u8             = 5;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
-        secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
+        secret_context: nil, fn_fill: deterministic_entropy, initialized: true};
     var anchor:    cert.Certificate       = cert.Certificate{der: "x"::*u8, der_len: 1};
     var trust:     cert.TrustStore        = cert.TrustStore{anchors: ?anchor, len: 1};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
@@ -3365,7 +3366,7 @@ test client__complete_authenticated_rfc_8446_flight_has_exact_traffic_transition
         0xca, 0x3f, 0xf8, 0x03, 0x7d, 0x60, 0xbb, 0x30,
         0x42, 0x18, 0xc8, 0x8c, 0xd4, 0xb7, 0x9b, 0x72,
     };
-    var owner:      secret.Allocator = secret.system_allocator();
+    var owner:      secret.Allocator = system_allocator.make();
     var client_key: keys.PrivateKey  = keys.empty_private();
     val loaded_key: contracts.Error  = load.private_der(
         contracts.SecretBytes{data: ?key_der[0], len: 48}, cert.PKCS8_DER,
@@ -3378,7 +3379,7 @@ test client__complete_authenticated_rfc_8446_flight_has_exact_traffic_transition
     };
     var entropy_counter: u8             = 7;
     var entropy:         secret.Entropy = secret.Entropy{context: ?entropy_counter,
-        secret_context: nil, fill_fn: deterministic_entropy, initialized: true};
+        secret_context: nil, fn_fill: deterministic_entropy, initialized: true};
     var protocols: [1]config.ProtocolName = [1]config.ProtocolName{
         config.ProtocolName{data: "h2"::*u8, len: 2}
     };
@@ -3737,6 +3738,6 @@ test client__complete_authenticated_rfc_8446_flight_has_exact_traffic_transition
         value.core.receive.active || !value.core.quic) { ret 40; }
     transcript.destroy(?server_transcript);
     key_schedule.destroy(?server_schedule);
-    if (!destroy(?value) || keys.destroy_private(?client_key) != contracts.OK) { ret 35; }
+    if (!destroy(?value) || keys.private_dnit(?client_key) != contracts.OK) { ret 35; }
     ret 0;
 }

@@ -3,9 +3,6 @@
 use pki.verify;
 use std.print;
 use std.runtime;
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;

@@ -4,9 +4,6 @@
 # replay exactly. each run applies one of six structural mutations: flip a bit,
 # set a byte, truncate, extend with random bytes, swap two bytes, or zero a run
 
-use std.types.bool.bool;
-use std.types.bool.false;
-use std.types.bool.true;
 use std.types.size.usize;
 
 pub val FLIP_BIT: u8    = 0;

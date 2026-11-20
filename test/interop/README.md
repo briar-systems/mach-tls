@@ -462,13 +462,12 @@ zero. The client counts include the two P-384 verification legs.
 
 ```sh
 mach dep pull test/interop
-mach dep update test/interop tls
 mach build test/interop
 ./test/interop/run.sh
 ```
 
-`mach dep update test/interop tls` refreshes the harness's copy of the library.
-`mach dep pull` alone keeps a copy taken earlier.
+`mach dep pull test/interop` refreshes the harness's copy of the library from the
+working tree every time, and a build reads the copy as it is.
 
 The footprint leg serves four TLS 1.3 connections with `--footprint` and bounds
 the resident pages of the last connection, its stream, engine and held buffers,
