@@ -69,6 +69,10 @@ ref = "branch/dev"
 git = "https://github.com/briar-systems/mach-pki"
 ref = "branch/dev"
 
+[dep.encoding]
+git = "https://github.com/briar-systems/mach-encoding"
+ref = "branch/dev"
+
 # test-only: the library and every test module, run with `mach test . -a tests`
 [artifact.tests]
 kind = "static"
