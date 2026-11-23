@@ -653,7 +653,7 @@ test tls12_codec__the_server_flight_round_trips_through_exact_framing {
     hello.session_id         = contracts.Bytes{data: nil, len: 0};
     hello.cipher_suite       = tls12.ECDHE_RSA_AES_128_GCM_SHA256;
     hello.compression_method = 0;
-    hello.extensions         = extensions.list(?extension_bytes[0], 9,
+    hello.extensions         = extensions.list(?extension_bytes[0], 8,
         extensions.TLS12_SERVER_HELLO);
     # a truncated renegotiation_info body is refused
     if (encode_server_hello(?hello,

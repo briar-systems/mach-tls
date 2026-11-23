@@ -497,7 +497,7 @@ pub fun begin(
     operation.provider               = nil;
     operation.provider_drifted       = false;
     operation.lock                   = mutex.make();
-    cancel.init_registration(?operation.cancellation);
+    cancel.registration_make(?operation.cancellation);
     val attached: cancel.Reason = cancel.attach(scope, ?operation.cancellation, cancel_operation, operation::ptr);
     if (sel attached.active) {
         operation.cancellation_active = true;

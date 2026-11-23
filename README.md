@@ -38,8 +38,8 @@ X.509 parsing, loading, and certification path validation from `mach-pki`
 - `tls.stream` implements a completion-driven TLS 1.3 secure byte stream for
   either role.
 
-`use tls;` binds `tls.lib.tls`, which re-exports these modules for consumers
-that prefer one import.
+A consumer that prefers one import takes `use tls.lib.tls;`, which binds the
+module that re-exports these as `tls`.
 
 ## Status
 
@@ -110,42 +110,31 @@ testing, and independent review.
 
 ## Record literals
 
-A record literal leaves every field it does not name holding the previous stack
-frame's contents rather than zero, which covers `T{}` as well as any partial
-form (briar-systems/mach#3108). Clearing a security-bearing record with a
-literal therefore does not clear it.
-
-Name every field of every literal. A record containing an array cannot satisfy
-that, because an array field cannot be named in a literal at all, so those are
-built by declaring `var value: T;` — which does zero the whole record including
-its arrays — and assigning each field. The `no_transport`, `no_client_config`,
-`no_server_config`, `no_entropy`, `no_identity`, `no_trust_store` and
-`no_certificate` constructors exist for exactly this: they return a value
-cleared by declaration, and teardown paths copy from them rather than assigning
-a literal.
-
-Nothing enforces this automatically. Enumerating the violations was a
-workaround for briar-systems/mach#3108, and that defect is being fixed in the
-compiler, so the constructors above are what keep the rule in one place rather
-than at every teardown site.
+A record literal zeroes every field it does not name, so `T{}` and any partial
+literal clear the whole record. Before mach 7 an unnamed field held the previous
+stack frame's contents (briar-systems/mach#3108), and the `no_transport`,
+`no_client_config`, `no_server_config`, `no_entropy`, `no_identity`,
+`no_trust_store` and `no_certificate` constructors date from then. They return
+a value cleared by declaration, and teardown paths copy from them, so the
+cleared value of each record is still written in one place.
 
 ## Local development
 
-Dependencies are selected by version range and realized as committed
-gitlinks under `dep/`, so `mach dep pull` checks out the pinned release and
-`mach dep update` moves the pin. `test/interop` pins std and crypto by tag
-itself, because a path dependency carries no pin for a dependency it selects
-by version. On aarch64, tls links crypto's DIT-required start: the program
-turns PSTATE.DIT on before `main` and refuses to start on a processor or
-kernel without the mode. Build output uses Mach's default `out/` directory
-inside this repository.
+Dependencies follow their `branch/dev` refs until their mach 7 releases and
+are realized as committed gitlinks under `dep/`, so `mach dep pull` checks out
+the pinned commit and `mach dep update` moves the pin. `test/interop` and
+`test/fuzz` declare std, crypto and pki at the same refs themselves, since
+those trees are not committed and hold no pins of their own. A
+constant-time function switches the processor's timing mode (PSTATE.DIT on
+aarch64) on entry and off on return where the processor has one, so the
+program needs no special start. Build output uses Mach's default `out/`
+directory inside this repository.
 
 ```sh
 mach dep pull .
 mach build .
-mach test .
+mach test . -a tests
 mach dep pull test/interop
-mach dep update test/interop tls
 mach build test/interop
 ```
 

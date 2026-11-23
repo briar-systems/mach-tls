@@ -1,6 +1,8 @@
 use crypto.contracts;
 use crypto.encoding.keys;
 use crypto.secret;
+use system_allocator: crypto.system.allocator;
+use system_entropy:   crypto.system.entropy;
 use interop.pool;
 use pki.cert;
 use pki.load;
@@ -62,7 +64,7 @@ var runtime_pages: A.Allocator;
 fun make_runtime(runtime: *io_runtime.Runtime, initial: usize) bool {
     val paged: err[A.Error] = page.make(?runtime_pages);
     if (sel paged.err) { ret false; }
-    ret runtime_ok(io_runtime.make(runtime, ?runtime_pages, initial));
+    ret runtime_ok(io_runtime.init(runtime, ?runtime_pages, initial));
 }
 
 fun runtime_closed(outcome: res[bool, io_error.Error]) bool {
@@ -210,7 +212,7 @@ fun decode_hex(input: *u8, length: usize, output: *u8,
     ret true;
 }
 
-#[oblivious]
+#[constant_time("soft")]
 fun decode_secret_hex(input: *u8, length: usize, output: *^u8,
     capacity: usize) bool {
     if (input == nil || output == nil || (length & 1) != 0 ||
@@ -383,15 +385,15 @@ fun duplex_exchange(secure: *stream.Stream) i64 {
     }
     report("duplex bytes=", received);
     report("duplex overlaps=", overlaps);
-    if (overlaps == 0 || !operation_ok(cancel.destroy(?writes)) ||
-        !operation_ok(cancel.destroy(?reads))) { ret 81; }
+    if (overlaps == 0 || !operation_ok(cancel.dnit(?writes)) ||
+        !operation_ok(cancel.dnit(?reads))) { ret 81; }
     ret 0;
 }
 
 # the bundled adapter over the async driver, which completes reads and writes
 # as the socket allows rather than inside submit
 fun dial_async() i64 {
-    if (!runtime_ok(net_async.make(?dial_driver, ?dial_runtime))) { ret 3; }
+    if (!runtime_ok(net_async.init(?dial_driver, ?dial_runtime))) { ret 3; }
     var scope: cancel.Scope;
     if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{}))) { ret 3; }
     val submitted: res[io_runtime.Token, io_error.Error] = net_async.submit_connect(
@@ -403,7 +405,7 @@ fun dial_async() i64 {
     if (sel waited.err)                         { ret 2; }
     if (waited.ok != 1 || completion.has_error) { ret 2; }
     dial_socket = net_async.stream(?completion);
-    if (!operation_ok(cancel.destroy(?scope)) ||
+    if (!operation_ok(cancel.dnit(?scope)) ||
         !transport.make_tcp(?dial_lower, ?dial_adapter, ?dial_driver, ?dial_socket,
         lifecycle.GRACEFUL)) { ret 3; }
     ret 0;
@@ -521,10 +523,10 @@ fun dial_one(index: usize) i64 {
     report("version=", negotiated.version::usize);
     report("suite=", negotiated.suite::usize);
     # a client with a store must resume every connection after its first
-    if (option_sessions && index != 0 && !negotiated.resumed)       { ret 44; }
-    if (negotiated.resumed)                                         { print.print("resumed=1\n"); }
-    or                                                              { print.print("resumed=0\n"); }
-    if (!release(?secure) || !operation_ok(cancel.destroy(?scope))) { ret 43; }
+    if (option_sessions && index != 0 && !negotiated.resumed)    { ret 44; }
+    if (negotiated.resumed)                                      { print.print("resumed=1\n"); }
+    or                                                           { print.print("resumed=0\n"); }
+    if (!release(?secure) || !operation_ok(cancel.dnit(?scope))) { ret 43; }
 
     var application_input: [64]u8;
     # the cancelled and timed-out read checks rely on the blocking transport
@@ -537,7 +539,7 @@ fun dial_one(index: usize) i64 {
             ?application_input[0], 64, 2)) { ret 44; }
         val cancelled: transport.Snapshot = transport.snapshot(operation(?secure));
         if (cancelled.terminal_error != error.CANCELLED ||
-            !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
+            !release(?secure) || !operation_ok(cancel.dnit(?scope))) {
             ret 45;
         }
         if (!operation_ok(cancel.make_root(?scope, opt[time.Instant].none{})) ||
@@ -547,7 +549,7 @@ fun dial_one(index: usize) i64 {
             ?application_input[0], 64, 3)) { ret 46; }
         val timed_out: transport.Snapshot = transport.snapshot(operation(?secure));
         if (timed_out.terminal_error != error.TIMEOUT ||
-            !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
+            !release(?secure) || !operation_ok(cancel.dnit(?scope))) {
             ret 47;
         }
     }
@@ -562,7 +564,7 @@ fun dial_one(index: usize) i64 {
             report("key update error=", updated.terminal_error::usize);
             ret 61;
         }
-        if (!release(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        if (!release(?secure) || !operation_ok(cancel.dnit(?scope))) {
             ret 62;
         }
         print.print("key-updated\n");
@@ -579,7 +581,7 @@ fun dial_one(index: usize) i64 {
         !settle(?secure, ?dial_runtime)) { ret 48; }
     val written: transport.Snapshot = transport.snapshot(operation(?secure));
     if (written.terminal_error != error.OK || written.application_bytes != 15 ||
-        !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 49;
     }
 
@@ -590,7 +592,7 @@ fun dial_one(index: usize) i64 {
         !settle(?secure, ?dial_runtime)) { ret 50; }
     val read: transport.Snapshot = transport.snapshot(operation(?secure));
     if (read.terminal_error != error.OK || read.application_bytes == 0 ||
-        !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 51;
     }
 
@@ -605,7 +607,7 @@ fun dial_one(index: usize) i64 {
         !settle(?secure, ?dial_runtime)) { ret 52; }
     val half_closed: transport.Snapshot = transport.snapshot(operation(?secure));
     if (half_closed.terminal_error != error.OK || !secure.send_closed ||
-        !release(?secure) || !operation_ok(cancel.destroy(?scope))) {
+        !release(?secure) || !operation_ok(cancel.dnit(?scope))) {
         ret 53;
     }
 
@@ -616,10 +618,10 @@ fun dial_one(index: usize) i64 {
     val closed: transport.Snapshot = transport.snapshot(operation(?secure));
     if (closed.terminal_error != error.OK || !release(?secure) ||
         !stream.destroy(?secure) ||
-        !operation_ok(cancel.destroy(?scope)) ||
-        (option_duplex && !runtime_ok(net_async.destroy(?dial_driver))) ||
+        !operation_ok(cancel.dnit(?scope)) ||
+        (option_duplex && !runtime_ok(net_async.dnit(?dial_driver))) ||
         !runtime_closed(io_runtime.close(?dial_runtime)) ||
-        !runtime_ok(io_runtime.destroy(?dial_runtime))) {
+        !runtime_ok(io_runtime.dnit(?dial_runtime))) {
         ret 8;
     }
     if (option_tls12) {
@@ -697,8 +699,8 @@ fun main(argc: i64, argv: **u8) i64 {
         tls13.ECDSA_SECP384R1_SHA384, tls13.RSA_PSS_RSAE_SHA256,
         tls13.RSA_PSS_RSAE_SHA384
     };
-    var entropy:    secret.Entropy   = secret.system_entropy();
-    var allocator:  secret.Allocator = secret.system_allocator();
+    var entropy:    secret.Entropy   = system_entropy.make();
+    var allocator:  secret.Allocator = system_allocator.make();
     var client_key: keys.PrivateKey  = keys.empty_private();
     val loaded_key: contracts.Error  = load.private_der(
         contracts.SecretBytes{data: ?client_key_der[0], len: 48}, cert.PKCS8_DER,

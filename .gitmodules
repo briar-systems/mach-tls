@@ -7,3 +7,6 @@
 [submodule "dep/pki"]
 	path = dep/pki
 	url = https://github.com/briar-systems/mach-pki
+[submodule "dep/encoding"]
+	path = dep/encoding
+	url = https://github.com/briar-systems/mach-encoding

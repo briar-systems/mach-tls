@@ -88,9 +88,9 @@ pub rec Loaded {
     skip_count:   usize;
 }
 
-val BEGIN:       [11]u8 = [11]u8{'-', '-', '-', '-', '-', 'B', 'E', 'G', 'I', 'N', ' '};
-val END:         [9]u8  = [9]u8{'-', '-', '-', '-', '-', 'E', 'N', 'D', ' '};
-val DASHES:      [5]u8  = [5]u8{'-', '-', '-', '-', '-'};
+val BEGIN:       [11]u8 = "-----BEGIN ";
+val END:         [9]u8  = "-----END ";
+val DASHES:      [5]u8  = "-----";
 val CERTIFICATE: [11]u8 = [11]u8{
     'C', 'E', 'R', 'T', 'I', 'F', 'I', 'C', 'A', 'T', 'E',
 };
@@ -449,9 +449,9 @@ pub fun release(a: *allocator.Allocator, loaded: *Loaded) {
 #[testing]
 val ROOT: str = "-----BEGIN CERTIFICATE-----\nMIIBoDCCAVKgAwIBAgIUcUBdqlz8lEoxcPtVyGLrQN0qDrwwBQYDK2VwMDwxCzAJ\nBgNVBAYTAlVTMRMwEQYDVQQKDApCcmlhciBUZXN0MRgwFgYDVQQDDA9CcmlhciBU\nZXN0IFJvb3QwHhcNMjYwODI4MTEzMjQ1WhcNMzYwODI1MTEzMjQ1WjA8MQswCQYD\nVQQGEwJVUzETMBEGA1UECgwKQnJpYXIgVGVzdDEYMBYGA1UEAwwPQnJpYXIgVGVz\ndCBSb290MCowBQYDK2VwAyEA1zQsVUhtzx5sroC8d3ohC0MJZbzDcOsY4SoyGpTY\ncU2jZjBkMB8GA1UdIwQYMBaAFELfNo+RqDCA56syuG7lnW5tmzn+MBIGA1UdEwEB\n/wQIMAYBAf8CAQAwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBRC3zaPkagwgOer\nMrhu5Z1ubZs5/jAFBgMrZXADQQB+WLFqB51+X7MOjRk2ZhOLGMvH4WNx8S8TO5rD\nVHQtXkYNVwGK3eDz3CZdB9uJH2HCTrIISG55wgGR3yg6cHoJ\n-----END CERTIFICATE-----\n";
 
-# a P-521 key, which this build cannot represent
+# an Ed448 key, which this build cannot represent
 #[testing]
-val P521_ROOT: str = "-----BEGIN CERTIFICATE-----\nMIICBTCCAWagAwIBAgIUdCIyy1M1plepJx9Rx4jW/1gRlhgwCgYIKoZIzj0EAwIw\nFDESMBAGA1UEAwwJUDUyMSBSb290MB4XDTI2MDkyNzA2NTUxNFoXDTM2MDkyNDA2\nNTUxNFowFDESMBAGA1UEAwwJUDUyMSBSb290MIGbMBAGByqGSM49AgEGBSuBBAAj\nA4GGAAQB6r27q74kR2bnzCe518X4u9oi36t0+sSTCD3sYi97eyHrrk87sf2tkw7q\n/E9q3TRlKRkj11TaOzMANQ8TBcXPRg0AUVFesV7196pa2nwg50bUGVd943pk5vzA\nO8faUOllkoRLvCNOFgVwFv653rKFFpjHhNEDlcf/nlGQyGUA2pgGPumjUzBRMB0G\nA1UdDgQWBBT1EPlmAcVldcCX8QoVJmrZfDKUCzAfBgNVHSMEGDAWgBT1EPlmAcVl\ndcCX8QoVJmrZfDKUCzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA4GMADCB\niAJCAJtYloGQ4V4O4ij4yZycBQ8EFAn1AQcIVNqwMJoeq1VfOhKiZBfYCIWOd9cO\n4eOLhlC7uX3GoJq7yKjdv9Bbnc0UAkIBuKSg6hnLBeyuR3k9txlWixHxVpk+pX8f\nrrztkcR5IEJYiF3uVNvk5wBRNzvp3oQ3zS3FJvi7LPfqtN4l9hGp0HU=\n-----END CERTIFICATE-----\n";
+val ED448_ROOT: str = "-----BEGIN CERTIFICATE-----\nMIIBijCCAQqgAwIBAgIUKuF24oS7tvK4QEVslKLj9Jei4/kwBQYDK2VxMBUxEzAR\nBgNVBAMMCkVkNDQ4IFJvb3QwHhcNMjYxMTIwMDMyNjUyWhcNMzYxMTE3MDMyNjUy\nWjAVMRMwEQYDVQQDDApFZDQ0OCBSb290MEMwBQYDK2VxAzoAUV9DxpN40+CR6J21\nm3jMndmxDrxCMepAyZN0FhksTpAB/B43tx40PkR4amNtam1Bzc/N6mGVTc8Ao1Mw\nUTAdBgNVHQ4EFgQUyphpXu+Fz0QiABhFMSkkw799svkwHwYDVR0jBBgwFoAUyphp\nXu+Fz0QiABhFMSkkw799svkwDwYDVR0TAQH/BAUwAwEB/zAFBgMrZXEDcwDjXYdA\nLfAwWNucdJWLvV55AQlMreQ6JExRf5ppLGJM7myKtEUKWkl5kMZSZ1GFECfb6rXC\nOaAn0wAN7z6YnQOJtBaM6doYJPJzdXstjF2tvwiDnsrs1aewa4s642Ebu9fNRYAs\ngheG9RoopwrHRLlQGQA=\n-----END CERTIFICATE-----\n";
 
 #[testing]
 fun put(target: *u8, at: usize, value: str) usize {
@@ -498,7 +498,7 @@ test cert_bundle__every_block_is_an_anchor_or_a_reported_skip {
     at = put(?text[0], at, "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n");
     at = put(?text[0], at, "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n");
     at = put(?text[0], at, "-----BEGIN CERTIFICATE-----\nMAA=\n-----END CERTIFICATE-----\n");
-    at = put(?text[0], at, P521_ROOT);
+    at = put(?text[0], at, ED448_ROOT);
     val tail: usize = at;
     at = put(?text[0], at, "-----BEGIN CERTIFICATE-----\nAAAA\n");
     val input: contracts.Bytes = contracts.Bytes{data: ?text[0], len: at};
@@ -534,8 +534,8 @@ test cert_bundle__every_block_is_an_anchor_or_a_reported_skip {
         anchors:       ?anchors[0], anchor_capacity: 8, skips: ?skips[0],
         skip_capacity: 7}, ?bundle) != STORAGE) { ret 6; }
     # without one usable anchor the bundle is refused, and still says why
-    val unusable: contracts.Bytes = contracts.Bytes{data: ?text[tail - 761],
-        len: at - (tail - 761)};
+    val unusable: contracts.Bytes = contracts.Bytes{data: ?text[tail - 595],
+        len: at - (tail - 595)};
     if (parse(unusable, Storage{der: contracts.Buffer{data: ?der[0], capacity: 4096},
         anchors:       ?anchors[0], anchor_capacity: 8, skips: ?skips[0],
         skip_capacity: 8}, ?bundle) != NO_ANCHORS || bundle.store.len != 0 ||
@@ -594,10 +594,10 @@ fun loads(path: str, blocks: usize, anchors: usize, unsupported: usize) bool {
 }
 
 test cert_bundle__loads_the_debian_and_alpine_system_bundles {
-    # every debian root loads. alpine's one skip is e-szigno tls root ca 2023,
-    # whose p-521 key this build has no verifier for
+    # every debian and alpine root loads, alpine's p-521 e-szigno tls root ca
+    # 2023 among them
     if (!loads("test/fixtures/bundles/debian.pem", 150, 150, 0)) { ret 1; }
-    if (!loads("test/fixtures/bundles/alpine.pem", 121, 120, 1)) { ret 2; }
+    if (!loads("test/fixtures/bundles/alpine.pem", 121, 121, 0)) { ret 2; }
     ret 0;
 }
 
