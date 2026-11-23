@@ -61,12 +61,12 @@ path = "../.."
 # tree is not committed and holds no pins of its own
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"
-ref = "branch/dev"
+version = "^10.0.0"
 
 [dep.crypto]
 git = "https://github.com/briar-systems/mach-crypto"
-ref = "branch/dev"
+version = "^0.30.0"
 
 [dep.pki]
 git = "https://github.com/briar-systems/mach-pki"
-ref = "branch/dev"
+version = "^0.5.0"
