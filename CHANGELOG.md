@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-24
+
+### Changed
+
+- Replaced the byte-by-byte linear pointer overlap checks in `record.secret_overlap` and `record.secret_public_overlap` with O(1) range checks, added 8-byte unrolled copy helpers, and added `record.seal_public` so `stream.prepare_record` seals public plaintext in a single copy using a `content.len + 1` secret scratch reservation instead of `content.len * 2 + 1` (#172).
+
 ## [0.18.0] - 2026-11-23
 
 ### Changed
